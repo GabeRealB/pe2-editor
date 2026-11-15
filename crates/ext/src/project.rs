@@ -39,7 +39,7 @@ pub trait Project {
     /// has none.
     fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>>;
     /// An output of an asset that is a picture (`palettes/default`): none where it has no such output.
-    fn image(&self, path: &str, address: &str) -> Option<Result<Image>>;
+    fn image(&self, path: &str, asked: &crate::Asked) -> Option<Result<Image>>;
     /// The target of the config in use.
     fn target(&self) -> Option<String> {
         None
@@ -49,23 +49,23 @@ pub trait Project {
         0
     }
     /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
-    fn table(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
-        let _ = (path, address);
+    fn table(&self, path: &str, asked: &crate::Asked) -> Option<Result<crate::Table>> {
+        let _ = (path, asked);
         None
     }
     /// An output of an asset that is one file, whole, made from its settings as they are written: what a viewer shows
     /// of what is being edited. None where it has no such output, or why it could not be made.
-    fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
-        let _ = (path, address);
+    fn bytes(&self, path: &str, asked: &crate::Asked) -> Option<Result<Vec<u8>>> {
+        let _ = (path, asked);
         None
     }
     /// What `bytes` gives, without waiting for it: for a frame, as how long an output takes is what it reads. What is on its
     /// way is shown again when it is there. Where nothing can make it on the side, it is made here.
-    fn request(&self, path: &str, address: &str) -> Requested {
-        match self.bytes(path, address) {
+    fn request(&self, path: &str, asked: &crate::Asked) -> Requested {
+        match self.bytes(path, asked) {
             Some(Ok(bytes)) => Requested::Ready(bytes),
             Some(Err(why)) => Requested::Failed(format!("{why:#}")),
-            None => Requested::Failed(format!("{path} has no {address}")),
+            None => Requested::Failed(format!("{path} has no {asked}")),
         }
     }
     /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only

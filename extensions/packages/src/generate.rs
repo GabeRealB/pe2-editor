@@ -1,6 +1,6 @@
 //! `generate`: a package's build made from its description, as a build system makes its build from what a project says
-//! (a generator's operation: what it makes is an operation the project uses, `uid://<generator>#<part>`). One `part` a
-//! layer: `first-pass`, `unit.<extension>` (what a unit of a language is made into), `package`, `library`.
+//! (a generator's operation: what it makes is an operation the project uses, `uid://<generator>/<part>`). One `part` a
+//! layer: `first_pass`, `unit/<extension>` (what a unit of a language is made into), `package`, `library`.
 //!
 //! The description is the generator node's own settings, those of the configuration built laid over them
 //! (`configs.<name>`):
@@ -20,7 +20,7 @@
 //! steps = [...]
 //! ```
 //!
-//! A generator's operations name one another as `#<part>`, which the host makes `uid://<generator>#<part>`.
+//! A generator's operations name one another as `/<part>`, which the host makes `uid://<generator>/<part>`.
 
 use pe2_ext::{Call, Result, Table, Value, anyhow, bail, ty};
 
@@ -173,7 +173,7 @@ fn package(description: &Table, library: bool) -> Result<Table> {
     // The units a first pass reads: C's, where the description says no other.
     let first = description.get("first_pass").and_then(|f| f.get("extension")).and_then(Value::as_str).unwrap_or("c");
     ops.insert("first_units".into(), units("sources", first));
-    ops.insert("first".into(), op("for_each", &[("body", text("#first-pass"))], &[("items", text("first_units"))]));
+    ops.insert("first".into(), op("for_each", &[("body", text("/first_pass"))], &[("items", text("first_units"))]));
     ops.insert(
         "firsted".into(),
         op("pe2.packages@with", &[], &[("sources", text("sources")), ("files", texts(&["first"]))]),
@@ -182,7 +182,7 @@ fn package(description: &Table, library: bool) -> Result<Table> {
     let mut compiled = vec![];
     for extension in &languages {
         ops.insert(format!("units_{extension}"), units("resolved", extension));
-        let body = format!("#unit.{extension}");
+        let body = format!("/unit/{extension}");
         let each = op("for_each", &[("body", text(&body))], &[("items", text(&format!("units_{extension}")))]);
         ops.insert(format!("objects_{extension}"), each);
         compiled.push(text(&format!("objects_{extension}")));
@@ -240,12 +240,12 @@ pub fn generate(call: &mut Call) -> Result<Table> {
         laid_over(&mut description, &over);
     }
     match part.as_str() {
-        "first-pass" => first_pass(&description),
+        "first_pass" => first_pass(&description),
         "package" => package(&description, false),
         "library" => package(&description, true),
-        _ => match part.strip_prefix("unit.") {
+        _ => match part.strip_prefix("unit/") {
             Some(extension) => unit(&description, extension),
-            None => bail!("no part {part}: first-pass, unit.<extension>, package or library"),
+            None => bail!("no part {part}: first_pass, unit/<extension>, package or library"),
         },
     }
 }

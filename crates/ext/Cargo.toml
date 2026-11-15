@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 # What an operation in steps carries from one step to the next, as CBOR (stepped), an item in its settings as base64.
+pe2-path.workspace = true
 serde.workspace = true
 ciborium = "0.2"
 base64 = "0.22"

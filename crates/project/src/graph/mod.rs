@@ -127,6 +127,8 @@ pub struct OpDef {
     pub output: Option<Type>,
     /// Its parameter's name: what reaches it is a family of it.
     pub parameter: Option<String>,
+    /// The keys of a query it takes, each with what it does: a reference asking with another is refused.
+    pub query: Vec<(String, String)>,
     pub run: Option<Arc<Run>>,
     /// What it will read, said before it runs.
     pub prepare: Option<Arc<Prepare>>,
@@ -161,6 +163,7 @@ impl OpDef {
             inputs: Vec::new(),
             output: None,
             parameter: None,
+            query: Vec::new(),
             run: None,
             prepare: None,
             stepped: false,
@@ -634,12 +637,13 @@ fn add_logic(ops: &mut Ops) {
         let field = call.settings().get("field").and_then(Toml::as_str).map(str::to_owned);
         let of = call.settings().get("of").and_then(Toml::as_table).context("it chooses `of` nothing")?.clone();
         let address = call.settings().get("output").and_then(Toml::as_str).unwrap_or(RESULT).to_owned();
+        let address = pe2_path::Asked::new(&address)?;
         let given = call.take(0)?;
         let key = value_at(given.value(), field.as_deref());
         let key = key.as_ref().and_then(Toml::as_str).filter(|k| of.contains_key(*k));
         let key = key.or_else(|| call.settings().get("default").and_then(Toml::as_str));
         let Some(reference) = key.and_then(|k| of.get(k)) else { return Err(anyhow::Error::new(Absent)) };
-        Ok((*call.output_of(reference, &address)?).clone())
+        Ok((*call.output_of(reference, address)?).clone())
     }));
     ops.add(OpDef::new(OVERLAY, "Overlay", "1").input(port("over", Type::Any)).input(port("under", Type::Any)).makes(
         Type::Table,
@@ -713,7 +717,7 @@ fn add_lists(ops: &mut Ops) {
     ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {
         let field = call.setting_str("field")?;
         let key = call.settings().get("key").and_then(Toml::as_str);
-        let address = call.setting_str("output")?;
+        let address = pe2_path::Asked::new(call.setting_str("output")?)?;
         let mut at = call.fields().get(field.split('.').next().unwrap_or_default());
         for part in field.split('.').skip(1) {
             at = at.and_then(|v| v.get(part));
@@ -785,7 +789,8 @@ impl Default for Ops {
         }));
         let declared = |settings: &Table| Type::parse(settings.get("type")?.as_str()?, "").ok();
         ops.add(OpDef::new(BELOW, "The version below", "1").output_of(declared).makes(Type::Any, move |call| {
-            let address = call.settings().get("output").and_then(Toml::as_str).unwrap_or("native");
+            let address =
+                pe2_path::Asked::new(call.settings().get("output").and_then(Toml::as_str).unwrap_or("native"))?;
             let reference = format!("{}{}", crate::index::BELOW, exec::id(call.recorder().node()));
             let value = (*call.output_of(&Toml::String(reference), address)?).clone();
             if let Some(ty) = declared(call.settings()) {
@@ -1300,6 +1305,10 @@ impl Plan {
         if let Some(i) = self.outputs.iter().position(|o| o.parameter.is_none() && o.name == address) {
             return Some((i, None));
         }
+        // A family asked for as it is, no member named: its operation is given no parameter.
+        if let Some(i) = self.outputs.iter().position(|o| o.name == address) {
+            return Some((i, None));
+        }
         let (name, value) = address.split_once('/')?;
         let i = self.outputs.iter().position(|o| o.parameter.is_some() && o.name == name)?;
         Some((i, Some(value.to_string())))
@@ -1764,8 +1773,9 @@ impl Lowering<'_> {
             self.problem(at, "is an output without a name");
             return;
         };
-        if name.is_empty() || name.contains(['/', '(', ')']) {
-            self.problem(at, &format!("`{name}` is not an output's name"));
+        // An output is named by its path: the groups it is in, then its own name (`unit/c`), as a reference names it.
+        if let Err(why) = pe2_path::Address::new(name) {
+            self.problem(at, &format!("`{name}` is not an output's name: {why}"));
             return;
         }
         if self.plan.outputs.iter().any(|o| o.name == name) {

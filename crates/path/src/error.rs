@@ -28,6 +28,17 @@ pub enum Why {
     NoUid,
     /// A suffix after `#` with nothing in it.
     EmptySuffix,
+    /// A character an address or a query does not take: an address's parts and a query's keys are ASCII letters,
+    /// digits and `_`; a query's values those, `-` and `.`.
+    Word(char),
+    /// A part of an address, or a key of a query, starting with `_`: what joins parts in C, which could not tell it apart.
+    Underscore,
+    /// A query naming a key twice.
+    Repeated,
+    /// A query's pair with no `=`.
+    NoValue,
+    /// A query asking something of no output: a reference with no address.
+    NoOutput,
     /// A name the system gave that is not text (on Windows, unpaired UTF-16; elsewhere, bytes that are not UTF-8).
     NotText,
     /// A name with a character that turns how text around it reads (U+202E and its kind): shown as what it is not.
@@ -57,6 +68,13 @@ impl fmt::Display for PathError {
             Why::Trailing(c) => write!(f, "{text:?} has a name ending in `{c}`, which Windows drops"),
             Why::NoUid => write!(f, "{text:?} is no uid (`uid://` and its digits)"),
             Why::EmptySuffix => write!(f, "{text:?} has nothing after its `#`"),
+            Why::Word(c) => write!(f, "{text:?} has a `{c}` where only ASCII letters, digits and `_` are taken"),
+            Why::Underscore => {
+                write!(f, "{text:?} has a part starting with `_`, which could not be told from what joins parts")
+            }
+            Why::Repeated => write!(f, "{text:?} names a key of its query twice"),
+            Why::NoValue => write!(f, "{text:?} has a key of its query with no `=` and value"),
+            Why::NoOutput => write!(f, "{text:?} asks with its query for no output: a query follows an address"),
             Why::NotText => write!(f, "{text:?} has a name that is not text"),
             Why::Direction(c) => {
                 write!(

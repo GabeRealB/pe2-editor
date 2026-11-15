@@ -1128,7 +1128,9 @@ mod tests {
         let index = project::index::Index::open(&p, &cache).unwrap();
         let _ = extensions.take_definitions(&index);
         let engine = extensions.engine();
-        let given = extensions.output(&engine, &index, &index.assets[tree("notes")], "text", true).unwrap();
+        let given = extensions
+            .output(&engine, &index, &index.assets[tree("notes")], pe2_path::Asked::constant("text"), true)
+            .unwrap();
         let project::graph::Value::Typed(typed) = &*given.value.unwrap() else { panic!("no file") };
         assert_eq!(typed.files[0].name, "notes.txt");
         let _ = std::fs::remove_dir_all(&dir);

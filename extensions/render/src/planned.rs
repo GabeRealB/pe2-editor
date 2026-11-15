@@ -247,7 +247,9 @@ mod tests {
     #[test]
     fn a_binding_chooses_its_palette_over_its_cells() {
         let texture: Table =
-            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
+            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left', query = { palette = 'two' } }"
+                .parse()
+                .unwrap();
         let at = placement(&tables(), texture.get("main").unwrap(), None).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [384, 256], palette: [0, 246] });
     }

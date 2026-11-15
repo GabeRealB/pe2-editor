@@ -390,7 +390,7 @@ fn atlas_texture(call: &mut Call) -> Result<Typed> {
     let atlas: String =
         call.given().get("atlas").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("it names no atlas"))?.to_string();
     #[request]
-    let page: Data = call.output_of(&atlas, "page")?;
+    let page: Data = call.output_of(&atlas, pe2_ext::Asked::constant("page"))?;
     let given = call.given();
     let Data::Typed(page) = page else { bail!("{atlas}: its page is no file") };
     let file = page.file()?.clone();
@@ -735,9 +735,12 @@ fn atlas_faces(
 }
 
 /// What an atlas reads, both requests' pairs: its fonts' native forms, then their encodings' settings.
-fn atlas_reads<'a>(fonts: &'a [String], encodings: &'a [String]) -> impl Iterator<Item = (&'a str, &'a str)> {
-    let natives = fonts.iter().map(|node| (node.as_str(), "native"));
-    natives.chain(encodings.iter().map(|encoding| (encoding.as_str(), SETTINGS)))
+fn atlas_reads<'a>(
+    fonts: &'a [String],
+    encodings: &'a [String],
+) -> impl Iterator<Item = (&'a str, &'a pe2_ext::Asked)> {
+    let natives = fonts.iter().map(|node| (node.as_str(), pe2_ext::NATIVE));
+    natives.chain(encodings.iter().map(|encoding| (encoding.as_str(), pe2_ext::SETTINGS)))
 }
 
 /// An atlas's layout, from the file its stack reads.
@@ -860,7 +863,9 @@ fn atlas_act(
 ) -> Result<ContentOutcome> {
     match request {
         ContentRequest::Action { action, .. } if action == PACK => {
-            let packed = project.bytes(asset.path(), "packed").ok_or_else(|| anyhow!("it has no packed layout"))??;
+            let packed = project
+                .bytes(asset.path(), pe2_ext::Asked::constant("packed"))
+                .ok_or_else(|| anyhow!("it has no packed layout"))??;
             if asset.read(LAYOUT).is_ok_and(|now| now == packed) {
                 bail!("its layout places everything its faces draw");
             }

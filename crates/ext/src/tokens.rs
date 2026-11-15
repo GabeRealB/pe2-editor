@@ -1,7 +1,11 @@
 //! Tokenizers: what a value is in the language a package is written in. One is declared for a type, with what it makes of the
 //! whole value and the derived values a target needs and no node shows (a material's `tpage`), each with what it generates
-//! and the args it reads. It is an ordinary operation, kept and traced as any, reached as the output `tokens/<address>` of a
-//! node; `tokenizer` says what it declares, without making anything. A target's own, for one target alone, overrides.
+//! and the args it reads. It is an ordinary operation, kept and traced as any, reached as the output `tokens` of a node,
+//! asked by a query: what it derives (`derive`; none, the whole value) and its entries' args (`tokens?derive=tpage`,
+//! `tokens?symbol=gBody`), each derived value made only when asked for. `tokenizer` says what it declares, without
+//! making anything. A target's own, for one target alone, overrides: `tokens_<target>`, `tokenizer_<target>`. A source
+//! reads one through `PE2_VALUE(slot, derive, tpage)`: the output, its query, are the package system's, never a
+//! reference's.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -13,6 +17,8 @@ use crate::{Result, Table, Value, anyhow, bail};
 
 /// The output making tokens, and the one saying what a tokenizer declares.
 pub const OUTPUT: &str = "tokens";
+/// The key of the query naming what a tokenizer derives of the value; none, the whole value.
+pub const DERIVE: &str = "derive";
 pub const DECLARED: &str = "tokenizer";
 
 /// What an output a sub-path goes through is: a table holding one of these, the node it leads to, or a plain value it ends at.
@@ -67,7 +73,7 @@ impl fmt::Display for Yields {
     }
 }
 
-/// What a source gave an address with `PE2_BIND_ARG`: each arg's values.
+/// How a read asks for a value: each key's values (`PE2_VALUE(slot, key, value)`, a reference's query).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Args(pub BTreeMap<String, Vec<String>>);
 
@@ -96,23 +102,23 @@ struct Entry {
     make: Make,
 }
 
-/// The address of what a tokenizer makes of an entry (`None`: the whole value), with its args.
-#[must_use]
-pub fn address(entry: Option<&str>, args: &Args) -> String {
-    let mut out = format!("{OUTPUT}/{}", entry.unwrap_or_default());
-    for (name, values) in &args.0 {
-        let _ = write!(out, ";{name}={}", values.join(","));
+/// What a tokenizer makes, asked of the output making tokens (`OUTPUT`, or a target's own) by its args - what it
+/// derives (`DERIVE`) among them: `tokens?derive=tpage&symbol=gBody`.
+///
+/// # Errors
+/// An arg has other than one value, or an arg or a value is none a query takes.
+pub fn address(output: &str, args: &Args) -> Result<std::sync::Arc<crate::Asked>> {
+    let mut text = output.to_string();
+    for (at, (name, values)) in args.0.iter().enumerate() {
+        let [value] = values.as_slice() else { bail!("{name} takes one value") };
+        let _ = write!(text, "{}{name}={value}", if at == 0 { '?' } else { '&' });
     }
-    out
+    Ok(std::sync::Arc::from(crate::Asked::new(&text)?))
 }
 
-fn parsed(text: &str) -> (Option<&str>, Args) {
-    let mut pieces = text.split(';');
-    let entry = pieces.next().filter(|entry| !entry.is_empty());
-    let args = pieces
-        .filter_map(|piece| piece.split_once('='))
-        .map(|(name, values)| (name.to_string(), values.split(',').map(str::to_string).collect()));
-    (entry, Args(args.collect()))
+/// The args an output making tokens was asked with: its query's.
+fn args_of(query: &crate::Query) -> Args {
+    Args(query.pairs().map(|(name, value)| (name.to_string(), vec![value.to_string()])).collect())
 }
 
 /// A tokenizer being declared: `Registry::tokenizer`.
@@ -162,19 +168,26 @@ impl Tokenizer<'_> {
         let suffix = target.as_ref().map_or_else(String::new, |target| format!("_{target}"));
         let declared = declaration(&entries);
         let held = entries.clone();
-        let names = |name: &str| target.as_ref().map_or_else(|| name.to_string(), |target| format!("{name}.{target}"));
+        let names = |name: &str| target.as_ref().map_or_else(|| name.to_string(), |target| format!("{name}_{target}"));
         let taken: Vec<&str> = values.iter().map(String::as_str).collect();
-        let op = registry
+        let mut op = registry
             .op(&format!("tokens_{local}{suffix}"))
             .label("Tokens")
             .takes("value", &taken)
             .output::<ty::Tokens>()
-            .parameter::<String>("address")
             .provides(&names(OUTPUT))
-            .keeps(Retain::Cache);
+            .keeps(Retain::Cache)
+            .asks(DERIVE, "what it derives of the value; none, the whole value");
+        let mut read: Vec<&str> = entries.iter().flat_map(|entry| entry.args.iter().copied()).collect();
+        read.sort_unstable();
+        read.dedup();
+        for arg in read {
+            op = op.asks(arg, "an arg its entries read");
+        }
         let made = move |call: &mut Call<'_>| {
-            let asked: String = call.parameter()?;
-            let (name, args) = parsed(&asked);
+            let name = call.query().get(DERIVE).map(str::to_string);
+            let name = name.as_deref();
+            let args = args_of(call.query());
             let call: &Call<'_> = call;
             let entry =
                 held.iter().find(|entry| entry.name == name).ok_or_else(|| anyhow!("{}", unknown(&held, name)))?;
@@ -247,12 +260,16 @@ mod tests {
     #[test]
     fn an_address_says_what_is_asked_and_with_what() {
         let args = Args(BTreeMap::from([("symbol".to_string(), vec!["gBody".to_string()])]));
-        assert_eq!(address(None, &args), "tokens/;symbol=gBody");
-        assert_eq!(address(Some("tpage"), &Args::default()), "tokens/tpage");
-        let (entry, read) = parsed("tpage;symbol=gBody;many=a,b");
-        assert_eq!(entry, Some("tpage"));
-        assert_eq!(read.0["many"], ["a", "b"]);
-        assert_eq!(parsed("").0, None);
+        assert_eq!(address(OUTPUT, &args).unwrap().to_string(), "tokens?symbol=gBody");
+        let derived = Args(BTreeMap::from([(DERIVE.to_string(), vec!["tpage".to_string()])]));
+        assert_eq!(address(OUTPUT, &derived).unwrap().to_string(), "tokens?derive=tpage");
+        let mut both = args.clone();
+        both.0.extend(derived.0);
+        let asked = address("tokens_psx", &both).unwrap();
+        assert_eq!(asked.to_string(), "tokens_psx?derive=tpage&symbol=gBody");
+        assert_eq!(args_of(asked.query()), both);
+        let many = Args(BTreeMap::from([("many".to_string(), vec!["a".to_string(), "b".to_string()])]));
+        assert!(address(OUTPUT, &many).is_err());
     }
 
     #[test]

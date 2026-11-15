@@ -190,7 +190,7 @@ impl Sourcing<'_> {
             .with_context(|| format!("{path}: its stack keeps no result"))?;
         let given = self
             .engine
-            .output(&plan, &lent, &result, true)
+            .output(&plan, &lent, pe2_path::Asked::new(&result)?, true)
             .with_context(|| format!("{path}: {op} could not import its source"))?;
         let Some(crate::graph::Value::Typed(made)) = given.value.as_deref() else {
             bail!("{path}: its import made no native form");
@@ -408,7 +408,7 @@ fn joined_sha1(world: &Layer<'_>, path: &str, engine: &crate::graph::exec::Engin
         .with_context(|| format!("{path}: its stack keeps no result"))?;
     let _span = tracing::info_span!("assembled", path = %path).entered();
     let given = engine
-        .output_in(Some(reach), &plan, node, &result, None, true)
+        .output_in(Some(reach), &plan, node, pe2_path::Asked::new(&result)?, None, true)
         .with_context(|| format!("{path}: its movies could not be joined"))?;
     Ok(match given.value.as_deref() {
         Some(crate::graph::Value::Typed(typed)) => match &typed.file()?.content {

@@ -842,7 +842,9 @@ fn retargeted(value: &toml::Value, asset: &Asset) -> Option<toml::Value> {
 
 fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value> {
     let toml::Value::Table(table) = value else {
-        let part = value.as_str()?.split_once('#').map_or_else(String::new, |(_, part)| format!("#{part}"));
+        // What it names of its asset, kept: all that follows its uid.
+        let text = value.as_str()?;
+        let part = &text[pe2_ext::target_of(value)?.len()..];
         return Some(format!("{uid}{part}").into());
     };
     let mut table = table.clone();
@@ -1246,13 +1248,18 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
                 None => name.to_string(),
             };
             // An output, after the asset's name.
-            let short = match pe2_ext::output_of(value) {
-                Some(output) => format!("{short}#{output}"),
-                None => short,
+            let asked = pe2_ext::asked_of(value);
+            let short = match &asked {
+                Ok(Some(output)) => format!("{short}#{output}"),
+                Ok(None) => short,
+                Err(_) => format!("{short}#?"),
             };
-            // Whole on hover, its output with it: the chip may be cut short.
-            let whole = pe2_ext::output_of(value)
-                .map_or_else(|| asset.path.to_string(), |output| format!("{}#{output}", asset.path));
+            // Whole on hover, its output with it: the chip may be cut short; what names no output says why.
+            let whole = match &asked {
+                Ok(Some(output)) => format!("{}#{output}", asset.path),
+                Ok(None) => asset.path.to_string(),
+                Err(why) => format!("{}: {why:#}", asset.path),
+            };
             if chip(ui, icon, &short, tint).on_hover_text(whole).clicked() {
                 *nav = Some(crate::workspace::Nav::to(asset.path.clone()));
             }
@@ -1389,12 +1396,14 @@ fn row_ui(
 /// The picture of the output a reference names, where it is one: a strip (a palette) as a swatch,
 /// anything else small.
 fn part_picture(ui: &mut egui::Ui, sheet: &Sheet, parts: &mut crate::workspace::Parts, value: &toml::Value) {
-    let (Some(part), Some((uid, path))) = (pe2_ext::output_of(value), project::index::reference(value)) else {
+    // What names no output shows no picture: its chip says why.
+    let (Ok(Some(part)), Some((uid, path))) = (pe2_ext::asked_of(value), project::index::reference(value)) else {
         return;
     };
+    let part = part.to_string();
     let Some(asset) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) else { return };
     let ctx = ui.ctx().clone();
-    let Some(Ok(picture)) = parts.get(&ctx, sheet.extensions, asset, part) else { return };
+    let Some(Ok(picture)) = parts.get(&ctx, sheet.extensions, asset, &part) else { return };
     let size = if picture.size.y <= 1.0 {
         egui::vec2(if picture.size.x <= 16.0 { 96.0 } else { 160.0 }, 10.0)
     } else {
@@ -2279,11 +2288,11 @@ mod tests {
     #[test]
     fn a_reference_is_retargeted_as_it_is_written() {
         let asset: toml::Table =
-            "a = \"uid://old#palettes/x\"\nb = { slot = \"uid://old\", at = [1, 2] }\n".parse().unwrap();
+            "a = \"uid://old/palettes/x\"\nb = { slot = \"uid://old\", at = [1, 2] }\n".parse().unwrap();
         let (a, b) = (&asset["a"], &asset["b"]);
         assert_eq!(super::reference_in(b).and_then(toml::Value::as_str), Some("uid://old"));
         let retarget = |value| super::retarget_to(value, "uid://new", "g/new");
-        assert_eq!(retarget(a).unwrap().as_str(), Some("uid://new#palettes/x"));
+        assert_eq!(retarget(a).unwrap().as_str(), Some("uid://new/palettes/x"));
         let moved = retarget(b).unwrap();
         assert_eq!(moved["slot"].as_str(), Some("uid://new"));
         assert_eq!(moved["at"], b["at"]);

@@ -400,9 +400,12 @@ impl FromOutputs for Result<Table> {
     }
 }
 
+/// An output of another node read, as a step's record holds it: the node, and what of it.
+type Read = (String, Box<crate::Asked>);
+
 /// The outputs a `#[request]` names: `(node, address)` pairs.
 #[must_use]
-pub fn needs<N: AsRef<str>, A: AsRef<str>>(pairs: impl IntoIterator<Item = (N, A)>) -> Vec<Need> {
+pub fn needs<N: AsRef<str>, A: AsRef<crate::Asked>>(pairs: impl IntoIterator<Item = (N, A)>) -> Vec<Need> {
     pairs.into_iter().map(|(node, address)| Need::new(node.as_ref(), address.as_ref())).collect()
 }
 
@@ -446,7 +449,7 @@ const SEALED_FILE: &str = "state.cbor";
 struct Record {
     cut: u32,
     held: u64,
-    needs: Vec<(String, String)>,
+    needs: Vec<Read>,
     /// Each item spawned, as its settings hold it (`ITEM`).
     items: Vec<String>,
     next: String,
@@ -473,7 +476,7 @@ pub fn continuation(data: &Data, read: impl FnOnce(&File) -> Result<Vec<u8>>) ->
         return Ok(None);
     }
     let record: Record = from_bytes(&read(record_file(typed, RECORD_FILE)?)?)?;
-    let needs = record.needs.into_iter().map(|(node, address)| Need { node, address }).collect();
+    let needs = record.needs.iter().map(|(node, address)| Need::new(node, address)).collect();
     Ok(Some(Continuation { needs, items: record.items, spawn: record.spawn, next: record.next }))
 }
 
@@ -559,6 +562,7 @@ fn as_own<T>(call: &mut Call<'_>, after_own: bool, code: impl FnOnce(&mut Call<'
         settings: &settings,
         made: std::cell::RefCell::new(call.made.take()),
         parameter_text: call.parameter_text,
+        query: call.query,
         host: call.host,
     };
     let done = code(&mut own);
@@ -614,7 +618,7 @@ fn step_run(
                 let record = Record {
                     cut: ended.cut,
                     held: hold(ended.state),
-                    needs: ended.needs.into_iter().map(|need| (need.node, need.address)).collect(),
+                    needs: ended.needs.into_iter().map(|need| (need.node, Box::from(&*need.address))).collect(),
                     items: ended.items.iter().map(item_text).collect::<Result<_>>()?,
                     next: step_name(&name, at + 1),
                     spawn: spawns.get(at).cloned().flatten(),
@@ -718,9 +722,9 @@ pub(crate) fn register_operation(
 /// requested whole and run once.
 pub fn replayed<R: 'static>(run: impl Fn(&mut Call<'_>) -> Result<R> + Send + Sync + 'static) -> Steps<R> {
     let turn = move |call: &mut Call<'_>, mut handed: Handed| -> Result<Flow<R>> {
-        let known: Vec<(String, String)> = handed.state().unwrap_or_default();
+        let known: Vec<Read> = handed.state().unwrap_or_default();
         let got: Vec<Result<Data>> = handed.requested()?;
-        let read: std::collections::HashMap<(String, String), std::result::Result<Data, String>> =
+        let read: std::collections::HashMap<Read, std::result::Result<Data, String>> =
             known.iter().cloned().zip(got.into_iter().map(|got| got.map_err(|e| format!("{e:#}")))).collect();
         let replaying = Replaying { inner: call.host, read, missed: std::sync::Mutex::default() };
         let mut replay = Call {
@@ -729,6 +733,7 @@ pub fn replayed<R: 'static>(run: impl Fn(&mut Call<'_>) -> Result<R> + Send + Sy
             carried: std::mem::take(&mut call.carried),
             made: std::cell::RefCell::new(call.made.take()),
             parameter_text: call.parameter_text,
+            query: call.query,
             host: &replaying,
         };
         let made = run(&mut replay);
@@ -757,8 +762,8 @@ pub fn replayed<R: 'static>(run: impl Fn(&mut Call<'_>) -> Result<R> + Send + Sy
 /// What a replayed run is lent of the host: what was read so far served, anything else noted and failing.
 struct Replaying<'a> {
     inner: &'a dyn crate::data::CallHost,
-    read: std::collections::HashMap<(String, String), std::result::Result<Data, String>>,
-    missed: std::sync::Mutex<Vec<(String, String)>>,
+    read: std::collections::HashMap<Read, std::result::Result<Data, String>>,
+    missed: std::sync::Mutex<Vec<Read>>,
 }
 
 impl crate::data::CallHost for Replaying<'_> {
@@ -782,11 +787,11 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.writer(name)
     }
 
-    fn temp(&self) -> Result<String> {
+    fn temp(&self) -> Result<crate::HostPath> {
         self.inner.temp()
     }
 
-    fn keep(&self, path: &str, name: &str) -> Result<File> {
+    fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
         self.inner.keep(path, name)
     }
 
@@ -802,12 +807,12 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.assets_of(node_type)
     }
 
-    fn place(&self, path: &str) -> Option<String> {
+    fn place(&self, path: &str) -> Option<crate::HostPath> {
         self.inner.place(path)
     }
 
-    fn output_of(&self, path: &str, address: &str) -> Result<Data> {
-        let pair = (path.to_string(), address.to_string());
+    fn output_of(&self, path: &str, address: &crate::Asked) -> Result<Data> {
+        let pair: Read = (path.to_string(), Box::from(address));
         if let Some(read) = self.read.get(&pair) {
             return read.clone().map_err(|why| anyhow!("{why}"));
         }
@@ -826,11 +831,11 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.build_config()
     }
 
-    fn path_of(&self, content: &crate::Content) -> Option<String> {
+    fn path_of(&self, content: &crate::Content) -> Option<crate::HostPath> {
         self.inner.path_of(content)
     }
 
-    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<String> {
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<crate::HostPath> {
         self.inner.serve(files, how)
     }
 }

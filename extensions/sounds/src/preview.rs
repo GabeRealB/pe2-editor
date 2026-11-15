@@ -41,7 +41,9 @@ pub trait Nodes {
 
 impl Nodes for Call<'_> {
     fn node(&self, reference: &str) -> Result<(Table, Table)> {
-        let Data::Typed(typed) = self.output_of(reference, "native")? else { anyhow::bail!("{reference}: no file") };
+        let Data::Typed(typed) = self.output_of(reference, pe2_ext::NATIVE)? else {
+            anyhow::bail!("{reference}: no file")
+        };
         // A node holding only what it is set to (a script) is that.
         if typed.files.is_empty() {
             return Ok((typed.settings.clone(), typed.settings));
@@ -50,7 +52,9 @@ impl Nodes for Call<'_> {
     }
 
     fn body(&self, reference: &str) -> Result<formats::spk::PoolItem> {
-        let Data::Typed(typed) = self.output_of(reference, "native")? else { anyhow::bail!("{reference}: no body") };
+        let Data::Typed(typed) = self.output_of(reference, pe2_ext::NATIVE)? else {
+            anyhow::bail!("{reference}: no body")
+        };
         Ok(formats::spk::PoolItem::Sample(self.read(typed.file()?)?))
     }
 }

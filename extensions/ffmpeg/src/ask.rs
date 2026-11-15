@@ -138,21 +138,12 @@ fn number(arguments: &Value, name: &str) -> Result<i64> {
     arguments.get(name).and_then(Value::as_integer).ok_or_else(|| anyhow!("no `{name}`"))
 }
 
-/// Where a trial may write: what the system says, a path a program can open.
-fn scratch() -> String {
-    let folder = ["TMPDIR", "TEMP", "TMP"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .unwrap_or_else(|| "/tmp".to_string());
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_nanos());
-    format!("{}/pe2-ffmpeg-check-{stamp}", folder.trim_end_matches('/'))
-}
-
 /// An encoding tried on one black frame of a size, and a moment of silence: whether it works, and what ffmpeg said.
 fn check(arguments: &Value) -> Result<Value> {
     let encoding = Encoding::parse(argument(arguments, "encoding")?)?;
     let size = format!("{}x{}", number(arguments, "width")?, number(arguments, "height")?);
-    let file = scratch();
+    // Where the trial writes: a place the host gives, in the system's folder of temporary files.
+    let file = pe2_ext::process::temp()?;
     let mut args = strings(&[
         "-hide_banner",
         "-loglevel",
@@ -172,9 +163,10 @@ fn check(arguments: &Value) -> Result<Value> {
     ]);
     args.extend(encoding.video.args("v"));
     args.extend(encoding.audio.args("a"));
-    args.extend(strings(&["-strict", "-2", "-f", &encoding.container, &file]));
+    args.extend(strings(&["-strict", "-2", "-f", &encoding.container]));
+    args.push(pe2_ext::Arg::from(&file));
     let worked = spawn("ffmpeg", &args)?.wait();
-    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(file.guest());
     Ok(match worked {
         Ok(()) => table([("works", Value::Boolean(true))]),
         Err(why) => table([("works", Value::Boolean(false)), ("why", text(&format!("{why:#}")))]),

@@ -252,7 +252,10 @@ pub fn link_inputs(call: &mut Call) -> Result<Typed> {
     let bound: Vec<String> = linked_in(&listed, "bound");
     #[request]
     let read: Vec<pe2_ext::Data> = call.outputs_of(
-        dependencies.iter().map(|d| (d.as_str(), "objects")).chain(bound.iter().map(|b| (b.as_str(), "symbols"))),
+        dependencies
+            .iter()
+            .map(|d| (d.as_str(), pe2_ext::Asked::constant("objects")))
+            .chain(bound.iter().map(|b| (b.as_str(), pe2_ext::Asked::constant("symbols")))),
     )?;
     let (objects_read, symbols_read) = read.split_at(dependencies.len());
     let target = target(call)?;

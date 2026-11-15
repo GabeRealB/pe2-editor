@@ -493,7 +493,11 @@ impl Imports {
             let problems: Vec<Problem> = named
                 .into_iter()
                 .filter_map(|reference| {
-                    let output = reference.output.as_ref().filter(|o| !addresses.contains(crate::ext::listed(o)))?;
+                    // Named by its address, however it is asked for; what is no address names no output it has.
+                    let has = |o: &&String| {
+                        pe2_path::Asked::new(o).is_ok_and(|asked| addresses.contains(asked.address().as_str()))
+                    };
+                    let output = reference.output.as_ref().filter(|o| !has(o))?;
                     Some(Problem::MissingOutput {
                         asset: reference.from.to_string(),
                         slot: reference.slot.clone(),
@@ -529,12 +533,13 @@ impl Imports {
     ) -> Look {
         let (plan, wrong) = tracing::info_span!("look: the plan made").in_scope(|| extensions.plan(asset));
         let Some((importer, output)) = import_output(&plan, extensions) else { return Look { wrong, import: None } };
-        let key = tracing::info_span!("look: its key").in_scope(|| reach.engine.key(&plan, asset, output, None));
+        let key = tracing::info_span!("look: its key")
+            .in_scope(|| reach.engine.key(&plan, asset, output, graph::exec::Asking::none()));
         if let Some((_, import)) = held.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
             return Look { wrong, import: Some((key, Import::Held(import.clone()))) };
         }
         let kept = tracing::info_span!("look: found kept, its trace held to what it read")
-            .in_scope(|| reach.engine.kept_in(Some(reach), &plan, asset, output, None));
+            .in_scope(|| reach.engine.kept_in(Some(reach), &plan, asset, output, graph::exec::Asking::none()));
         let kept = tracing::info_span!("look: what was kept read")
             .in_scope(|| kept.and_then(|trace| Some((self.store.describe(&trace.value)?, trace))));
         let import = match kept {
@@ -595,7 +600,8 @@ impl Imports {
         (importer, plan, output): (String, &Plan, usize),
         key: &str,
     ) -> Result<(bool, Reads, Arc<Known>)> {
-        reach.engine.output_in(Some(reach), plan, asset, &plan.outputs[output].name, None, true)?;
+        let asked = pe2_path::Asked::new(&plan.outputs[output].name)?;
+        reach.engine.output_in(Some(reach), plan, asset, asked, None, true)?;
         let trace = self.store.trace(key).context("its import was not kept")?;
         let kept = self.store.describe(&trace.value).context("its import was not kept")?;
         let (reads, import) = known_of(extensions, importer, kept, trace.reads)?;
@@ -1036,7 +1042,7 @@ mod attaching {
         let next_of = |call: &pe2_ext::Call<'_>| call.settings.get("next").and_then(Value::as_str).map(str::to_string);
         let reads = move |call: &mut pe2_ext::Call<'_>| {
             Ok(pe2_ext::Prepared {
-                needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, "native")).collect(),
+                needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, pe2_ext::NATIVE)).collect(),
                 micros: Vec::new(),
             })
         };
@@ -1047,7 +1053,7 @@ mod attaching {
             });
             DEEPEST.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
             let next = call.settings.get("next").and_then(Value::as_str).map(str::to_string);
-            let read = next.map(|next| call.output_of(&next, "native")).transpose();
+            let read = next.map(|next| call.output_of(&next, pe2_ext::NATIVE)).transpose();
             DEPTH.with(|depth| depth.set(depth.get() - 1));
             read?;
             Ok(Typed {
@@ -1102,10 +1108,10 @@ mod attaching {
     fn copying(r: &mut Registry) -> Result<()> {
         strips(r)?;
         let needs = |_: &mut pe2_ext::Call<'_>| {
-            Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", "native")], micros: Vec::new() })
+            Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", pe2_ext::NATIVE)], micros: Vec::new() })
         };
         let _ = r.op("copy").output::<Strip>().prepare(needs).run(|call| {
-            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", "native")? else {
+            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", pe2_ext::NATIVE)? else {
                 anyhow::bail!("uid://s makes no files")
             };
             let bytes = call.read(read.file()?)?;
@@ -1217,9 +1223,9 @@ mod attaching {
         // Reads what the setting names, and what that says comes next: known only once the first is made.
         let _ = r.op("hops").output::<ty::Table>().steps(pe2_ext::stepped::replayed(|call| {
             let first = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
-            let found = call.table_of(&first, "native")?;
+            let found = call.table_of(&first, pe2_ext::NATIVE)?;
             let next = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
-            call.table_of(&next, "native")
+            call.table_of(&next, pe2_ext::NATIVE)
         }));
         // Reads each of its `reads`, a list of nodes.
         let list = |call: &pe2_ext::Call<'_>| -> Vec<String> {
@@ -1237,13 +1243,13 @@ mod attaching {
             .output::<ty::Table>()
             .prepare(move |call| {
                 Ok(pe2_ext::Prepared {
-                    needs: list(call).iter().map(|node| pe2_ext::Need::new(node, "native")).collect(),
+                    needs: list(call).iter().map(|node| pe2_ext::Need::new(node, pe2_ext::NATIVE)).collect(),
                     micros: Vec::new(),
                 })
             })
             .run(move |call| {
                 for node in list(call) {
-                    call.table_of(&node, "native")?;
+                    call.table_of(&node, pe2_ext::NATIVE)?;
                 }
                 Ok(Table::new())
             });
@@ -1308,10 +1314,10 @@ mod attaching {
     fn chained(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
         let first: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
         #[request]
-        let found: Table = call.table_of(&first, "native")?;
+        let found: Table = call.table_of(&first, pe2_ext::NATIVE)?;
         let next: String = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
         #[request]
-        let arrived: Vec<Table> = call.tables_of([(next.as_str(), "native")])?;
+        let arrived: Vec<Table> = call.tables_of([(next.as_str(), pe2_ext::NATIVE)])?;
         #[each]
         let doubled: Vec<i64> = vec![1_i64, 2, 3]
             .into_iter()
@@ -1332,7 +1338,7 @@ mod attaching {
     #[pe2_ext::steps]
     fn hop(call: &mut pe2_ext::Call<'_>, node: String) -> Result<Table> {
         #[request]
-        let got: Table = call.table_of(&node, "native")?;
+        let got: Table = call.table_of(&node, pe2_ext::NATIVE)?;
         Ok(got)
     }
 
@@ -1343,7 +1349,7 @@ mod attaching {
         let mut seen: Vec<String> = Vec::new();
         loop {
             #[request]
-            let found: Table = call.table_of(&at, "native")?;
+            let found: Table = call.table_of(&at, pe2_ext::NATIVE)?;
             seen.push(at.clone());
             let Some(next) = found.get("next").and_then(Value::as_str) else { break };
             at = next.to_string();
@@ -1361,7 +1367,7 @@ mod attaching {
         let mut keys: Vec<String> = Vec::new();
         for name in names {
             #[request]
-            let found: Table = call.table_of(&name, "native")?;
+            let found: Table = call.table_of(&name, pe2_ext::NATIVE)?;
             keys.extend(found.keys().cloned());
         }
         Ok(Table::from_iter([
@@ -1374,7 +1380,7 @@ mod attaching {
     #[pe2_ext::steps]
     fn depth(call: &mut pe2_ext::Call<'_>, node: String) -> Result<i64> {
         #[request]
-        let found: Table = call.table_of(&node, "native")?;
+        let found: Table = call.table_of(&node, pe2_ext::NATIVE)?;
         if let Some(next) = found.get("next").and_then(Value::as_str) {
             let next: String = next.to_string();
             #[call]
@@ -1387,9 +1393,9 @@ mod attaching {
     /// Reads what nothing requested.
     #[pe2_ext::steps]
     fn unasked(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
-        let read: Table = call.table_of("one", "native")?;
+        let read: Table = call.table_of("one", pe2_ext::NATIVE)?;
         #[request]
-        let never: Table = call.table_of("two", "native")?;
+        let never: Table = call.table_of("two", pe2_ext::NATIVE)?;
         Ok(read)
     }
 
@@ -1413,7 +1419,7 @@ mod attaching {
         let (root, extensions) = staged("lasting", &nodes);
         let (_lock, cache, index) = opened(&root);
         let make = |engine: &crate::graph::exec::Engine, at: &str| {
-            extensions.output(engine, &index, &index.assets[&tree(at)], "native", true).unwrap()
+            extensions.output(engine, &index, &index.assets[&tree(at)], pe2_ext::NATIVE, true).unwrap()
         };
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let run = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone())).for_a_run();
@@ -1441,7 +1447,7 @@ mod attaching {
             extensions.operations(),
             Some(crate::graph::store::Store::open(&cache).unwrap()),
         );
-        let given = extensions.output(&engine, &index, &index.assets[&tree("hop")], "native", true).unwrap();
+        let given = extensions.output(&engine, &index, &index.assets[&tree("hop")], pe2_ext::NATIVE, true).unwrap();
         let value = format!("{:?}", given.value.unwrap());
         assert!(value.contains("arrived"), "{value}");
         let _ = std::fs::remove_dir_all(&root);
@@ -1463,7 +1469,7 @@ mod attaching {
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let make = |at: &str| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-            extensions.output(&engine, &index, &index.assets[&tree(at)], "native", true)
+            extensions.output(&engine, &index, &index.assets[&tree(at)], pe2_ext::NATIVE, true)
         };
         let value = format!("{:?}", make("chain").unwrap().value.unwrap());
         assert!(value.contains("arrived"), "the second read, named by the first: {value}");
@@ -1480,11 +1486,13 @@ mod attaching {
         );
         let index = Index::open(&Project::load(&root).unwrap(), &cache).unwrap();
         let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-        let followed = extensions.output(&engine, &index, &index.assets[&tree("followed")], "native", true).unwrap();
+        let followed =
+            extensions.output(&engine, &index, &index.assets[&tree("followed")], pe2_ext::NATIVE, true).unwrap();
         let followed = format!("{:?}", followed.value.unwrap());
         assert!(followed.contains("[String(\"one\"), String(\"two\"), String(\"three\")]"), "{followed}");
         // A helper calling itself, a `for` with a cut in it.
-        let counted = extensions.output(&engine, &index, &index.assets[&tree("counted_on")], "native", true).unwrap();
+        let counted =
+            extensions.output(&engine, &index, &index.assets[&tree("counted_on")], pe2_ext::NATIVE, true).unwrap();
         let counted = format!("{:?}", counted.value.unwrap());
         assert!(counted.contains("\"length\": Integer(3)"), "{counted}");
         assert!(counted.contains("[String(\"next\"), String(\"arrived\"), String(\"next\")]"), "{counted}");
@@ -1506,8 +1514,10 @@ mod attaching {
             extensions.operations(),
             Some(crate::graph::store::Store::open(&cache).unwrap()),
         );
-        let why =
-            extensions.output(&engine, &index, &index.assets[&tree("a")], "native", true).err().expect("a circle");
+        let why = extensions
+            .output(&engine, &index, &index.assets[&tree("a")], pe2_ext::NATIVE, true)
+            .err()
+            .expect("a circle");
         assert!(format!("{why:#}").contains("reads, through others, itself"), "{why:#}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1521,7 +1531,7 @@ mod attaching {
         let make = |index: &Index| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
             let value = extensions
-                .output(&engine, index, &index.assets[&tree("whole")], "native", true)
+                .output(&engine, index, &index.assets[&tree("whole")], pe2_ext::NATIVE, true)
                 .unwrap()
                 .value
                 .unwrap();
@@ -1598,7 +1608,7 @@ mod attaching {
             ),
         );
         write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
+        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1660,7 +1670,7 @@ mod attaching {
             &format!("uid = \"uid://s\"\ncells.a = {{ palette = \"warm\" }}\n{stack}"),
         );
         write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
+        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1714,7 +1724,7 @@ mod attaching {
         write(&root, ".layers/base/s.node/source.txt", "a b");
         write(&root, ".layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
         write(&root, ".layers/base/t.node/source.txt", "a");
-        write(&root, ".layers/base/r.node/node.toml", "one = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
+        write(&root, ".layers/base/r.node/node.toml", "one = \"uid://s/cells/b\"\ntwo = \"uid://t/cells/b\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1739,7 +1749,7 @@ mod attaching {
         for (path, text) in [
             ("s.node/source.txt", "a"),
             ("t.node/source.txt", "a b"),
-            ("r.node/node.toml", "one = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
+            ("r.node/node.toml", "one = \"uid://s/cells/a\"\ntwo = \"uid://t/cells/c\"\n"),
         ] {
             write(&root, &format!(".layers/base/{path}"), text);
             let refreshed = index.refresh(&project, &[base(path)]).unwrap();

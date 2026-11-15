@@ -4034,6 +4034,7 @@ dependencies = [
  "base64",
  "ciborium",
  "pe2-ext-macros",
+ "pe2-path",
  "serde",
  "toml 0.8.23",
  "wit-bindgen 0.63.0",

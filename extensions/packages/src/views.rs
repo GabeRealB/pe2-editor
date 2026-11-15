@@ -47,7 +47,7 @@ impl Slots {
         }
         self.revision = revision;
         let Some(path) = ui.asset().map(|asset| asset.path().to_string()) else { return };
-        let told = ui.project().table(&path, "reflection");
+        let told = ui.project().table(&path, pe2_ext::Asked::constant("reflection"));
         self.told = told.map(|told| told.map_err(|e| format!("{e:#}")));
     }
 }
@@ -219,7 +219,7 @@ fn tree(ui: &mut Ui, reflected: &Table, slots: &[Table]) {
     });
 }
 
-/// The slot selected: what its sources read of it and the args they give.
+/// The slot selected: what its sources read of it, each as a reference would end (how it is made, the part read).
 fn detail(ui: &mut Ui, slots: &[Table]) {
     let selected = ui.selected();
     let shown = selected.as_deref().and_then(|part| part.strip_prefix("slots/"));
@@ -227,18 +227,6 @@ fn detail(ui: &mut Ui, slots: &[Table]) {
     ui.section(text(slot, "name"), |ui| {
         for read in words(slot, "reads") {
             ui.label(if read.is_empty() { "the whole value" } else { &read });
-        }
-        for given in tables(slot, "args") {
-            let at = text(&given, "path");
-            let values = words(&given, "values").join(", ");
-            ui.styled(
-                &format!(
-                    "{}{} = {values}",
-                    if at.is_empty() { String::new() } else { format!("{at} ") },
-                    text(&given, "arg")
-                ),
-                Style::Note,
-            );
         }
     });
 }
@@ -565,8 +553,10 @@ impl View for Tokens {
             let own = ui
                 .project()
                 .target()
-                .and_then(|target| ui.project().table(&path, &format!("{}.{target}", pe2_ext::tokens::DECLARED))?.ok());
-            let told = own.map(Ok).or_else(|| ui.project().table(&path, pe2_ext::tokens::DECLARED));
+                .map(|target| format!("{}_{target}", pe2_ext::tokens::DECLARED))
+                .and_then(|own| ui.project().table(&path, pe2_ext::Asked::new(&own).ok()?)?.ok());
+            let told =
+                own.map(Ok).or_else(|| ui.project().table(&path, pe2_ext::Asked::constant(pe2_ext::tokens::DECLARED)));
             self.told = told.map(|told| told.map_err(|e| format!("{e:#}")));
         }
         let table = match &self.told {

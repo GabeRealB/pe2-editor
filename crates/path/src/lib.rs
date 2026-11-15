@@ -4,8 +4,9 @@
 //!
 //! - [`Name`]: one part of a path, portable: a name every system the editor runs on can hold as it is.
 //! - [`RelPath`]: names joined by `/`, relative to whatever it is taken within.
-//! - [`Uid`] and [`ResourcePath`]: what a project names an asset by - its uid, and what of it a suffix names
-//!   (`uid://x#objects`, `uid://x#cells/left`).
+//! - [`Uid`] and [`ResourcePath`]: what a project names an asset by - its uid, what of it an address names, and how
+//!   that is asked for, written as a URL is (`uid://x/objects`, `uid://x/cells/body?palette=night`); [`Address`],
+//!   [`Query`] and [`Asked`] are those parts, checked as the program is compiled where it holds them.
 //! - [`VfsPath`]: a path within a scope of the project's filesystem, typed by the kind of scope ([`Tree`], [`Run`],
 //!   [`Given`]), so that one kind's path is not taken for another's.
 //!
@@ -46,5 +47,5 @@ pub fn from<T: ?Sized>(start: &T) -> (std::ops::Bound<&T>, std::ops::Bound<&T>) 
 pub use error::{PathError, Why};
 pub use fold::{UNICODE_VERSION, folded};
 pub use name::{Name, Names, RelPath};
-pub use resource::{ResourcePath, Uid};
+pub use resource::{Address, Asked, Query, ResourcePath, Uid};
 pub use vfs::{Given, Run, Scope, Tree, VfsPath};

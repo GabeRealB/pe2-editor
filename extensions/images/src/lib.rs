@@ -195,7 +195,7 @@ fn part_outputs(r: &mut Registry) {
             palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
         });
     // A cell as what reads its values sees it: the image again, told which cell (`tokens::leads_on`), so that
-    // `PE2_VALUE(chrome, cell, prompt, _v)` reads the prompt's row of the chrome.
+    // `PE2_VALUE(chrome, derive, v, _cell, prompt)` reads the prompt's row of the chrome.
     let _ = r
         .op("cell")
         .label("A cell, as what reads it")
@@ -215,18 +215,28 @@ fn part_outputs(r: &mut Registry) {
         .input::<NativeForm>("native")
         .output::<ty::Image>()
         .parameter::<String>("name")
+        .asks(PALETTE, "a palette of the image's to draw the cell through, other than its own")
         .members(|asset| {
             asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()
         })
         .run(|call| {
             let name: String = call.parameter()?;
+            let through = call.query().get(PALETTE).map(str::to_string);
             let ty::Either::Second(image) = call.take::<NativeForm>(0)? else {
                 pe2_ext::bail!("a background has no cells")
             };
-            cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name)
+            let lent = call.lend_settings(&image.derived);
+            let asset = lent.asset();
+            if let Some(palette) = through.as_ref().filter(|palette| !palette_names(&asset).contains(palette)) {
+                pe2_ext::bail!("it has no palette {palette}");
+            }
+            cell_picture(&asset, &image, &name, through.as_deref())
                 .ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
         });
 }
+
+/// The key of a cell's picture asked through another palette: `cells/skin?palette=night`.
+const PALETTE: &str = "palette";
 
 /// What an image offers, whichever way it is stored: each hanging off the layer named `image`.
 const OFFERS: &str = r#"
@@ -613,7 +623,7 @@ pub(crate) fn output_picture(asset: &Asset, address: &str) -> Option<Result<Imag
         Err(e) => return Some(Err(e)),
     };
     if let Some(name) = address.strip_prefix("cells/") {
-        return cell_picture(asset, &image, name).map(Ok);
+        return cell_picture(asset, &image, name, None).map(Ok);
     }
     palette_picture(&image, address.strip_prefix("palettes/")?).map(Ok)
 }
@@ -624,9 +634,8 @@ fn palette_picture(image: &TexelImage, name: &str) -> Option<Image> {
     Some(Image { width: colors.len(), height: 1, rgba: colors.iter().flat_map(|&c| rgba(c)).collect() })
 }
 
-/// A cell where it is drawn; `skin@night` through a palette of the image's other than its own.
-fn cell_picture(asset: &Asset, image: &TexelImage, name: &str) -> Option<Image> {
-    let (name, through) = name.split_once('@').map_or((name, None), |(name, palette)| (name, Some(palette)));
+/// A cell where it is drawn, through a palette of the image's other than its own where one is named.
+fn cell_picture(asset: &Asset, image: &TexelImage, name: &str, through: Option<&str>) -> Option<Image> {
     let cell = cells(asset).into_iter().find(|c| c.name == name)?;
     let through = match through {
         Some(palette) => Some((name, palette_names(asset).iter().position(|known| known == palette)?)),
@@ -832,7 +841,7 @@ mod tests {
         assert_eq!(pixel(7), super::rgba(red));
         assert_eq!(pixel(8), super::rgba(blue), "the second is not under the first");
         // A cell alone has every texel it has, and none of its neighbor's.
-        let alone = super::cell_picture(&asset, &image, "left").unwrap();
+        let alone = super::cell_picture(&asset, &image, "left", None).unwrap();
         assert_eq!((alone.width, alone.height), (16, 1));
         assert!(alone.rgba.chunks(4).all(|pixel| pixel == super::rgba(red)));
     }

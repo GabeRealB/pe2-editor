@@ -15,7 +15,7 @@ const PREVIEW: f32 = 128.0;
 pub struct Pictures(HashMap<String, Option<Texture>>);
 
 impl Pictures {
-    pub fn get(&mut self, ui: &Ui, image: &str, part: &str) -> Option<&Texture> {
+    pub fn get(&mut self, ui: &Ui, image: &str, part: &pe2_ext::Asked) -> Option<&Texture> {
         let key = format!("{image}#{part}");
         self.0
             .entry(key.clone())
@@ -42,8 +42,9 @@ pub struct Choices {
 pub fn choices_of(ui: &Ui, texture: &Value) -> Option<Choices> {
     let image = ui.project().resolve(texture.get("slot").unwrap_or(texture))?;
     let named = |list: Vec<(&str, &Value)>| list.into_iter().map(|(name, _)| name.to_string()).collect();
-    let cell =
-        material::cell_of(texture).and_then(|cell| image.parts("cells").into_iter().find(|(name, _)| *name == cell));
+    // What names no cell is said where its cell is shown (`named_in`); its choices are the image's.
+    let cell_named = material::cell_of(texture).ok().flatten();
+    let cell = cell_named.and_then(|cell| image.parts("cells").into_iter().find(|(name, _)| *name == cell));
     let own = cell.and_then(|(_, cell)| cell.get("palette")).and_then(Value::as_str).map(str::to_string);
     Some(Choices {
         image: image.path().to_string(),
@@ -53,6 +54,25 @@ pub fn choices_of(ui: &Ui, texture: &Value) -> Option<Choices> {
     })
 }
 
+/// What a texture names of its image, as the panes show it: its cell, and the palette it is read through - the cell's own
+/// where it names none.
+///
+/// # Errors
+/// It names what is no cell, or asks by what is no palette.
+pub fn named_in(texture: &Value, choices: &Choices) -> pe2_ext::Result<(String, String)> {
+    let cell = material::cell_of(texture)?.unwrap_or_default().to_string();
+    let palette = material::palette_of(texture)?.map(str::to_string).or_else(|| choices.own.clone());
+    Ok((cell, palette.unwrap_or_default()))
+}
+
+/// A texture read anew, set where it is held; why not, where it cannot be.
+pub fn set_reading(ui: &mut Ui, key: &str, read: pe2_ext::Result<Value>) {
+    match read {
+        Ok(read) => ui.set(key, Some(&read)),
+        Err(why) => ui.styled(&format!("{why:#}"), Style::Error),
+    }
+}
+
 impl Panel {
     fn slot(&mut self, ui: &mut Ui, key: &str, texture: &Value) {
         ui.field(key, texture);
@@ -60,11 +80,12 @@ impl Panel {
             ui.styled("Its image is not in the project", Style::Error);
             return;
         };
-        let cell = material::cell_of(texture).unwrap_or_default().to_string();
-        let palette =
-            material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
+        let (cell, palette) = match named_in(texture, &choices) {
+            Ok(named) => named,
+            Err(why) => return ui.styled(&format!("{why:#}"), Style::Error),
+        };
         let part = material::cell_address(&cell, Some(&palette));
-        if let Some(picture) = self.pictures.get(ui, &choices.image, &part).cloned() {
+        if let Some(picture) = part.ok().and_then(|part| self.pictures.get(ui, &choices.image, &part).cloned()) {
             #[expect(clippy::cast_precision_loss, reason = "a picture is far smaller than floats lose pixels at")]
             let wide = picture.width() as f32 / picture.height().max(1) as f32;
             ui.image(&picture, PREVIEW * wide, PREVIEW);
@@ -72,11 +93,12 @@ impl Panel {
         ui.horizontal(|ui| {
             ui.label("Cell");
             if let Some(chosen) = ui.combo(&format!("{key}.cell"), &cell, &choices.cells) {
-                ui.set(key, Some(&material::reading(texture, &choices.cells[chosen], material::palette_of(texture))));
+                let palette = material::palette_of(texture).ok().flatten();
+                set_reading(ui, key, material::reading(texture, &choices.cells[chosen], palette));
             }
             ui.label("Palette");
             if let Some(chosen) = ui.combo(&format!("{key}.palette"), &palette, &choices.palettes) {
-                ui.set(key, Some(&material::reading(texture, &cell, Some(&choices.palettes[chosen]))));
+                set_reading(ui, key, material::reading(texture, &cell, Some(&choices.palettes[chosen])));
             }
         });
     }

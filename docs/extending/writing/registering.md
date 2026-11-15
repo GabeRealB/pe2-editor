@@ -44,11 +44,15 @@ cells, that the user can hover and click.
 | `output`, `also`, `output_same_as`, `output_list_of` | What it makes, and extra outputs. |
 | `field`, `derives`, `inverse` | Its settings; settings it works out from its input; how to undo it, for importers. |
 | `parameter`, `members` | A family of outputs, such as one picture per look. |
+| `asks(key, does)` | A key of a query it takes: how what it makes is asked for (`palette` of `uid://…/cells/left?palette=night`), read with `Call::query`. A reference asking with a key no operation takes is refused. |
 | `run` | The work itself. |
 | `prepare`, `steps`, `streams` | Work in stages: declaring what it reads first, steps written with `#[pe2_ext::steps]`, or a stream such as video frames. |
 | `keeps` | How long its result is kept: `Retain::Cache`, `Build` or `Transient`. |
 | `provides` | Offers it as a conversion to every asset making a value it takes. |
 | `exports(label, extension)` | Offers it as an exporter in **File ▸ Export…**. |
+
+An output is named by its path, any groups and then its own name (`unit/c`), each part ASCII letters, digits and `_`,
+not starting with `_`: the parts reach C as parts of a name.
 
 The SDK provides kinds of value to take and make: `Image`, `Table`, `Pcm`, `Sound`, `Playback`, `Bytes`, `File<T>`,
 `List<T>`, `Stream<T>`, `Marks`, `Any`, `OneOf`.

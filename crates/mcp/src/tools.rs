@@ -25,7 +25,8 @@ struct AssetArgs {
 struct OutputArgs {
     /// The asset: its path or its uid.
     asset: String,
-    /// The output, by its address: `stream`, `native`, a family's member by its parameter's value (`picture/night`).
+    /// The output, by its address: `stream`, `native`, a family's member by its parameter's value (`picture/night`),
+    /// and how it is asked for after a `?` where it takes a query (`cells/body?palette=night`).
     output: String,
 }
 
@@ -64,8 +65,9 @@ struct ProblemsArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct PreviewArgs {
-    /// The image: its path or its uid; after a `#`, one of its outputs (`#picture/night`, `#cells/cursor`,
-    /// `#palettes/default`; `get_asset` lists them).
+    /// The image: its path or its uid, and one of its outputs - a reference to it (`uid://.../cells/cursor`,
+    /// `uid://.../cells/body?palette=night`), or after a path's `#` (`#picture/night`, `#palettes/default`;
+    /// `get_asset` lists them).
     asset: String,
     /// The look to show it in, by name (an image's variants; an atlas's `default` and its variants). Its first when
     /// absent.
@@ -585,10 +587,11 @@ fn problems(index: &Index, limit: usize) -> Value {
 fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Result<CallToolResult, String> {
     use project::graph::{Content, Value as Made};
     let asset = asset(index, &args.asset)?;
+    let output = pe2_path::Asked::new(&args.output).map_err(|e| format!("{e}"))?;
     let engine = extensions.engine();
     // A stream is opened, not made: what it is, its header.
     if extensions.stream_output(asset).as_deref() == Some(args.output.as_str()) {
-        let stream = extensions.stream(&engine, index, asset, &args.output).map_err(|e| format!("{e:#}"))?;
+        let stream = extensions.stream(&engine, index, asset, output).map_err(|e| format!("{e:#}"))?;
         let header = serde_json::to_value(stream.header()).unwrap_or_default();
         return Ok(CallToolResult::success(vec![ContentBlock::text(json!({ "stream": header }).to_string())]));
     }
@@ -596,7 +599,7 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
     let given = if args.output == project::graph::THUMBNAIL {
         extensions.thumbnail(&engine, asset)
     } else {
-        extensions.output(&engine, index, asset, &args.output, true)
+        extensions.output(&engine, index, asset, output, true)
     };
     let given = given.map_err(|e| format!("{e:#}"))?;
     let value = given.value.ok_or_else(|| format!("{}: {} made nothing", asset.path, args.output))?;
@@ -645,12 +648,24 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
 }
 
 fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {
-    // An output: `uid://...#picture/night`, `path#cells/cursor`.
-    if let Some((name, output)) = args.asset.split_once('#') {
-        let asset = asset(index, name)?;
+    // An output: a reference naming one (`uid://.../picture/night`), or one after a path's `#` (`path#cells/cursor`).
+    let (named, output) = match args.asset.trim() {
+        text if text.starts_with("uid://") => {
+            let named = pe2_path::ResourcePath::new(text).map_err(|e| format!("{e}"))?;
+            (asset(index, &named.uid.to_string())?, named.asked)
+        }
+        text => match text.split_once('#') {
+            Some((name, output)) => {
+                (asset(index, name)?, Some(Arc::from(pe2_path::Asked::new(output).map_err(|e| format!("{e}"))?)))
+            }
+            None => (asset(index, text)?, None),
+        },
+    };
+    if let Some(output) = output {
+        let asset = named;
         let ids: Vec<String> = extensions.addresses(asset).into_iter().map(|(address, _)| address).collect();
         let image = extensions
-            .output_image(asset, output)
+            .output_image(asset, &output)
             .ok_or_else(|| {
                 format!("{}: no output {output} that is a picture; its outputs: {}", asset.path, ids.join(", "))
             })?
@@ -663,7 +678,7 @@ fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result
             ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"),
         ]));
     }
-    let asset = asset(index, &args.asset)?;
+    let asset = named;
     let looks = extensions.looks(asset);
     let look = match &args.variant {
         Some(name) => looks

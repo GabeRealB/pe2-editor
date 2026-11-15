@@ -10,6 +10,24 @@ lowered to a **plan**: a graph of steps, each an operation with its inputs, sett
 extensions (see [The extension runtime](../extensions/runtime.md)) or from the project itself (`pe2.graph`
 operations, inlined into the plan where they are used).
 
+## Outputs and how they are asked for
+
+An output is named by its path - any groups, then its own name (`unit/c`) - which `pe2_path::Address` checks where the
+plan is laid out. A reference names one as a URL names a page, `uid://<uid>/<path>[?<query>][#<fragment>]`
+(`pe2_path::ResourcePath`), and what reaches the engine is an `Asked`: the path and the query.
+
+- A **family** is an output whose operation takes a parameter: `picture/night` is the member `night` of the family
+  `picture` (`Plan::output`); the family asked for as it is gives its operation no parameter.
+- A **query** says how the output is made (`palette=night`). An operation declares the keys it takes
+  (`OpDef::query`); `Engine::output_in` refuses any other by name before anything runs, and the operation reads it as
+  `Call::query`. The member and the query go together as `exec::Asking`, into the key an output is kept under, so two
+  ways of making one output are two results.
+- A **fragment** is the part of what is made that a reader takes. It never reaches the engine and is never part of a
+  key: what is made is the same whichever part is read.
+
+A read of another node's output is recorded by the node and what was asked (`<node>#<path>?<query>`), and checked again
+by that.
+
 ## Pulled, not pushed
 
 A plan is evaluated by pulling: a step is made when something asks for its output, and asks for its own inputs
@@ -56,7 +74,7 @@ package is built by whatever operation its node names (`pe2.packages`: what it g
 A generator (`pe2.graph@generator`) is a node whose outputs are operations - declarations, each defining one - as a
 build system makes its build from a description. When definitions are taken, the generators are collected; what they
 make is made when the operations are next asked for, for the configuration built, and kept until it or they change,
-each output defining `uid://<generator>#<output>` (`#<output>` naming another of its own). A generator is laid out
+each output defining `uid://<generator>/<output>` (`/<output>` naming another of its own). A generator is laid out
 with the project's own definitions alone and made of its own settings and the configuration, no other node, so it
 cannot depend on what it makes; a thread making them is given those definitions alone when it asks again. Plans are
 laid out afresh with the definitions of the configuration built, so two configurations may build a package with two

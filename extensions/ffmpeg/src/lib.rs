@@ -15,7 +15,7 @@
 use pe2_ext::media::{AudioData, PixelFormat, SampleFormat};
 use pe2_ext::process::{Process, spawn};
 use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Data, File, Registry, Result, Signature, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Arg, Data, File, HostPath, Registry, Result, Signature, Table, Typed, Value, anyhow, bail};
 
 mod ask;
 mod decode;
@@ -71,9 +71,9 @@ impl Encoder {
     }
 
     /// Its part of a command line, for a stream (`v`, `a`).
-    fn args(&self, stream: &str) -> Vec<String> {
-        let mut args = vec![format!("-c:{stream}"), self.name.clone()];
-        args.extend(self.options.iter().flat_map(|(key, value)| [format!("-{key}"), value.clone()]));
+    fn args(&self, stream: &str) -> Vec<Arg> {
+        let mut args = vec![Arg::from(format!("-c:{stream}")), Arg::from(&self.name)];
+        args.extend(self.options.iter().flat_map(|(key, value)| [Arg::from(format!("-{key}")), Arg::from(value)]));
         args
     }
 }
@@ -162,13 +162,9 @@ fn register(r: &mut Registry) -> Result<()> {
                 bail!("it takes s16-interleaved sound, not {}", first.format.name());
             }
             let file = call.temp()?;
-            let mut args = strings(&[
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                &video,
+            let mut args = strings(&["-hide_banner", "-loglevel", "error", "-y", "-i"]);
+            args.push(Arg::from(&video));
+            args.extend(strings(&[
                 "-f",
                 "s16le",
                 "-ar",
@@ -183,15 +179,16 @@ fn register(r: &mut Registry) -> Result<()> {
                 "1:a",
                 "-c:v",
                 "copy",
-            ]);
+            ]));
             args.extend(encoding.audio.args("a"));
-            args.extend(strings(&["-strict", "-2", "-f", &encoding.container, &file]));
+            args.extend(strings(&["-strict", "-2", "-f", &encoding.container]));
+            args.push(Arg::from(&file));
             let mut mux = spawn("ffmpeg", &args)?;
             if sound.iter().any(|heard| mux.write_buffer(&heard.buffer).is_err()) {
                 return Err(stopped(mux));
             }
             mux.wait()?;
-            let _ = std::fs::remove_file(&video);
+            let _ = std::fs::remove_file(video.guest());
             let made: File = call.keep(&file, &source)?;
             Ok(Typed::new(Video::NAME, vec![made]))
         });
@@ -203,12 +200,13 @@ fn stopped(process: Process) -> pe2_ext::Error {
     process.wait().err().unwrap_or_else(|| anyhow!("ffmpeg stopped reading"))
 }
 
-fn strings(args: &[&str]) -> Vec<String> {
-    args.iter().map(ToString::to_string).collect()
+/// Arguments of text, as a program is told them.
+fn strings(args: &[&str]) -> Vec<Arg> {
+    args.iter().map(|&arg| Arg::from(arg)).collect()
 }
 
 /// ffmpeg, encoding frames written to it to a file.
-fn encode(encoding: &Encoding, width: u32, height: u32, rate: f64, file: &str) -> Result<Process> {
+fn encode(encoding: &Encoding, width: u32, height: u32, rate: f64, file: &HostPath) -> Result<Process> {
     let mut args = strings(&[
         "-hide_banner",
         "-loglevel",
@@ -229,7 +227,8 @@ fn encode(encoding: &Encoding, width: u32, height: u32, rate: f64, file: &str) -
     ]);
     args.extend(encoding.video.args("v"));
     // Full range going in and coming out: an encoder taking no `yuvj420p` is not given limited range by a conversion.
-    args.extend(strings(&["-color_range", "pc", "-f", &encoding.container, file]));
+    args.extend(strings(&["-color_range", "pc", "-f", &encoding.container]));
+    args.push(Arg::from(file));
     spawn("ffmpeg", &args)
 }
 

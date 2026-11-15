@@ -663,7 +663,7 @@ impl Tree {
     pub fn leaf_macros(&self, name: &str) -> String {
         let mut out = String::new();
         for (path, number) in self.leaves().into_iter().filter(|(path, _)| !path.is_empty()) {
-            let _ = writeln!(out, "#define pe2_option_{name}_{} {number}", path.join("_"));
+            let _ = writeln!(out, "#define pe2_option${name}${} {number}", path.join("$"));
         }
         out
     }
@@ -705,7 +705,7 @@ mod tests {
         let given: Value = toml::from_str::<toml::Table>("v = [{}, { limit = 7 }]").unwrap()["v"].clone();
         let merged = types.merged(&shape, Some(&default), &given, "decl", "").unwrap();
         assert_eq!(merged.initializer(), "{ { 8, 144, { 1, 2 } }, { -1, 7, { 3, 4 } } }");
-        assert!(merged.leaf_macros("LEVELS").contains("#define pe2_option_LEVELS_1_steps_0 3\n"));
+        assert!(merged.leaf_macros("LEVELS").contains("#define pe2_option$LEVELS$1$steps$0 3\n"));
     }
 
     #[test]

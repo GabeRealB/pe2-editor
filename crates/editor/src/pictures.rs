@@ -150,8 +150,10 @@ fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request:
     let declared = index.assets.get(&request.path).map_or_default(|a| a.text().to_string());
     let failed = |why: String| Made { picture: Err(why), marks: None, reads: None, declaration: declared.clone() };
     let Some(asset) = index.assets.get(&request.path) else { return failed("it has no picture".to_string()) };
-    let Some(address) = extensions.picture_address(asset, request.look) else {
-        return failed("it has no picture".to_string());
+    let address = match extensions.picture_address(asset, request.look) {
+        Some(Ok(address)) => address,
+        Some(Err(why)) => return failed(format!("{why:#}")),
+        None => return failed("it has no picture".to_string()),
     };
     let given = match extensions.output(engine, index, asset, &address, true) {
         Ok(given) => given,
@@ -161,8 +163,10 @@ fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request:
         return failed("it drew no picture".to_string());
     };
     let mut reads = given.reads.clone();
-    let marked =
-        extensions.marks_output(asset).and_then(|name| extensions.output(engine, index, asset, &name, true).ok());
+    let marked = extensions.marks_output(asset).and_then(|name| {
+        let address = pe2_path::Asked::new(&name).ok()?;
+        extensions.output(engine, index, asset, address, true).ok()
+    });
     let marks = marked.and_then(|given| {
         reads.merge(&given.reads);
         match given.value.as_deref() {

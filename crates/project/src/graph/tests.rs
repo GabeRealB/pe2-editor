@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
-use super::exec::{Call, Engine, Node, evaluate};
+use super::exec::{Asking, Call, Engine, Node, evaluate};
 use super::store::Store;
 use super::{Content, File, OpDef, Ops, Plan, Retain, Tail, Type, Typed, Value, port, ports};
 
@@ -352,7 +352,7 @@ fn a_graph_layer_runs_what_its_outputs_reach() {
     let node = Bundle::new(GRAPH, &[("a.txt", "a"), ("b.txt", "b")]);
     let before = runs();
     let (joined, _) = plan.output("joined").unwrap();
-    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, None)], &Vec::new(), (None, None));
+    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, Asking::none())], &Vec::new(), (None, None));
     assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBa");
     // `unused` is pruned; `t.repeat` is below the output asked for.
     let ran = runs();
@@ -361,7 +361,14 @@ fn a_graph_layer_runs_what_its_outputs_reach() {
     // A family's output, by its parameter's value; the tap inside the graph.
     let (repeated, times) = plan.output("repeated/3").unwrap();
     let (b, _) = plan.output("b").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(repeated, times.as_deref()), (b, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(
+        &plan,
+        &ops,
+        &node,
+        &[(repeated, Asking::member(times.as_deref())), (b, Asking::none())],
+        &Vec::new(),
+        (None, None),
+    );
     assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBaaBaaBa");
     assert_eq!(data(&node, made[1].as_ref().unwrap()), b"B");
 }
@@ -394,13 +401,14 @@ fn a_value_taken_once_is_moved() {
     let before = shared();
     // `upper` alone: the file's bytes are taken by it alone, and moved.
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, Asking::none())], &Vec::new(), (None, None));
     assert_eq!(made[0].as_ref().unwrap().as_ref(), &Value::Table(toml::from_str("len = 3").unwrap()));
     assert_eq!(shared(), before);
     // Asked for with `source`, the bytes are shared: upper copies them, the source is unchanged.
     let (source, _) = plan.output("source").unwrap();
     let (upper, _) = plan.output("upper").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)], &Vec::new(), (None, None));
+    let (made, _) =
+        evaluate(&plan, &ops, &node, &[(source, Asking::none()), (upper, Asking::none())], &Vec::new(), (None, None));
     assert_eq!(
         (data(&node, made[0].as_ref().unwrap()), data(&node, made[1].as_ref().unwrap())),
         (b"abc".to_vec(), b"ABC".to_vec())
@@ -414,7 +422,7 @@ fn a_failure_reaches_what_takes_from_it() {
     let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops, &[]);
     let node = Bundle::new(STACK, &[]);
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, Asking::none())], &Vec::new(), (None, None));
     assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: test/bundle: no file or folder a.txt");
 }
 
@@ -426,14 +434,14 @@ fn a_stored_folder_is_every_file_in_it_named_within_it() {
     let node =
         Bundle::new(stack, &[("face.ufo/metainfo.plist", "m"), ("face.ufo/glyphs/A_.glif", "a"), ("other.txt", "o")]);
     let (source, _) = plan.output("source").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &ops, &node, &[(source, Asking::none())], &Vec::new(), (None, None));
     let made = made[0].as_ref().unwrap();
     let Value::Typed(typed) = &**made else { panic!("not files") };
     let names: Vec<&str> = typed.files.iter().map(|file| file.name.as_str()).collect();
     assert_eq!(names, ["glyphs/A_.glif", "metainfo.plist"]);
     // What is not there is said so.
     let empty = Bundle::new(stack, &[("other.txt", "o")]);
-    let (made, _) = evaluate(&plan, &ops, &empty, &[(source, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &ops, &empty, &[(source, Asking::none())], &Vec::new(), (None, None));
     assert!(made[0].as_ref().unwrap_err().contains("no file or folder face.ufo"), "{:?}", made[0]);
 }
 
@@ -444,7 +452,7 @@ fn an_optional_stored_file_is_none_where_the_node_lacks_it_and_read_once_it_is_t
     let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
     let (source, _) = plan.output("source").unwrap();
     let made_of = |node: &Bundle| {
-        let (made, reads) = evaluate(&plan, &ops, node, &[(source, None)], &Vec::new(), (None, None));
+        let (made, reads) = evaluate(&plan, &ops, node, &[(source, Asking::none())], &Vec::new(), (None, None));
         let Value::Typed(typed) = &**made[0].as_ref().unwrap() else { panic!("not files") };
         (typed.files.iter().map(|file| file.name.clone()).collect::<Vec<_>>(), reads)
     };
@@ -472,7 +480,8 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
     let read_for = |engine: &Engine| {
         let reach = super::exec::Reach { engine, world: &world };
         let (node, plan) = super::exec::World::node(&world, &toml::Value::String("test/bundle".into())).unwrap();
-        let made = engine.output_in(Some(reach), &plan, node, "source", None, false).unwrap();
+        let made =
+            engine.output_in(Some(reach), &plan, node, pe2_path::Asked::constant("source"), None, false).unwrap();
         let Value::Typed(typed) = &*made.value.unwrap() else { panic!("not a file") };
         typed.files[0].name.clone()
     };
@@ -481,7 +490,7 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
         name: release.to_lowercase(),
         release: Some(release.to_string()),
         target: None,
-        folder: String::new(),
+        folder: pe2_ext::HostPath::of_host(std::path::PathBuf::new()),
         known: Vec::new(),
         properties: toml::Table::new(),
     };
@@ -494,7 +503,8 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
     let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &engine.ops, &[]);
     let (source, _) = plan.output("source").unwrap();
     let reach = super::exec::Reach { engine: &engine, world: &world };
-    let (_, reads) = evaluate(&plan, &engine.ops, &shared_only, &[(source, None)], &Vec::new(), (None, Some(reach)));
+    let (_, reads) =
+        evaluate(&plan, &engine.ops, &shared_only, &[(source, Asking::none())], &Vec::new(), (None, Some(reach)));
     assert!(reads.config.is_none(), "the config was read");
 }
 
@@ -505,18 +515,18 @@ fn a_kept_output_holds_while_what_it_read_does() {
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let node = Bundle::new(STACK, &[("a.txt", "abc")]);
     let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
-    let first = engine.output(&plan, &node, "source", false).unwrap();
+    let first = engine.output(&plan, &node, pe2_path::Asked::constant("source"), false).unwrap();
     assert!(!first.kept);
-    let again = engine.output(&plan, &node, "source", true).unwrap();
+    let again = engine.output(&plan, &node, pe2_path::Asked::constant("source"), true).unwrap();
     assert!(again.kept);
     assert_eq!(data(&node, again.value.as_deref().unwrap()), b"abc");
     // A transient output is never kept: its trace alone is, for what reads it to know its hash.
-    assert!(!engine.output(&plan, &node, "upper", false).unwrap().kept);
+    assert!(!engine.output(&plan, &node, pe2_path::Asked::constant("upper"), false).unwrap().kept);
     let (upper, _) = plan.output("upper").unwrap();
-    assert!(engine.traced(None, &plan, &node, upper, None).is_some());
+    assert!(engine.traced(None, &plan, &node, upper, Asking::none()).is_some());
     // The file changed: made again.
     node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
-    let changed = engine.output(&plan, &node, "source", true).unwrap();
+    let changed = engine.output(&plan, &node, pe2_path::Asked::constant("source"), true).unwrap();
     assert!(!changed.kept);
     assert_eq!(data(&node, changed.value.as_deref().unwrap()), b"abcd");
     // Swept: the traces no longer live (the transient's too), their values and blobs go.
@@ -533,11 +543,11 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     let one = Bundle::new(STACK, &[("a.txt", "abc")]);
     let two = Bundle { path: "test/other", ..Bundle::new(STACK, &[("a.txt", "abc")]) };
     let (plan, _) = Plan::of(&one.fields, &engine.ops, &[]);
-    assert!(!engine.output(&plan, &one, "source", false).unwrap().kept);
-    assert!(!engine.output(&plan, &two, "source", false).unwrap().kept);
+    assert!(!engine.output(&plan, &one, pe2_path::Asked::constant("source"), false).unwrap().kept);
+    assert!(!engine.output(&plan, &two, pe2_path::Asked::constant("source"), false).unwrap().kept);
     // Each found kept by its own trace; the other's file changing leaves it.
     two.files.lock().unwrap().insert("a.txt".into(), b"xyz".to_vec());
-    assert!(engine.output(&plan, &one, "source", false).unwrap().kept);
+    assert!(engine.output(&plan, &one, pe2_path::Asked::constant("source"), false).unwrap().kept);
     let count = |sub: &str| std::fs::read_dir(dir.at(sub)).unwrap().count();
     assert_eq!((count("traces"), count("values")), (2, 1));
     let _ = std::fs::remove_dir_all(&dir);
@@ -565,16 +575,16 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     assert!(problems.is_empty(), "{problems:?}");
     // The kept native form is taken as made: `upper` runs once, for it, and not again for what is made of it.
     let before = runs();
-    assert!(!engine.output(&plan, &node, "native", false).unwrap().kept);
-    let counted = engine.output(&plan, &node, "counted", true).unwrap();
+    assert!(!engine.output(&plan, &node, pe2_path::Asked::constant("native"), false).unwrap().kept);
+    let counted = engine.output(&plan, &node, pe2_path::Asked::constant("counted"), true).unwrap();
     assert_eq!((counted.kept, runs()[0] - before[0]), (false, 1));
     assert_eq!(counted.value.as_deref(), Some(&Value::Table(toml::from_str("len = 3").unwrap())));
     // It read what the native form read: what neither read changing leaves both; what they read, makes them again.
     assert_eq!(counted.reads.files.keys().collect::<Vec<_>>(), ["a.txt"]);
     node.files.lock().unwrap().insert("b.txt".into(), b"changed".to_vec());
-    assert!(engine.output(&plan, &node, "counted", false).unwrap().kept);
+    assert!(engine.output(&plan, &node, pe2_path::Asked::constant("counted"), false).unwrap().kept);
     node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
-    let again = engine.output(&plan, &node, "counted", true).unwrap();
+    let again = engine.output(&plan, &node, pe2_path::Asked::constant("counted"), true).unwrap();
     assert_eq!((again.kept, again.value.as_deref()), (false, Some(&Value::Table(toml::from_str("len = 4").unwrap()))));
     // An output's trace is under one key: its older value goes with the sweep (the count of three), and what was
     // written out for the count's port asking for a file (`ABCD`), which no value names; a node no longer live, all of
@@ -603,7 +613,7 @@ fn an_outputs_newest_trace_of_each_of_the_last_two_builds_is_kept() {
     let live: HashSet<String> = ["test/bundle".to_string()].into();
     let made = |engine: &Engine| {
         let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
-        let kept = engine.output(&plan, &node, "native", false).unwrap().kept;
+        let kept = engine.output(&plan, &node, pe2_path::Asked::constant("native"), false).unwrap().kept;
         // Traces written apart in time, as editors run apart.
         std::thread::sleep(std::time::Duration::from_millis(20));
         kept
@@ -715,7 +725,7 @@ fn what_is_made_from_the_projects_files_is_made_again_when_they_change() {
     let reach = super::exec::Reach { engine: &engine, world: &world };
     let make = || {
         let (node, plan) = super::exec::World::node(&world, &toml::Value::String(String::new())).unwrap();
-        engine.output_in(Some(reach), &plan, node, "native", None, true).unwrap()
+        engine.output_in(Some(reach), &plan, node, pe2_path::Asked::constant("native"), None, true).unwrap()
     };
     assert!(!make().kept);
     assert!(make().kept, "nothing changed");
@@ -760,7 +770,7 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     let reach = super::exec::Reach { engine: &engine, world: &world };
     let make = |path: &str| {
         let (node, plan) = super::exec::World::node(&world, &toml::Value::String(path.into())).unwrap();
-        engine.output_in(Some(reach), &plan, node, "native", None, true)
+        engine.output_in(Some(reach), &plan, node, pe2_path::Asked::constant("native"), None, true)
     };
     let stored = |given: &super::exec::Given| match &given.value.as_deref() {
         Some(Value::Typed(typed)) => match &typed.files[0].content {
@@ -822,7 +832,7 @@ fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() 
     let reach = super::exec::Reach { engine: &engine, world: &world };
     let make = |path: &str| {
         let (node, plan) = super::exec::World::node(&world, &toml::Value::String(path.into())).unwrap();
-        engine.output_in(Some(reach), &plan, node, "native", None, false).unwrap()
+        engine.output_in(Some(reach), &plan, node, pe2_path::Asked::constant("native"), None, false).unwrap()
     };
     assert!(!make("test/one").kept && !make("test/two").kept);
     // Both found kept: what they share is held to what it read for the first, and not again for the second.
@@ -1011,9 +1021,9 @@ fn a_wire_names_a_layer_and_one_of_its_outputs() {
     let (plan, problems) = Plan::of(&node.fields, &engine.ops, &[]);
     assert!(problems.is_empty(), "{problems:?}");
     // The first port takes what is above it, the first output of the layer; the other is wired.
-    let sum = engine.output(&plan, &node, "sum", true).unwrap();
+    let sum = engine.output(&plan, &node, pe2_path::Asked::constant("sum"), true).unwrap();
     assert_eq!(sum.value.as_deref(), Some(&Value::Table(toml::from_str("n = 12").unwrap())));
-    let second = engine.output(&plan, &node, "second", true).unwrap();
+    let second = engine.output(&plan, &node, pe2_path::Asked::constant("second"), true).unwrap();
     assert_eq!(second.value.as_deref(), Some(&Value::Table(toml::from_str("n = 2").unwrap())));
     // What names nothing is told, and what is left connected to nothing.
     let wrong = Bundle::new(
@@ -1059,11 +1069,11 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
     let stack = |op: &str| format!("[[stack]]\nop = \"{op}\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n");
     let failing = Bundle::new(&stack("t.spill_fail"), &[]);
     let (plan, _) = Plan::of(&failing.fields, &engine.ops, &[]);
-    assert!(engine.output(&plan, &failing, "native", false).is_err());
+    assert!(engine.output(&plan, &failing, pe2_path::Asked::constant("native"), false).is_err());
     assert_eq!(left_in_tmp(&dir), Vec::<String>::new(), "an unfinished writer's spill");
     let temps = Bundle::new(&stack("t.temps"), &[]);
     let (plan, _) = Plan::of(&temps.fields, &engine.ops, &[]);
-    let made = engine.output(&plan, &temps, "native", false).unwrap();
+    let made = engine.output(&plan, &temps, pe2_path::Asked::constant("native"), false).unwrap();
     let Some(Value::Typed(typed)) = made.value.as_deref() else { panic!("not a file") };
     let Content::Stored { sha1, .. } = &typed.files[0].content else { panic!("not kept") };
     assert_eq!(std::fs::read(engine.store().unwrap().blob_path(sha1).unwrap()).unwrap(), b"made");
@@ -1134,7 +1144,7 @@ fn config_of(name: &str, language: &str) -> pe2_ext::data::BuildConfig {
         name: name.to_string(),
         release: Some("USA".to_string()),
         target: None,
-        folder: String::new(),
+        folder: pe2_ext::HostPath::of_host(std::path::PathBuf::new()),
         known: Vec::new(),
         properties: toml::Table::from_iter([("language".to_string(), toml::Value::String(language.to_string()))]),
     }
@@ -1173,7 +1183,8 @@ fn a_step_not_active_is_not_made_and_a_merge_takes_the_branch_that_is() {
         engine.config = Some(config_of(language, language));
         let reach = super::exec::Reach { engine: &engine, world: &world };
         let before = (runs(), shared());
-        let (made, reads) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+        let (made, reads) =
+            evaluate(&plan, &engine.ops, &node, &[(text, Asking::none())], &Vec::new(), (None, Some(reach)));
         let after = (runs(), shared());
         let value = made.into_iter().next().unwrap().unwrap();
         let text = String::from_utf8(data(&node, &value)).unwrap();
@@ -1190,7 +1201,7 @@ fn a_step_not_active_is_not_made_and_a_merge_takes_the_branch_that_is() {
     let (plan, _) = Plan::of(&toml::from_str(&lone).unwrap(), &ops(), &[]);
     engine.config = Some(config_of("en", "en"));
     let reach = super::exec::Reach { engine: &engine, world: &world };
-    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, Asking::none())], &Vec::new(), (None, Some(reach)));
     let why = made.into_iter().next().unwrap().unwrap_err();
     assert!(why.contains("not active"), "{why}");
 }
@@ -1278,7 +1289,8 @@ fn select_reads_only_the_node_it_chooses_and_nothing_where_it_names_none() {
     let mut made_for = |language: &str| {
         engine.config = Some(config_of(language, language));
         let reach = super::exec::Reach { engine: &engine, world: &world };
-        let (made, reads) = evaluate(&plan, &engine.ops, &node, &[(strings, None)], &Vec::new(), (None, Some(reach)));
+        let (made, reads) =
+            evaluate(&plan, &engine.ops, &node, &[(strings, Asking::none())], &Vec::new(), (None, Some(reach)));
         let Value::Table(table) = &*made.into_iter().next().unwrap().unwrap() else { panic!("no table") };
         (table["strings"].to_string(), reads.outputs.keys().cloned().collect::<Vec<_>>())
     };
@@ -1339,7 +1351,8 @@ name = "text"
     let mut made_for = |language: &str| {
         engine.config = Some(config_of(language, language));
         let reach = super::exec::Reach { engine: &engine, world: &world };
-        let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+        let (made, _) =
+            evaluate(&plan, &engine.ops, &node, &[(text, Asking::none())], &Vec::new(), (None, Some(reach)));
         String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap()
     };
     assert_eq!(made_for("en"), "ABC", "the layer's setting over the default");
@@ -1434,7 +1447,7 @@ value = { from = "two.second" }
     let engine = Engine::new(ops, None);
     let text = |name: &str| {
         let (output, _) = plan.output(name).unwrap();
-        let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, None)], &Vec::new(), (None, None));
+        let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, Asking::none())], &Vec::new(), (None, None));
         String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap()
     };
     assert_eq!(text("joined"), "ABcd", "the setting set: the first made upper case");
@@ -1446,7 +1459,7 @@ value = { from = "two.second" }
     let (plan, problems) = Plan::of(&toml::from_str(graph).unwrap(), &engine.ops, &[]);
     assert!(problems.is_empty(), "{problems:?}");
     let (output, _) = plan.output("out").unwrap();
-    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, Asking::none())], &Vec::new(), (None, None));
     assert_eq!(String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap(), "cd");
 }
 
@@ -1479,7 +1492,7 @@ fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
         assert!(problems.is_empty(), "{problems:?}");
         let node = Bundle::new(&declaration, &[]);
         let before = SHOUTS.load(std::sync::atomic::Ordering::SeqCst);
-        let given = engine.output(&plan, &node, "all", true).unwrap();
+        let given = engine.output(&plan, &node, pe2_path::Asked::constant("all"), true).unwrap();
         let ran = SHOUTS.load(std::sync::atomic::Ordering::SeqCst) - before;
         (String::from_utf8(data(&node, &given.value.unwrap())).unwrap(), ran)
     };
@@ -1490,7 +1503,8 @@ fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
                  [[stack]]\nop = \"output\"\nname = \"all\"\n";
     let (plan, _) = Plan::of(&toml::from_str(wrong).unwrap(), &engine.ops, &[]);
     let node = Bundle::new(wrong, &[]);
-    let why = engine.output(&plan, &node, "all", true).err().map_or_default(|e| format!("{e:#}"));
+    let why =
+        engine.output(&plan, &node, pe2_path::Asked::constant("all"), true).err().map_or_default(|e| format!("{e:#}"));
     assert!(why.contains("items[0]"), "a failing item is named: {why}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1515,7 +1529,7 @@ fn a_for_each_leaves_out_what_its_body_makes_nothing_of() {
     assert!(problems.is_empty(), "{problems:?}");
     let node = Bundle::new(stack, &[]);
     let engine = Engine::new(ops, None);
-    let given = engine.output(&plan, &node, "kept", true).unwrap();
+    let given = engine.output(&plan, &node, pe2_path::Asked::constant("kept"), true).unwrap();
     let Value::List(items) = &*given.value.unwrap() else { panic!("no list") };
     let keys: Vec<String> = items
         .iter()
@@ -1540,7 +1554,7 @@ fn a_branch_told_it_runs_and_then_not_taken_lets_go_of_what_it_takes_once() {
     let world = Nodes(Vec::new(), engine.ops.clone());
     let reach = super::exec::Reach { engine: &engine, world: &world };
     let (text, _) = plan.output("text").unwrap();
-    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, Asking::none())], &Vec::new(), (None, Some(reach)));
     let value = made.into_iter().next().unwrap().unwrap();
     assert_eq!(String::from_utf8(data(&node, &value)).unwrap(), "ABC");
 }
@@ -1553,7 +1567,7 @@ fn a_layer_written_not_active_is_not_made() {
     assert!(wrong.is_empty(), "{wrong:?}");
     let node = Bundle::new(stack, &[("a.txt", "abc")]);
     let (up, _) = plan.output("up").unwrap();
-    let (made, _) = evaluate(&plan, &ops(), &node, &[(up, None)], &Vec::new(), (None, None));
+    let (made, _) = evaluate(&plan, &ops(), &node, &[(up, Asking::none())], &Vec::new(), (None, None));
     assert!(made[0].as_ref().is_err_and(|e| e.contains("not active")), "{made:?}");
     let said = problems(&stack.replace("active = false", "active = 1"));
     assert!(said.iter().any(|p| p.contains("`active` is 1")), "{said:?}");
@@ -1579,11 +1593,45 @@ fn an_operation_is_served_a_folder_of_its_files_for_its_run() {
     assert!(wrong.is_empty(), "{wrong:?}");
     let node = Bundle::new(stack, &[("a.txt", "abc")]);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
-    let given = engine.output(&plan, &node, "read", true).unwrap();
+    let given = engine.output(&plan, &node, pe2_path::Asked::constant("read"), true).unwrap();
     assert_eq!(data(&node, &given.value.unwrap()), b"abc!");
     let tmp = dir.at("tmp");
     let left = std::fs::read_dir(&tmp)
         .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("served-")).count());
     assert_eq!(left.unwrap_or(0), 0, "the folder is gone once the run is done");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_output_is_asked_for_by_the_keys_its_operation_takes() {
+    let mut ops = Ops::default();
+    let mut said = OpDef::new("t.said", "Says what it is asked", "1").makes(Type::Table, |call| {
+        let palette = call.query().get("palette").unwrap_or("its own").to_string();
+        Ok(Value::Table(toml::Table::from_iter([("palette".to_string(), toml::Value::String(palette))])))
+    });
+    said.query = vec![("palette".to_string(), "the palette it is drawn through".to_string())];
+    ops.add(said);
+    let node = Bundle::new("[[stack]]\nop = \"t.said\"\n\n[[stack]]\nop = \"output\"\nname = \"cells/left\"\n", &[]);
+    let engine = Engine::new(ops, None);
+    let (plan, problems) = Plan::of(&node.fields, &engine.ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let palette = |asked: &str| {
+        let made = engine.output(&plan, &node, pe2_path::Asked::new(asked).unwrap(), true)?;
+        let value = made.value.expect("made");
+        Ok::<_, anyhow::Error>(
+            value.settings().and_then(|t| t.get("palette")).and_then(toml::Value::as_str).map(str::to_string),
+        )
+    };
+    // An output is named by its path, its groups then itself, and asked for as its operation takes.
+    assert_eq!(palette("cells/left").unwrap().as_deref(), Some("its own"));
+    assert_eq!(palette("cells/left?palette=night").unwrap().as_deref(), Some("night"));
+    let refused = palette("cells/left?look=night").unwrap_err();
+    assert!(format!("{refused:#}").contains("takes no `look`"), "{refused:#}");
+    // A name no address is, is no output's.
+    let (_, problems) = Plan::of(
+        &Bundle::new("[[stack]]\nop = \"t.said\"\n\n[[stack]]\nop = \"output\"\nname = \"unit.c\"\n", &[]).fields,
+        &engine.ops,
+        &[],
+    );
+    assert_eq!(problems.len(), 1, "{problems:?}");
 }

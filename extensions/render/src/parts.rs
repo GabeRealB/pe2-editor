@@ -85,9 +85,12 @@ fn material_contents(asset: &Asset) -> Contents {
         let held = asset.field(key);
         let detail = held.map_or_else(
             || "Empty".to_string(),
-            |texture| {
-                let cell = material::cell_of(texture).unwrap_or("?");
-                material::palette_of(texture).map_or_else(|| cell.to_string(), |palette| format!("{cell}  {palette}"))
+            |texture| match (material::cell_of(texture), material::palette_of(texture)) {
+                (Ok(cell), Ok(palette)) => {
+                    let cell = cell.unwrap_or("?");
+                    palette.map_or_else(|| cell.to_string(), |palette| format!("{cell}  {palette}"))
+                }
+                (Err(why), _) | (_, Err(why)) => format!("{why:#}"),
             },
         );
         rows.push(ContentRow::new(&format!("textures/{key}"), label).detail(&detail).icon(Icon::Image, Tint::Picture));

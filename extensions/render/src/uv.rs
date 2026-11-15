@@ -172,7 +172,7 @@ impl UvView {
             let ([left, top], [width, height]) = (tile.place, tile.size);
             let rect = Rect { x: left, y: top, width, height };
             let texture =
-                tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
+                tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, bound.output()).cloned());
             match texture {
                 Some(texture) => {
                     canvas.pictures.push(Placed { texture, rect, label: Some(tile.names.join(", ")), link: None });
@@ -234,7 +234,8 @@ mod tests {
     use crate::model::{Blend, Corner, Material, Model, Part, Shading};
 
     fn bound(cell: &str, size: u32) -> Bound {
-        Bound { image: "i".to_string(), cell: cell.to_string(), palette: None, size: [size; 2] }
+        let picture = Box::from(&*crate::material::cell_address(cell, None).unwrap());
+        Bound { image: "i".to_string(), cell: cell.to_string(), palette: None, size: [size; 2], picture }
     }
 
     fn slot(name: &str, main: Option<Bound>) -> Slot {

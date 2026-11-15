@@ -6,16 +6,23 @@ An operation's `run` receives a `Call`:
 
 | To | Use |
 |---|---|
-| Read its inputs and settings | `take`, `take_all`, `parameter`, `settings`, `given` |
+| Read its inputs and settings | `take`, `take_all`, `parameter`, `query`, `settings`, `given` |
 | Make its outputs | `make`; `writer` streams a large file to the editor's store |
 | Read other assets and their outputs | `output_of`, `outputs_of`, `table_of`, `tables_of`, `node_named`, `assets_of`, `entries`, `read_entry` |
 | Know what is being built | `config()`: the configuration's name, release, target and properties |
 
 Everything an operation reads is recorded, so the editor runs it again when, and only when, what it read changes.
 
-Only outside the sandbox: `temp()` gives a path a program can write to, `keep(path)` takes that file back into the
+An output is asked for by an `Asked`: its path and, after `?`, its query - `pe2_ext::NATIVE` and `pe2_ext::SETTINGS`,
+which every asset has, `Asked::constant("page")` for a name written in the code (checked as it is compiled), or
+`Asked::new(text)?` for one read from somewhere. A reference held in a field is read with `target_of` (the asset it
+names), `asked_of` (what of it, and how), `address_of`, `query_of(key)` and `fragment_of` (the part read), whether it
+is written as text or as a table.
+
+Only outside the sandbox: `temp()` gives a place a program can write to, `keep(place)` takes that file back into the
 project, `path_of(file)` says where a stored file is on disk, and `serve(files)` hands a program a read-only folder
-of files. See [Running programs](unsandboxed.md).
+of files. A place is a `HostPath`: `guest()` is how the extension opens it, `native()` how a program is told it, and
+`join(path)` a place within it. See [Running programs](unsandboxed.md).
 
 ## In views, tools and services
 

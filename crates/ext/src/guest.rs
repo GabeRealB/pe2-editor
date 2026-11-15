@@ -23,7 +23,43 @@ pub mod bindings {
 }
 
 use bindings::exports::pe2::extension::guest as g;
-use bindings::pe2::extension::{host, media, types};
+use bindings::pe2::extension::{host, media, types, unsandboxed};
+
+/// A place the host gave this component, by the handle it holds.
+struct GivenPlace(unsandboxed::HostPath);
+
+// SAFETY: a component runs on one thread; the handle is only ever used there.
+unsafe impl Send for GivenPlace {}
+// SAFETY: as above.
+unsafe impl Sync for GivenPlace {}
+
+impl crate::Place for GivenPlace {
+    fn guest(&self) -> std::path::PathBuf {
+        self.0.guest().into()
+    }
+
+    fn native(&self) -> String {
+        self.0.native()
+    }
+
+    fn join(&self, within: &pe2_path::RelPath) -> crate::Result<crate::HostPath> {
+        self.0.join(within.as_str()).map(given).map_err(crate::Error::msg)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A place by the handle the host gave for it.
+pub(crate) fn given(handle: unsandboxed::HostPath) -> crate::HostPath {
+    crate::HostPath::of(GivenPlace(handle))
+}
+
+/// The handle the host gave for a place; none for a place it did not give this component.
+pub(crate) fn handle(path: &crate::HostPath) -> Option<&unsandboxed::HostPath> {
+    path.place().as_any().downcast_ref::<GivenPlace>().map(|given| &given.0)
+}
 
 unsafe extern "Rust" {
     /// The extension's declaration, defined by `extension!` in the extension's crate.
@@ -200,8 +236,8 @@ impl Source for Lent<'_> {
         Some(writer.map(|w| Box::new(HostWriter(Some(w))) as Box<dyn crate::FileWriter>))
     }
 
-    fn temp(&self) -> Option<crate::Result<String>> {
-        Some(self.resource().temp().map_err(crate::Error::msg))
+    fn temp(&self) -> Option<crate::Result<crate::HostPath>> {
+        Some(self.resource().temp().map(given).map_err(crate::Error::msg))
     }
 
     fn entries(&self, folder: &str) -> Option<crate::Result<Vec<String>>> {
@@ -216,12 +252,12 @@ impl Source for Lent<'_> {
         Some(self.resource().assets_of(node_type).map_err(crate::Error::msg))
     }
 
-    fn place(&self, path: &str) -> Option<String> {
-        self.resource().place(path)
+    fn place(&self, path: &str) -> Option<crate::HostPath> {
+        self.resource().place(path).map(given)
     }
 
-    fn output_of(&self, path: &str, address: &str) -> Option<crate::Result<Data>> {
-        Some(self.resource().output_of(path, address).map(from_wit).map_err(crate::Error::msg))
+    fn output_of(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Data>> {
+        Some(self.resource().output_of(path, address.as_str()).map(from_wit).map_err(crate::Error::msg))
     }
 
     fn node_named(&self, reference: &str) -> Option<crate::NodeNamed> {
@@ -237,24 +273,27 @@ impl Source for Lent<'_> {
             name: c.name,
             release: c.release,
             target: c.target,
-            folder: c.folder,
+            folder: given(c.folder),
             known: c.known,
             properties: c.properties.parse().unwrap_or_default(),
         })
     }
 
-    fn keep(&self, path: &str, name: &str) -> Option<crate::Result<crate::File>> {
+    fn keep(&self, path: &crate::HostPath, name: &str) -> Option<crate::Result<crate::File>> {
+        let Some(path) = handle(path) else {
+            return Some(Err(crate::anyhow!("{path}: no place the host gave")));
+        };
         Some(self.resource().keep(path, name).map(file_from_wit).map_err(crate::Error::msg))
     }
 
-    fn path_of(&self, name: &str) -> Option<String> {
-        self.resource().path_of(name)
+    fn path_of(&self, name: &str) -> Option<crate::HostPath> {
+        self.resource().path_of(name).map(given)
     }
 
-    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<crate::Result<String>> {
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<crate::Result<crate::HostPath>> {
         let files: Vec<types::File> = files.iter().cloned().map(file_to_wit).collect();
         let how = types::ServeUse { often: how.often, ranges: how.ranges };
-        Some(self.resource().serve(&files, how).map_err(crate::Error::msg))
+        Some(self.resource().serve(&files, how).map(given).map_err(crate::Error::msg))
     }
 }
 
@@ -330,21 +369,21 @@ impl Project for Lens<'_> {
         self.project.revision()
     }
 
-    fn image(&self, path: &str, address: &str) -> Option<crate::Result<Image>> {
-        self.project.image(path, address).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    fn image(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Image>> {
+        self.project.image(path, address.as_str()).map(|made| made.map(from_image).map_err(crate::Error::msg))
     }
 
-    fn table(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
-        let told = self.project.table(path, address)?.map_err(crate::Error::msg);
+    fn table(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<crate::Table>> {
+        let told = self.project.table(path, address.as_str())?.map_err(crate::Error::msg);
         Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
     }
 
-    fn bytes(&self, path: &str, address: &str) -> Option<crate::Result<Vec<u8>>> {
-        Some(self.project.bytes(path, address)?.map_err(crate::Error::msg))
+    fn bytes(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Vec<u8>>> {
+        Some(self.project.bytes(path, address.as_str())?.map_err(crate::Error::msg))
     }
 
-    fn request(&self, path: &str, address: &str) -> crate::Requested {
-        match self.project.request(path, address) {
+    fn request(&self, path: &str, address: &crate::Asked) -> crate::Requested {
+        match self.project.request(path, address.as_str()) {
             host::Requested::Ready(bytes) => crate::Requested::Ready(bytes),
             host::Requested::Pending(waited) => crate::Requested::Pending { waited },
             host::Requested::Failed(why) => crate::Requested::Failed(why),
@@ -766,6 +805,7 @@ impl g::Guest for Component {
         inputs: Vec<Vec<types::Value>>,
         settings: String,
         parameter: Option<String>,
+        query: String,
     ) -> Result<g::Generator, String> {
         let def = registered().ops.get(op as usize).ok_or("no such operation")?;
         let start = def.start.as_ref().ok_or("it is no stream")?;
@@ -780,14 +820,17 @@ impl g::Guest for Component {
             made: std::cell::RefCell::default(),
             carried: started_with.clone(),
             parameter_text: parameter.as_deref(),
+            query: asked(&query)?,
             host: &host,
         };
         let generator = start(&mut call).map_err(|e| format!("{e:#}"))?;
+        let query = Box::from(asked(&query)?);
         Ok(g::Generator::new(Generating {
             generator: RefCell::new(generator),
             settings,
             carried: started_with,
             parameter,
+            query,
         }))
     }
 
@@ -818,6 +861,7 @@ impl g::Guest for Component {
         inputs: Vec<Vec<types::Value>>,
         settings: String,
         parameter: Option<String>,
+        query: String,
     ) -> Result<types::Value, String> {
         let def = registered().ops.get(op as usize).ok_or("no such operation")?;
         let lent = Lent::borrowed(node);
@@ -831,6 +875,7 @@ impl g::Guest for Component {
             made: std::cell::RefCell::default(),
             carried,
             parameter_text: parameter.as_deref(),
+            query: asked(&query)?,
             host: &host,
         };
         (def.run)(&mut call).map(to_wit).map_err(|e| format!("{e:#}"))
@@ -847,6 +892,7 @@ impl g::Guest for Component {
         inputs: Vec<Vec<types::Value>>,
         settings: String,
         parameter: Option<String>,
+        query: String,
     ) -> Result<g::Prepared, String> {
         let def = registered().ops.get(op as usize).ok_or("no such operation")?;
         let prepare = def.prepare.as_ref().ok_or("it says nothing before it runs")?;
@@ -861,6 +907,7 @@ impl g::Guest for Component {
             made: std::cell::RefCell::default(),
             carried,
             parameter_text: parameter.as_deref(),
+            query: asked(&query)?,
             host: &host,
         };
         prepare(&mut call).map(prepared_to_wit).map_err(|e| format!("{e:#}"))
@@ -1171,6 +1218,7 @@ fn imports(ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) 
             derives: op.derives.clone(),
             inverse: op.inverse.clone(),
             parameter: op.parameter.clone(),
+            query: op.query.clone(),
             priority: op.priority,
             provides: op.provides.as_ref().map(describe_provides),
             members: op.members.is_some(),
@@ -1179,6 +1227,11 @@ fn imports(ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) 
             stepped: op.stepped,
         });
     }
+}
+
+/// How an operation's output is asked for, as the host said it: a query's text, checked.
+fn asked(query: &str) -> Result<&crate::Query, String> {
+    crate::Query::new(query).map_err(|why| why.to_string())
 }
 
 /// What an operation said before it runs, as the contract carries it.
@@ -1192,7 +1245,11 @@ fn prepared_to_wit(prepared: crate::Prepared) -> g::Prepared {
         keep: micro.keep,
     };
     g::Prepared {
-        needs: prepared.needs.into_iter().map(|need| g::Need { node: need.node, address: need.address }).collect(),
+        needs: prepared
+            .needs
+            .into_iter()
+            .map(|need| g::Need { node: need.node, address: need.address.to_string() })
+            .collect(),
         micros: prepared.micros.into_iter().map(micro).collect(),
     }
 }
@@ -1242,7 +1299,7 @@ impl CallHost for NodeHost<'_> {
         Source::assets_of(self.0, node_type).ok_or_else(|| crate::anyhow!("the host finds nothing here"))?
     }
 
-    fn place(&self, path: &str) -> Option<String> {
+    fn place(&self, path: &str) -> Option<crate::HostPath> {
         Source::place(self.0, path)
     }
 
@@ -1250,7 +1307,7 @@ impl CallHost for NodeHost<'_> {
         Source::node_named(self.0, reference)
     }
 
-    fn output_of(&self, path: &str, address: &str) -> crate::Result<Data> {
+    fn output_of(&self, path: &str, address: &crate::Asked) -> crate::Result<Data> {
         Source::output_of(self.0, path, address).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 
@@ -1258,22 +1315,22 @@ impl CallHost for NodeHost<'_> {
         Source::build_config(self.0)
     }
 
-    fn temp(&self) -> crate::Result<String> {
+    fn temp(&self) -> crate::Result<crate::HostPath> {
         Source::temp(self.0).ok_or_else(|| crate::anyhow!("the host has no temporary files for this call"))?
     }
 
-    fn keep(&self, path: &str, name: &str) -> crate::Result<crate::File> {
+    fn keep(&self, path: &crate::HostPath, name: &str) -> crate::Result<crate::File> {
         Source::keep(self.0, path, name).ok_or_else(|| crate::anyhow!("the host keeps nothing for this call"))?
     }
 
-    fn path_of(&self, content: &Content) -> Option<String> {
+    fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
         match content {
             Content::Inline(_) => None,
             Content::Stored { sha1, .. } => Source::path_of(self.0, sha1),
         }
     }
 
-    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<String> {
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<crate::HostPath> {
         Source::serve(self.0, files, how).ok_or_else(|| crate::anyhow!("the host serves no folders for this call"))?
     }
 }
@@ -1481,6 +1538,7 @@ pub struct Generating {
     settings: Table,
     carried: Table,
     parameter: Option<String>,
+    query: Box<crate::Query>,
 }
 
 impl Generating {
@@ -1498,6 +1556,7 @@ impl Generating {
             made: std::cell::RefCell::default(),
             carried: self.carried.clone(),
             parameter_text: self.parameter.as_deref(),
+            query: &self.query,
             host: &host,
         };
         call(&mut **self.generator.borrow_mut(), &lent_call).map_err(|e| format!("{e:#}"))

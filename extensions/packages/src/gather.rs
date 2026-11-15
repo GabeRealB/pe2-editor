@@ -28,7 +28,7 @@ pub const INCLUDES: &str = "includes";
 pub const LINKED: &str = "linked";
 /// What declares a package's slots and options, and how the editor shows them: all of it in one of the package's units, whose order is
 /// the order the editor lists them in.
-const DECLARING: [&str; 5] = ["PE2_BIND", "PE2_BIND_ARG", "PE2_BIND_SELF", "PE2_OPTION_DEF", "PE2_EDITOR_LABEL"];
+const DECLARING: [&str; 4] = ["PE2_BIND", "PE2_BIND_SELF", "PE2_OPTION_DEF", "PE2_EDITOR_LABEL"];
 /// What a gathered tree is of: the package's name, which names its objects.
 pub const NAME: &str = "package";
 /// Where a package's tree holds what it can include of others, each under its name: what it includes in angle brackets.
@@ -708,8 +708,8 @@ struct Slot {
     label: String,
     /// Where it was first declared, among all a package's slots and options: a later declaration of it moves nothing.
     order: i64,
+    /// What its sources read of it: each read's arguments after the slot.
     reads: BTreeSet<Vec<String>>,
-    args: BTreeMap<(Vec<String>, String), Vec<String>>,
 }
 
 impl Slots {
@@ -722,8 +722,7 @@ impl Slots {
                 if slot.ty.is_none() {
                     (slot.ty, slot.label, slot.order) = (rest.first().cloned(), label.to_string(), order);
                 }
-                slot.attributes
-                    .extend(rest.iter().skip(1).filter_map(|word| word.strip_prefix('_')).map(str::to_string));
+                slot.attributes.extend(rest.iter().skip(1).cloned());
             }
             // What `pe2.h` expands it to, as a source reads before a first pass has: a file, and the package built.
             "PE2_BIND_SELF" => {
@@ -738,17 +737,6 @@ impl Slots {
             "PE2_VALUE" => {
                 self.held.entry((*name).to_string()).or_default().reads.insert(rest);
             }
-            "PE2_BIND_ARG" => {
-                if let Some(at) = rest.iter().position(|word| word.starts_with('_')) {
-                    let (path, given) = rest.split_at(at);
-                    let values = given[1..].to_vec();
-                    self.held
-                        .entry((*name).to_string())
-                        .or_default()
-                        .args
-                        .insert((path.to_vec(), given[0][1..].to_string()), values);
-                }
-            }
             _ => {}
         }
     }
@@ -760,19 +748,10 @@ impl Slots {
             out.insert("order".into(), slot.order.into());
             out.insert("type".into(), slot.ty.clone().unwrap_or_default().into());
             out.insert(HIDDEN.into(), slot.attributes.contains(HIDDEN).into());
-            let reads = slot.reads.iter().map(|read| Value::String(read.join("/")));
+            // Each read as a reference would end: how it is made, and the part read (`?symbol=gBody#buffer`).
+            let reads =
+                slot.reads.iter().map(|args| Value::String(Read { binding: name.clone(), args: args.clone() }.said()));
             out.insert("reads".into(), Value::Array(reads.collect()));
-            let args = slot.args.iter().map(|((path, arg), values)| {
-                let mut given = Table::new();
-                given.insert("path".into(), path.join("/").into());
-                given.insert("arg".into(), arg.clone().into());
-                given.insert(
-                    "values".into(),
-                    Value::Array(values.iter().map(|value| Value::String(value.clone())).collect()),
-                );
-                Value::Table(given)
-            });
-            out.insert("args".into(), Value::Array(args.collect()));
             if let Some(package) = packages.get(&name).filter(|_| slot.ty.as_deref() == Some("package")) {
                 out.insert("package".into(), package.path.clone().into());
             }
@@ -952,10 +931,10 @@ impl Options {
                 unwritten
                     .push_str(&failing(&format!("{UNSET}{name}"), &format!("{name} has no value on this package")));
             }
-            let _ = writeln!(header, "#define pe2_option_{name} {}", value.as_deref().unwrap_or(&unset));
+            let _ = writeln!(header, "#define pe2_option${name} {}", value.as_deref().unwrap_or(&unset));
             if let Some(tree) = shaped_value(name, def, fields, &self.types)? {
                 if let Tree::List(items) = &tree {
-                    let _ = writeln!(header, "#define pe2_option_{name}_count {}", items.len());
+                    let _ = writeln!(header, "#define pe2_option_count${name} {}", items.len());
                 }
                 header.push_str(&tree.leaf_macros(name));
             }
@@ -964,7 +943,7 @@ impl Options {
                     let is = value
                         .as_ref()
                         .map_or_else(|| unset.clone(), |value| i32::from(*value == at.to_string()).to_string());
-                    let _ = writeln!(header, "#define pe2_option_{name}_is_{member} {is}");
+                    let _ = writeln!(header, "#define pe2_option_is${name}${member} {is}");
                 }
             }
         }
@@ -976,7 +955,7 @@ impl Options {
         ];
         for (key, value) in values {
             if let Some(value) = value {
-                let _ = writeln!(header, "#define pe2_config_{key} \"{value}\"\n#define pe2_config_{key}_is_{value} 1");
+                let _ = writeln!(header, "#define pe2_config${key} \"{value}\"\n#define pe2_config_is${key}${value} 1");
             }
         }
         // Past the first pass: there, an undefined name in `#if` is what divides by zero.
@@ -1082,38 +1061,69 @@ fn integer(text: &str) -> Option<i64> {
     Some(if negative { -magnitude } else { magnitude })
 }
 
-/// A use of a value, read from what a first pass left.
+/// A use of a value, read from what a first pass left: `PE2_VALUE(slot, key, value, ..., _part, part, ...)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Read {
     binding: String,
-    path: Vec<String>,
-    derived: Option<String>,
+    /// Its arguments after the slot, as written.
+    args: Vec<String>,
 }
+
+/// How a value is made and the part of it read: its query's keys with their values, and its fragment's steps.
+type Parts = (BTreeMap<String, Vec<String>>, Vec<String>);
 
 impl Read {
     fn of(args: &[&str]) -> Option<Read> {
         let (binding, rest) = args.split_first()?;
-        let mut path: Vec<String> = rest.iter().map(ToString::to_string).collect();
-        let derived = path.last().filter(|word| word.starts_with('_')).map(|word| word[1..].to_string());
-        if derived.is_some() {
-            path.pop();
+        Some(Read { binding: (*binding).to_string(), args: rest.iter().map(ToString::to_string).collect() })
+    }
+
+    /// Its query and its fragment: keys with their values, in pairs, to the first argument starting with `_`, which
+    /// starts the fragment - each value whatever it starts with, as it always follows its key.
+    ///
+    /// # Errors
+    /// A key has no value.
+    fn parts(&self) -> std::result::Result<Parts, String> {
+        let (mut query, mut at) = (BTreeMap::new(), 0);
+        while let Some(key) = self.args.get(at).filter(|word| !word.starts_with('_')) {
+            let value = self.args.get(at + 1).ok_or_else(|| format!("{key} is given no value"))?;
+            query.insert(key.clone(), vec![value.clone()]);
+            at += 2;
         }
-        Some(Read { binding: (*binding).to_string(), path, derived })
+        let mut fragment: Vec<String> = self.args[at..].to_vec();
+        if let Some(first) = fragment.first_mut() {
+            first.remove(0);
+        }
+        Ok((query, fragment))
+    }
+
+    /// As a reference would end: how it is made, and the part of it read (`?symbol=gBody#buffer`).
+    fn said(&self) -> String {
+        let Ok((query, fragment)) = self.parts() else { return self.args.join(", ") };
+        let query: Vec<String> = query.iter().map(|(key, values)| format!("{key}={}", values.join(","))).collect();
+        let mut said = String::new();
+        if !query.is_empty() {
+            let _ = write!(said, "?{}", query.join("&"));
+        }
+        if !fragment.is_empty() {
+            let _ = write!(said, "#{}", fragment.join("/"));
+        }
+        said
     }
 
     /// The macro it reads, as `PE2_VALUE` pastes it.
     fn name(&self) -> String {
-        let mut name = format!("pe2_value_{}", self.binding);
-        for word in &self.path {
-            name.push('_');
-            name.push_str(word);
-        }
-        if let Some(derived) = &self.derived {
-            let _ = write!(name, "__{derived}");
-        }
-        name
+        joined("pe2_value", std::iter::once(&self.binding).chain(&self.args))
     }
 }
+
+/// A name `pe2.h` pastes: a prefix and arguments, joined by `$`.
+fn joined<'a>(prefix: &str, args: impl IntoIterator<Item = &'a String>) -> String {
+    args.into_iter().fold(prefix.to_string(), |name, arg| format!("{name}${arg}"))
+}
+
+/// The most arguments a `pe2.h` macro takes.
+const ARGUMENTS: usize = 32;
 
 /// A macro firing an error where it is used: stopping at the preprocessor where that can, and on what cannot, leaving what the compiler
 /// stops on.
@@ -1155,10 +1165,26 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
         if wanted.is_empty() {
             break;
         }
+        // What is no address is that use's failure, said; the rest are read together.
+        let asked: Vec<std::result::Result<Box<pe2_ext::Asked>, String>> = wanted
+            .iter()
+            .map(|(_, node, address)| {
+                pe2_ext::Asked::new(address).map(Box::from).map_err(|why| format!("{node}: {why}"))
+            })
+            .collect();
         #[request]
-        let got: Vec<Result<pe2_ext::Data>> =
-            call.outputs_tried(wanted.iter().map(|(_, node, address)| (node.as_str(), address.as_str())));
-        for ((at, ..), got) in wanted.iter().zip(got) {
+        let got: Vec<Result<pe2_ext::Data>> = call.outputs_tried(
+            wanted
+                .iter()
+                .zip(&asked)
+                .filter_map(|((_, node, _), asked)| Some((node.as_str(), &**asked.as_ref().ok()?))),
+        );
+        let mut got = got.into_iter();
+        for ((at, ..), asked) in wanted.iter().zip(&asked) {
+            let got = match asked {
+                Ok(_) => got.next().unwrap_or_else(|| Err(anyhow!("it was not read"))),
+                Err(why) => Err(anyhow!("{why}")),
+            };
             uses[*at].given(call, got);
         }
     }
@@ -1210,16 +1236,25 @@ fn scanned(call: &Call) -> Result<Scanned> {
 /// and type, the values read and the queries asked.
 #[derive(Serialize, Deserialize)]
 struct Pass {
-    slots: Vec<(String, String)>,
+    /// Each slot: its name, its type, and why it is refused where it says of itself what no slot says.
+    slots: Vec<(String, String, Option<String>)>,
     reads: BTreeSet<Read>,
     queries: BTreeSet<Query>,
 }
 
 impl Pass {
     fn of(scanned: &Scanned) -> Pass {
-        let slots = scanned.slots.held.iter().map(|(name, slot)| (name.clone(), slot.ty.clone().unwrap_or_default()));
+        let slots = scanned.slots.held.iter().map(|(name, slot)| {
+            (name.clone(), slot.ty.clone().unwrap_or_default(), refused_attribute(name, &slot.attributes))
+        });
         Pass { slots: slots.collect(), reads: scanned.reads.clone(), queries: scanned.queries.clone() }
     }
+}
+
+/// Why a slot is refused where it says of itself what no slot says (`hiden`), naming what a slot may say.
+fn refused_attribute(name: &str, attributes: &BTreeSet<String>) -> Option<String> {
+    let said = attributes.iter().find(|said| !ATTRIBUTES.contains(&said.as_str()))?;
+    Some(format!("{name}: there is no attribute {said}; there is {}", ATTRIBUTES.join(", ")))
 }
 
 /// What a use came to: its tokens, or why not; for a slot, nothing where what fills it is what it declares.
@@ -1242,19 +1277,19 @@ fn uses_of(call: &Call, scanned: &Scanned) -> Vec<Use> {
     let mut names = BTreeSet::new();
     for read in reads.iter().filter(|read| names.insert(read.name())) {
         let slot = slots.held.get(&read.binding).filter(|slot| slot.ty.is_some());
-        let stage = match (slot, bound(call, fields, slots, &read.binding)) {
-            (None, _) => Stage::Said(Err("it has no PE2_BIND".into())),
-            (_, None) => Stage::Said(Err("nothing fills it on this package".into())),
-            (Some(_), Some(bound)) => Stage::Walking(Trail::new(&bound, read.path.clone())),
-        };
-        let mut args = BTreeMap::new();
-        for ((path, arg), values) in slot.map(|slot| &slot.args).into_iter().flatten() {
-            if *path == read.path {
-                args.insert(arg.clone(), values.clone());
+        let parts = read.parts();
+        let stage = match (slot, bound(call, fields, slots, &read.binding), &parts) {
+            _ if read.args.len() + 1 > ARGUMENTS => {
+                Stage::Said(Err(format!("it has {} arguments, and pe2.h takes {ARGUMENTS}", read.args.len() + 1)))
             }
-        }
+            (_, _, Err(why)) => Stage::Said(Err(why.clone())),
+            (None, _, _) => Stage::Said(Err("it has no PE2_BIND".into())),
+            (_, None, _) => Stage::Said(Err("nothing fills it on this package".into())),
+            (Some(_), Some(bound), Ok((_, fragment))) => Stage::Walking(Trail::new(&bound, fragment.clone())),
+        };
+        let args = parts.map_or_default(|(query, _)| query);
         let stage = match stage {
-            Stage::Walking(walk) => value_walked(read, &args, active.as_deref(), walk),
+            Stage::Walking(walk) => value_walked(&args, active.as_deref(), walk),
             other => other,
         };
         uses.push(Use::Value { read: read.clone(), args, active: active.clone(), stage });
@@ -1355,31 +1390,30 @@ impl Use {
                     walk.given(got);
                 }
             }
-            Use::Value { read, args, active, stage } => {
-                let next =
-                    match std::mem::replace(stage, Stage::Said(Ok(String::new()))) {
-                        Stage::Walking(mut walk) => {
-                            walk.given(got);
-                            value_walked(read, args, active.as_deref(), walk)
-                        }
-                        Stage::Probing { target, args, mut probe } => {
-                            probe.given(got);
-                            match probe.found.clone() {
-                                None => Stage::Probing { target, args, probe },
-                                Some(Err(why)) => Stage::Said(Err(why)),
-                                Some(Ok(output)) => {
-                                    let address = pe2_ext::tokens::address(read.derived.as_deref(), &Args(args))
-                                        .replacen(tokens::OUTPUT, &output, 1);
-                                    Stage::Reading { target, address }
+            Use::Value { args, active, stage, .. } => {
+                let next = match std::mem::replace(stage, Stage::Said(Ok(String::new()))) {
+                    Stage::Walking(mut walk) => {
+                        walk.given(got);
+                        value_walked(args, active.as_deref(), walk)
+                    }
+                    Stage::Probing { target, args, mut probe } => {
+                        probe.given(got);
+                        match probe.found.clone() {
+                            None => Stage::Probing { target, args, probe },
+                            Some(Err(why)) => Stage::Said(Err(why)),
+                            Some(Ok(output)) => {
+                                match pe2_ext::tokens::address(&output, &Args(args)) {
+                                    Ok(address) => Stage::Reading { target, address: address.to_string() },
+                                    Err(why) => Stage::Said(Err(format!("{why:#}"))),
                                 }
                             }
                         }
-                        Stage::Reading { .. } => Stage::Said(
-                            got.and_then(|made| pe2_ext::tokens::text_of(call, &made))
-                                .map_err(|why| format!("{why:#}")),
-                        ),
-                        other => other,
-                    };
+                    }
+                    Stage::Reading { .. } => Stage::Said(
+                        got.and_then(|made| pe2_ext::tokens::text_of(call, &made)).map_err(|why| format!("{why:#}")),
+                    ),
+                    other => other,
+                };
                 *stage = next;
             }
             Use::Query { stage, .. } => {
@@ -1432,12 +1466,12 @@ impl Use {
 }
 
 /// Where a value's walk leaves it: at a node, to find its tokens; at a plain value, printed.
-fn value_walked(read: &Read, args: &BTreeMap<String, Vec<String>>, active: Option<&str>, walk: Trail) -> Stage {
+fn value_walked(args: &BTreeMap<String, Vec<String>>, active: Option<&str>, walk: Trail) -> Stage {
     match walk.ended.clone() {
         None => Stage::Walking(walk),
         Some(Err(why)) => Stage::Said(Err(why)),
-        Some(Ok(Reached::Value(_))) if read.derived.is_some() => {
-            Stage::Said(Err(format!("{} is a value, and nothing is derived from it", read.path.join("/"))))
+        Some(Ok(Reached::Value(_))) if args.contains_key(tokens::DERIVE) => {
+            Stage::Said(Err(format!("{} is a value, and nothing is derived from it", walk.path.join("/"))))
         }
         Some(Ok(Reached::Value(value))) => Stage::Said(Ok(tokenizers::printed(&value))),
         Some(Ok(Reached::Node { node, args: led, .. })) => {
@@ -1481,7 +1515,7 @@ struct Trail {
     path: Vec<String>,
     reached: Reached,
     at: usize,
-    /// The output the reference names, read first where it names one.
+    /// The output the reference names, read first where it names one: its address and query, as text.
     first: Option<(String, String)>,
     /// Whether the family member at this step was tried and is none: its plain output is read.
     member_tried: bool,
@@ -1491,8 +1525,11 @@ struct Trail {
 impl Trail {
     fn new(from: &Bound, path: Vec<String>) -> Trail {
         let reached = Reached::Node { node: from.node.clone(), reads_as: None, args: BTreeMap::new() };
-        let first = from.output.clone().map(|output| (from.node.clone(), output));
-        let mut walk = Trail { path, reached, at: 0, first, member_tried: false, ended: None };
+        let (first, ended) = match &from.output {
+            Ok(output) => (output.clone().map(|output| (from.node.clone(), output)), None),
+            Err(why) => (None, Some(Err(format!("{}: {why}", from.node)))),
+        };
+        let mut walk = Trail { path, reached, at: 0, first, member_tried: false, ended };
         walk.settle();
         walk
     }
@@ -1584,14 +1621,14 @@ impl Probe {
             return None;
         }
         Some(match (&self.active, self.own_tried) {
-            (Some(active), false) => (self.target.clone(), format!("{}.{active}", tokens::DECLARED)),
+            (Some(active), false) => (self.target.clone(), format!("{}_{active}", tokens::DECLARED)),
             _ => (self.target.clone(), tokens::DECLARED.to_string()),
         })
     }
 
     fn given(&mut self, got: Result<pe2_ext::Data>) {
         match (&self.active, self.own_tried, table(got).is_ok()) {
-            (Some(active), false, true) => self.found = Some(Ok(format!("{}.{active}", tokens::OUTPUT))),
+            (Some(active), false, true) => self.found = Some(Ok(format!("{}_{active}", tokens::OUTPUT))),
             (Some(_), false, false) => self.own_tried = true,
             (_, _, true) => self.found = Some(Ok(tokens::OUTPUT.to_string())),
             (_, _, false) => self.found = Some(Err("it has no tokenizer".into())),
@@ -1669,12 +1706,13 @@ fn header(pass: &Pass, outcomes: Vec<Option<Said>>) -> (String, Vec<String>) {
     let mut failed = Vec::new();
     let mut outcomes = outcomes.into_iter();
     let mut next = || outcomes.next().flatten().unwrap_or_else(|| Err("it was not read".into()));
-    for (name, ty) in slots {
-        let wrong = if ty == "package" { None } else { next().err() };
+    for (name, ty, refused) in slots {
+        let said = if ty == "package" { None } else { next().err() };
+        let wrong = refused.clone().or(said);
         failed.extend(wrong.clone());
         header.push_str(
             &wrong
-                .map_or_else(|| format!("#define pe2_bind_{name}\n"), |why| failing(&format!("pe2_bind_{name}"), &why)),
+                .map_or_else(|| format!("#define pe2_bind${name}\n"), |why| failing(&format!("pe2_bind${name}"), &why)),
         );
     }
     let mut written: BTreeMap<String, &Read> = BTreeMap::new();
@@ -1731,12 +1769,7 @@ impl Query {
 
     /// The macro it reads, as `PE2_QUERY` pastes it.
     fn name(&self) -> String {
-        let mut name = format!("pe2_query_{}_{}", self.binding, self.key);
-        for arg in &self.args {
-            name.push('_');
-            name.push_str(arg);
-        }
-        name
+        joined("pe2_query", [&self.binding, &self.key].into_iter().chain(&self.args))
     }
 }
 
@@ -1756,32 +1789,38 @@ fn names(call: &Call, value: &Value, wanted: &str) -> bool {
 fn said(binding: &str, why: &str) -> String {
     let told = why.rsplit("pe2.packages: ").next().unwrap_or(why);
     match told.strip_prefix("it needs ") {
-        Some(arg) => format!("{binding} needs PE2_BIND_ARG({binding}, _{arg}, <value>)"),
+        Some(arg) => format!("{binding} needs {arg}: PE2_VALUE({binding}, {arg}, <value>)"),
         None => format!("{binding}: {told}"),
     }
 }
 
 /// The slot `PE2_BIND_SELF` fills with the package built.
 const SELF: &str = "self";
+/// What a slot may say of itself after its type: filled with the package built where the package's
+/// declaration does not fill it; kept out of the editor.
+const ATTRIBUTES: [&str; 2] = ["self", HIDDEN];
 /// What a slot kept out of the editor says of itself.
 const HIDDEN: &str = "hidden";
 
-/// What fills a slot: a node, and the output of it a reference names.
+/// What fills a slot: a node, and the output of it a reference names, asked as it asks (`cells/body?palette=a`) - or
+/// why what it names is none.
 #[derive(Clone, Serialize, Deserialize)]
 struct Bound {
     node: String,
-    output: Option<String>,
+    output: std::result::Result<Option<String>, String>,
 }
 
 /// What its package's declaration fills a slot with; else, for a slot filled by default with the package built, the package.
 fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<Bound> {
     let Some(reference) = fields.get("bind").and_then(|bind| bind.get(name)) else {
         let own = slots.held.get(name).is_some_and(|slot| slot.attributes.contains("self"));
-        return own.then(|| Bound { node: call.host.path().to_string(), output: None });
+        return own.then(|| Bound { node: call.host.path().to_string(), output: Ok(None) });
     };
     Some(Bound {
         node: pe2_ext::target_of(reference)?.to_string(),
-        output: pe2_ext::output_of(reference).map(str::to_string),
+        output: pe2_ext::asked_of(reference)
+            .map(|asked| asked.map(|asked| asked.to_string()))
+            .map_err(|why| format!("{why:#}")),
     })
 }
 
@@ -1809,12 +1848,12 @@ impl Reached {
 pub fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
     let active = call.config().and_then(|config| config.target);
     if let Some(active) = active {
-        let own = format!("{}.{active}", tokens::OUTPUT);
-        if call.table_of(target, &format!("{}.{active}", tokens::DECLARED)).is_ok() {
+        let own = format!("{}_{active}", tokens::OUTPUT);
+        if call.table_of(target, pe2_ext::Asked::new(&format!("{}_{active}", tokens::DECLARED))?).is_ok() {
             return Ok(own);
         }
     }
-    call.table_of(target, tokens::DECLARED)
+    call.table_of(target, pe2_ext::Asked::constant(tokens::DECLARED))
         .map(|_| tokens::OUTPUT.to_string())
         .map_err(|_| anyhow!("it has no tokenizer"))
 }
@@ -1904,7 +1943,32 @@ impl Gathering<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Option_, Types, value_of};
+    use super::{Option_, Read, Types, refused_attribute, value_of};
+
+    #[test]
+    fn a_slot_saying_of_itself_what_no_slot_says_is_refused_naming_what_one_may() {
+        let said = |words: &[&str]| words.iter().map(ToString::to_string).collect();
+        assert_eq!(refused_attribute("a", &said(&["self", "hidden"])), None);
+        assert_eq!(
+            refused_attribute("a", &said(&["hiden"])).as_deref(),
+            Some("a: there is no attribute hiden; there is self, hidden")
+        );
+    }
+
+    #[test]
+    fn a_read_is_its_query_in_pairs_then_its_fragment_and_named_as_pasted() {
+        let read = |args: &[&str]| Read::of(args).unwrap();
+        let (query, fragment) = read(&["a", "symbol", "_gA", "_cell", "p", "v"]).parts().unwrap();
+        assert_eq!(
+            (query["symbol"].as_slice(), fragment.as_slice()),
+            (["_gA".to_string()].as_slice(), ["cell", "p", "v"].map(String::from).as_slice())
+        );
+        assert_eq!(read(&["a", "_count"]).parts().unwrap().1, ["count"]);
+        assert!(read(&["a", "symbol"]).parts().is_err());
+        assert_eq!(read(&["a", "derive", "id", "_items", "0"]).said(), "?derive=id#items/0");
+        assert_eq!(read(&["a", "derive", "id", "_items", "0"]).name(), "pe2_value$a$derive$id$_items$0");
+        assert_ne!(read(&["a", "k", "v_w"]).name(), read(&["a", "k_v", "w"]).name());
+    }
 
     #[test]
     fn a_string_option_is_a_string_to_the_compiler() {

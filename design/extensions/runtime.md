@@ -84,6 +84,11 @@ An unsandboxed extension gets the whole system and may start programs. It runs o
   read for its manifest and never instantiated.
 - **Programs** are looked for in the extension's folder (per platform first), then its downloads, then the system.
   Programs given files from a sealed extension get them through the served filesystem.
+- **Places on disk** cross the boundary as handles, never as text: the `host-path` resource, given by the calls that
+  name a place (`temp`, `keep`, `path-of`, `serve`, `place`, a build's folder), offers the form the component opens
+  (`guest`), the form a program is told (`native`), and a place within it (`join`). `spawn` takes its arguments as
+  `arg`s - text, a place, or parts joined into one - and the host writes each place as the program reads it, so no
+  extension writes a path for another system's programs.
 - **Programs offered** (`[[program]]`) are named by others as `<extension>:<program>`: what every unsandboxed
   extension loaded offers is kept with the loaded set (`unsandboxed::Offered`, filled once it is known which loaded),
   and a program is started through the extension offering it - its required downloads fetched first, its tree's places

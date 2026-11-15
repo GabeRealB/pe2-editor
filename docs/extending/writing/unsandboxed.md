@@ -14,6 +14,9 @@ beside the editor, only from a project.
 ## Programs
 
 `pe2_ext::process::spawn(tool, args)` starts a program and returns a `Process` to write to, read from and wait for.
+Its arguments are `Arg`s: text, a place on disk (a `HostPath`), which the editor writes as the program reads it, or
+parts joined into one (`-I` and a folder); `pe2_ext::args!["-o", &out, "-c"]` makes them. `process::temp()` gives a
+place for work that belongs to no operation's run.
 The program is looked for in the extension's folder for the user's platform, then in the extension's folder, then
 among its downloads, then on the system.
 

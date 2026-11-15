@@ -284,22 +284,22 @@ impl<'a> Reach<'a> {
     ///
     /// # Errors
     /// No node is so named.
-    pub fn key(&self, reference: &toml::Value, address: &str) -> Result<String> {
+    pub fn key(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<String> {
         let (node, _) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
-        Ok(format!("{}#{address}", id(node)))
+        Ok(format!("{}#{asked}", id(node)))
     }
 
     /// Another node's output, by its reference and its address: made, or found kept, in the world; with its hash.
     ///
     /// # Errors
     /// No node is so named, it has no such output, it reads, through others, itself, or it cannot be made.
-    pub fn output(&self, reference: &toml::Value, address: &str) -> Result<(String, Given, &'a dyn Node)> {
+    pub fn output(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<(String, Given, &'a dyn Node)> {
         let (node, plan) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
-        let read = format!("{}#{address}", id(node));
+        let read = format!("{}#{asked}", id(node));
         let cycle = MAKING.with(|m| m.borrow().contains(&read));
         anyhow::ensure!(!cycle, "{read} reads, through others, itself");
         MAKING.with(|m| m.borrow_mut().push(read.clone()));
-        let given = self.engine.output_in(Some(*self), &plan, node, address, None, true);
+        let given = self.engine.output_in(Some(*self), &plan, node, asked, None, true);
         MAKING.with(|m| m.borrow_mut().pop());
         Ok((read, given?, node))
     }
@@ -330,19 +330,21 @@ impl<'a> Reach<'a> {
             return Some(hash);
         }
         let made = self.engine.made();
-        let (node, address) = read.rsplit_once('#')?;
+        let (node, asked) = read.rsplit_once('#')?;
+        let asked = pe2_path::Asked::new(asked).ok()?;
         let (found, plan) = self.world.node(&toml::Value::String(node.to_string()))?;
-        let (output, parameter) = plan.output(address)?;
-        if let Some(trace) = self.engine.traced(Some(*self), &plan, found, output, parameter.as_deref()) {
+        let (output, parameter) = plan.output(asked.address().as_str())?;
+        let asking = Asking { member: parameter.as_deref(), query: asked.query() };
+        if let Some(trace) = self.engine.traced(Some(*self), &plan, found, output, asking) {
             self.engine.find(read.to_string(), made, &trace.value);
             return Some(trace.value);
         }
-        let read = format!("{}#{address}", id(found));
+        let read = format!("{}#{asked}", id(found));
         if MAKING.with(|m| m.borrow().contains(&read)) {
             return None;
         }
         MAKING.with(|m| m.borrow_mut().push(read));
-        let given = self.engine.output_in(Some(*self), &plan, found, address, None, false);
+        let given = self.engine.output_in(Some(*self), &plan, found, asked, None, false);
         MAKING.with(|m| m.borrow_mut().pop());
         given.ok().map(|given| given.hash)
     }
@@ -395,12 +397,33 @@ impl Input {
     }
 }
 
+/// What an output is asked for as: the member of its family where it is one, and how it is asked for (its query).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asking<'a> {
+    pub member: Option<&'a str>,
+    pub query: &'a pe2_path::Query,
+}
+
+impl<'a> Asking<'a> {
+    /// An output asked for as it is: no member, no query.
+    #[must_use]
+    pub fn none() -> Asking<'static> {
+        Asking { member: None, query: pe2_path::Query::NONE }
+    }
+
+    /// A member of a family, asked for as it is.
+    #[must_use]
+    pub fn member(member: Option<&'a str>) -> Asking<'a> {
+        Asking { member, query: pe2_path::Query::NONE }
+    }
+}
+
 /// An operation running: what it is given, its settings, its output's parameter, its node, and the store its
 /// contents may be in.
 pub struct Call<'a> {
     inputs: Vec<Vec<Input>>,
     settings: &'a Table,
-    parameter: Option<&'a str>,
+    parameter: Asking<'a>,
     recorder: Recorder<'a>,
     store: Option<&'a Store>,
     reach: Option<Reach<'a>>,
@@ -442,8 +465,8 @@ type Others = Mutex<HashMap<String, HostPath>>;
 
 /// Another node's output, made or found kept, and its stored contents found: where its node has them, or - its node having
 /// them nowhere a path names - kept in the store.
-fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, address: &str) -> Result<Got> {
-    let (read, given, node) = reach.output(reference, address)?;
+fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<Got> {
+    let (read, given, node) = reach.output(reference, asked)?;
     let value = given.value.with_context(|| format!("{read}: made nothing"))?;
     let mut stored = Vec::new();
     stored_contents(&value, &mut stored);
@@ -517,7 +540,13 @@ impl<'a> Call<'a> {
     /// The value of its output's parameter, where it makes one of a family.
     #[must_use]
     pub fn parameter(&self) -> Option<&'a str> {
-        self.parameter
+        self.parameter.member
+    }
+
+    /// How its output is asked for: the keys its operation declares, as a reference set them.
+    #[must_use]
+    pub fn query(&self) -> &'a pe2_path::Query {
+        self.parameter.query
     }
 
     /// A stored file of its node as a value of the types it is recognized as (`names`: the first its type, the
@@ -593,12 +622,12 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// Nothing beyond its node is reachable here, or the output cannot be made.
-    pub fn output_of(&self, reference: &toml::Value, address: &str) -> Result<Arc<Value>> {
+    pub fn output_of(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<Arc<Value>> {
         let reach = self.reach.context("no other node is reachable here")?;
         let got = match self.needs {
-            None => fetch(reach, self.others, reference, address)?,
+            None => fetch(reach, self.others, reference, asked)?,
             Some(needs) => {
-                let key = reach.key(reference, address)?;
+                let key = reach.key(reference, asked)?;
                 let made = needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned();
                 match made {
                     Some(Ok(got)) => got,
@@ -678,8 +707,8 @@ impl<'a> Call<'a> {
 
     /// Where a file or folder of the project is on disk.
     #[must_use]
-    pub fn place(&self, path: &str) -> Option<String> {
-        Some(self.reach?.world.place(path)?.display().to_string())
+    pub fn place(&self, path: &str) -> Option<HostPath> {
+        self.reach?.world.place(path)
     }
 
     /// The config being built, recorded as read (all of it; none built is a reading too).
@@ -986,16 +1015,16 @@ pub fn evaluate(
     plan: &Plan,
     ops: &Ops,
     node: &dyn Node,
-    wanted: &[(usize, Option<&str>)],
+    wanted: &[(usize, Asking<'_>)],
     known: &Known,
     (store, reach): (Option<&Store>, Option<Reach<'_>>),
 ) -> (Vec<Made>, Reads) {
     let reads = Mutex::new(Reads::default());
     let mut made: Vec<Option<Made>> = vec![None; wanted.len()];
     // Outputs of one parameter's value run together; those of none with the first.
-    let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+    let mut groups: Vec<(Asking<'_>, Vec<usize>)> = Vec::new();
     for (i, (_, parameter)) in wanted.iter().enumerate() {
-        match groups.iter_mut().find(|(p, _)| p == parameter || parameter.is_none()) {
+        match groups.iter_mut().find(|(p, _)| p == parameter || *parameter == Asking::none()) {
             Some((_, members)) => members.push(i),
             None => groups.push((*parameter, vec![i])),
         }
@@ -1089,14 +1118,14 @@ struct Evaluation<'a> {
 }
 
 impl Evaluation<'_> {
-    fn run(&self, outputs: &[usize], parameter: Option<&str>) -> Vec<Made> {
+    fn run(&self, outputs: &[usize], parameter: Asking<'_>) -> Vec<Made> {
         let steps: Vec<usize> = outputs.iter().map(|&o| self.plan.outputs[o].from).collect();
         self.run_steps(&steps, parameter)
     }
 
     /// The values of these steps, made as `run` makes outputs': each asked for - what says whether it runs first, and
     /// only where it does what it takes - and made once. What is never asked for is never made.
-    fn run_steps(&self, targets: &[usize], parameter: Option<&str>) -> Vec<Made> {
+    fn run_steps(&self, targets: &[usize], parameter: Asking<'_>) -> Vec<Made> {
         let plan = self.plan;
         let known: HashMap<usize, (&Arc<Value>, &Reads)> = self.known.iter().map(|(s, v, r)| (*s, (v, r))).collect();
         let needed = plan.steps_reached(targets, &known.keys().copied().collect());
@@ -1139,7 +1168,7 @@ impl Evaluation<'_> {
 
     /// Make a step, where it is not made: what says whether it runs asked for first; where it does not, nothing, and
     /// what it takes let go of. A `merge` asks for what it takes in turn, until one is made.
-    fn make(&self, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) {
+    fn make(&self, s: usize, run: &mut Run<'_>, parameter: Asking<'_>, recorder: Recorder<'_>) {
         if run.slots[s].is_some() {
             return;
         }
@@ -1199,7 +1228,7 @@ impl Evaluation<'_> {
 
     /// Whether a step runs, asking what says so where it was not asked yet. One that does not makes nothing - its
     /// value said - and lets go of what it takes.
-    fn gate(&self, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) -> bool {
+    fn gate(&self, s: usize, run: &mut Run<'_>, parameter: Asking<'_>, recorder: Recorder<'_>) -> bool {
         let step = &self.plan.steps[s];
         let Some(active) = step.active.filter(|_| !run.passed[s]) else {
             run.passed[s] = true;
@@ -1225,7 +1254,7 @@ impl Evaluation<'_> {
     /// Before a step takes a value others take too, tell the others whether they run, where what says so is made
     /// already or is logic of the config alone (`settled_cheaply`) - asking reads no other node, and makes nothing of a
     /// branch not taken - so that one that does not lets go of the value, and it is moved to its last taker, not copied.
-    fn settle_takers(&self, from: usize, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) {
+    fn settle_takers(&self, from: usize, s: usize, run: &mut Run<'_>, parameter: Asking<'_>, recorder: Recorder<'_>) {
         if run.left[from] <= 1 {
             return;
         }
@@ -1264,7 +1293,7 @@ impl Evaluation<'_> {
     /// A `for_each`: its body - an operation the project defines - laid out alone and run for each item it is given,
     /// with what `with` takes, at the same time; each item kept by what it is given and what the body is, so that an item
     /// changed is made again alone. What the body makes nothing of is left out; an item failing fails it, named.
-    fn for_each(&self, step: &super::Step, mut inputs: Vec<Vec<Input>>, parameter: Option<&str>) -> Made {
+    fn for_each(&self, step: &super::Step, mut inputs: Vec<Vec<Input>>, parameter: Asking<'_>) -> Made {
         let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
         let Some(uid) = step.settings.get("body").and_then(toml::Value::as_str) else {
             return fail("it runs no `body`".into());
@@ -1327,7 +1356,7 @@ impl Evaluation<'_> {
         (body, with_hashes): (&str, &[String]),
         (n, item): (usize, &Arc<Value>),
         with: &[Arc<Value>],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Made {
         let text = format!(
             "{VALUES}\n{}\nfor_each\n{body}\n{}\n{with_hashes:?}\n{parameter:?}",
@@ -1380,7 +1409,7 @@ impl Evaluation<'_> {
         &self,
         step: &super::Step,
         mut inputs: Vec<Vec<Input>>,
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
         recorder: Recorder<'_>,
     ) -> Made {
         if step.op == super::FOR_EACH {
@@ -1491,7 +1520,7 @@ impl Evaluation<'_> {
         step: &super::Step,
         mut value: Value,
         given: &[Vec<Input>],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
         recorder: Recorder<'_>,
     ) -> Result<Value> {
         let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
@@ -1532,9 +1561,10 @@ impl Evaluation<'_> {
     /// What an operation said it reads, or a step requested, made - at once, where nothing connects them - for it to read.
     fn make_needs(&self, wanted: &[pe2_ext::Need], needs: &Needs) {
         let Some(reach) = self.reach else { return };
-        let mut keyed: Vec<(String, toml::Value, String)> = Vec::new();
+        let mut keyed: Vec<(String, toml::Value, Arc<pe2_path::Asked>)> = Vec::new();
         for need in wanted {
             let reference = toml::Value::String(need.node.clone());
+            // What names no node is refused where it is read: `output_of` finds no key for it.
             let Ok(key) = reach.key(&reference, &need.address) else { continue };
             if !keyed.iter().any(|(known, ..)| *known == key) {
                 keyed.push((key, reference, need.address.clone()));
@@ -1557,7 +1587,7 @@ impl Evaluation<'_> {
         spawn: &str,
         items: &[String],
         given: &[Vec<Input>],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Result<Vec<Input>> {
         let ports: Vec<Vec<pe2_ext::MicroInput>> = [Vec::new(), Vec::new()]
             .into_iter()
@@ -1615,7 +1645,7 @@ impl Evaluation<'_> {
         prepare: &super::Prepare,
         step: &super::Step,
         inputs: &[Vec<Input>],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
         recorder: Recorder<'_>,
         needs: &Needs,
     ) -> Result<Vec<pe2_ext::Micro>> {
@@ -1643,7 +1673,7 @@ impl Evaluation<'_> {
         step: &super::Step,
         inputs: &[Vec<Input>],
         micros: &[pe2_ext::Micro],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Made {
         let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
         let after = |micro: &pe2_ext::Micro| {
@@ -1690,7 +1720,7 @@ impl Evaluation<'_> {
         micro: &pe2_ext::Micro,
         given: &[Vec<Input>],
         made: &[Option<Made>],
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Made {
         let at = format!("{}: {}", step.at, micro.label);
         let fail = |what: String| -> Made { Err(Arc::from(format!("{at}: {what}"))) };
@@ -1878,17 +1908,41 @@ impl Engine {
         self.store.as_ref()
     }
 
+    /// Whether a query asks only what the operation making an output declares it takes.
+    ///
+    /// # Errors
+    /// It names a key the operation does not take, or the operation is none here.
+    fn asks_only_declared(&self, plan: &Plan, output: usize, query: &pe2_path::Query) -> Result<()> {
+        if query.is_empty() {
+            return Ok(());
+        }
+        let op = &plan.steps[plan.outputs[output].from].op;
+        let def = self.ops.get(op).with_context(|| format!("`{op}`: no extension provides it"))?;
+        for (key, _) in query.pairs() {
+            anyhow::ensure!(
+                def.query.iter().any(|(takes, _)| takes == key),
+                "`{op}` takes no `{key}`: it takes {}",
+                if def.query.is_empty() {
+                    "no query".to_string()
+                } else {
+                    def.query.iter().map(|(k, _)| format!("`{k}`")).collect::<Vec<_>>().join(", ")
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// The key an output's trace is kept under: its node (by uid, else by path), what makes it, and its parameter's
     /// value. Two nodes making alike keep a trace each, of what each read, and share the value they made.
     #[must_use]
-    pub fn key(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> String {
+    pub fn key(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Asking<'_>) -> String {
         let text = format!("{VALUES}\n{}\n{}\n{parameter:?}", id(node), plan.describe(output, &self.ops));
         crate::extract::sha1_hex(text.as_bytes())
     }
 
     /// An output's hash where it is kept and what it read still holds; none where it must be made.
     #[must_use]
-    pub fn kept(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> Option<Trace> {
+    pub fn kept(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Asking<'_>) -> Option<Trace> {
         self.kept_in(None, plan, node, output, parameter)
     }
 
@@ -1908,7 +1962,7 @@ impl Engine {
         plan: &Plan,
         node: &dyn Node,
         output: usize,
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
@@ -1926,7 +1980,7 @@ impl Engine {
         plan: &Plan,
         node: &dyn Node,
         output: usize,
-        parameter: Option<&str>,
+        parameter: Asking<'_>,
     ) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
@@ -1939,8 +1993,8 @@ impl Engine {
     ///
     /// # Errors
     /// The node has no such output, or it could not be made or kept.
-    pub fn output(&self, plan: &Plan, node: &dyn Node, address: &str, read: bool) -> Result<Given> {
-        self.output_with(plan, node, address, None, read)
+    pub fn output(&self, plan: &Plan, node: &dyn Node, asked: &pe2_path::Asked, read: bool) -> Result<Given> {
+        self.output_with(plan, node, asked, None, read)
     }
 
     /// An output as `output` makes it, the parameter of what it reaches given this value where the address gives none
@@ -1952,11 +2006,11 @@ impl Engine {
         &self,
         plan: &Plan,
         node: &dyn Node,
-        address: &str,
+        asked: &pe2_path::Asked,
         supplied: Option<&str>,
         read: bool,
     ) -> Result<Given> {
-        self.output_in(None, plan, node, address, supplied, read)
+        self.output_in(None, plan, node, asked, supplied, read)
     }
 
     /// An output as `output_with` makes it, its operations reaching other nodes' outputs in `reach`.
@@ -1968,13 +2022,15 @@ impl Engine {
         reach: Option<Reach<'_>>,
         plan: &Plan,
         node: &dyn Node,
-        address: &str,
+        asked: &pe2_path::Asked,
         supplied: Option<&str>,
         read: bool,
     ) -> Result<Given> {
+        let address = asked.address().as_str();
         let (output, parameter) =
             plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
-        let parameter = parameter.as_deref().or(supplied);
+        let parameter = Asking { member: parameter.as_deref().or(supplied), query: asked.query() };
+        self.asks_only_declared(plan, output, asked.query()).with_context(|| format!("{}: {asked}", node.path()))?;
         let retained = plan.outputs[output].retain != Retain::Transient;
         if retained && let Some(trace) = self.kept_in(reach, plan, node, output, parameter) {
             // Read where asked; one kept as this store does not read values is made again.
@@ -2036,11 +2092,13 @@ impl Engine {
         reach: Option<Reach<'_>>,
         plan: &Plan,
         node: &dyn Node,
-        address: &str,
+        asked: &pe2_path::Asked,
     ) -> Result<(Box<dyn super::stream::Producer>, Reads, String)> {
+        let address = asked.address().as_str();
         let (output, parameter) =
             plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
-        let parameter = parameter.as_deref();
+        let parameter = Asking { member: parameter.as_deref(), query: asked.query() };
+        self.asks_only_declared(plan, output, asked.query()).with_context(|| format!("{}: {asked}", node.path()))?;
         let step = &plan.steps[plan.outputs[output].from];
         let def = self.ops.get(&step.op).with_context(|| format!("`{}`: no extension provides it", step.op))?;
         let start = def.start.as_ref().with_context(|| format!("{address} is no stream"))?;
@@ -2131,7 +2189,7 @@ impl Engine {
         let mut call = Call {
             inputs,
             settings,
-            parameter: None,
+            parameter: Asking::none(),
             recorder,
             store: self.store.as_ref(),
             reach,
@@ -2153,7 +2211,7 @@ impl Engine {
             .filter(|(i, o)| *i != except && o.retain != Retain::Transient && o.parameter.is_none());
         cached
             .filter_map(|(i, o)| {
-                let trace = self.kept_in(reach, plan, node, i, None)?;
+                let trace = self.kept_in(reach, plan, node, i, Asking::none())?;
                 let value = store.get(&trace.value).ok()?;
                 Some((o.from, Arc::new(value), trace.reads))
             })

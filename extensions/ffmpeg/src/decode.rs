@@ -4,27 +4,25 @@
 
 use pe2_ext::media::{AudioData, MediaBuffer, PixelFormat, SampleFormat, VideoFrame};
 use pe2_ext::process::{Process, spawn};
-use pe2_ext::{Call, Data, Generator, Result, Table, Typed, Value, anyhow};
+use pe2_ext::{Arg, Call, Data, Generator, HostPath, Result, Table, Typed, Value, anyhow};
 
 use crate::strings;
 
 /// What ffprobe says of a stream of a file (`v:0`, `a:0`), as its `key=value` lines.
-fn probed(path: &str, stream: &str, entries: &str) -> Result<Vec<(String, String)>> {
-    let mut process = spawn(
-        "ffprobe",
-        &strings(&[
-            "-v",
-            "error",
-            "-count_packets",
-            "-select_streams",
-            stream,
-            "-show_entries",
-            &format!("stream={entries}"),
-            "-of",
-            "default=nw=1",
-            path,
-        ]),
-    )?;
+fn probed(path: &HostPath, stream: &str, entries: &str) -> Result<Vec<(String, String)>> {
+    let mut args = strings(&[
+        "-v",
+        "error",
+        "-count_packets",
+        "-select_streams",
+        stream,
+        "-show_entries",
+        &format!("stream={entries}"),
+        "-of",
+        "default=nw=1",
+    ]);
+    args.push(Arg::from(path));
+    let mut process = spawn("ffprobe", &args)?;
     let text = read(&mut process, usize::MAX)?;
     process.wait()?;
     let text = String::from_utf8_lossy(&text);
@@ -92,7 +90,8 @@ impl Reading {
         let frames = frames.ok_or_else(|| anyhow!("ffprobe says no frame rate"))?;
         let sound = probed(&path, "a:0", "sample_rate,channels")?;
         let run = |args: &[&str]| {
-            let mut all = strings(&["-hide_banner", "-loglevel", "error", "-nostdin", "-i", &path]);
+            let mut all = strings(&["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]);
+            all.push(Arg::from(&path));
             all.extend(strings(args));
             spawn("ffmpeg", &all)
         };

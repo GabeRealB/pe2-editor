@@ -25,13 +25,15 @@ pub struct Bound {
     pub palette: Option<String>,
     /// In texels.
     pub size: [u32; 2],
+    /// The output of its image that is the picture: the cell, through its palette.
+    pub picture: Box<pe2_ext::Asked>,
 }
 
 impl Bound {
     /// The output of its image that is the picture.
     #[must_use]
-    pub fn output(&self) -> String {
-        material::cell_address(&self.cell, self.palette.as_deref())
+    pub fn output(&self) -> &pe2_ext::Asked {
+        &self.picture
     }
 }
 
@@ -160,7 +162,7 @@ impl Source for Held<'_, '_> {
 
     /// The stored file a node makes as itself.
     fn read(&self, _: &str) -> Result<Vec<u8>> {
-        let Data::Typed(stored) = self.call.output_of(&self.path, "native")? else {
+        let Data::Typed(stored) = self.call.output_of(&self.path, pe2_ext::NATIVE)? else {
             bail!("{}: it makes no file", self.path)
         };
         self.call.read(stored.file()?)
@@ -171,7 +173,7 @@ impl<'c, 'a> Nodes<'c, 'a> {
     /// The node a reference names.
     fn named(&self, reference: &str) -> Result<Held<'c, 'a>> {
         let named = self.call.node_named(reference).ok_or_else(|| anyhow!("{reference}: no such node"))?;
-        let settings = self.call.table_of(&named.path, "settings")?;
+        let settings = self.call.table_of(&named.path, pe2_ext::SETTINGS)?;
         Ok(Held {
             call: self.call,
             path: named.path,
@@ -205,7 +207,7 @@ fn resolved<'c, 'a>(
 fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
     let image = resolved(nodes, holder, "image", Some(texture))?;
     let image = image.asset();
-    let cell = material::cell_of(texture).ok_or_else(|| anyhow!("{}: a texture has no cell", holder.path()))?;
+    let cell = material::cell_of(texture)?.ok_or_else(|| anyhow!("{}: a texture has no cell", holder.path()))?;
     let held = image
         .parts("cells")
         .into_iter()
@@ -215,11 +217,13 @@ fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
         held.1.get("rect").and_then(Value::as_array).ok_or_else(|| anyhow!("{}: {cell} has no size", image.path()))?;
     let side =
         |at: usize| rect.get(at).and_then(Value::as_integer).and_then(|side| u32::try_from(side).ok()).unwrap_or(1);
+    let palette = material::palette_of(texture)?;
     Ok(Bound {
         image: image.path().to_string(),
         cell: cell.to_string(),
-        palette: material::palette_of(texture).map(str::to_string),
+        palette: palette.map(str::to_string),
         size: [side(2), side(3)],
+        picture: Box::from(&*material::cell_address(cell, palette)?),
     })
 }
 
@@ -549,11 +553,12 @@ pub fn attach(tree: &mut Model, mut child: Model, node: usize) {
 /// # Errors
 /// It is none of what shows in 3D, or something it refers to is missing or unreadable.
 pub fn scene(call: &mut Call) -> Result<Typed> {
-    let chosen: String = call.parameter()?;
-    let chosen = chosen
-        .split(',')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(group, member)| (group.to_string(), member.to_string()));
+    // Each group and its member chosen, in turn: `scene/outfit/mist/hair/long`; none chosen, `scene`.
+    let parts: Vec<&str> = call.parameter_text.map_or_default(|chosen| chosen.split('/').collect());
+    if parts.len() % 2 != 0 {
+        bail!("a group is named with no member chosen of it");
+    }
+    let chosen = parts.chunks(2).map(|pair| (pair[0].to_string(), pair[1].to_string()));
     let nodes = Nodes { call, chosen: chosen.collect() };
     let own = nodes.named(call.host.path())?;
     let assembled = built(&nodes, &own.asset())?;
@@ -563,9 +568,6 @@ pub fn scene(call: &mut Call) -> Result<Typed> {
 
 /// The file a scene is held in.
 const FILE: &str = "scene.json";
-
-/// No group chosen, as an address has to say something.
-const NONE_CHOSEN: &str = "-";
 
 fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     // A type comes qualified by what registered it.
@@ -594,7 +596,7 @@ fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
 /// # Errors
 /// It has no such output, or it could not be made.
 pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    let address = scene_address(project, asset);
+    let address = scene_address(project, asset)?;
     let bytes =
         project.bytes(asset.path(), &address).ok_or_else(|| anyhow!("{}: it shows nothing in 3D", asset.path()))??;
     Ok(serde_json::from_slice(&bytes)?)
@@ -610,7 +612,11 @@ pub enum Scene {
 
 /// What `assemble` gives, without waiting: a view shows what it has meanwhile, and is shown again when this is there.
 pub fn requested(project: &dyn Project, asset: &Asset) -> Scene {
-    match project.request(asset.path(), &scene_address(project, asset)) {
+    let address = match scene_address(project, asset) {
+        Ok(address) => address,
+        Err(why) => return Scene::Failed(format!("{why:#}")),
+    };
+    match project.request(asset.path(), &address) {
         Requested::Ready(bytes) => serde_json::from_slice(&bytes)
             .map_or_else(|why| Scene::Failed(why.to_string()), |made| Scene::Ready(Box::new(made))),
         Requested::Pending { waited } => Scene::Waiting(waited),
@@ -626,11 +632,16 @@ pub fn say_waiting(ui: &mut Ui, waited: u32) {
     }
 }
 
-fn scene_address(project: &dyn Project, asset: &Asset) -> String {
-    let chosen: Vec<String> =
-        prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
-    let chosen = if chosen.is_empty() { NONE_CHOSEN.to_string() } else { chosen.join(",") };
-    format!("scene/{chosen}")
+/// A scene's address: each group and the member chosen of it, in turn.
+///
+/// # Errors
+/// A group or a member is named as no address names a part.
+fn scene_address(project: &dyn Project, asset: &Asset) -> Result<std::sync::Arc<pe2_ext::Asked>> {
+    let mut address = "scene".to_string();
+    for group in prefab::groups(asset, project) {
+        address = format!("{address}/{}/{}", group.name, group.chosen);
+    }
+    Ok(std::sync::Arc::from(pe2_ext::Asked::new(&address)?))
 }
 
 #[cfg(test)]

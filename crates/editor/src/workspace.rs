@@ -548,7 +548,12 @@ impl Parts {
             return None;
         }
         if !self.shown.contains_key(&key) {
-            let Some(drawn) = extensions.output_image(asset, part) else {
+            // A part named as no output is, is said where it is shown, as one that could not be drawn.
+            let drawn = match pe2_path::Asked::new(part) {
+                Ok(address) => extensions.output_image(asset, address),
+                Err(why) => Some(Err(why.into())),
+            };
+            let Some(drawn) = drawn else {
                 self.none.insert(key);
                 return None;
             };
@@ -2853,7 +2858,9 @@ impl Workspace {
         }
         let key = (path.clone(), output.to_string(), self.revision);
         if self.tapped.as_ref().is_none_or(|(known, _)| *known != key) {
-            let made = self.extensions.output_picture(&self.index, asset, output);
+            let made = pe2_path::Asked::new(output)
+                .map_err(anyhow::Error::from)
+                .and_then(|output| self.extensions.output_picture(&self.index, asset, output));
             let made = made.map(|image| {
                 let color = egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba);
                 ui.ctx().load_texture(format!("tap {path} {output}"), color, egui::TextureOptions::NEAREST)

@@ -40,10 +40,10 @@ pub trait Source {
     }
     /// What an unsandboxed extension's operation is lent of the host (`CallHost::temp`, `keep`, `path_of`): only an asset lent
     /// for an operation's run has them.
-    fn temp(&self) -> Option<Result<String>> {
+    fn temp(&self) -> Option<Result<crate::HostPath>> {
         None
     }
-    fn keep(&self, path: &str, name: &str) -> Option<Result<crate::File>> {
+    fn keep(&self, path: &crate::HostPath, name: &str) -> Option<Result<crate::File>> {
         let _ = (path, name);
         None
     }
@@ -60,12 +60,12 @@ pub trait Source {
         let _ = node_type;
         None
     }
-    fn place(&self, path: &str) -> Option<String> {
+    fn place(&self, path: &str) -> Option<crate::HostPath> {
         let _ = path;
         None
     }
-    fn output_of(&self, path: &str, address: &str) -> Option<Result<crate::Data>> {
-        let _ = (path, address);
+    fn output_of(&self, path: &str, asked: &crate::Asked) -> Option<Result<crate::Data>> {
+        let _ = (path, asked);
         None
     }
     fn node_named(&self, reference: &str) -> Option<crate::data::NodeNamed> {
@@ -75,11 +75,11 @@ pub trait Source {
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
         None
     }
-    fn path_of(&self, name: &str) -> Option<String> {
+    fn path_of(&self, name: &str) -> Option<crate::HostPath> {
         let _ = name;
         None
     }
-    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<Result<String>> {
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<Result<crate::HostPath>> {
         let _ = (files, how);
         None
     }

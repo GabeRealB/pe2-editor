@@ -66,8 +66,8 @@ A template that takes no files is listed under **File ▸ New node**. One that t
 
 A generator is a node whose outputs are operations: it makes them from a description, for the configuration being
 built, as a build system makes a build from what a project says of it. Each output is an operation used as
-`uid://<generator>#<output>`, made again when the configuration built changes or the generator does. Its outputs name
-one another as `#<output>`.
+`uid://<generator>/<output>`, made again when the configuration built changes or the generator does. Its outputs name
+one another as `/<output>`.
 
 ```toml
 [[stack]]

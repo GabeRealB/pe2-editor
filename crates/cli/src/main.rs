@@ -1743,6 +1743,7 @@ fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &st
     if let Some(of_type) = of_type {
         paths.extend(extensions.find(&index, of_type).map(|a| a.path.clone()));
     }
+    let output = pe2_path::Asked::new(output)?;
     let mut failed = 0;
     for path in &paths {
         let asset = &index.assets[path];

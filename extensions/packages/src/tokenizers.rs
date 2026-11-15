@@ -9,7 +9,7 @@ use pe2_model::model::{Arrays, Binding, Model, arrays};
 use pe2_model::skeleton;
 use pe2_model::{clip, clip_usd, material};
 
-pub const SETTINGS: &str = "settings";
+pub use pe2_ext::SETTINGS;
 
 /// Where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
 fn placed(call: &Call, placement: &Value) -> Option<[i64; 2]> {
@@ -34,7 +34,9 @@ fn binding_of(call: &Call, fields: &Table) -> Result<Binding> {
 
 /// A mesh at rest on its skeleton, the joints a prefab moves where it moves them, and the names of its slots.
 fn rested(call: &Call, reference: &str, pose: Option<&Value>) -> Result<(Model, Vec<String>)> {
-    let Data::Typed(stored) = call.output_of(reference, "native")? else { bail!("{reference}: its output is no mesh") };
+    let Data::Typed(stored) = call.output_of(reference, pe2_ext::NATIVE)? else {
+        bail!("{reference}: its output is no mesh")
+    };
     let (mut model, slots) = mesh::read(&String::from_utf8(call.read(stored.file()?)?)?)?;
     if let Some(named) = call.table_of(reference, SETTINGS)?.get("skeleton").and_then(pe2_ext::target_of) {
         let table = call.table_of(named, SETTINGS)?;
@@ -313,13 +315,15 @@ fn list_count(call: &Call, _: &Args) -> Result<String> {
 
 /// An item's `id`, as its own tokenizer reads it: the item's output leads to it, with the args it is read by.
 fn item_id(call: &Call, at: usize) -> Result<i64> {
-    let led = call.table_of(call.host.path(), &format!("items/{at}"))?;
+    let led = call.table_of(call.host.path(), pe2_ext::Asked::new(&format!("items/{at}"))?)?;
     let node =
         led.get(pe2_ext::tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("item {at} leads nowhere"))?;
     let held = led.get(pe2_ext::tokens::ARGS).and_then(Value::as_table).into_iter().flatten();
     let args = Args(held.filter_map(|(name, value)| Some((name.clone(), vec![value.as_str()?.to_string()]))).collect());
     let output = crate::gather::tokenizer_of(call, node)?;
-    let address = pe2_ext::tokens::address(Some("id"), &args).replacen(pe2_ext::tokens::OUTPUT, &output, 1);
+    let mut args = args;
+    args.0.insert(pe2_ext::tokens::DERIVE.to_string(), vec!["id".to_string()]);
+    let address = pe2_ext::tokens::address(&output, &args)?;
     let text = pe2_ext::tokens::text_of(call, &call.output_of(node, &address)?)?;
     text.trim().parse().map_err(|_| anyhow!("item {at}'s id is {text}, no number"))
 }
@@ -502,7 +506,7 @@ fn bank_whole(call: &Call, args: &Args) -> Result<String> {
     let mut out = Vec::new();
     // Every clip asked for at once (`outputs_of`): a tokenizer following what it reads is run until it has them, and
     // asking one at a time took a run each.
-    let made = call.outputs_of(stored.iter().map(|reference| (reference.as_str(), "native")))?;
+    let made = call.outputs_of(stored.iter().map(|reference| (reference.as_str(), pe2_ext::NATIVE)))?;
     for (reference, made) in stored.iter().zip(made) {
         let (path, arrays) = clip_arrays(call, reference, made)?;
         let name = clip_name(&path);

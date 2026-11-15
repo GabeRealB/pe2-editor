@@ -120,7 +120,7 @@ pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
         name: config.name.to_string(),
         release: config.release.clone(),
         target: config.target.clone(),
-        folder: folder.to_string(),
+        folder: pe2_ext::HostPath::of_host(folder.into_path_buf()),
         known,
         properties: project.properties_of(config),
     }
@@ -203,11 +203,13 @@ impl Site<'_> {
             Err(why) => return Outcome { failed: Some(format!("{why:#}")), ..outcome },
         };
         let events = &plan.outputs[at].events;
-        let key = self.engine.key(&plan, found, at, None);
+        let key = self.engine.key(&plan, found, at, crate::graph::exec::Asking::none());
         let before = self.engine.store().and_then(|store| store.trace(&key)).map(|trace| trace.value);
         let made = {
             let _span = tracing::info_span!("pull: the output made or found kept").entered();
-            self.extensions.output(&self.engine, self.index, found, output, true)
+            pe2_path::Asked::new(output)
+                .map_err(anyhow::Error::from)
+                .and_then(|asked| self.extensions.output(&self.engine, self.index, found, asked, true))
         };
         let deployed = made.and_then(|given| {
             let value = given.value.as_deref().context("no value")?;
@@ -244,7 +246,7 @@ impl Site<'_> {
             Ok(found) => found,
             Err(why) => return Outcome { failed: Some(format!("{why:#}")), ..Outcome::default() },
         };
-        let key = self.engine.key(&plan, found, at, None);
+        let key = self.engine.key(&plan, found, at, crate::graph::exec::Asking::none());
         let Some(store) = self.engine.store() else { return Outcome::default() };
         let trace = store.trace(&key);
         let kept = trace.and_then(|trace| store.get(&trace.value).ok());

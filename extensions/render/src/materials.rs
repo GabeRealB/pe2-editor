@@ -156,15 +156,20 @@ fn set_overrides(fill: &mut Table, overrides: Table) {
 fn fitted(ui: &Ui, texture: &Value) -> Option<Value> {
     let choices = choices_of(ui, texture).filter(|choices| !choices.cells.is_empty())?;
     let held = |name: &str, known: &[String]| known.iter().any(|known| known == name);
-    let cell = material::cell_of(texture).filter(|cell| held(cell, &choices.cells)).unwrap_or(&choices.cells[0]);
-    let palette = material::palette_of(texture).map(|palette| {
+    // What names no cell or palette of it is fitted to its first, as one it does not have is.
+    let cell = material::cell_of(texture)
+        .ok()
+        .flatten()
+        .filter(|cell| held(cell, &choices.cells))
+        .unwrap_or(&choices.cells[0]);
+    let palette = material::palette_of(texture).ok().flatten().map(|palette| {
         if held(palette, &choices.palettes) {
             palette
         } else {
             choices.palettes.first().map_or(palette, String::as_str)
         }
     });
-    Some(material::reading(texture, cell, palette))
+    material::reading(texture, cell, palette).ok()
 }
 
 #[derive(Default)]
@@ -209,7 +214,7 @@ impl Bindings {
 
     fn thumbnail(&mut self, ui: &mut Ui, slot: &Slot) {
         let bound = slot.drawn.as_ref().and_then(|drawn| drawn.main.as_ref());
-        let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
+        let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, bound.output()).cloned());
         // Nothing to show keeps the place, so that the rows' text lines up.
         let picture =
             picture.unwrap_or_else(|| Texture::new("no texture", Image { width: 1, height: 2, rgba: vec![0; 8] }));
@@ -225,21 +230,23 @@ impl Bindings {
             *change = Some(Change::Texture(new));
         }
         let Some(choices) = choices_of(ui, texture) else { return };
-        let cell = material::cell_of(texture).unwrap_or_default().to_string();
-        let palette =
-            material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
+        let (cell, palette) = match crate::material_panel::named_in(texture, &choices) {
+            Ok(named) => named,
+            Err(why) => return ui.styled(&format!("{why:#}"), Style::Error),
+        };
+        let mut read = |ui: &mut Ui, made: pe2_ext::Result<Value>| match made {
+            Ok(made) => *change = Some(Change::Texture(made)),
+            Err(why) => ui.styled(&format!("{why:#}"), Style::Error),
+        };
         ui.horizontal(|ui| {
             ui.styled("Cell", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.cell"), &cell, &choices.cells) {
-                *change = Some(Change::Texture(material::reading(
-                    texture,
-                    &choices.cells[chosen],
-                    material::palette_of(texture),
-                )));
+                let palette = material::palette_of(texture).ok().flatten();
+                read(ui, material::reading(texture, &choices.cells[chosen], palette));
             }
             ui.styled("Palette", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.palette"), &palette, &choices.palettes) {
-                *change = Some(Change::Texture(material::reading(texture, &cell, Some(&choices.palettes[chosen]))));
+                read(ui, material::reading(texture, &cell, Some(&choices.palettes[chosen])));
             }
         });
     }

@@ -78,9 +78,39 @@ interface unsandboxed {
         wait: func() -> result<_, string>;
     }
 
+    /// A place on disk the host gave - a file to write, a folder served, where a content or a file of the project is:
+    /// read in its forms, never made of text. A place within it is one too (`join`).
+    resource host-path {
+        /// As this extension's filesystem names it (on Windows each drive a root: `/D:/a/b`): what it opens it by.
+        guest: func() -> string;
+        /// As a program on this system is told it, and a file written for one holds it (`D:\a\b`, `/a/b`).
+        native: func() -> string;
+        /// A place within it, by a path within a folder (`a/b`): refused where a name of it is none every system
+        /// takes.
+        join: func(within: string) -> result<host-path, string>;
+    }
+
+    /// Part of a program's argument: text, or a place, written as the program reads it.
+    variant arg-part {
+        text(string),
+        path(borrow<host-path>),
+    }
+
+    /// A program's argument: text, a place written as the program reads it, or parts joined into one (`-I` and a
+    /// folder).
+    variant arg {
+        text(string),
+        path(borrow<host-path>),
+        joined(list<arg-part>),
+    }
+
     /// Start a program: where it ships one (for this platform, in `<platform>/` of its folder, or any), else as the
     /// system finds it.
-    spawn: func(tool: string, args: list<string>) -> result<process, string>;
+    spawn: func(tool: string, args: list<arg>) -> result<process, string>;
+
+    /// A place for a program to write a file to, in the system's folder of temporary files - for what is no
+    /// operation's run (an operation's has its own, removed with it: `asset.temp`). Its to remove.
+    temp: func() -> result<host-path, string>;
 
     /// Have what its setup names (`name` of a `[[setup]]` entry of its manifest) on this machine: fetched where it is
     /// not yet, an optional one only where the user lets it - one they turned off is refused, saying so.
@@ -196,12 +226,14 @@ interface types {
 }
 
 interface host {
+    use unsandboxed.{host-path};
+
     /// The config being built: its name, release and target, and the folder its results go to.
     record build-config {
         name: string,
         release: option<string>,
         target: option<string>,
-        folder: string,
+        folder: host-path,
         /// What every config of the project says, as `key=value`.
         known: list<string>,
         /// Its properties, each the project declares as it sets it or by default (a TOML table).
@@ -229,16 +261,16 @@ interface host {
         writer: func(name: string) -> result<writer, string>;
         /// For an unsandboxed extension's operation: a path to have a program write to, on the file system its contents are
         /// kept on.
-        temp: func() -> result<string, string>;
+        temp: func() -> result<host-path, string>;
         /// For an unsandboxed extension's operation: a file it made kept as a content, moved rather than read, named `name`.
-        keep: func(path: string, name: string) -> result<file, string>;
+        keep: func(path: borrow<host-path>, name: string) -> result<file, string>;
         /// For an unsandboxed extension's operation: where a content is on disk, to point a program at it.
-        path-of: func(name: string) -> option<string>;
+        path-of: func(name: string) -> option<host-path>;
         /// For an unsandboxed extension's operation: a read-only folder holding these files by their names (a name's
         /// folders made), for a program to read, until the operation's run is done; its path. Each is served where its
         /// content is, nothing written where the host has a filesystem to serve it with - chosen by how they will be
         /// used.
-        serve: func(files: list<file>, how: serve-use) -> result<string, string>;
+        serve: func(files: list<file>, how: serve-use) -> result<host-path, string>;
         /// For an operation's run: the plain files under a folder of the project, each by its path, as the stack resolves it. What is
         /// made is made again when the list changes.
         entries: func(folder: string) -> result<list<string>, string>;
@@ -246,7 +278,7 @@ interface host {
         /// changes.
         read-entry: func(path: string) -> result<list<u8>, string>;
         /// For an operation's run: where a file or folder of the project is on disk, for what is told paths.
-        place: func(path: string) -> option<string>;
+        place: func(path: string) -> option<host-path>;
         /// For an operation's run: an output of another asset, by its path or a reference to it, recorded as read.
         output-of: func(path: string, address: string) -> result<value, string>;
         /// For an operation's run: the node a reference names, by its path and uid.
@@ -711,6 +743,9 @@ interface guest {
         inverse: option<string>,
         /// Its parameter: its name, and the type of value it takes (`name`, `number`).
         parameter: option<tuple<string, string>>,
+        /// The keys of a query it takes (a reference's `?palette=default`), each with what it does: a key it does not
+        /// declare is refused.
+        query: list<tuple<string, string>>,
         priority: s32,
         provides: option<provides>,
         /// Whether the members of what it makes are listed: called back by the operation.
@@ -852,16 +887,17 @@ interface guest {
     register: func() -> result<registration, string>;
 
     /// An operation's run: lent its node as an asset - its path, type and declared settings, its files the
-    /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
-    /// parameter.
-    run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
+    /// contents its values hold, named by their hashes - given its values by port, its settings (TOML), its output's
+    /// parameter and how its output is asked for (a query's text, `palette=default`: of the keys it declares; empty
+    /// for none).
+    run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>, query: string) -> result<value, string>;
     /// What the step that just ended at a cut carries, which the instance holds for its next step: written out (CBOR) and
     /// let go of, as the host lets go of the instance and runs that step elsewhere. None where it holds nothing.
     seal-step: func() -> result<option<list<u8>>, string>;
     /// What an operation's run will read, given what its run is given. Asked again once that is made, as long as it asks for
     /// more: what it read is there to read, and anything else is noted as asked for, and fails. Its reads are its run's, so
     /// that an operation reads only what this said.
-    prepare-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<prepared, string>;
+    prepare-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>, query: string) -> result<prepared, string>;
     /// A family's members, of an asset: each by its parameter's value, with a label. An added output goes by its place
     /// after the types, as `type`.
     members: func(op: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
@@ -901,7 +937,7 @@ interface guest {
 
     /// A stream operation opened: lent its node, given its values by port, its settings and its output's parameter
     /// (as `run-op`), it starts its generator.
-    start-stream: func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<generator, string>;
+    start-stream: func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>, query: string) -> result<generator, string>;
 }
 
 /// The GPU, for what shows itself in a view: the device the editor draws with, and a texture of it made known to `ui.gpu-image`.

@@ -82,40 +82,54 @@ impl Definition {
     }
 }
 
-/// What a texture slot holds is a reference to a cell of an image: `cells/<cell>`, or `cells/<cell>@<palette>` through a
-/// palette other than the cell's own.
-fn cell_output(texture: &Value) -> Option<&str> {
-    pe2_ext::output_of(texture)?.strip_prefix("cells/")
+/// What a texture slot holds is a reference to a cell of an image: `cells/<cell>`, asked through a palette other than
+/// the cell's own with `palette` (`uid://x/cells/<cell>?palette=<palette>`).
+///
+/// # Errors
+/// It names what is no address.
+pub fn cell_of(texture: &Value) -> Result<Option<&str>> {
+    let address = pe2_ext::address_of(texture)?;
+    Ok(address.filter(|address| address.output() == "cells").and_then(pe2_ext::Address::member))
 }
 
-#[must_use]
-pub fn cell_of(texture: &Value) -> Option<&str> {
-    cell_output(texture).map(|output| output.split_once('@').map_or(output, |(cell, _)| cell))
+/// The palette a texture asks its cell through, where it names one other than the cell's own.
+///
+/// # Errors
+/// It asks by what is no query.
+pub fn palette_of(texture: &Value) -> Result<Option<&str>> {
+    pe2_ext::query_of(texture, "palette")
 }
 
-#[must_use]
-pub fn palette_of(texture: &Value) -> Option<&str> {
-    cell_output(texture)?.split_once('@').map(|(_, palette)| palette)
-}
-
-/// The output naming a cell, through a palette where one is named.
-#[must_use]
-pub fn cell_address(cell: &str, palette: Option<&str>) -> String {
-    palette.map_or_else(|| format!("cells/{cell}"), |palette| format!("cells/{cell}@{palette}"))
+/// The output naming a cell, asked through a palette where one is named.
+///
+/// # Errors
+/// The cell's or the palette's name is none an address or a query takes.
+pub fn cell_address(cell: &str, palette: Option<&str>) -> Result<std::sync::Arc<pe2_ext::Asked>> {
+    let address = pe2_ext::Address::new(&format!("cells/{cell}"))?.to_owned();
+    let query = palette.map_or_default(|palette| format!("palette={palette}"));
+    Ok(pe2_ext::Asked::with(&address, pe2_ext::Query::new(&query)?))
 }
 
 /// A texture naming this cell through this palette, of the image it names.
-#[must_use]
-pub fn reading(texture: &Value, cell: &str, palette: Option<&str>) -> Value {
-    let output = cell_address(cell, palette);
+///
+/// # Errors
+/// As `cell_address`.
+pub fn reading(texture: &Value, cell: &str, palette: Option<&str>) -> Result<Value> {
+    let asked = cell_address(cell, palette)?;
     if let Value::Table(table) = texture {
         let mut table = table.clone();
-        table.insert("output".to_string(), output.into());
-        return Value::Table(table);
+        table.insert("output".to_string(), asked.address().as_str().into());
+        match palette {
+            Some(palette) => table.insert(
+                "query".to_string(),
+                Value::Table([("palette".to_string(), palette.into())].into_iter().collect()),
+            ),
+            None => table.remove("query"),
+        };
+        return Ok(Value::Table(table));
     }
-    let reference = texture.as_str().unwrap_or_default();
-    let uid = reference.split_once('#').map_or(reference, |(uid, _)| uid);
-    format!("{uid}#{output}").into()
+    let uid = pe2_ext::target_of(texture).unwrap_or_default();
+    Ok(format!("{uid}/{asked}").into())
 }
 
 /// A pair of numbers.
@@ -166,9 +180,9 @@ pub fn placement_at(image: &Table, texture: &Value, bits: Option<i64>) -> Result
     if !matches!(bits, 4 | 8) {
         bail!("a {bits} bit image is no texture of a face");
     }
-    let name = cell_of(texture).ok_or_else(|| anyhow!("no cell is named"))?;
+    let name = cell_of(texture)?.ok_or_else(|| anyhow!("no cell is named"))?;
     let cell = image.get("cells").and_then(|cells| cells.get(name)).ok_or_else(|| anyhow!("no cell {name}"))?;
-    let palette = palette_of(texture).or_else(|| cell.get("palette").and_then(Value::as_str));
+    let palette = palette_of(texture)?.or_else(|| cell.get("palette").and_then(Value::as_str));
     let palette = palette.ok_or_else(|| anyhow!("{name} has no palette"))?;
     let colors = pair(image.get("palettes").and_then(|palettes| palettes.get(palette)))
         .ok_or_else(|| anyhow!("{palette} is in no slot"))?;
@@ -209,21 +223,26 @@ mod tests {
     #[test]
     fn a_texture_is_placed_by_what_its_image_says() {
         let image: Table = "bits = 8\npage = [384, 256]\ncells.right = { rect = [128, 0, 128, 256], palette = 'one' }\npalettes.one = [0, 245]\npalettes.two = [0, 246]".parse().unwrap();
-        let texture = Value::String("uid://x#cells/right@two".to_string());
+        let texture = Value::String("uid://x/cells/right?palette=two".to_string());
         assert_eq!(placement(&image, &texture).unwrap(), Placement { bits: 8, page: [448, 256], palette: [0, 246] });
     }
 
     #[test]
     fn a_texture_names_a_cell_and_a_palette_of_its_image() {
         let table: pe2_ext::Table =
-            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
+            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left', query = { palette = 'two' } }"
+                .parse()
+                .unwrap();
         let written = &table["main"];
-        assert_eq!((cell_of(written), palette_of(written)), (Some("left"), Some("two")));
-        let again = reading(written, "right", None);
-        assert_eq!((cell_of(&again), palette_of(&again)), (Some("right"), None));
+        assert_eq!((cell_of(written).unwrap(), palette_of(written).unwrap()), (Some("left"), Some("two")));
+        let again = reading(written, "right", None).unwrap();
+        assert_eq!((cell_of(&again).unwrap(), palette_of(&again).unwrap()), (Some("right"), None));
         assert_eq!(again["uid"].as_str(), Some("uid://x"));
-        let extracted = Value::String("uid://x#cells/left".to_string());
-        assert_eq!(reading(&extracted, "left", Some("two")).as_str(), Some("uid://x#cells/left@two"));
+        let extracted = Value::String("uid://x/cells/left".to_string());
+        let read = reading(&extracted, "left", Some("two")).unwrap();
+        assert_eq!(read.as_str(), Some("uid://x/cells/left?palette=two"));
+        assert_eq!((cell_of(&read).unwrap(), palette_of(&read).unwrap()), (Some("left"), Some("two")));
+        assert!(cell_of(&Value::String("uid://x/cells/left@two".to_string())).is_err());
     }
 
     #[test]

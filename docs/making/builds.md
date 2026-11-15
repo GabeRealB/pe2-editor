@@ -21,7 +21,7 @@ op = "pe2.packages@gather"
 
 [[stack]]
 id = "built"
-op = "uid://<the build>#package"
+op = "uid://<the build>/package"
 
 [[stack]]
 op = "output"

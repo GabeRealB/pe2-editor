@@ -46,10 +46,18 @@ An **Output** step has these settings:
 
 | Setting | What it means |
 |---|---|
-| **Name** | What the output is called. Other assets refer to it as *asset*`#`*name*. |
+| **Name** | What the output is called: letters, digits and `_`, not starting with `_`. A name with `/` puts it in a group (`unit/c`: the output `c` of the group `unit`). |
 | **Kept** | **Not kept**, **In the cache** (kept on this computer, made again when needed), or **With the build**. |
 | **Made** | **When asked for** (when something needs it) or **As soon as it can be**. |
 | **Made on**, **Stale on**, **Goes to**, **Ran**, **Changed**, **Failed** | Which events make it, which make it out of date, where builds put it, and which events it signals. See [Events](events.md). |
+
+Another asset refers to an output as a web address names a page: the asset's uid, then the output's name -
+`uid://…/cells/left`. What follows can say more:
+
+- After `?`, how the output is made, where its operation takes it: `uid://…/cells/left?palette=night` draws the cell
+  through another palette. An operation takes only the keys it says it takes; any other is a problem.
+- After `#`, the part of what it makes that is read: `uid://…/skeleton#joints/3`. Reading a part never changes what is
+  made.
 
 A field that refers to an output shows the asset's name followed by `#`*output*.
 

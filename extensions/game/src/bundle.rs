@@ -87,8 +87,12 @@ fn resources(given: &Table) -> Result<Vec<Resource<'_>>> {
 fn entry(value: &Value) -> Result<Option<(String, String)>> {
     let Some(palette) = value.get("palette") else { return Ok(None) };
     let image = target(Some(palette), "a palette")?;
-    let output = pe2_ext::output_of(palette).ok_or_else(|| anyhow!("{image}: a palette names no output"))?;
-    let name = output.strip_prefix("palettes/").ok_or_else(|| anyhow!("{image}: {output} is no palette"))?;
+    let asked = pe2_ext::asked_of(palette)?.ok_or_else(|| anyhow!("{image}: a palette names no output"))?;
+    let address = asked.address();
+    let name = match (address.output(), address.member()) {
+        ("palettes", Some(name)) if asked.query().is_empty() => name,
+        _ => bail!("{image}: {asked} is no palette"),
+    };
     Ok(Some((image, name.to_string())))
 }
 
@@ -132,17 +136,18 @@ fn absolute(slots: &[(String, Table)], placed: &Value, what: &str) -> Result<(i6
 fn palette_resource(resource: &Resource<'_>, making: &PaletteMaking<'_>) -> Result<Vec<u8>> {
     let what = format!("resource {}", resource.index);
     // Its rectangle: where it uploads, or - holding runs alone, naming no slot - the stored chunk's.
-    let (x, y, w, h) = if let (Some(slot), Some(up)) = (making.upload, resource.table.get("upload").and_then(Value::as_table)) {
-        let [sx, sy, sw, sh] = rect(slot, &what)?;
-        let (ax, ay) = pair(up.get("at")).unwrap_or((0, 0));
-        let (w, h) = pair(up.get("size")).unwrap_or((sw, sh));
-        (sx + ax, sy + ay, w, h)
-    } else {
-        let chunk = making.stored_chunk.ok_or_else(|| anyhow!("{what}: no upload, and no stored chunk"))?;
-        let stored = codecs::texture::palette(chunk).map_err(|e| anyhow!("{what}: {e:?}"))?;
-        let rows = i64::try_from(stored.rows.len())?;
-        (i64::from(stored.x), i64::from(stored.y), i64::try_from(stored.width)?, rows)
-    };
+    let (x, y, w, h) =
+        if let (Some(slot), Some(up)) = (making.upload, resource.table.get("upload").and_then(Value::as_table)) {
+            let [sx, sy, sw, sh] = rect(slot, &what)?;
+            let (ax, ay) = pair(up.get("at")).unwrap_or((0, 0));
+            let (w, h) = pair(up.get("size")).unwrap_or((sw, sh));
+            (sx + ax, sy + ay, w, h)
+        } else {
+            let chunk = making.stored_chunk.ok_or_else(|| anyhow!("{what}: no upload, and no stored chunk"))?;
+            let stored = codecs::texture::palette(chunk).map_err(|e| anyhow!("{what}: {e:?}"))?;
+            let rows = i64::try_from(stored.rows.len())?;
+            (i64::from(stored.x), i64::from(stored.y), i64::try_from(stored.width)?, rows)
+        };
     let width = usize::try_from(w)?;
     let mut colors = vec![0u16; width * usize::try_from(h)?];
     let mut put = |(cx, cy): (i64, i64), words: &mut dyn Iterator<Item = u16>, said: &str| -> Result<()> {
@@ -158,7 +163,8 @@ fn palette_resource(resource: &Resource<'_>, making: &PaletteMaking<'_>) -> Resu
         let stored = codecs::texture::palette(chunk).map_err(|e| anyhow!("{what}: {e:?}"))?;
         let (rx, ry) = absolute(making.slots, run, name)?;
         let count = usize::try_from(integer(run.as_table().unwrap_or(&Table::new()), "entries").unwrap_or(16))?;
-        let row = stored.rows.get(usize::try_from(ry - i64::from(stored.y))?).ok_or_else(|| anyhow!("{name}: not stored"))?;
+        let row =
+            stored.rows.get(usize::try_from(ry - i64::from(stored.y))?).ok_or_else(|| anyhow!("{name}: not stored"))?;
         let from = usize::try_from(rx - i64::from(stored.x))?;
         let mut words = row.get(from..from + count).ok_or_else(|| anyhow!("{name}: not stored"))?.iter().copied();
         put((rx, ry), &mut words, name)?;
@@ -242,11 +248,15 @@ pub fn join(call: &mut Call) -> Result<Typed> {
         .filter(|r| r.kind() == "dialogue")
         .map(|r| target(r.table.get("dialogue"), &format!("dialogue {}", r.index)))
         .collect::<Result<_>>()?;
-    let addresses: Vec<String> = images.iter().map(|(_, n, _)| format!("palettes/{n}")).collect();
+    let addresses: Vec<std::sync::Arc<pe2_ext::Asked>> = images
+        .iter()
+        .map(|(_, n, _)| Ok(std::sync::Arc::from(pe2_ext::Asked::new(&format!("palettes/{n}"))?)))
+        .collect::<Result<_>>()?;
     // The palettes' pictures, then the dialogues' files: one request, as what a step holds of them is not carried.
-    let pictures_of = images.iter().zip(&addresses).map(|((i, _, _), a)| (i.as_str(), a.as_str()));
+    let pictures_of = images.iter().zip(&addresses).map(|((i, _, _), a)| (i.as_str(), &**a));
     #[request]
-    let made: Vec<Data> = call.outputs_of(pictures_of.chain(dialogues.iter().map(|d| (d.as_str(), "native"))))?;
+    let made: Vec<Data> =
+        call.outputs_of(pictures_of.chain(dialogues.iter().map(|d| (d.as_str(), pe2_ext::NATIVE))))?;
     let (pictures, natives) = made.split_at(images.len());
     let all = resources(&given)?;
     let layout = call.take::<ty::Bytes>(1)?;
@@ -263,13 +273,18 @@ pub fn join(call: &mut Call) -> Result<Typed> {
             "palette" => {
                 let count = list(resource.table, "palettes").iter().filter(|e| e.get("palette").is_some()).count();
                 let names_slot = resource.table.get("upload").and_then(|u| u.get("slot")).is_some();
-                let up = if names_slot { Some(upload.next().ok_or_else(|| anyhow!("an upload was not read"))?) } else { None };
+                let up = if names_slot {
+                    Some(upload.next().ok_or_else(|| anyhow!("an upload was not read"))?)
+                } else {
+                    None
+                };
                 let stored_bytes = layout
                     .get("palette_bytes")
                     .and_then(|p| p.get(resource.index.to_string()))
                     .and_then(Value::as_integer)
                     .and_then(|n| usize::try_from(n).ok());
-                let chunk = if has_runs(resource.table) { Some(stored_file(call, &stored, resource.index)?) } else { None };
+                let chunk =
+                    if has_runs(resource.table) { Some(stored_file(call, &stored, resource.index)?) } else { None };
                 let making = PaletteMaking {
                     upload: up,
                     images: &images[image..image + count],

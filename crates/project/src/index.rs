@@ -1596,15 +1596,13 @@ fn bundle_at(rel: &TreePath) -> Option<Arc<TreePath>> {
 }
 
 /// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
-/// reference is the asset's uid, `"uid://..."` - with an output of it after a `#` (`#palettes/default`), which
+/// reference is the asset's uid, `"uid://..."` - with what of it it names after a `/` (`/palettes/default`), which
 /// this leaves out (`part_of` gives it) -, or, as written before uids sufficed, a table of the uid and the bundle's
 /// `res://` path.
 #[must_use]
 pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     match value {
-        toml::Value::String(s) if s.starts_with("uid://") => {
-            Some((s.split_once('#').map_or(s.as_str(), |(uid, _)| uid).to_string(), None))
-        }
+        toml::Value::String(s) if s.starts_with("uid://") => Some((pe2_ext::target_of(value)?.to_string(), None)),
         toml::Value::Table(t) => {
             let uid = t.get("uid")?.as_str()?;
             let rel = t.get("path")?.as_str()?.strip_prefix("res://")?;
@@ -1614,17 +1612,18 @@ pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     }
 }
 
+/// What a reference names of its asset, and how it asks for it, as text to show (`cells/body?palette=default`): empty
+/// where it names the asset itself, or what it names is no address - which whoever reads it refuses, saying why.
+fn asked_text(value: &toml::Value) -> String {
+    pe2_ext::asked_of(value).ok().flatten().map_or_default(|asked| asked.to_string())
+}
+
 /// Every reference in a value (`reference`), named by the enclosing slot's `name` or else the field it sits in.
 fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String, String)>) {
     match value {
         toml::Value::Table(t) => {
             if let Some((uid, path)) = reference(value) {
-                out.push((
-                    field.to_string(),
-                    uid,
-                    path.unwrap_or_default(),
-                    pe2_ext::output_of(value).unwrap_or_default().to_string(),
-                ));
+                out.push((field.to_string(), uid, path.unwrap_or_default(), asked_text(value)));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
@@ -1635,12 +1634,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
         toml::Value::String(_) => {
             if let Some((uid, _)) = reference(value) {
-                out.push((
-                    field.to_string(),
-                    uid,
-                    String::new(),
-                    pe2_ext::output_of(value).unwrap_or_default().to_string(),
-                ));
+                out.push((field.to_string(), uid, String::new(), asked_text(value)));
             }
         }
         _ => {}
@@ -4354,7 +4348,7 @@ mod tests {
         write(
             &root,
             ".layers/base/b.node/node.toml",
-            "stack = [{ op = \"t.file\" }]\nslot = \"uid://a#palettes/default\"\n",
+            "stack = [{ op = \"t.file\" }]\nslot = \"uid://a/palettes/default\"\n",
         );
         write(
             &root,

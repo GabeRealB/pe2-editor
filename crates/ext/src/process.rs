@@ -17,14 +17,54 @@ pub struct Process {
 ///
 /// # Errors
 /// This extension is not unsandboxed, or it could not be started.
-pub fn spawn(tool: &str, args: &[String]) -> Result<Process> {
+pub fn spawn(tool: &str, args: &[crate::Arg]) -> Result<Process> {
     #[cfg(target_family = "wasm")]
-    return host::spawn(tool, args).map(|process| Process { process }).map_err(|e| anyhow!(e));
+    {
+        let args = args.iter().map(told).collect::<Result<Vec<_>>>()?;
+        return host::spawn(tool, &args).map(|process| Process { process }).map_err(|e| anyhow!(e));
+    }
     #[cfg(not(target_family = "wasm"))]
     {
         let _ = args;
         Err(anyhow!("{tool}: only an unsandboxed extension's component launches programs"))
     }
+}
+
+/// An argument as the host is told it: a place, by the handle the host gave for it.
+///
+/// # Errors
+/// A place is none the host gave this component.
+#[cfg(target_family = "wasm")]
+fn told(arg: &crate::Arg) -> Result<host::Arg<'_>> {
+    use crate::{Arg, ArgPart};
+    fn handle(path: &crate::HostPath) -> Result<&host::HostPath> {
+        crate::guest::handle(path).ok_or_else(|| anyhow!("{path}: no place the host gave"))
+    }
+    Ok(match arg {
+        Arg::Text(text) => host::Arg::Text(text.clone()),
+        Arg::Path(path) => host::Arg::Path(handle(path)?),
+        Arg::Joined(parts) => host::Arg::Joined(
+            parts
+                .iter()
+                .map(|part| match part {
+                    ArgPart::Text(text) => Ok(host::ArgPart::Text(text.clone())),
+                    ArgPart::Path(path) => handle(path).map(host::ArgPart::Path),
+                })
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
+/// A place for a program to write a file to, in the system's folder of temporary files: for what is no operation's
+/// run (`Call::temp` is an operation's). The extension's to remove (`HostPath::guest`).
+///
+/// # Errors
+/// This extension is not unsandboxed, or the host has no such place.
+pub fn temp() -> Result<crate::HostPath> {
+    #[cfg(target_family = "wasm")]
+    return host::temp().map(crate::guest::given).map_err(|e| anyhow!(e));
+    #[cfg(not(target_family = "wasm"))]
+    Err(anyhow!("only an unsandboxed extension's component is given temporary files"))
 }
 
 /// Have what this extension's setup names (`name` of a `[[setup]]` entry of its manifest) on this machine: what is

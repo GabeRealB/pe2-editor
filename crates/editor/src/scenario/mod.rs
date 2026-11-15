@@ -298,6 +298,7 @@ impl Scenario {
         let ws = self.workspace();
         let asset = ws.index.assets.get(&at).cloned().ok_or_else(|| format!("no asset {path}"))?;
         let engine = project::graph::exec::Engine::new(ws.extensions.operations(), None);
+        let address = pe2_path::Asked::new(address).map_err(|e| e.to_string())?;
         let made = ws.extensions.output(&engine, &ws.index, &asset, address, false);
         Ok(made.err().map_or_else(String::new, |why| format!("{why:#}")))
     }
@@ -594,9 +595,9 @@ impl Scenario {
                 let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
                 let ws = self.workspace();
                 let asset = ws.index.assets.get(&tree(said)?).cloned().ok_or_else(|| format!("no asset {said}"))?;
-                return Ok(Value::Boolean(
-                    ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok()),
-                ));
+                return Ok(Value::Boolean(pe2_path::Asked::new(address).is_ok_and(|address| {
+                    ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok())
+                })));
             }
             other => return Err(format!("no step {other}")),
         }

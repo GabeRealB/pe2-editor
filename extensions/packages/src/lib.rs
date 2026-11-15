@@ -93,7 +93,7 @@ from = { value = "overlay" }
 const PACKAGE: &str = "pe2.packages@package";
 
 /// A list: references in order, which a package indexes. Each item is an output leading to what it names
-/// (`items/<index>`), so that `PE2_VALUE(demos, items, 0, _id)` reads the first through its own tokenizer.
+/// (`items/<index>`), so that `PE2_VALUE(demos, derive, id, _items, 0)` reads the first through its own tokenizer.
 const LIST: &str = r#"[[stack]]
 id = "list"
 op = "pe2.packages@list"
@@ -112,12 +112,13 @@ name = "items"
 fn item(call: &mut Call) -> Result<Table> {
     let reference: Value = item_reference(call)?;
     // An output of another node is read; anything else is the item as it is.
-    let read: Vec<(String, String)> = match (pe2_ext::target_of(&reference), pe2_ext::output_of(&reference)) {
-        (Some(node), Some(output)) => vec![(node.to_string(), output.to_string())],
-        _ => Vec::new(),
-    };
+    let read: Vec<(String, std::sync::Arc<pe2_ext::Asked>)> =
+        match (pe2_ext::target_of(&reference), pe2_ext::asked_of(&reference)?) {
+            (Some(node), Some(asked)) => vec![(node.to_string(), asked)],
+            _ => Vec::new(),
+        };
     #[request]
-    let mut got: Vec<Table> = call.tables_of(read.iter().map(|(node, output)| (node.as_str(), output.as_str())))?;
+    let mut got: Vec<Table> = call.tables_of(read.iter().map(|(node, asked)| (node.as_str(), &**asked)))?;
     match got.pop() {
         Some(table) => Ok(table),
         None => pe2_ext::tokens::link(Some(&reference)),

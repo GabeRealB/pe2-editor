@@ -908,6 +908,7 @@ impl Registry {
             derives: vec![],
             inverse: None,
             parameter: None,
+            query: Vec::new(),
             priority: 0,
             provides: None,
             members: None,
@@ -1526,6 +1527,14 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     #[must_use]
     pub fn parameter<P: crate::ty::Parameter>(mut self, name: &str) -> Self {
         self.def.parameter = Some((name.to_string(), P::KIND.to_string()));
+        self
+    }
+
+    /// A key of a query it takes (`palette` of `uid://x/cells/body?palette=default`), with what it does: read by
+    /// `Call::query`. A reference asking with a key no operation making the output declares is refused.
+    #[must_use]
+    pub fn asks(mut self, key: &str, does: &str) -> Self {
+        self.def.query.push((key.to_string(), does.to_string()));
         self
     }
 

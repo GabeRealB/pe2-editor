@@ -36,7 +36,7 @@ retain = "cache"
 "#;
 
 /// What a node's fields are, read by another's op.
-pub(crate) const SETTINGS: &str = "settings";
+pub(crate) use pe2_ext::SETTINGS;
 
 /// The groups or folders a stage's layout lists, by their nodes, in its order: stage 0's groups, a stage's folders.
 fn layout_parts(layout: &Table) -> Result<Vec<String>> {
@@ -130,7 +130,7 @@ fn inter(call: &mut Call) -> Result<Typed> {
     let fields: Vec<Table> = call.tables_of(files.iter().map(|file| (file.as_str(), SETTINGS)))?;
     let movies: Vec<String> = movies_of(&files, &fields, disc)?;
     #[request]
-    let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie.as_str(), "native")))?;
+    let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie.as_str(), pe2_ext::NATIVE)))?;
     let mut writer = call.writer("native.str")?;
     for (movie, native) in movies.iter().zip(&natives) {
         let Data::Typed(native) = native else { pe2_ext::bail!("{movie}: its native is no file") };

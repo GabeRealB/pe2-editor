@@ -50,7 +50,9 @@ name = "atlas"
 value = { from = "make.atlas" }
 "#;
 
-const SETTINGS: &str = "settings";
+use pe2_ext::SETTINGS;
+/// A flag registry's output naming its flags by id.
+const IDS: &pe2_ext::Asked = pe2_ext::Asked::constant("ids");
 const FACES: [&str; 3] = ["glyphs", "bold", "speakers"];
 
 fn reference(table: &Table, key: &str) -> Result<String> {
@@ -132,18 +134,22 @@ fn make(call: &mut Call) -> Result<Typed> {
     }
     let reads: Vec<String> = [reference(&given, "strings")?, reference(&given, "cast")?].into();
     // The string table's text as the output its reference names has it - translated, say - else as it is set.
-    let strings_output = given.get("strings").and_then(pe2_ext::output_of).unwrap_or(SETTINGS).to_string();
-    let addresses: Vec<String> = [strings_output, SETTINGS.to_string()].into();
+    let strings_output = match given.get("strings") {
+        Some(strings) => pe2_ext::asked_of(strings)?,
+        None => None,
+    };
+    let addresses: Vec<std::sync::Arc<pe2_ext::Asked>> =
+        [strings_output.unwrap_or_else(|| SETTINGS.into()), SETTINGS.into()].into();
     let faces = given.get("faces").and_then(Value::as_table).cloned().unwrap_or_default();
     let face_nodes: Vec<String> = FACES.iter().map(|f| reference(&faces, f)).collect::<Result<_>>()?;
     #[request]
-    let tables: Vec<Table> = call.tables_of(reads.iter().zip(&addresses).map(|(r, a)| (r.as_str(), a.as_str())))?;
+    let tables: Vec<Table> = call.tables_of(reads.iter().zip(&addresses).map(|(r, a)| (r.as_str(), &**a)))?;
     let registries: Vec<String> = dialogue::registries(&given);
     #[request]
-    let ids: Vec<Table> = call.tables_of(registries.iter().map(|r| (r.as_str(), "ids")))?;
+    let ids: Vec<Table> = call.tables_of(registries.iter().map(|r| (r.as_str(), IDS)))?;
     // The faces last: what a step holds of them is not carried.
     #[request]
-    let natives: Vec<Data> = call.outputs_of(face_nodes.iter().map(|f| (f.as_str(), "native")))?;
+    let natives: Vec<Data> = call.outputs_of(face_nodes.iter().map(|f| (f.as_str(), pe2_ext::NATIVE)))?;
     let mut font = Font::default();
     for ((face, native), node) in FACES.iter().zip(&natives).zip(&face_nodes) {
         font.faces.insert((*face).to_string(), pictures_of(&face_glyphs(call, native, node)?));
@@ -152,7 +158,9 @@ fn make(call: &mut Call) -> Result<Typed> {
     let flags: BTreeMap<String, BTreeMap<String, i64>> = registries
         .iter()
         .zip(&ids)
-        .map(|(registry, ids)| (registry.clone(), ids.iter().filter_map(|(k, v)| Some((k.clone(), v.as_integer()?))).collect()))
+        .map(|(registry, ids)| {
+            (registry.clone(), ids.iter().filter_map(|(k, v)| Some((k.clone(), v.as_integer()?))).collect())
+        })
         .collect();
     let (file, laid) = dialogue::make(&given, &strings, &cast_of(&tables[1]), &font, &flags).map_err(|e| anyhow!(e))?;
     let mut atlas = call.writer("atlas.texels")?;
@@ -181,7 +189,8 @@ fn atlas_page(chunk: &[u8], column: usize) -> Result<Vec<u8>> {
 /// A table of `[[key, value...]]` rows, as the plan passes the glyph and plate tables.
 fn rows(args: &Table, key: &str) -> Vec<Vec<String>> {
     let rows = args.get(key).and_then(Value::as_array).into_iter().flatten();
-    rows.map(|row| row.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()).collect()
+    rows.map(|row| row.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect())
+        .collect()
 }
 
 fn toml_text(table: &Table) -> Result<Vec<u8>> {
@@ -237,9 +246,15 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
     let mut bundles: BTreeMap<usize, BTreeMap<usize, (u8, Vec<u8>)>> = BTreeMap::new();
     for entry in args.get("dialogues").and_then(Value::as_array).into_iter().flatten() {
         let entry = entry.as_table().ok_or_else(|| anyhow!("a dialogue is no table"))?;
-        let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow!("a dialogue has no {key}"));
+        let text = |key: &str| {
+            entry.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow!("a dialogue has no {key}"))
+        };
         let index = |key: &str| {
-            entry.get(key).and_then(Value::as_integer).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| anyhow!("no {key}"))
+            entry
+                .get(key)
+                .and_then(Value::as_integer)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| anyhow!("no {key}"))
         };
         let path = text("path")?;
         let bundle = index("bundle")?;
@@ -247,7 +262,8 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
                 let chunk = chunks.get(bundle).ok_or_else(|| anyhow!("{path}: no chunk {bundle}"))?;
-                let parsed = formats::bundle::resources(chunk).into_iter().map(|(n, (k, b))| (n, (k, b.to_vec()))).collect();
+                let parsed =
+                    formats::bundle::resources(chunk).into_iter().map(|(n, (k, b))| (n, (k, b.to_vec()))).collect();
                 e.insert(parsed)
             }
         };

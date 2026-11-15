@@ -489,14 +489,14 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The host has none to give.
-    fn temp(&self) -> Result<String> {
+    fn temp(&self) -> Result<crate::HostPath> {
         bail!("{}: no temporary files here", self.path())
     }
     /// A file an unsandboxed extension's program made kept as a content, moved rather than read.
     ///
     /// # Errors
     /// It cannot be kept.
-    fn keep(&self, path: &str, name: &str) -> Result<File> {
+    fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
         let _ = (path, name);
         bail!("{}: nothing is kept here", self.path())
     }
@@ -523,7 +523,7 @@ pub trait CallHost {
         bail!("{}: {node_type}: no project to look in here", self.path())
     }
     /// Where a file or folder of the project is on disk, followed through links; none where it has no such place.
-    fn place(&self, path: &str) -> Option<String> {
+    fn place(&self, path: &str) -> Option<crate::HostPath> {
         let _ = path;
         None
     }
@@ -531,8 +531,8 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
-    fn output_of(&self, path: &str, address: &str) -> Result<Value> {
-        bail!("{path}: {address}: no project to look in here")
+    fn output_of(&self, path: &str, asked: &crate::Asked) -> Result<Value> {
+        bail!("{path}: {asked}: no project to look in here")
     }
     /// The node a reference names.
     fn node_named(&self, reference: &str) -> Option<NodeNamed> {
@@ -544,7 +544,7 @@ pub trait CallHost {
         None
     }
     /// Where a content is on disk, for an unsandboxed extension's operation to point a program at.
-    fn path_of(&self, content: &Content) -> Option<String> {
+    fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
         let _ = content;
         None
     }
@@ -553,7 +553,7 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The host serves no folders here, or a file's content cannot be found.
-    fn serve(&self, files: &[File], how: &Use) -> Result<String> {
+    fn serve(&self, files: &[File], how: &Use) -> Result<crate::HostPath> {
         let _ = (files, how);
         bail!("{}: no folder is served here", self.path())
     }
@@ -644,6 +644,8 @@ pub struct Call<'a> {
     /// Its outputs after the first, as it makes them (`make`).
     pub made: std::cell::RefCell<std::collections::BTreeMap<String, Value>>,
     pub parameter_text: Option<&'a str>,
+    /// How its output is asked for: the keys it declares taking (`OpBuilder::asks`), as a reference set them.
+    pub query: &'a crate::Query,
     pub host: &'a dyn CallHost,
 }
 
@@ -700,7 +702,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The host has none to give.
-    pub fn temp(&self) -> Result<String> {
+    pub fn temp(&self) -> Result<crate::HostPath> {
         self.host.temp()
     }
 
@@ -710,15 +712,15 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The host serves no folders here, or a file's content cannot be found.
-    pub fn serve(&self, files: &[File], how: &Use) -> Result<std::path::PathBuf> {
-        self.host.serve(files, how).map(std::path::PathBuf::from)
+    pub fn serve(&self, files: &[File], how: &Use) -> Result<crate::HostPath> {
+        self.host.serve(files, how)
     }
 
     /// A file a program of this extension made kept as a content, named `name`.
     ///
     /// # Errors
     /// It cannot be kept.
-    pub fn keep(&self, path: &str, name: &str) -> Result<File> {
+    pub fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
         self.host.keep(path, name)
     }
 
@@ -748,7 +750,7 @@ impl Call<'_> {
 
     /// Where a file or folder of the project is on disk, followed through links.
     #[must_use]
-    pub fn place(&self, path: &str) -> Option<String> {
+    pub fn place(&self, path: &str) -> Option<crate::HostPath> {
         self.host.place(path)
     }
 
@@ -756,8 +758,14 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
-    pub fn output_of(&self, path: &str, address: &str) -> Result<Value> {
-        self.host.output_of(path, address)
+    pub fn output_of(&self, path: &str, asked: &crate::Asked) -> Result<Value> {
+        self.host.output_of(path, asked)
+    }
+
+    /// How its output is asked for: the keys it declares taking (`OpBuilder::asks`), as a reference set them.
+    #[must_use]
+    pub fn query(&self) -> &crate::Query {
+        self.query
     }
 
     /// The node a reference names; none where nothing is so named.
@@ -770,10 +778,10 @@ impl Call<'_> {
     ///
     /// # Errors
     /// As `output_of`, or it is no table.
-    pub fn table_of(&self, path: &str, address: &str) -> Result<Table> {
-        match self.output_of(path, address)? {
+    pub fn table_of(&self, path: &str, asked: &crate::Asked) -> Result<Table> {
+        match self.output_of(path, asked)? {
             Value::Table(table) => Ok(table),
-            other => bail!("{path}: {address} is {}, no table", other.ty()),
+            other => bail!("{path}: {asked} is {}, no table", other.ty()),
         }
     }
 
@@ -783,15 +791,18 @@ impl Call<'_> {
     ///
     /// # Errors
     /// As `output_of`, for the first that fails.
-    pub fn outputs_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Vec<Value>> {
-        let got: Vec<Result<Value>> = wanted.into_iter().map(|(path, address)| self.output_of(path, address)).collect();
+    pub fn outputs_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>) -> Result<Vec<Value>> {
+        let got: Vec<Result<Value>> = wanted.into_iter().map(|(path, asked)| self.output_of(path, asked)).collect();
         got.into_iter().collect()
     }
 
     /// Outputs of several assets, each read on its own: what it made, or why it could not be - for reads that may find
     /// nothing, asked for together as `outputs_of` asks.
     #[must_use]
-    pub fn outputs_tried<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<Result<Value>> {
+    pub fn outputs_tried<'a>(
+        &self,
+        wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>,
+    ) -> Vec<Result<Value>> {
         wanted.into_iter().map(|(path, address)| self.output_of(path, address)).collect()
     }
 
@@ -799,8 +810,8 @@ impl Call<'_> {
     ///
     /// # Errors
     /// As `outputs_of`, or one is no table.
-    pub fn tables_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Vec<Table>> {
-        let wanted: Vec<(&str, &str)> = wanted.into_iter().collect();
+    pub fn tables_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>) -> Result<Vec<Table>> {
+        let wanted: Vec<(&str, &crate::Asked)> = wanted.into_iter().collect();
         let got = self.outputs_of(wanted.iter().copied())?;
         got.into_iter()
             .zip(wanted)
@@ -819,7 +830,7 @@ impl Call<'_> {
 
     /// Where a file is on disk, for this extension to point a program at; none where it is held in memory.
     #[must_use]
-    pub fn path_of(&self, file: &File) -> Option<String> {
+    pub fn path_of(&self, file: &File) -> Option<crate::HostPath> {
         self.host.path_of(&file.content)
     }
 
@@ -999,7 +1010,7 @@ pub struct BuildConfig {
     pub name: String,
     pub release: Option<String>,
     pub target: Option<String>,
-    pub folder: String,
+    pub folder: crate::HostPath,
     /// What every config of the project says, as `key=value`: what a source may test for.
     pub known: Vec<String>,
     /// Its properties: each the project declares, as it sets it or else by default (`[property.<name>]`).
@@ -1022,6 +1033,9 @@ pub struct OpDef {
     /// Its parameter - its name, and the type of value it takes (`name`, `number`) - which makes what reaches it a
     /// family: each member addressed by a value of it (`picture/night`).
     pub parameter: Option<(String, String)>,
+    /// The keys of a query it takes (`?palette=default`), each with what it does (`Call::query`): a reference asking
+    /// with another is refused.
+    pub query: Vec<(String, String)>,
     /// Which of several operations taking a source is offered first: the highest.
     pub priority: i32,
     /// What it makes of what it takes for whoever asks by name.
@@ -1047,13 +1061,14 @@ pub type PrepareOp = dyn Fn(&mut Call<'_>) -> Result<Prepared> + Send + Sync;
 pub struct Need {
     /// The node, by its path or a reference to it.
     pub node: String,
-    pub address: String,
+    /// What of it, and how it is asked for.
+    pub address: std::sync::Arc<crate::Asked>,
 }
 
 impl Need {
     #[must_use]
-    pub fn new(node: &str, address: &str) -> Need {
-        Need { node: node.to_string(), address: address.to_string() }
+    pub fn new(node: &str, asked: &crate::Asked) -> Need {
+        Need { node: node.to_string(), address: std::sync::Arc::from(asked) }
     }
 }
 

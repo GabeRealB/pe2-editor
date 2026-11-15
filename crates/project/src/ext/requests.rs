@@ -22,9 +22,9 @@ pub const SAY_AFTER: Duration = Duration::from_millis(100);
 const KEPT: usize = 16;
 const THREADS: usize = 2;
 
-type Key = (Arc<crate::TreePath>, String);
+type Key = (Arc<crate::TreePath>, Arc<pe2_path::Asked>);
 type Wake = Box<dyn Fn(Duration) + Send>;
-type Maker = Arc<dyn Fn(&Index, &crate::index::Asset, &str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+type Maker = Arc<dyn Fn(&Index, &crate::index::Asset, &pe2_path::Asked) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 enum Slot {
     Making { since: Instant, asked: u64 },
@@ -98,9 +98,9 @@ impl Shared {
 /// What extensions are served by, as they hold what holds them only weakly and neither is to know the other's whole type.
 pub trait Asking: Send + Sync {
     /// An output, kept or on its way.
-    fn request(&self, path: &str, address: &str) -> Requested;
+    fn request(&self, path: &str, asked: &pe2_path::Asked) -> Requested;
     /// An output where it is kept.
-    fn kept(&self, path: &str, address: &str) -> Option<Arc<Vec<u8>>>;
+    fn kept(&self, path: &str, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>>;
 }
 
 /// The outputs asked for by what shows the project open.
@@ -194,13 +194,13 @@ impl Requests {
 }
 
 impl Asking for Requests {
-    fn request(&self, path: &str, address: &str) -> Requested {
+    fn request(&self, path: &str, asked: &pe2_path::Asked) -> Requested {
         // What was asked names its asset as text: checked here, and refused with why where it is no path.
         let path = match crate::TreePath::new(path) {
             Ok(path) => path,
             Err(why) => return Requested::Failed(format!("{path}: {why}")),
         };
-        let key = (path.to_owned(), address.to_string());
+        let key = (path.to_owned(), Arc::from(asked));
         let mut state = self.shared.lock();
         if !state.slots.contains_key(&key) {
             state.asked += 1;
@@ -233,10 +233,10 @@ impl Asking for Requests {
         answer
     }
 
-    fn kept(&self, path: &str, address: &str) -> Option<Arc<Vec<u8>>> {
+    fn kept(&self, path: &str, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>> {
         // What is no path was never made: `request` refused it.
         let path = crate::TreePath::new(path).ok()?;
-        match self.shared.lock().slots.get(&(path.to_owned(), address.to_string())) {
+        match self.shared.lock().slots.get(&(path.to_owned(), Arc::from(asked))) {
             Some(Slot::Made(bytes)) => Some(bytes.clone()),
             _ => None,
         }
@@ -316,6 +316,7 @@ mod tests {
     }
 
     fn ready(requests: &Requests, address: &str) -> Requested {
+        let address = pe2_path::Asked::new(address).unwrap();
         let started = Instant::now();
         loop {
             match requests.request("n", address) {
@@ -332,10 +333,13 @@ mod tests {
         let (root, _lock, requests, _extensions) = opened("once");
         TAKES.store(150, Ordering::SeqCst);
         let started = Instant::now();
-        assert!(matches!(requests.request("n", "native"), Requested::Pending { .. }), "too long to wait for");
+        assert!(
+            matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }),
+            "too long to wait for"
+        );
         assert!(started.elapsed() < Duration::from_millis(120), "whoever asked went on");
         // Others asking share it.
-        assert!(matches!(requests.request("n", "native"), Requested::Pending { .. }));
+        assert!(matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }));
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));
         assert_eq!(MADE.load(Ordering::SeqCst), 1);
         drop(ready(&requests, "native"));
@@ -345,7 +349,7 @@ mod tests {
         TAKES.store(0, Ordering::SeqCst);
         requests.clear();
         assert_eq!(
-            requests.request("n", "native"),
+            requests.request("n", pe2_path::Asked::constant("native")),
             Requested::Ready(b"made".to_vec()),
             "within what a frame can spare"
         );
@@ -353,12 +357,12 @@ mod tests {
         // What was forgotten while on its way arrives to nobody.
         TAKES.store(60, Ordering::SeqCst);
         requests.clear();
-        assert!(matches!(requests.request("n", "native"), Requested::Pending { .. }));
+        assert!(matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }));
         requests.clear();
         TAKES.store(0, Ordering::SeqCst);
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));
         // Why it could not be is said, and kept with the rest.
-        assert!(matches!(ready(&requests, "no such output"), Requested::Failed(_)));
+        assert!(matches!(ready(&requests, "absent"), Requested::Failed(_)));
         assert!(!requests.busy());
         let _ = std::fs::remove_dir_all(&root);
     }

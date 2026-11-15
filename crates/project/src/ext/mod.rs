@@ -482,7 +482,7 @@ impl Extensions {
 /// named (`op`, a for-each's `body`), is `<generator>#<output>`.
 fn own_named(table: &toml::Table, generator: &str) -> toml::Table {
     let named = |key: &str, value: &toml::Value| match (key, value) {
-        ("op" | "body", toml::Value::String(text)) if text.starts_with('#') => {
+        ("op" | "body", toml::Value::String(text)) if text.starts_with('/') => {
             Some(toml::Value::String(format!("{generator}{text}")))
         }
         _ => None,
@@ -1364,14 +1364,16 @@ impl Extensions {
         engine: &graph::exec::Engine,
         index: &index::Index,
         asset: &index::Asset,
-        address: &str,
+        asked: &pe2_path::Asked,
     ) -> Result<Arc<graph::stream::Stream>> {
         let (plan, _) = self.plan(asset);
         let world = Graph { index, extensions: self };
         let reach = graph::exec::Reach { engine, world: &world };
+        let address = asked.address();
         let (output, parameter) =
-            plan.output(address).with_context(|| format!("{} has no output `{address}`", asset.path))?;
-        let key = engine.key(&plan, asset, output, parameter.as_deref());
+            plan.output(address.as_str()).with_context(|| format!("{} has no output `{address}`", asset.path))?;
+        let asking = graph::exec::Asking { member: parameter.as_deref(), query: asked.query() };
+        let key = engine.key(&plan, asset, output, asking);
         let mut streams = self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         streams.retain(|_, (stream, _)| stream.strong_count() > 0);
         if let Some((stream, reads)) = streams.get(&key)
@@ -1381,7 +1383,7 @@ impl Extensions {
             return Ok(stream);
         }
         drop(streams);
-        let (producer, reads, key) = engine.open_stream(Some(reach), &plan, asset, address)?;
+        let (producer, reads, key) = engine.open_stream(Some(reach), &plan, asset, asked)?;
         let stream = graph::stream::Stream::open(producer);
         self.streams
             .lock()
@@ -1400,13 +1402,13 @@ impl Extensions {
         engine: &graph::exec::Engine,
         index: &index::Index,
         asset: &index::Asset,
-        address: &str,
+        asked: &pe2_path::Asked,
         read: bool,
     ) -> Result<graph::exec::Given> {
         let (plan, _) = self.plan(asset);
         let world = Graph { index, extensions: self };
         let reach = graph::exec::Reach { engine, world: &world };
-        engine.output_in(Some(reach), &plan, asset, address, None, read)
+        engine.output_in(Some(reach), &plan, asset, asked, None, read)
     }
 
     /// Whether an output is not what it would be made as now.
@@ -1420,7 +1422,8 @@ impl Extensions {
         output: usize,
     ) -> bool {
         let world = Graph { index, extensions: self };
-        engine.kept_in(Some(graph::exec::Reach { engine, world: &world }), plan, asset, output, None).is_none()
+        let reach = graph::exec::Reach { engine, world: &world };
+        engine.kept_in(Some(reach), plan, asset, output, graph::exec::Asking::none()).is_none()
     }
 
     /// Run an extension's hook, its node the project as a whole.
@@ -1439,11 +1442,11 @@ impl Extensions {
     ///
     /// # Errors
     /// It has no such output, it could not be made, or it is no table.
-    pub fn table(&self, asset: &index::Asset, index: &index::Index, address: &str) -> Result<Table> {
-        let given = self.output(&self.engine(), index, asset, address, true)?;
+    pub fn table(&self, asset: &index::Asset, index: &index::Index, asked: &pe2_path::Asked) -> Result<Table> {
+        let given = self.output(&self.engine(), index, asset, asked, true)?;
         match given.value.as_deref() {
             Some(graph::Value::Table(table)) => Ok(table.clone()),
-            _ => anyhow::bail!("{}: {address} is no table", asset.path),
+            _ => anyhow::bail!("{}: {asked} is no table", asset.path),
         }
     }
 
@@ -1544,7 +1547,7 @@ impl Extensions {
     ///
     /// # Errors
     /// It has no such output, it is no file, or it could not be made.
-    pub fn bytes(&self, index: &index::Index, asset: &index::Asset, address: &str) -> Result<Vec<u8>> {
+    pub fn bytes(&self, index: &index::Index, asset: &index::Asset, address: &pe2_path::Asked) -> Result<Vec<u8>> {
         let (plan, _) = self.plan(asset);
         let world = Graph { index, extensions: self };
         let engine = self.engine();
@@ -1645,7 +1648,7 @@ impl Extensions {
         member: Option<&str>,
     ) -> Result<Vec<u8>> {
         let address = member.map_or_else(|| output.to_string(), |member| format!("{output}/{member}"));
-        self.bytes(index, asset, &address)
+        self.bytes(index, asset, pe2_path::Asked::new(&address)?)
     }
 
     /// The output of an asset's type saying what is marked on its pictures, by name.
@@ -1682,10 +1685,14 @@ impl Extensions {
 
     /// The address of an asset's picture in one of its looks (its first, past them).
     #[must_use]
-    pub fn picture_address(&self, asset: &index::Asset, look: usize) -> Option<String> {
+    ///
+    /// # Errors
+    /// Its picture's output, or the look's name, is no address.
+    pub fn picture_address(&self, asset: &index::Asset, look: usize) -> Option<Result<Arc<pe2_path::Asked>>> {
         let (output, members) = self.pictured(asset)?;
         let (key, _) = members.get(look).or_else(|| members.first())?;
-        Some(if self.family(&output) { format!("{}/{key}", output.name) } else { output.name.clone() })
+        let text = if self.family(&output) { format!("{}/{key}", output.name) } else { output.name.clone() };
+        Some(pe2_path::Asked::new(&text).map(Arc::from).map_err(anyhow::Error::from))
     }
 
     /// An asset's picture in one of its looks, made now; none when it has none.
@@ -1693,12 +1700,11 @@ impl Extensions {
     /// # Errors
     /// It could not be made.
     pub fn picture(&self, asset: &index::Asset, look: usize) -> Option<Result<Image>> {
-        let address = self.picture_address(asset, look)?;
-        Some(self.image(asset, &address))
+        Some(self.picture_address(asset, look)?.and_then(|address| self.image(asset, &address)))
     }
 
     /// An output that is an image, made now (of its node alone).
-    fn image(&self, asset: &index::Asset, address: &str) -> Result<Image> {
+    fn image(&self, asset: &index::Asset, address: &pe2_path::Asked) -> Result<Image> {
         let (plan, _) = self.plan(asset);
         let given = self.engine().output(&plan, asset, address, true)?;
         match given.value.as_deref() {
@@ -1722,7 +1728,7 @@ impl Extensions {
         let (output, members) = self.pictured(asset).context("it has no picture")?;
         let first = members.first().filter(|_| self.family(&output)).map(|(key, _)| key.as_str());
         let (plan, _) = self.plan(asset);
-        engine.output_with(&plan, asset, graph::THUMBNAIL, first, true)
+        engine.output_with(&plan, asset, pe2_path::Asked::constant(graph::THUMBNAIL), first, true)
     }
 
     /// The fields an asset has: what is set on the operations of its stack and those it has provided, each once.
@@ -1771,7 +1777,12 @@ impl Extensions {
     ///
     /// # Errors
     /// It has no such output, or it is no picture, or it could not be made.
-    pub fn output_picture(&self, index: &index::Index, asset: &index::Asset, address: &str) -> Result<Image> {
+    pub fn output_picture(
+        &self,
+        index: &index::Index,
+        asset: &index::Asset,
+        address: &pe2_path::Asked,
+    ) -> Result<Image> {
         let given = self.output(&self.engine(), index, asset, address, true)?;
         match given.value.as_deref() {
             Some(graph::Value::Image(image)) => Ok(image.clone()),
@@ -1789,12 +1800,12 @@ impl Extensions {
     /// An output of an asset that is a picture, made now: `palettes/default`, `cells/skin@night` (that member through
     /// another palette, which is no member to list); none where it has no such output.
     #[must_use]
-    pub fn output_image(&self, asset: &index::Asset, address: &str) -> Option<Result<Image>> {
-        let (name, member) = address.split_once('/').map_or((address, None), |(name, member)| (name, Some(member)));
+    pub fn output_image(&self, asset: &index::Asset, address: &pe2_path::Asked) -> Option<Result<Image>> {
+        let (name, member) = (address.address().output(), address.address().member());
         let outputs = self.outputs_of(asset);
         let output = outputs.iter().find(|o| o.name == name && self.makes_pictures(o))?;
         let there = match (&output.members, member) {
-            (Some(members), Some(member)) => members(&self.lend(asset)).iter().any(|(key, _)| key == listed(member)),
+            (Some(members), Some(member)) => members(&self.lend(asset)).iter().any(|(key, _)| key == member),
             (None, None) => true,
             _ => false,
         };
@@ -2051,9 +2062,11 @@ impl Extensions {
                 format!("{}\n{said}", graph::exec::Node::declaration_sha1(&**asset)).as_bytes(),
             );
             for output in &plan.outputs {
-                let named = format!("{uid}#{}", output.name);
+                let named = format!("{uid}/{}", output.name);
                 let reach = graph::exec::Reach { engine: &engine, world: &Alone };
-                let given = engine.output_in(Some(reach), &plan, &**asset, &output.name, None, true);
+                let given = pe2_path::Asked::new(&output.name)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|asked| engine.output_in(Some(reach), &plan, &**asset, asked, None, true));
                 let declared = match given.map(|given| given.value) {
                     Ok(Some(value)) => match &*value {
                         graph::Value::Table(table) => graph::Definition::of(&named, &own_named(table, uid), &version),
@@ -2211,6 +2224,7 @@ impl Extensions {
             let mut op = graph::OpDef::new(name, &def.label, &version);
             op.inputs.clone_from(&def.inputs);
             op.parameter = def.parameter.as_ref().map(|(name, _)| name.clone());
+            op.query.clone_from(&def.query);
             op.priority = def.priority;
             op.also.clone_from(&def.also);
             op.required = def.fields.iter().filter(|field| field.required).map(|field| field.key.clone()).collect();
@@ -2232,6 +2246,7 @@ impl Extensions {
                         made: std::cell::RefCell::default(),
                         carried,
                         parameter_text: call.parameter(),
+                        query: call.query(),
                         host: &hosted,
                     };
                     prepare(&mut lent)
@@ -2247,6 +2262,7 @@ impl Extensions {
                     made: std::cell::RefCell::default(),
                     carried,
                     parameter_text: call.parameter(),
+                    query: call.query(),
                     host: &hosted,
                 };
                 run(&mut lent)
@@ -2341,12 +2357,6 @@ fn brought(view: &ViewDef, asset: &index::Asset) -> bool {
     view.tab
         .as_ref()
         .is_none_or(|tab| tab.fields.is_empty() || tab.fields.iter().any(|field| settings.contains_key(field)))
-}
-
-/// A member of a family, as it is listed: `skin` of `skin@night`.
-#[must_use]
-pub fn listed(member: &str) -> &str {
-    member.split_once('@').map_or(member, |(listed, _)| listed)
 }
 
 /// A template a project defines (`pe2.graph@template`): its `label`, the stack it makes (`makes`, its layers), the
@@ -2502,7 +2512,7 @@ impl Project for Lens<'_> {
         self.extensions.picture(asset, self.extensions.look_at(asset, look))
     }
 
-    fn image(&self, path: &str, address: &str) -> Option<Result<Image>> {
+    fn image(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Image>> {
         self.extensions.output_image(self.index.asset_at(path)?, address)
     }
 
@@ -2514,12 +2524,12 @@ impl Project for Lens<'_> {
         self.extensions.config.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.target.clone()
     }
 
-    fn table(&self, path: &str, address: &str) -> Option<Result<Table>> {
+    fn table(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Table>> {
         let asset = self.index.asset_at(path)?;
         Some(self.extensions.table(asset, self.index, address))
     }
 
-    fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
+    fn bytes(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Vec<u8>>> {
         let asset = self.index.asset_at(path)?;
         let requests = self.extensions.requests();
         if let Some(kept) = requests.as_ref().and_then(|requests| requests.kept(path, address)) {
@@ -2528,7 +2538,7 @@ impl Project for Lens<'_> {
         Some(self.extensions.bytes(self.index, asset, address))
     }
 
-    fn request(&self, path: &str, address: &str) -> pe2_ext::Requested {
+    fn request(&self, path: &str, address: &pe2_path::Asked) -> pe2_ext::Requested {
         match self.extensions.requests() {
             Some(requests) => requests.request(path, address),
             None => match self.bytes(path, address) {
@@ -2631,17 +2641,33 @@ fn start_stream(
         made: std::cell::RefCell::default(),
         carried: lent_carried.clone(),
         parameter_text: call.parameter(),
+        query: call.query(),
         host: &hosted,
     };
     let generator = start(&mut lent)?;
     let node = call.recorder().node();
     let host = StreamHost { path: node.path().to_string(), contents };
     let (settings, parameter) = (call.settings().clone(), call.parameter().map(str::to_string));
-    Ok(Box::new(Generating { generator, host, settings, carried: lent_carried, parameter }))
+    let query = Box::from(call.query());
+    Ok(Box::new(Generating { generator, host, settings, carried: lent_carried, parameter, query }))
 }
 
 /// What a stream's generator is lent between its calls: its node's path, type and settings, and the contents its
 /// inputs held, read where they are.
+/// A place of the host's, as an operation is given it.
+fn given(place: HostPath) -> pe2_ext::HostPath {
+    pe2_ext::HostPath::of_host(place.into_path_buf())
+}
+
+/// A place an operation gives back, as the host's: one it gave, never one made of text.
+///
+/// # Errors
+/// It is none the host gave.
+pub(crate) fn taken(place: &pe2_ext::HostPath) -> Result<HostPath> {
+    let on_host = place.on_host().with_context(|| format!("{place}: no place the host gave"))?;
+    Ok(HostPath::new(on_host)?)
+}
+
 struct StreamHost {
     path: String,
     contents: HashMap<String, HostPath>,
@@ -2658,14 +2684,13 @@ impl pe2_ext::CallHost for StreamHost {
         &self.path
     }
 
-    fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
+    fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
         match content {
             pe2_ext::Content::Inline(_) => None,
             // A program is given a file: a chunked content assembled for it.
-            pe2_ext::Content::Stored { sha1, .. } => StreamHost::path_of(self, sha1)
-                .ok()
-                .and_then(|p| crate::content::for_program(p).ok())
-                .map(|p| p.display().to_string()),
+            pe2_ext::Content::Stored { sha1, .. } => {
+                StreamHost::path_of(self, sha1).ok().and_then(|p| crate::content::for_program(p).ok()).map(given)
+            }
         }
     }
 
@@ -2704,6 +2729,8 @@ struct Generating {
     settings: Table,
     carried: Table,
     parameter: Option<String>,
+    /// How its output was asked for.
+    query: Box<pe2_path::Query>,
 }
 
 impl graph::stream::Producer for Generating {
@@ -2718,6 +2745,7 @@ impl graph::stream::Producer for Generating {
             made: std::cell::RefCell::default(),
             carried: self.carried.clone(),
             parameter_text: self.parameter.as_deref(),
+            query: &self.query,
             host: &self.host,
         };
         self.generator.next(&call, count)
@@ -2730,6 +2758,7 @@ impl graph::stream::Producer for Generating {
             made: std::cell::RefCell::default(),
             carried: self.carried.clone(),
             parameter_text: self.parameter.as_deref(),
+            query: &self.query,
             host: &self.host,
         };
         self.generator.seek(&call, position)
@@ -2757,8 +2786,8 @@ impl pe2_ext::CallHost for Hosted<'_> {
         Ok(Box::new(self.call.writer(name)))
     }
 
-    fn temp(&self) -> Result<String> {
-        Ok(self.call.temp()?.display().to_string())
+    fn temp(&self) -> Result<pe2_ext::HostPath> {
+        Ok(given(self.call.temp()?))
     }
 
     fn entries(&self, folder: &str) -> Result<Vec<String>> {
@@ -2769,15 +2798,15 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.read_entry(path)
     }
 
-    fn place(&self, path: &str) -> Option<String> {
-        self.call.place(path)
+    fn place(&self, path: &str) -> Option<pe2_ext::HostPath> {
+        self.call.place(path).map(given)
     }
 
     fn node_named(&self, reference: &str) -> Option<pe2_ext::NodeNamed> {
         self.call.node_named(&toml::Value::String(reference.to_string()))
     }
 
-    fn output_of(&self, path: &str, address: &str) -> Result<graph::Value> {
+    fn output_of(&self, path: &str, address: &pe2_path::Asked) -> Result<graph::Value> {
         Ok((*self.call.output_of(&toml::Value::String(path.to_string()), address)?).clone())
     }
 
@@ -2789,24 +2818,21 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.assets_of(node_type)
     }
 
-    fn keep(&self, path: &str, name: &str) -> Result<pe2_ext::File> {
-        let path = HostPath::from_plain(path.into()).with_context(|| format!("{path}: no place a program wrote"))?;
-        self.call.keep(&path, name)
+    fn keep(&self, path: &pe2_ext::HostPath, name: &str) -> Result<pe2_ext::File> {
+        self.call.keep(&taken(path)?, name)
     }
 
-    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Result<String> {
-        self.call.serve(files, how).map(|at| at.to_string())
+    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Result<pe2_ext::HostPath> {
+        self.call.serve(files, how).map(given)
     }
 
-    fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
+    fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
         match content {
             pe2_ext::Content::Inline(_) => None,
             // A program is given a file: a chunked content assembled for it.
-            pe2_ext::Content::Stored { sha1, .. } => self
-                .call
-                .content_path(sha1)
-                .and_then(|p| crate::content::for_program(&p).ok())
-                .map(|p| p.display().to_string()),
+            pe2_ext::Content::Stored { sha1, .. } => {
+                self.call.content_path(sha1).and_then(|p| crate::content::for_program(&p).ok()).map(given)
+            }
         }
     }
 }

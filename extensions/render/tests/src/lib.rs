@@ -51,8 +51,7 @@ fn doll(editor: &Editor) -> Result<()> {
         settings: on_it,
         files: &[("mesh.usda", &mesh)],
     })?;
-    let paint =
-        "shader = \"textured\"\nsurface = \"opaque\"\nblend = \"add\"\nmain = \"uid://skin#cells/page_0@default\"";
+    let paint = "shader = \"textured\"\nsurface = \"opaque\"\nblend = \"add\"\nmain = \"uid://skin/cells/page_0?palette=default\"";
     editor.node(&NewNode {
         path: "doll/paint",
         uid: "uid://paint",

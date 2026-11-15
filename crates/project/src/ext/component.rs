@@ -57,6 +57,7 @@ mod bindings {
             "pe2:extension/media.media-buffer": super::HostMediaBuffer,
             "pe2:extension/types.stream-reader": super::HostStreamReader,
             "pe2:extension/unsandboxed.process": super::HostProcess,
+            "pe2:extension/unsandboxed.host-path": super::GivenPath,
         },
     });
 }
@@ -195,6 +196,9 @@ pub struct LentAsset {
 
 // SAFETY: a lent asset is read only during the call that lent it, on the thread making the call.
 unsafe impl Send for LentAsset {}
+
+/// A place on disk the host gave a component: its handle's, read in its forms and never made of text.
+pub struct GivenPath(HostPath);
 
 /// A program running for an unsandboxed extension's component. Dropped, it is stopped.
 pub struct HostProcess {
@@ -421,8 +425,9 @@ impl host::HostAsset for State {
             .map_err(|e| format!("{e:#}")))
     }
 
-    fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<String>> {
-        Ok(self.lent(&asset)?.place(&path).map(|at| guest_path(&at)))
+    fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<Resource<GivenPath>>> {
+        let placed = self.lent(&asset)?.place(&path);
+        placed.map(|at| self.give(&at)).transpose()
     }
 
     fn node_named(
@@ -440,10 +445,11 @@ impl host::HostAsset for State {
         path: String,
         address: String,
     ) -> wasmtime::Result<Result<types::Value, String>> {
-        let told = self
-            .lent(&asset)?
-            .output_of(&path, &address)
-            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        let lent = self.lent(&asset)?;
+        let told = match pe2_ext::Asked::new(&address) {
+            Ok(asked) => lent.output_of(&path, asked).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))),
+            Err(why) => Err(why.into()),
+        };
         Ok(match told {
             Ok(value) => Ok(value_to_wit(value, &mut self.table).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?),
             Err(e) => Err(format!("{e:#}")),
@@ -451,12 +457,13 @@ impl host::HostAsset for State {
     }
 
     fn build_config(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<host::BuildConfig>> {
-        let told = self.lent(&asset)?.build_config();
-        Ok(told.map(|c| host::BuildConfig {
+        let Some(c) = self.lent(&asset)?.build_config() else { return Ok(None) };
+        let folder = self.give(&c.folder)?;
+        Ok(Some(host::BuildConfig {
             name: c.name,
             release: c.release,
             target: c.target,
-            folder: guest_path(&c.folder),
+            folder,
             known: c.known,
             properties: c.properties.to_string(),
         }))
@@ -474,37 +481,37 @@ impl host::HostAsset for State {
             .map_err(|e| format!("{e:#}")))
     }
 
-    fn temp(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Result<String, String>> {
+    fn temp(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Result<Resource<GivenPath>, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        Ok(self
-            .lent(&asset)?
-            .temp()
-            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
-            .map(|at| guest_path(&at))
-            .map_err(|e| format!("{e:#}")))
+        let temp = self.lent(&asset)?.temp().unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        match temp {
+            Ok(at) => self.give(&at).map(Ok),
+            Err(e) => Ok(Err(format!("{e:#}"))),
+        }
     }
 
     fn keep(
         &mut self,
         asset: Resource<LentAsset>,
-        path: String,
+        path: Resource<GivenPath>,
         name: String,
     ) -> wasmtime::Result<Result<types::File, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        let path = host_path(&path);
+        let path = pe2_ext::HostPath::of_host(self.table.get(&path)?.0.clone().into_path_buf());
         let kept = self.lent(&asset)?.keep(&path, &name).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
         Ok(kept.map(file_to_wit).map_err(|e| format!("{e:#}")))
     }
 
-    fn path_of(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<String>> {
+    fn path_of(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<Resource<GivenPath>>> {
         if self.unsandboxed.is_none() {
             return Ok(None);
         }
-        Ok(self.lent(&asset)?.path_of(&name).map(|at| guest_path(&at)))
+        let found = self.lent(&asset)?.path_of(&name);
+        found.map(|at| self.give(&at)).transpose()
     }
 
     fn serve(
@@ -512,7 +519,7 @@ impl host::HostAsset for State {
         asset: Resource<LentAsset>,
         files: Vec<types::File>,
         how: types::ServeUse,
-    ) -> wasmtime::Result<Result<String, String>> {
+    ) -> wasmtime::Result<Result<Resource<GivenPath>, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
@@ -520,7 +527,10 @@ impl host::HostAsset for State {
         let how = pe2_ext::Use { often: how.often, ranges: how.ranges };
         let served =
             self.lent(&asset)?.serve(&files, &how).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
-        Ok(served.map(|at| guest_path(&at)).map_err(|e| format!("{e:#}")))
+        match served {
+            Ok(at) => self.give(&at).map(Ok),
+            Err(e) => Ok(Err(format!("{e:#}"))),
+        }
     }
 
     fn drop(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<()> {
@@ -627,6 +637,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
+        let address = match pe2_ext::Asked::new(&address) {
+            Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
+            Err(why) => return Ok(Some(Err(why.to_string()))),
+        };
         Ok(elsewhere(project, move |p| {
             p.image(&path, &address).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))
         }))
@@ -639,6 +653,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<String, String>>> {
         let project = self.project(&project)?;
+        let address = match pe2_ext::Asked::new(&address) {
+            Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
+            Err(why) => return Ok(Some(Err(why.to_string()))),
+        };
         Ok(elsewhere(project, move |p| {
             p.table(&path, &address).map(|made| made.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
         }))
@@ -651,6 +669,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<Vec<u8>, String>>> {
         let project = self.project(&project)?;
+        let address = match pe2_ext::Asked::new(&address) {
+            Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
+            Err(why) => return Ok(Some(Err(why.to_string()))),
+        };
         Ok(elsewhere(project, move |p| p.bytes(&path, &address).map(|made| made.map_err(|e| format!("{e:#}")))))
     }
 
@@ -661,6 +683,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<host::Requested> {
         let project = self.project(&project)?;
+        let address = match pe2_ext::Asked::new(&address) {
+            Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
+            Err(why) => return Ok(host::Requested::Failed(why.to_string())),
+        };
         Ok(match elsewhere(project, move |p| p.request(&path, &address)) {
             pe2_ext::Requested::Ready(bytes) => host::Requested::Ready(bytes),
             pe2_ext::Requested::Pending { waited } => host::Requested::Pending(waited),
@@ -777,12 +803,42 @@ impl unsandboxed::Host for State {
         Ok(fetched.map_err(|e| format!("{id}: {name}: {e:#}")))
     }
 
-    fn spawn(&mut self, tool: String, args: Vec<String>) -> wasmtime::Result<Result<Resource<HostProcess>, String>> {
+    fn temp(&mut self) -> wasmtime::Result<Result<Resource<GivenPath>, String>> {
+        if self.unsandboxed.is_none() {
+            return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
+        }
+        Ok(self.system_temp().map_err(|e| format!("{e:#}")))
+    }
+
+    fn spawn(
+        &mut self,
+        tool: String,
+        args: Vec<unsandboxed::Arg>,
+    ) -> wasmtime::Result<Result<Resource<HostProcess>, String>> {
+        // Each place written as the program reads it.
+        let native =
+            |place: &Resource<GivenPath>| -> wasmtime::Result<String> { Ok(self.table.get(place)?.0.to_string()) };
+        let mut told = Vec::with_capacity(args.len());
+        for arg in &args {
+            told.push(match arg {
+                unsandboxed::Arg::Text(text) => text.clone(),
+                unsandboxed::Arg::Path(place) => native(place)?,
+                unsandboxed::Arg::Joined(parts) => {
+                    let mut joined = String::new();
+                    for part in parts {
+                        match part {
+                            unsandboxed::ArgPart::Text(text) => joined.push_str(text),
+                            unsandboxed::ArgPart::Path(place) => joined.push_str(&native(place)?),
+                        }
+                    }
+                    joined
+                }
+            });
+        }
+        let args = told;
         let Some(unsandboxed) = &self.unsandboxed else {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         };
-        // Paths in its filesystem's form, as the program reads them.
-        let args: Vec<String> = args.iter().map(|arg| host_arg(arg)).collect();
         // A program it offers, or another extension does, is another with arguments of its own, before those passed.
         let (program, args) = match unsandboxed.start(&tool) {
             Ok((program, mut before)) => {
@@ -848,6 +904,53 @@ impl unsandboxed::Host for State {
             }
         });
         Ok(Ok(self.table.push(HostProcess { child, input, output, said })?))
+    }
+}
+
+impl State {
+    /// A place in the system's folder of temporary files, for an unsandboxed extension's program to write to.
+    fn system_temp(&mut self) -> anyhow::Result<Resource<GivenPath>> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name =
+            format!("pe2-{}-{}-{n}", self.id.replace(|c: char| !c.is_ascii_alphanumeric(), "-"), std::process::id());
+        let place = HostPath::new(&std::env::temp_dir())?.join(pe2_path::Name::new(&name)?);
+        Ok(self.table.push(GivenPath(place))?)
+    }
+}
+
+impl unsandboxed::HostHostPath for State {
+    fn guest(&mut self, place: Resource<GivenPath>) -> wasmtime::Result<String> {
+        Ok(self.table.get(&place)?.0.guest())
+    }
+
+    fn native(&mut self, place: Resource<GivenPath>) -> wasmtime::Result<String> {
+        Ok(self.table.get(&place)?.0.to_string())
+    }
+
+    fn join(
+        &mut self,
+        place: Resource<GivenPath>,
+        within: String,
+    ) -> wasmtime::Result<Result<Resource<GivenPath>, String>> {
+        let Ok(within) = pe2_path::RelPath::new(&within) else {
+            return Ok(Err(format!("{within}: no path within a folder")));
+        };
+        let joined = self.table.get(&place)?.0.join(within);
+        Ok(Ok(self.table.push(GivenPath(joined))?))
+    }
+
+    fn drop(&mut self, place: Resource<GivenPath>) -> wasmtime::Result<()> {
+        self.table.delete(place)?;
+        Ok(())
+    }
+}
+
+impl State {
+    /// A place the host gives a component, as a handle of its own.
+    fn give(&mut self, place: &pe2_ext::HostPath) -> wasmtime::Result<Resource<GivenPath>> {
+        let place = super::taken(place).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?;
+        Ok(self.table.push(GivenPath(place))?)
     }
 }
 
@@ -2301,28 +2404,38 @@ fn provided<'r>(builder: pe2_ext::OpBuilder<'r>, provides: &g::Provides) -> pe2_
     }
 }
 
+/// An operation's description, as its component gave it: its ports, output, fields, derived settings, other outputs,
+/// inverse, parameter and query.
+fn described<'r>(mut builder: pe2_ext::OpBuilder<'r>, op: &mut g::Op, shared: &Arc<Shared>) -> pe2_ext::OpBuilder<'r> {
+    for port in &op.inputs {
+        builder = builder.port(&port.name, &port.ty, port.many);
+    }
+    builder = builder.output_described(&op.output);
+    for f in std::mem::take(&mut op.fields) {
+        builder = builder.field(field(shared, f));
+    }
+    for path in &op.derives {
+        builder = builder.derives(path);
+    }
+    for (name, ty) in &op.also {
+        builder = builder.also_described(name, ty);
+    }
+    if let Some(inverse) = &op.inverse {
+        builder = builder.inverse_described(inverse);
+    }
+    if let Some((name, node_type)) = &op.parameter {
+        builder = builder.parameter_described(name, node_type);
+    }
+    for (key, does) in &op.query {
+        builder = builder.asks(key, does);
+    }
+    builder
+}
+
 fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
-    for op in ops {
-        let mut builder = registry.op(&op.name).label(&op.label).priority(op.priority);
-        for port in &op.inputs {
-            builder = builder.port(&port.name, &port.ty, port.many);
-        }
-        builder = builder.output_described(&op.output);
-        for f in op.fields {
-            builder = builder.field(field(shared, f));
-        }
-        for path in &op.derives {
-            builder = builder.derives(path);
-        }
-        for (name, ty) in &op.also {
-            builder = builder.also_described(name, ty);
-        }
-        if let Some(inverse) = &op.inverse {
-            builder = builder.inverse_described(inverse);
-        }
-        if let Some((name, node_type)) = &op.parameter {
-            builder = builder.parameter_described(name, node_type);
-        }
+    for mut op in ops {
+        let builder = registry.op(&op.name).label(&op.label).priority(op.priority);
+        let mut builder = described(builder, &mut op, shared);
         if op.members {
             let (shared, handle) = (shared.clone(), op.handle);
             builder = builder.members_described(move |asset| {
@@ -2344,15 +2457,16 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let given = call.inputs.clone();
                 let settings = toml::to_string(call.settings).unwrap_or_default();
                 let parameter = call.parameter_text.map(str::to_string);
+                let query = call.query.to_string();
                 let node = Node::new(call.host);
                 let asset = Asset::new(&node, call.host.node_type());
                 let prepared = shared.job(cap, |r| {
                     let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
                     r.with_asset(&asset, shared.long(), async |a, g, lent| {
-                        g.call_prepare_op(a, handle, lent, inputs, settings, parameter).await
+                        g.call_prepare_op(a, handle, lent, inputs, settings, parameter, query).await
                     })
                 })?;
-                prepared.map(prepared_from_wit).map_err(|e| anyhow!(e))
+                prepared.map_err(|e| anyhow!(e)).and_then(prepared_from_wit)
             });
         }
         if op.output.starts_with("stream<") {
@@ -2360,13 +2474,14 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let given = std::mem::take(&mut call.inputs);
                 let settings = toml::to_string(call.settings).unwrap_or_default();
                 let parameter = call.parameter_text.map(str::to_string);
+                let query = call.query.to_string();
                 let node = Node::new(call.host);
                 let asset = Asset::new(&node, call.host.node_type());
                 // An instance of its own, kept while the stream is read.
                 let mut runner = shared.instantiate(cap).with_context(|| shared.id.clone())?;
                 let inputs = values_to_wit(given, &mut runner.store.data_mut().table)?;
                 let started = runner.with_asset(&asset, LONG, async |a, g, lent| {
-                    g.call_start_stream(a, handle, lent, inputs, settings, parameter).await
+                    g.call_start_stream(a, handle, lent, inputs, settings, parameter, query).await
                 })?;
                 let resource = started.map_err(|e| anyhow!(e))?;
                 let header = runner.call(QUICK, async |a, g| g.generator().call_header(a, resource).await)?;
@@ -2380,12 +2495,13 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             let given = std::mem::take(&mut call.inputs);
             let settings = toml::to_string(call.settings).unwrap_or_default();
             let parameter = call.parameter_text.map(str::to_string);
+            let query = call.query.to_string();
             let node = Node::new(call.host);
             let asset = Asset::new(&node, call.host.node_type());
             shared.job(cap, |r| {
                 let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
                 let made = r.with_asset(&asset, shared.long(), async |a, g, lent| {
-                    g.call_run_op(a, handle, lent, inputs, settings, parameter).await
+                    g.call_run_op(a, handle, lent, inputs, settings, parameter, query).await
                 })?;
                 let mut made = value_from_wit(made.map_err(|e| anyhow!(e))?, &mut r.store.data_mut().table)?;
                 // A step ended at a cut, what it carries held by the instance: written out only where the next step will
@@ -2458,7 +2574,7 @@ impl Source for Node<'_> {
         Some(self.host.writer(name))
     }
 
-    fn temp(&self) -> Option<Result<String>> {
+    fn temp(&self) -> Option<Result<pe2_ext::HostPath>> {
         Some(self.host.temp())
     }
 
@@ -2470,7 +2586,7 @@ impl Source for Node<'_> {
         Some(self.host.read_entry(path))
     }
 
-    fn place(&self, path: &str) -> Option<String> {
+    fn place(&self, path: &str) -> Option<pe2_ext::HostPath> {
         self.host.place(path)
     }
 
@@ -2478,7 +2594,7 @@ impl Source for Node<'_> {
         self.host.node_named(reference)
     }
 
-    fn output_of(&self, path: &str, address: &str) -> Option<Result<pe2_ext::Data>> {
+    fn output_of(&self, path: &str, address: &pe2_ext::Asked) -> Option<Result<pe2_ext::Data>> {
         Some(self.host.output_of(path, address))
     }
 
@@ -2490,93 +2606,24 @@ impl Source for Node<'_> {
         Some(self.host.assets_of(node_type))
     }
 
-    fn keep(&self, path: &str, name: &str) -> Option<Result<pe2_ext::File>> {
+    fn keep(&self, path: &pe2_ext::HostPath, name: &str) -> Option<Result<pe2_ext::File>> {
         Some(self.host.keep(path, name))
     }
 
-    fn path_of(&self, name: &str) -> Option<String> {
+    fn path_of(&self, name: &str) -> Option<pe2_ext::HostPath> {
         self.host.path_of(&Node::content(name))
     }
 
-    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Option<Result<String>> {
+    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Option<Result<pe2_ext::HostPath>> {
         Some(self.host.serve(files, how))
     }
 }
 
-/// A host path as an unsandboxed extension's filesystem names it: on Windows each drive is a root of its own
-/// (`drive_form`), elsewhere it is as it is.
-fn guest_path(path: &str) -> String {
-    if cfg!(windows) { drive_form(path) } else { path.to_string() }
-}
-
-/// A path an unsandboxed extension names, as the host names it (`host_form` on Windows).
-fn host_path(path: &str) -> String {
-    if cfg!(windows) { host_form(path) } else { path.to_string() }
-}
-
-/// A program's argument as the program reads it (`arg_host_form` on Windows).
-fn host_arg(arg: &str) -> String {
-    if cfg!(windows) { arg_host_form(arg) } else { arg.to_string() }
-}
-
-/// A Windows path with its drive a root: `D:\a\b` (or `\\?\D:\a\b`) is `/D:/a/b`; what has no drive, as it is.
-fn drive_form(path: &str) -> String {
-    let plain = path.strip_prefix(r"\\?\").unwrap_or(path);
-    match plain.as_bytes() {
-        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
-            format!("/{}:{}", char::from(*letter).to_ascii_uppercase(), plain[2..].replace('\\', "/"))
-        }
-        _ => path.to_string(),
-    }
-}
-
-/// A path with its drive a root as Windows names it: `/D:/a/b` is `D:/a/b`.
-fn host_form(path: &str) -> String {
-    match path.as_bytes() {
-        [b'/', letter, b':', rest @ ..] if letter.is_ascii_alphabetic() && rest.first().is_none_or(|c| *c == b'/') => {
-            path[1..].to_string()
-        }
-        _ => path.to_string(),
-    }
-}
-
-/// Each path in an argument with its drive a root as Windows names it: `-I/D:/a` is `-ID:/a`.
-fn arg_host_form(arg: &str) -> String {
-    let bytes = arg.as_bytes();
-    let mut out = String::with_capacity(arg.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let drive = bytes[at] == b'/'
-            && bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic)
-            && bytes.get(at + 2) == Some(&b':')
-            && bytes.get(at + 3).is_none_or(|c| *c == b'/');
-        if drive {
-            at += 1;
-            continue;
-        }
-        let ch = arg[at..].chars().next().unwrap_or_default();
-        out.push(ch);
-        at += ch.len_utf8();
-    }
-    out
-}
-
-#[cfg(test)]
-#[test]
-fn a_windows_path_has_its_drive_a_root_in_an_extensions_filesystem_and_back() {
-    assert_eq!(drive_form(r"D:\pe2\project\tmp"), "/D:/pe2/project/tmp");
-    assert_eq!(drive_form(r"\\?\d:\pe2"), "/D:/pe2");
-    assert_eq!(drive_form("relative/path"), "relative/path");
-    assert_eq!(host_form("/D:/pe2/project"), "D:/pe2/project");
-    assert_eq!(host_form("/D:"), "D:");
-    assert_eq!(host_form("/Data/x"), "/Data/x");
-    assert_eq!(arg_host_form("-I/D:/pe2/tree/self"), "-ID:/pe2/tree/self");
-    assert_eq!(arg_host_form("--x=/C:/a,/D:/b"), "--x=C:/a,D:/b");
-    assert_eq!(arg_host_form("/usr/bin/a:b"), "/usr/bin/a:b");
-}
-
 /// What an operation said before it runs, as the contract carried it.
-fn prepared_from_wit(prepared: g::Prepared) -> pe2_ext::Prepared {
+///
+/// # Errors
+/// It reads an output by what is no address.
+fn prepared_from_wit(prepared: g::Prepared) -> Result<pe2_ext::Prepared> {
     let input = |from: g::MicroInput| pe2_ext::MicroInput { micro: from.micro, port: from.port, files: from.files };
     let micro = |micro: g::Micro| pe2_ext::Micro {
         op: micro.op,
@@ -2585,14 +2632,12 @@ fn prepared_from_wit(prepared: g::Prepared) -> pe2_ext::Prepared {
         ports: micro.ports.into_iter().map(|port| port.into_iter().map(input).collect()).collect(),
         keep: micro.keep,
     };
-    pe2_ext::Prepared {
-        needs: prepared
-            .needs
-            .into_iter()
-            .map(|need| pe2_ext::Need { node: need.node, address: need.address })
-            .collect(),
+    let needs =
+        prepared.needs.iter().map(|need| Ok(pe2_ext::Need::new(&need.node, pe2_ext::Asked::new(&need.address)?)));
+    Ok(pe2_ext::Prepared {
+        needs: needs.collect::<Result<_>>()?,
         micros: prepared.micros.into_iter().map(micro).collect(),
-    }
+    })
 }
 
 /// Each port's values as the contract carries them, their media buffers handed to the instance.

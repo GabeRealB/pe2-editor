@@ -356,7 +356,8 @@ impl Player {
                 let output = extensions
                     .stream_address(asset, chosen.as_deref())
                     .ok_or_else(|| "it has no stream".to_string())?;
-                extensions.stream(&engine, &index, asset, &output).map_err(|e| format!("{e:#}"))
+                let output = pe2_path::Asked::new(&output).map_err(|e| e.to_string())?;
+                extensions.stream(&engine, &index, asset, output).map_err(|e| format!("{e:#}"))
             });
             if let Ok(stream) = &opened {
                 let wake = ctx.clone();
