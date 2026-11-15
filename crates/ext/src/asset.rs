@@ -18,7 +18,7 @@ pub trait Source {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>>;
+    fn read(&self, name: &crate::RelPath) -> Result<Box<[u8]>>;
     /// A file's size in bytes; none where it has no such file. (A host that knows it without reading the file says so.)
     fn size(&self, name: &crate::RelPath) -> Option<u64> {
         self.read(name).ok().map(|bytes| bytes.len() as u64)
@@ -27,10 +27,10 @@ pub trait Source {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Box<[u8]>> {
         let bytes = self.read(name)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-        Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+        Ok(bytes[start..start.saturating_add(len).min(bytes.len())].into())
     }
     /// A file its operation makes, written through the host (`CallHost::writer`): only an asset lent for an
     /// operation's run has one.
@@ -52,7 +52,7 @@ pub trait Source {
         let _ = folder;
         None
     }
-    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Vec<u8>>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Box<[u8]>>> {
         let _ = path;
         None
     }
@@ -76,12 +76,12 @@ pub trait Source {
         None
     }
     /// For an operation's run: a stored content, whole, by its hash (`CallHost::read`).
-    fn read_stored(&self, sha1: &crate::Sha1) -> Option<Result<Vec<u8>>> {
+    fn read_stored(&self, sha1: &crate::Sha1) -> Option<Result<Box<[u8]>>> {
         let _ = sha1;
         None
     }
     /// For an operation's run: up to `len` bytes of a stored content from `offset`.
-    fn read_stored_range(&self, sha1: &crate::Sha1, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
+    fn read_stored_range(&self, sha1: &crate::Sha1, offset: u64, len: usize) -> Option<Result<Box<[u8]>>> {
         let _ = (sha1, offset, len);
         None
     }
@@ -161,7 +161,7 @@ impl<'a> Asset<'a> {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    pub fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
+    pub fn read(&self, name: &crate::RelPath) -> Result<Box<[u8]>> {
         self.source.read(name)
     }
 
@@ -176,7 +176,7 @@ impl<'a> Asset<'a> {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    pub fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Box<[u8]>> {
         self.source.read_range(name, offset, len)
     }
 

@@ -994,7 +994,7 @@ mod attaching {
 
     fn strip(call: &mut pe2_ext::Call<'_>) -> Result<Typed> {
         let source = call.take::<Line>(0)?;
-        let source = String::from_utf8(call.read(source.file()?)?)?;
+        let source = String::from_utf8(call.read(source.file()?)?.into_vec())?;
         let names: Vec<&str> = source.split_whitespace().collect();
         let mut cells = Table::new();
         for (i, name) in names.iter().enumerate() {
@@ -1005,7 +1005,8 @@ mod attaching {
         settings
             .insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
         settings.insert("cells".into(), Value::Table(cells));
-        let files = vec![File::new(pe2_ext::RelPath::constant("native.bin"), source.bytes().rev().collect())];
+        let files =
+            vec![File::new(pe2_ext::RelPath::constant("native.bin"), source.bytes().rev().collect::<Vec<u8>>())];
         Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
     }
 

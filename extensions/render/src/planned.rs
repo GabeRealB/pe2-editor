@@ -45,7 +45,7 @@ pub fn register(r: &mut Registry) {
         .output_described(FILES)
         .run_described(|call| {
             let mesh = file_of(call, "mesh", mesh::FILE)?;
-            check_model(&stored(call, "stored")?, &String::from_utf8(mesh)?, call.settings)?;
+            check_model(&stored(call, "stored")?, &String::from_utf8(mesh.into_vec())?, call.settings)?;
             Ok(Data::Typed(Typed::new(FILES, Vec::new())))
         });
 }
@@ -66,12 +66,12 @@ fn port<'c>(call: &'c Call<'_>, name: &str) -> Result<&'c Typed> {
 }
 
 /// The one file given at a port.
-fn stored(call: &Call<'_>, name: &str) -> Result<Vec<u8>> {
+fn stored(call: &Call<'_>, name: &str) -> Result<Box<[u8]>> {
     call.read(port(call, name)?.file()?)
 }
 
 /// A file given at a port, by name.
-fn file_of(call: &Call<'_>, name: &str, file: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+fn file_of(call: &Call<'_>, name: &str, file: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
     let given = port(call, name)?;
     let found = given.files.iter().find(|f| *f.name == *file).ok_or_else(|| anyhow!("its {name} holds no {file}"))?;
     call.read(found)

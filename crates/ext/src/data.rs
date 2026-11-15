@@ -342,9 +342,9 @@ impl Content {
 
     /// A copy of what it holds, in itself or in memory (in a component, copied in); none for a stored one.
     #[must_use]
-    pub fn local(&self) -> Option<Vec<u8>> {
+    pub fn local(&self) -> Option<Box<[u8]>> {
         match self {
-            Content::Inline { .. } => self.inline().map(<[u8]>::to_vec),
+            Content::Inline { .. } => self.inline().map(Box::from),
             Content::Memory(buffer) => Some(buffer.read()),
             Content::Stored { .. } => None,
         }
@@ -353,12 +353,12 @@ impl Content {
     /// Up to `len` bytes of what it holds from `offset`, fewer at its end - in a component, only those copied in; none
     /// for a stored one.
     #[must_use]
-    pub fn held_range(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+    pub fn held_range(&self, offset: u64, len: usize) -> Option<Box<[u8]>> {
         match self {
             Content::Inline { .. } => {
                 let bytes = self.inline()?;
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-                Some(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+                Some(bytes[start..start.saturating_add(len).min(bytes.len())].into())
             }
             Content::Memory(buffer) => Some(buffer.read_range(offset, len)),
             Content::Stored { .. } => None,
@@ -437,8 +437,8 @@ impl Use {
 impl File {
     /// A file made now, its bytes inline.
     #[must_use]
-    pub fn new(name: &crate::RelPath, bytes: Vec<u8>) -> File {
-        File { name: name.to_owned(), content: Content::owning(bytes) }
+    pub fn new(name: &crate::RelPath, bytes: impl Into<Vec<u8>>) -> File {
+        File { name: name.to_owned(), content: Content::owning(bytes.into()) }
     }
 }
 
@@ -658,12 +658,12 @@ pub trait CallHost {
     ///
     /// # Errors
     /// It is stored, and the host has no such blob or cannot read it.
-    fn read(&self, content: &Content) -> Result<Vec<u8>>;
+    fn read(&self, content: &Content) -> Result<Box<[u8]>>;
     /// Up to `len` bytes of a content from `offset`.
     ///
     /// # Errors
     /// As `read`.
-    fn read_range(&self, content: &Content, offset: u64, len: usize) -> Result<Vec<u8>>;
+    fn read_range(&self, content: &Content, offset: u64, len: usize) -> Result<Box<[u8]>>;
     /// A file the operation makes, named `name`, written a piece at a time: held where the host holds what is large
     /// (its store), or - by a host that holds nothing - in memory.
     ///
@@ -699,7 +699,7 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The project cannot be reached from here, or holds no such file.
-    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Box<[u8]>> {
         bail!("{}: {path}: no project to read here", self.path())
     }
     /// The assets of a type, each by its path with its declaration as written; recorded as read.
@@ -927,7 +927,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The project cannot be reached from here, or holds no such file.
-    pub fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
+    pub fn read_entry(&self, path: &crate::TreePath) -> Result<Box<[u8]>> {
         self.host.read_entry(path)
     }
 
@@ -1038,7 +1038,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// It cannot be read.
-    pub fn read(&self, file: &File) -> Result<Vec<u8>> {
+    pub fn read(&self, file: &File) -> Result<Box<[u8]>> {
         match file.content.local() {
             Some(bytes) => Ok(bytes),
             None => self.host.read(&file.content),
@@ -1049,7 +1049,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// It cannot be read.
-    pub fn read_range(&self, file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_range(&self, file: &File, offset: u64, len: usize) -> Result<Box<[u8]>> {
         match file.content.held_range(offset, len) {
             Some(bytes) => Ok(bytes),
             None => self.host.read_range(&file.content, offset, len),
@@ -1164,7 +1164,7 @@ impl Source for Lent<'_> {
         self.files.iter().any(|f| f.name == name)
     }
 
-    fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
+    fn read(&self, name: &crate::RelPath) -> Result<Box<[u8]>> {
         let content = &self.file(name)?.content;
         match content.local() {
             Some(bytes) => Ok(bytes),
@@ -1176,7 +1176,7 @@ impl Source for Lent<'_> {
         Some(self.file(name).ok()?.content.size())
     }
 
-    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Box<[u8]>> {
         let content = &self.file(name)?.content;
         match content.held_range(offset, len) {
             Some(bytes) => Ok(bytes),

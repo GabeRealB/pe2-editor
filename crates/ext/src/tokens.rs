@@ -254,7 +254,7 @@ impl Registry {
 /// It is no such value.
 pub fn text_of(call: &Call<'_>, value: &Data) -> Result<String> {
     let Data::Typed(typed) = value else { bail!("no tokens") };
-    Ok(String::from_utf8(call.read(typed.file()?)?)?)
+    Ok(String::from_utf8(call.read(typed.file()?)?.into_vec())?)
 }
 
 #[cfg(test)]

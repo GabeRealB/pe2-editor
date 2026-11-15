@@ -115,7 +115,8 @@ fn made_of(project: &dyn pe2_ext::Project, asset: &Asset<'_>, slot: Option<usize
     let nodes = crate::preview::Looked(project);
     let settings = asset.fields();
     let (bank, entry, script) = if let Some(slot) = slot {
-        let file = toml::from_str(&String::from_utf8(asset.read(pe2_ext::RelPath::constant("bank.toml"))?)?)?;
+        let file =
+            toml::from_str(&String::from_utf8(asset.read(pe2_ext::RelPath::constant("bank.toml"))?.into_vec())?)?;
         let (bank, entry) = crate::preview::slot_bank(&nodes, &file, settings, slot)?;
         let at = crate::preview::slots(asset).into_iter().find(|(s, _)| *s == slot).map(|(_, script)| script);
         let scripts = asset.array("scripts");

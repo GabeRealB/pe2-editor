@@ -143,7 +143,7 @@ pub fn release_since(mark: u64) {
 enum State {
     None,
     Held(Box<dyn Any>),
-    Sealed(Vec<u8>),
+    Sealed(Box<[u8]>),
 }
 
 /// What a step is handed: what the steps before carried, what was requested for it, what was spawned for it, and the
@@ -152,7 +152,7 @@ pub struct Handed {
     state: State,
     got: Vec<Result<Data>>,
     needs: Vec<Need>,
-    joined: Vec<Vec<u8>>,
+    joined: Vec<Box<[u8]>>,
     item: Option<Vec<u8>>,
 }
 
@@ -504,7 +504,7 @@ fn made_value(bytes: Vec<u8>) -> Data {
 }
 
 /// The bytes of the one file a value holds.
-fn bytes_of(call: &Call<'_>, data: &Data) -> Result<Vec<u8>> {
+fn bytes_of(call: &Call<'_>, data: &Data) -> Result<Box<[u8]>> {
     let Data::Typed(typed) = data else {
         return Err(anyhow!("a step was handed {}, not what a step makes", data.ty()));
     };
@@ -583,7 +583,7 @@ fn each_name(name: &str, cut: u32) -> String {
 /// What a step hands its code: what the cut it begins at carried, requested (read now) and spawned (made), and its item.
 fn handed(call: &Call<'_>, after_own: bool) -> Result<Handed> {
     let record = if after_own { record(call)? } else { None };
-    let joined: Vec<Vec<u8>> = if after_own {
+    let joined: Vec<Box<[u8]>> = if after_own {
         call.inputs.get(1).into_iter().flatten().map(|made| bytes_of(call, made)).collect::<Result<_>>()?
     } else {
         Vec::new()
@@ -775,11 +775,11 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.node_type()
     }
 
-    fn read(&self, content: &crate::Content) -> Result<Vec<u8>> {
+    fn read(&self, content: &crate::Content) -> Result<Box<[u8]>> {
         self.inner.read(content)
     }
 
-    fn read_range(&self, content: &crate::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, content: &crate::Content, offset: u64, len: usize) -> Result<Box<[u8]>> {
         self.inner.read_range(content, offset, len)
     }
 
@@ -799,7 +799,7 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.entries(folder)
     }
 
-    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Box<[u8]>> {
         self.inner.read_entry(path)
     }
 
@@ -865,7 +865,7 @@ mod tests {
         let token = hold(ended.state);
         let sealed = seal().unwrap().unwrap();
         assert!(take(token).is_none() && seal().unwrap().is_none());
-        assert_eq!(handed(State::Sealed(sealed)).state::<Carries>().unwrap(), carries());
+        assert_eq!(handed(State::Sealed(sealed.into_boxed_slice())).state::<Carries>().unwrap(), carries());
         // Taken as what it is not: said, not read.
         let token = hold(Box::new(carries()));
         assert!(handed(State::Held(take(token).unwrap().into_any())).state::<u32>().is_err());

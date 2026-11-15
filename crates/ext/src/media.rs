@@ -92,7 +92,7 @@ impl VideoFrame {
             crate::bail!("a frame of {} bytes, not {size}", bytes.len());
         }
         match self.format {
-            PixelFormat::Rgba8888 => Ok(bytes),
+            PixelFormat::Rgba8888 => Ok(bytes.into_vec()),
             PixelFormat::Yuv420p => {
                 let (half_w, half_h) = (width.div_ceil(2), height.div_ceil(2));
                 let (y, chroma) = bytes.split_at(width * height);

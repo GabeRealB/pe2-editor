@@ -161,7 +161,7 @@ impl Source for Held<'_, '_> {
     }
 
     /// The stored file a node makes as itself.
-    fn read(&self, _: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+    fn read(&self, _: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
         let Data::Typed(stored) = self.call.output_of(&pe2_ext::Reference::from(self.path.clone()), pe2_ext::NATIVE)?
         else {
             bail!("{}: it makes no file", self.path)

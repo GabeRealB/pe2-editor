@@ -264,7 +264,7 @@ pub fn join(call: &mut Call) -> Result<Typed> {
     let (pictures, natives) = made.split_at(images.len());
     let all = resources(&given)?;
     let layout = call.take::<ty::Bytes>(1)?;
-    let layout: Table = String::from_utf8(call.read(layout.file()?)?)?.parse()?;
+    let layout: Table = String::from_utf8(call.read(layout.file()?)?.into_vec())?.parse()?;
     let stored = call.take::<ty::Bytes>(2)?;
     let mut bundle = formats::bundle::Bundle {
         base: u32::try_from(integer(&layout, "base").ok_or_else(|| anyhow!("bundle.toml: no base"))?)?,
@@ -303,11 +303,11 @@ pub fn join(call: &mut Call) -> Result<Typed> {
             }
             "dialogue" => {
                 let Some(Data::Typed(typed)) = native.next() else { bail!("dialogue {}: no file", resource.index) };
-                (DATA, call.read(typed.file()?)?)
+                (DATA, call.read(typed.file()?)?.into_vec())
             }
             _ => {
                 let kind = integer(resource.table, "kind").and_then(|k| u8::try_from(k).ok()).unwrap_or(DATA);
-                (kind, stored_file(call, &stored, resource.index)?)
+                (kind, stored_file(call, &stored, resource.index)?.into_vec())
             }
         };
         bundle.resources.insert(resource.index, made);
@@ -318,7 +318,7 @@ pub fn join(call: &mut Call) -> Result<Typed> {
 }
 
 /// A resource's stored bytes, `resources/<index>.bin`.
-fn stored_file(call: &Call, stored: &Typed, index: usize) -> Result<Vec<u8>> {
+fn stored_file(call: &Call, stored: &Typed, index: usize) -> Result<Box<[u8]>> {
     let name = format!("{index}.bin");
     let file = stored.files.iter().find(|f| f.name.last().is_some_and(|last| *last == *name));
     call.read(file.ok_or_else(|| anyhow!("resource {index}: no resources/{name}"))?)

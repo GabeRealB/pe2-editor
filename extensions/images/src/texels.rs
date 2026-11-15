@@ -25,7 +25,7 @@ pub struct TexelImage {
     /// Bits a texel: 4, 8 or 16.
     pub bpp: u8,
     /// As VRAM holds them: halfwords of packed indices, or 16-bit colors.
-    pub texels: Vec<u8>,
+    pub texels: Box<[u8]>,
     /// Each palette the image declares, in order, with its colors where they are stored.
     pub palettes: Vec<Palette>,
     /// What was derived with them: settings taking the place of the declaration's (its size, its cells' rectangles).
@@ -89,7 +89,7 @@ impl TexelImage {
     fn files(&self) -> Vec<File> {
         let colors = self.palettes.iter().filter_map(|palette| {
             let colors = palette.colors.as_ref()?;
-            Some(File::new(&palette.file, colors.iter().flat_map(|c| c.to_le_bytes()).collect()))
+            Some(File::new(&palette.file, colors.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>()))
         });
         colors.chain(std::iter::once(File::new(TEXELS, self.texels.clone()))).collect()
     }

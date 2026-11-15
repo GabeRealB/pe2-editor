@@ -405,7 +405,7 @@ impl host::HostAsset for State {
             Ok(name) => name,
             Err(why) => return Ok(Err(why)),
         };
-        Ok(self.lent(&asset)?.read(name).map_err(|e| format!("{e:#}")))
+        Ok(self.lent(&asset)?.read(name).map(Vec::from).map_err(|e| format!("{e:#}")))
     }
 
     fn size(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<u64>> {
@@ -425,7 +425,7 @@ impl host::HostAsset for State {
             Ok(name) => name,
             Err(why) => return Ok(Err(why)),
         };
-        Ok(self.lent(&asset)?.read_range(name, offset, len as usize).map_err(|e| format!("{e:#}")))
+        Ok(self.lent(&asset)?.read_range(name, offset, len as usize).map(Vec::from).map_err(|e| format!("{e:#}")))
     }
 
     fn writer(
@@ -469,6 +469,7 @@ impl host::HostAsset for State {
             .lent(&asset)?
             .read_entry(path)
             .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(Vec::from)
             .map_err(|e| format!("{e:#}")))
     }
 
@@ -571,7 +572,10 @@ impl host::HostAsset for State {
 
     fn read_stored(&mut self, asset: Resource<LentAsset>, sha1: [u8; 20]) -> wasmtime::Result<Result<Vec<u8>, String>> {
         let read = self.lent(&asset)?.read_stored(&pe2_ext::Sha1::from_bytes(sha1));
-        Ok(read.unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+        Ok(read
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(Vec::from)
+            .map_err(|e| format!("{e:#}")))
     }
 
     fn read_stored_range(
@@ -582,7 +586,10 @@ impl host::HostAsset for State {
         len: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, String>> {
         let read = self.lent(&asset)?.read_stored_range(&pe2_ext::Sha1::from_bytes(sha1), offset, len as usize);
-        Ok(read.unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+        Ok(read
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(Vec::from)
+            .map_err(|e| format!("{e:#}")))
     }
 
     fn place_content(
@@ -2705,7 +2712,7 @@ impl Source for Node<'_> {
         false
     }
 
-    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
         anyhow::bail!("{}: an operation's node holds no file by name ({name})", self.host.path())
     }
 
@@ -2713,7 +2720,7 @@ impl Source for Node<'_> {
         None
     }
 
-    fn read_range(&self, name: &pe2_ext::RelPath, _: u64, _: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &pe2_ext::RelPath, _: u64, _: usize) -> Result<Box<[u8]>> {
         anyhow::bail!("{}: an operation's node holds no file by name ({name})", self.host.path())
     }
 
@@ -2729,7 +2736,7 @@ impl Source for Node<'_> {
         Some(self.host.entries(folder))
     }
 
-    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Vec<u8>>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Box<[u8]>>> {
         Some(self.host.read_entry(path))
     }
 
@@ -2757,11 +2764,11 @@ impl Source for Node<'_> {
         Some(self.host.keep(path, name))
     }
 
-    fn read_stored(&self, sha1: &pe2_ext::Sha1) -> Option<Result<Vec<u8>>> {
+    fn read_stored(&self, sha1: &pe2_ext::Sha1) -> Option<Result<Box<[u8]>>> {
         Some(self.host.read(&Node::stored(sha1)))
     }
 
-    fn read_stored_range(&self, sha1: &pe2_ext::Sha1, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
+    fn read_stored_range(&self, sha1: &pe2_ext::Sha1, offset: u64, len: usize) -> Option<Result<Box<[u8]>>> {
         Some(self.host.read_range(&Node::stored(sha1), offset, len))
     }
 

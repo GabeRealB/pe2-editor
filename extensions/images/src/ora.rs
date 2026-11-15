@@ -458,7 +458,15 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
         .zip(colors)
         .map(|(name, colors)| crate::texels::Palette::new(name, colors))
         .collect::<Result<_>>()?;
-    Ok(TexelImage { width, height, bpp, texels: texels.stored(), palettes, derived: settings, notes })
+    Ok(TexelImage {
+        width,
+        height,
+        bpp,
+        texels: texels.stored().into_boxed_slice(),
+        palettes,
+        derived: settings,
+        notes,
+    })
 }
 
 /// The depth a file's palettes are for: the colors a strip holds, and with no palette, direct color.
@@ -571,8 +579,8 @@ mod tests {
             self.files.contains_key(name.as_str())
         }
 
-        fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
-            self.files.get(name.as_str()).cloned().ok_or_else(|| anyhow!("no {name}"))
+        fn read(&self, name: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
+            self.files.get(name.as_str()).map(|bytes| bytes.as_slice().into()).ok_or_else(|| anyhow!("no {name}"))
         }
     }
 

@@ -75,7 +75,7 @@ fn planned(r: &mut Registry) {
             let chunks = given
                 .iter()
                 .map(|value| match value {
-                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?),
+                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?).map(Vec::from),
                     other => Err(pe2_ext::anyhow!("a chunk given as {}", other.ty())),
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -814,8 +814,8 @@ mod tests {
             self.files.contains_key(name.as_str())
         }
 
-        fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
-            self.files.get(name.as_str()).cloned().ok_or_else(|| anyhow!("no {name}"))
+        fn read(&self, name: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
+            self.files.get(name.as_str()).map(|bytes| bytes.as_slice().into()).ok_or_else(|| anyhow!("no {name}"))
         }
     }
 

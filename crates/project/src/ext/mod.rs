@@ -2705,21 +2705,22 @@ impl pe2_ext::CallHost for StreamHost {
         None
     }
 
-    fn read(&self, content: &pe2_ext::Content) -> Result<Vec<u8>> {
+    fn read(&self, content: &pe2_ext::Content) -> Result<Box<[u8]>> {
         match content {
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                crate::content::read(path).with_context(|| path.display().to_string())
+                crate::content::read(path).map(Vec::into_boxed_slice).with_context(|| path.display().to_string())
             }
-            held => Ok(held.held().unwrap_or_default().to_vec()),
+            held => Ok(held.held().unwrap_or_default().into()),
         }
     }
 
-    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Box<[u8]>> {
         match content {
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                crate::content::read_range(path, offset, len).with_context(|| path.display().to_string())
+                let read = crate::content::read_range(path, offset, len);
+                read.map(Vec::into_boxed_slice).with_context(|| path.display().to_string())
             }
             held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
@@ -2778,12 +2779,12 @@ impl pe2_ext::CallHost for Hosted<'_> {
         None
     }
 
-    fn read(&self, content: &pe2_ext::Content) -> Result<Vec<u8>> {
-        self.call.read(content)
+    fn read(&self, content: &pe2_ext::Content) -> Result<Box<[u8]>> {
+        self.call.read(content).map(Vec::into_boxed_slice)
     }
 
-    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.call.read_range(content, offset, len)
+    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Box<[u8]>> {
+        self.call.read_range(content, offset, len).map(Vec::into_boxed_slice)
     }
 
     fn writer(&self, name: &pe2_ext::RelPath) -> Result<Box<dyn pe2_ext::FileWriter>> {
@@ -2798,8 +2799,8 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.entries(folder)
     }
 
-    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
-        self.call.read_entry(path)
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Box<[u8]>> {
+        self.call.read_entry(path).map(Vec::into_boxed_slice)
     }
 
     fn place(&self, path: &crate::TreePath) -> Option<pe2_ext::HostPath> {
@@ -2857,20 +2858,21 @@ impl Source for index::Asset {
         self.files.iter().any(|f| *f.name == *name)
     }
 
-    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
-        crate::content::read(&file.path).with_context(|| file.path.display().to_string())
+        crate::content::read(&file.path).map(Vec::into_boxed_slice).with_context(|| file.path.display().to_string())
     }
 
     fn size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
         Some(self.files.iter().find(|f| *f.name == *name)?.size)
     }
 
-    fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Box<[u8]>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
-        crate::content::read_range(&file.path, offset, len).with_context(|| file.path.display().to_string())
+        let read = crate::content::read_range(&file.path, offset, len);
+        read.map(Vec::into_boxed_slice).with_context(|| file.path.display().to_string())
     }
 }
 

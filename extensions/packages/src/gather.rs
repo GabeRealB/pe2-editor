@@ -169,7 +169,7 @@ struct Gathering<'a> {
     packages: HashMap<String, Package>,
     /// The package gathered.
     own: String,
-    tree: BTreeMap<Arc<RelPath>, Vec<u8>>,
+    tree: BTreeMap<Arc<RelPath>, Box<[u8]>>,
     /// The packages whose target files it takes: its own, and the images it links against.
     reached: BTreeSet<String>,
     pending: Vec<Taken>,
@@ -422,7 +422,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.reached.extend(images.iter().cloned());
     gathering.follow()?;
     let header = gathering.options.header(call)?;
-    gathering.tree.insert(RelPath::constant(OPTIONS).to_owned(), header.into_bytes());
+    gathering.tree.insert(RelPath::constant(OPTIONS).to_owned(), header.into_bytes().into_boxed_slice());
     gathering.take_target_files(&name)?;
     // Where its includes are found: in quotes, its own folders; in angle brackets, its dependencies, each under its name.
     let own = &gathering.packages[&name];

@@ -94,7 +94,11 @@ const SAMPLE: &str = "The quick brown fox jumps over the lazy dog.\n0123456789 !
 /// A face's glyphs, read from its UFO's files.
 fn glyphs_of(call: &mut Call) -> Result<Vec<atlas::Glyph>> {
     let source = call.take::<UfoFont>(0)?;
-    let files = source.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
+    let files = source
+        .files
+        .iter()
+        .map(|file| Ok((file.name.to_string(), call.read(file)?.into_vec())))
+        .collect::<Result<_>>()?;
     let font = codecs::ufo::read(&files).map_err(|e| anyhow!(e))?;
     face::from_ufo(&font, &raster_of(&source.settings)?).map_err(|e| anyhow!(e))
 }
@@ -312,7 +316,7 @@ fn register(r: &mut Registry) -> Result<()> {
             let chunks = given
                 .iter()
                 .map(|value| match value {
-                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?),
+                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?).map(Vec::from),
                     other => Err(pe2_ext::anyhow!("a chunk given as {}", other.ty())),
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -721,8 +725,11 @@ fn atlas_faces(
         let name = named.path.name().unwrap_or_default().to_string();
         let Data::Typed(source) = source else { bail!("{node}: its native form is no files") };
         let Data::Table(encoding) = encoding else { bail!("{node}: its encoding's settings are no table") };
-        let files =
-            source.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
+        let files = source
+            .files
+            .iter()
+            .map(|file| Ok((file.name.to_string(), call.read(file)?.into_vec())))
+            .collect::<Result<_>>()?;
         let font = codecs::ufo::read(&files).map_err(|e| anyhow!("{node}: {e}"))?;
         glyphs.push(face::from_ufo(&font, &raster_of(&source.settings)?).map_err(|e| anyhow!("{node}: {e}"))?);
         specs.push(face_spec(&name, &source.settings, entry, encoding)?);
@@ -742,7 +749,7 @@ fn atlas_reads<'a>(
 /// An atlas's layout, from the file its stack reads.
 fn layout_given(call: &mut Call) -> Result<Layout> {
     let layout = call.take::<ty::Bytes>(0)?;
-    layout_of(&String::from_utf8(call.read(layout.file()?)?)?)
+    layout_of(&String::from_utf8(call.read(layout.file()?)?.into_vec())?)
 }
 
 /// The page and its faces' tables, made from its layout and its faces' UFOs.
@@ -862,7 +869,7 @@ fn atlas_act(
             let packed = project
                 .bytes(asset.path(), pe2_ext::Asked::constant("packed"))
                 .ok_or_else(|| anyhow!("it has no packed layout"))??;
-            if asset.read(LAYOUT).is_ok_and(|now| now == packed) {
+            if asset.read(LAYOUT).is_ok_and(|now| *now == *packed) {
                 bail!("its layout places everything its faces draw");
             }
             let name = asset.path().name().unwrap_or_default();

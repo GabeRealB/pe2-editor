@@ -39,7 +39,7 @@ fn rested(call: &Call, reference: &Reference, pose: Option<&Value>) -> Result<(M
     let Data::Typed(stored) = call.output_of(reference, pe2_ext::NATIVE)? else {
         bail!("{reference}: its output is no mesh")
     };
-    let (mut model, slots) = mesh::read(&String::from_utf8(call.read(stored.file()?)?)?)?;
+    let (mut model, slots) = mesh::read(&String::from_utf8(call.read(stored.file()?)?.into_vec())?)?;
     if let Some(named) = pe2_ext::target_in(call.table_of(reference, SETTINGS)?.get("skeleton"))? {
         let table = call.table_of(&named, SETTINGS)?;
         let joints = skeleton::parse(table.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice))?;
@@ -503,8 +503,8 @@ fn bank_of(call: &Call) -> Result<Bank> {
 fn clip_arrays(call: &Call, reference: &Reference, made: Data) -> Result<(std::sync::Arc<TreePath>, clip::Arrays)> {
     let path = call.node_named(reference).ok_or_else(|| anyhow!("no clip {reference}"))?.path;
     let Data::Typed(stored) = made else { bail!("{path}: its output is no clip") };
-    let read =
-        clip_usd::read(&String::from_utf8(call.read(stored.file()?)?)?).map_err(|why| anyhow!("{path}: {why:#}"))?;
+    let read = clip_usd::read(&String::from_utf8(call.read(stored.file()?)?.into_vec())?)
+        .map_err(|why| anyhow!("{path}: {why:#}"))?;
     Ok((path.clone(), clip::arrays(&read).map_err(|why| anyhow!("{path}: {why:#}"))?))
 }
 

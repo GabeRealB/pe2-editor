@@ -239,17 +239,17 @@ impl Source for Lent<'_> {
         self.resource().has_file(name.as_str())
     }
 
-    fn read(&self, name: &crate::RelPath) -> crate::Result<Vec<u8>> {
-        self.resource().read(name.as_str()).map_err(crate::Error::msg)
+    fn read(&self, name: &crate::RelPath) -> crate::Result<Box<[u8]>> {
+        self.resource().read(name.as_str()).map(Vec::into_boxed_slice).map_err(crate::Error::msg)
     }
 
     fn size(&self, name: &crate::RelPath) -> Option<u64> {
         self.resource().size(name.as_str())
     }
 
-    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> crate::Result<Box<[u8]>> {
         let len = u32::try_from(len).unwrap_or(u32::MAX);
-        self.resource().read_range(name.as_str(), offset, len).map_err(crate::Error::msg)
+        self.resource().read_range(name.as_str(), offset, len).map(Vec::into_boxed_slice).map_err(crate::Error::msg)
     }
 
     fn writer(&self, name: &crate::RelPath) -> Option<crate::Result<Box<dyn crate::FileWriter>>> {
@@ -266,8 +266,8 @@ impl Source for Lent<'_> {
         Some(told.map(|paths| paths.iter().map(|path| told_path(path)).collect()))
     }
 
-    fn read_entry(&self, path: &crate::TreePath) -> Option<crate::Result<Vec<u8>>> {
-        Some(self.resource().read_entry(path.as_str()).map_err(crate::Error::msg))
+    fn read_entry(&self, path: &crate::TreePath) -> Option<crate::Result<Box<[u8]>>> {
+        Some(self.resource().read_entry(path.as_str()).map(Vec::into_boxed_slice).map_err(crate::Error::msg))
     }
 
     fn assets_of(&self, node_type: &str) -> Option<crate::Result<crate::AssetsOf>> {
@@ -1292,18 +1292,21 @@ impl CallHost for NodeHost<'_> {
         self.0.node_type.as_deref()
     }
 
-    fn read(&self, content: &Content) -> crate::Result<Vec<u8>> {
+    fn read(&self, content: &Content) -> crate::Result<Box<[u8]>> {
         match content {
-            Content::Stored { sha1, .. } => self.0.resource().read_stored(*sha1.bytes()).map_err(crate::Error::msg),
+            Content::Stored { sha1, .. } => {
+                self.0.resource().read_stored(*sha1.bytes()).map(Vec::into_boxed_slice).map_err(crate::Error::msg)
+            }
             held => Ok(held.local().unwrap_or_default()),
         }
     }
 
-    fn read_range(&self, content: &Content, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+    fn read_range(&self, content: &Content, offset: u64, len: usize) -> crate::Result<Box<[u8]>> {
         match content {
             Content::Stored { sha1, .. } => {
                 let len = u32::try_from(len).unwrap_or(u32::MAX);
-                self.0.resource().read_stored_range(*sha1.bytes(), offset, len).map_err(crate::Error::msg)
+                let read = self.0.resource().read_stored_range(*sha1.bytes(), offset, len);
+                read.map(Vec::into_boxed_slice).map_err(crate::Error::msg)
             }
             held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
@@ -1317,7 +1320,7 @@ impl CallHost for NodeHost<'_> {
         Source::entries(self.0, folder).ok_or_else(|| crate::anyhow!("the host lists nothing here"))?
     }
 
-    fn read_entry(&self, path: &crate::TreePath) -> crate::Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> crate::Result<Box<[u8]>> {
         Source::read_entry(self.0, path).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 

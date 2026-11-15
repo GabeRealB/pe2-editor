@@ -36,23 +36,23 @@ impl Buffer {
 
     /// A copy of all of its bytes.
     #[must_use]
-    pub fn read(&self) -> Vec<u8> {
+    pub fn read(&self) -> Box<[u8]> {
         #[cfg(not(target_family = "wasm"))]
-        return self.bytes.to_vec();
+        return Box::from(&*self.bytes);
         #[cfg(target_family = "wasm")]
-        self.handle.bytes()
+        self.handle.bytes().into_boxed_slice()
     }
 
     /// Up to `len` bytes from `offset`, fewer at its end: in a component, only those copied in.
     #[must_use]
-    pub fn read_range(&self, offset: u64, len: usize) -> Vec<u8> {
+    pub fn read_range(&self, offset: u64, len: usize) -> Box<[u8]> {
         #[cfg(not(target_family = "wasm"))]
         {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(self.bytes.len());
-            self.bytes[start..start.saturating_add(len).min(self.bytes.len())].to_vec()
+            self.bytes[start..start.saturating_add(len).min(self.bytes.len())].into()
         }
         #[cfg(target_family = "wasm")]
-        self.handle.read(offset, u32::try_from(len).unwrap_or(u32::MAX))
+        self.handle.read(offset, u32::try_from(len).unwrap_or(u32::MAX)).into_boxed_slice()
     }
 
     /// Bytes the host holds already, shared.

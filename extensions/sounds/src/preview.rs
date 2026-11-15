@@ -56,7 +56,7 @@ impl Nodes for Call<'_> {
         let Data::Typed(typed) = self.output_of(reference, pe2_ext::NATIVE)? else {
             anyhow::bail!("{reference}: no body")
         };
-        Ok(formats::spk::PoolItem::Sample(self.read(typed.file()?)?))
+        Ok(formats::spk::PoolItem::Sample(self.read(typed.file()?)?.into_vec()))
     }
 }
 
@@ -76,7 +76,7 @@ impl Nodes for Looked<'_> {
         let Some(name) = FILES.iter().find(|name| asset.has_file(name)) else {
             return Ok((asset.fields().clone(), asset.fields().clone()));
         };
-        let table = toml::from_str(&String::from_utf8(asset.read(name)?)?)?;
+        let table = toml::from_str(&String::from_utf8(asset.read(name)?.into_vec())?)?;
         Ok((table, asset.fields().clone()))
     }
 
@@ -102,7 +102,7 @@ const FILES: [&pe2_ext::RelPath; 3] = [
 /// # Errors
 /// It is no TOML.
 pub fn table_of(call: &Call<'_>, typed: &Typed) -> Result<Table> {
-    Ok(toml::from_str(&String::from_utf8(call.read(typed.file()?)?)?)?)
+    Ok(toml::from_str(&String::from_utf8(call.read(typed.file()?)?.into_vec())?)?)
 }
 
 /// The nodes a node names under a key, in order.
@@ -204,7 +204,8 @@ pub fn slot(call: &Call<'_>, typed: &Typed, slot: usize) -> Result<Vec<Vec<i16>>
 /// The slots of a bank that play a script, as its file has them: each its number, and the script's place in the bank's
 /// list.
 pub fn slots(asset: &Asset) -> Vec<(usize, usize)> {
-    let Some(file) = asset.read(pe2_ext::RelPath::constant("bank.toml")).ok().and_then(|b| String::from_utf8(b).ok())
+    let Some(file) =
+        asset.read(pe2_ext::RelPath::constant("bank.toml")).ok().and_then(|b| String::from_utf8(b.into_vec()).ok())
     else {
         return vec![];
     };

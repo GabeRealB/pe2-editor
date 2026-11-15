@@ -120,7 +120,11 @@ fn glyphs_of(face: &str, pictures: &BTreeMap<String, Picture>) -> Vec<Glyph> {
 /// A face's UFO files, read into its glyphs.
 fn face_glyphs(call: &Call, face: &Data, what: &pe2_ext::Reference) -> Result<Vec<Glyph>> {
     let Data::Typed(typed) = face else { bail!("{what}: its native form is no files") };
-    let files = typed.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
+    let files = typed
+        .files
+        .iter()
+        .map(|file| Ok((file.name.to_string(), call.read(file)?.into_vec())))
+        .collect::<Result<_>>()?;
     let font = codecs::ufo::read(&files).map_err(|e| anyhow!("{what}: {e}"))?;
     typeface::face::from_ufo(&font, &typeface::raster::Raster::default()).map_err(|e| anyhow!("{what}: {e}"))
 }
@@ -397,7 +401,7 @@ fn register(r: &mut Registry) -> Result<()> {
             let chunks = given
                 .iter()
                 .map(|data| match data {
-                    Data::Typed(typed) => call.read(typed.file()?),
+                    Data::Typed(typed) => call.read(typed.file()?).map(Vec::from),
                     _ => bail!("a chunk is no file"),
                 })
                 .collect::<Result<Vec<_>>>()?;

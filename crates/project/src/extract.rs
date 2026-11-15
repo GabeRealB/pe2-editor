@@ -85,8 +85,9 @@ impl pe2_ext::Source for Lent<'_> {
         self.files.contains_key(name)
     }
 
-    fn read(&self, name: &pe2_ext::RelPath) -> pe2_ext::Result<Vec<u8>> {
-        self.files.get(name).cloned().ok_or_else(|| pe2_ext::anyhow!("{}: no file {name}", self.path))
+    fn read(&self, name: &pe2_ext::RelPath) -> pe2_ext::Result<Box<[u8]>> {
+        let bytes = self.files.get(name).ok_or_else(|| pe2_ext::anyhow!("{}: no file {name}", self.path))?;
+        Ok(bytes.as_slice().into())
     }
 }
 

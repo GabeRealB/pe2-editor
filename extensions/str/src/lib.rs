@@ -194,7 +194,7 @@ pub(crate) fn sectors(form: Form, count: u64) -> usize {
 }
 
 /// Sectors of a form, read from `at`: each one's bytes.
-pub(crate) fn read_sectors(asset: &Asset, form: Form, at: u64, count: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_sectors(asset: &Asset, form: Form, at: u64, count: u64) -> Result<Box<[u8]>> {
     asset.read_range(NATIVE, at * form.size() as u64, sectors(form, count))
 }
 

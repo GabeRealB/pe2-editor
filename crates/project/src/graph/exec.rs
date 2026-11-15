@@ -940,7 +940,7 @@ impl<'a> Call<'a> {
                 };
                 crate::content::read_range(&path, offset, len).with_context(|| path.display().to_string())
             }
-            held => Ok(held.held_range(offset, len).unwrap_or_default()),
+            held => Ok(held.held_range(offset, len).unwrap_or_default().into_vec()),
         }
     }
 
