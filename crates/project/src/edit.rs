@@ -961,7 +961,7 @@ mod tests {
             ..pe2_io::Composed::system()
         };
         let project = Project::load_with(root, std::sync::Arc::new(io)).unwrap();
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let index = Index::open(&project, &cache).unwrap();
         let (history, _) = History::open(&cache).unwrap();

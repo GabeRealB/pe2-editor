@@ -44,8 +44,8 @@ Processes talk over a local socket (a named pipe on Windows), one CBOR message p
 answers - an editor or a host, which build, trusting what - so a stale host from an older build is replaced rather
 than talked to. `project::role` knows how each kind of process is found, started and connected to.
 
-On Windows, background processes are started with `CREATE_NO_WINDOW`, never detached: a process with no console at all
-makes Windows open a terminal for every console program it starts.
+On Windows, every program is started with `CREATE_NO_WINDOW` (by `pe2-io`'s `Processes`), never detached: a process
+with no console at all makes Windows open a terminal for every console program it starts.
 
 ## Watching the layers
 

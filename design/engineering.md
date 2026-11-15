@@ -19,7 +19,9 @@ user names - does it through the `Io`'s `Filesystem` (a folder and names within 
 and places whole, as `std::fs` does), and the build refuses `std::fs` and `Path`'s own. What is allowed says why:
 what the processes on a machine find each other by (the project lock, roles, presence, the scopes' markers, trust),
 the program's own files (its settings, what it keeps beside it), and what only the system's own calls reach (a
-backend's mount points, what is touched through a mount for the kernel to hear).
+backend's mount points, what is touched through a mount for the kernel to hear). Files are watched through its
+`Watch`, programs started through its `Processes` - the build refuses `Command::new` - and the processes of a machine
+talk through its `Channels`; `notify` and `interprocess` are `pe2-io`'s dependencies alone.
 
 What a build needs that is no crate is pinned in `prepare.toml`, as an extension's `[[setup]]` entries are, and fetched
 by `cargo xtask prepare` into `prepared/<platform>/`; the editor crate's build script fails by name until it is there
@@ -129,5 +131,5 @@ Benchmarks that need a real project or folder are ignored tests, run by hand wit
 
 Linux and Windows are built and tested; macOS builds are not. Platform-specific code is mostly in the filesystem
 backends, in how paths are handed to extensions (Windows drives become roots in an extension's filesystem), and in
-how processes are started (`CREATE_NO_WINDOW`). `PE2_TEST_SCOPES` runs the filesystem tests through a chosen backend,
+how processes are started (`pe2-io`'s `Processes`, which sets `CREATE_NO_WINDOW` on every one). `PE2_TEST_SCOPES` runs the filesystem tests through a chosen backend,
 and `PE2_LICENSES_FOR` checks another platform's dependencies against the license policy.

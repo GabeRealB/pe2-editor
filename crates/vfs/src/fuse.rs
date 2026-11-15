@@ -681,9 +681,11 @@ fn unmount(at: &HostPath) {
     let tries: &[(&str, &[&str])] = &[("fusermount3", &["-uz"]), ("fusermount", &["-uz"])];
     #[cfg(target_os = "macos")]
     let tries: &[(&str, &[&str])] = &[("umount", &["-f"])];
+    // The system's own programs, as it is about to end too (`unmount_all`): nothing gives this an Io.
     for (program, args) in tries {
-        let done = std::process::Command::new(program).args(*args).arg(at.as_os_str()).status();
-        if done.is_ok_and(|s| s.success()) {
+        let unmounting = pe2_io::Program::new(program).args(*args).arg(at.as_os_str());
+        let done = pe2_io::Processes::output(&pe2_io::SystemProcesses, &unmounting);
+        if done.is_ok_and(|done| done.exit.success()) {
             return;
         }
     }

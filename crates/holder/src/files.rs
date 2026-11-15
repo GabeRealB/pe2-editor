@@ -212,11 +212,10 @@ fn cli(io: &dyn pe2_io::Io) -> anyhow::Result<std::path::PathBuf> {
 fn kept(project: &project::Project, args: &[String]) -> Kept {
     // The one running, whatever program this is; one started is `pe2-cli`.
     let environment = project.io.environment();
-    let kept = match project::server::keep_running(&project.root, who(environment)) {
+    let kept = match project::server::keep_running(&project.root, who(environment), &*project.io) {
         Some(lease) => Ok(lease),
-        None => cli(&*project.io).and_then(|program| {
-            project::server::keep(&project.root, who(environment), &program, args, project.io.clock())
-        }),
+        None => cli(&*project.io)
+            .and_then(|program| project::server::keep(&project.root, who(environment), &program, args, &*project.io)),
     };
     match kept {
         Ok(lease) => Kept::Leased(Arc::new(Mutex::new(lease)), None),

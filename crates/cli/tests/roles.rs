@@ -74,7 +74,7 @@ impl Tried {
 
     /// The process hosting the project, where one does.
     fn host(&self) -> Option<u32> {
-        match Connection::connect(&self.project())?.ask(&ToHost::Status).ok()? {
+        match Connection::connect(&self.project(), &pe2_io::System)?.ask(&ToHost::Status).ok()? {
             FromHost::Status { pid, .. } => Some(pid),
             _ => None,
         }
@@ -82,7 +82,7 @@ impl Tried {
 
     /// Who holds the project, as its host says.
     fn holder(&self) -> Option<String> {
-        match Connection::connect(&self.project())?.ask(&ToHost::Status).ok()? {
+        match Connection::connect(&self.project(), &pe2_io::System)?.ask(&ToHost::Status).ok()? {
             FromHost::Status { holder, .. } => Some(holder),
             _ => None,
         }
@@ -90,7 +90,7 @@ impl Tried {
 
     /// The process serving the project's folder, and who feeds it, where one serves.
     fn server(&self) -> Option<(u32, Option<String>)> {
-        match project::server::status(&self.project())? {
+        match project::server::status(&self.project(), &pe2_io::System)? {
             FromServer::Status { pid, fed_by, .. } => Some((pid, fed_by)),
             _ => None,
         }
@@ -371,7 +371,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     );
     drop(shared);
     // One feeder at a time: what another process lists while the host feeds it is not taken.
-    let mut other = project::server::ROLE.connect(&tried.project()).expect("the server listens");
+    let mut other = project::server::ROLE.connect(&tried.project(), &pe2_io::System).expect("the server listens");
     let listed: FromServer = other.ask(&ToServer::Shown).unwrap();
     assert_eq!(listed, FromServer::Fed { by: "pe2-cli".into() });
     assert_eq!(folder.read("notes/a.txt").as_deref(), Some("one"));
@@ -406,7 +406,7 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     assert_eq!(folder.read("c.txt").as_deref(), Some("three"));
     // Let go of - said first, as an editor closing says it - the project is the host's again without it looking for
     // it: it feeds the server what is served now, the other's edit in it.
-    let handing = project::host::leaving(&tried.project(), "a stand-in").expect("the host hears it");
+    let handing = project::host::leaving(&tried.project(), "a stand-in", &pe2_io::System).expect("the host hears it");
     drop(stand_in);
     drop(handing);
     assert!(tried.host_said("a stand-in is letting go of the project"));
@@ -427,7 +427,8 @@ fn what_is_written_while_nothing_holds_the_project_starts_a_host() {
     let folder = tried.serve();
     let host = tried.host().expect("a host holds it");
     // Its host gone - told to stop, as one that differs is - the server serves on what it was listed last.
-    let stopping = Connection::connect(&tried.project()).and_then(|mut host| host.ask(&ToHost::Stop).ok());
+    let stopping =
+        Connection::connect(&tried.project(), &pe2_io::System).and_then(|mut host| host.ask(&ToHost::Stop).ok());
     assert_eq!(stopping, Some(FromHost::Stopping));
     until(|| !project::host::running(&tried.project())); // the host stops
     assert!(tried.server().is_some(), "the server serves on for a while");

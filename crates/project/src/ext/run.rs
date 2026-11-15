@@ -136,7 +136,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
     }
     let (path, mut before, _) = super::program_in(offered, &program)?;
     before.extend(args);
-    let mut command = std::process::Command::new(path.as_os_str());
+    let mut command = pe2_io::Program::new(path.as_os_str());
     let folder = match settings.get("cwd").and_then(Toml::as_str) {
         Some(within) => match RelPath::new(within) {
             Ok(within) => laid.input.join(&within),
@@ -144,25 +144,20 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
         },
         None => laid.input.clone(),
     };
-    command.args(&before).current_dir(&folder).stdin(std::process::Stdio::null());
+    command = command.args(&before).folder(folder.clone().into_path_buf());
     // What it is run with besides what the editor has: each value's placeholders filled, one value each.
     for (name, value) in settings.get("env").and_then(Toml::as_table).into_iter().flatten() {
         let value = value.as_str().with_context(|| format!("its env {name} is no text"))?;
-        command.env(name, places.expand(value)?.join(" "));
+        command = command.env(name, places.expand(value)?.join(" "));
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let done = command.output().with_context(|| format!("{program} ({path}) could not be started"))?;
+    let done =
+        call.io().processes().output(&command).with_context(|| format!("{program} ({path}) could not be started"))?;
     let said = |bytes: &[u8]| rewritten(&String::from_utf8_lossy(bytes), &laid);
-    if !done.status.success() {
+    if !done.exit.success() {
         let (out, err) = (said(&done.stdout), said(&done.stderr));
         bail!(
             "{program}: {}: {}{}",
-            done.status,
+            done.exit,
             err.trim_end(),
             if out.trim().is_empty() { String::new() } else { format!("\n{}", out.trim_end()) }
         );

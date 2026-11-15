@@ -325,7 +325,7 @@ pub struct Workspace {
     lock: Lock,
     cache_dir: HostPath,
     /// The watcher on the layers, started with the first frame (it wakes the window).
-    watch: Option<notify::RecommendedWatcher>,
+    watch: Option<Box<dyn pe2_io::Watching>>,
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
     /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
@@ -333,7 +333,7 @@ pub struct Workspace {
     /// The host standing by told that the editor is letting go of the project: it takes it the moment this goes.
     handing: Option<project::host::Lease>,
     /// The watcher being started, off the window's thread.
-    watch_starting: Option<mpsc::Receiver<std::result::Result<notify::RecommendedWatcher, String>>>,
+    watch_starting: Option<mpsc::Receiver<std::result::Result<Box<dyn pe2_io::Watching>, String>>>,
     /// The generated layers as their plans say they are.
     pub plans: crate::plans::Plans,
     /// Filling them: the step of the project's onboarding that runs their plans.
@@ -727,6 +727,8 @@ pub struct Leaving {
     handing: Option<project::host::Lease>,
     /// The project's folder.
     root: HostPath,
+    /// What the host is told through.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Drop for Leaving {
@@ -734,7 +736,7 @@ impl Drop for Leaving {
         // The project is about to be let go of: the host standing by is told, once, and takes it the moment the
         // editor has let go, without looking for it.
         if self.handing.is_none() && self.files.is_some() {
-            self.handing = project::host::leaving(&self.root, "pe2-editor");
+            self.handing = project::host::leaving(&self.root, "pe2-editor", &*self.io);
         }
         // What may still write: the worker finishes the job it is on, an epoch running is given up.
         self.takein = None;
@@ -768,7 +770,7 @@ fn stand_by(root: &HostPath, io: Arc<dyn pe2_io::Io>) {
     }
     let root = root.clone();
     let _ = std::thread::Builder::new().name("standby".into()).spawn(move || {
-        if let Err(e) = project::host::stand_by(&root, &program, io.clock()) {
+        if let Err(e) = project::host::stand_by(&root, &program, &*io) {
             eprintln!("no host stands by for {root}: {e:#}");
         }
     });
@@ -1226,6 +1228,7 @@ impl Workspace {
             lock: Some(self.lock),
             files: self.files,
             handing: self.handing,
+            io: self.project.io.clone(),
             root: self.project.root,
         }
     }

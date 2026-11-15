@@ -3,8 +3,6 @@
 //! local socket - a file of the project's cache, a named pipe on Windows - one CBOR message a frame (`wire`).
 
 use anyhow::{Context, Result, bail};
-use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ListenerOptions, Name, Stream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sfs::HostPath;
@@ -39,7 +37,7 @@ impl Role {
     ///
     /// # Errors
     /// The name cannot be made.
-    pub fn name(&self, root: &HostPath) -> std::io::Result<Name<'static>> {
+    pub fn name(&self, root: &HostPath) -> std::io::Result<pe2_io::ChannelName> {
         crate::host::local_name(root, self.socket, self.pipe)
     }
 
@@ -93,8 +91,8 @@ impl Role {
 
     /// Connect to the one of the project in `root`; none where none listens.
     #[must_use]
-    pub fn connect(&self, root: &HostPath) -> Option<Link> {
-        Stream::connect(self.name(root).ok()?).ok().map(|stream| Link { stream: BufReader::new(stream) })
+    pub fn connect(&self, root: &HostPath, io: &dyn pe2_io::Io) -> Option<Link> {
+        io.channels().connect(&self.name(root).ok()?).ok().map(|stream| Link { stream: BufReader::new(stream) })
     }
 
     /// Start one for the project in `root`, on its own - not ended with this process, nor with its terminal - and
@@ -112,39 +110,29 @@ impl Role {
         root: &HostPath,
         program: &std::path::Path,
         args: &[String],
-        clock: &dyn pe2_io::Clock,
+        io: &dyn pe2_io::Io,
     ) -> Result<Link> {
         crate::cache::make(&pe2_io::SystemFilesystem, root)?;
-        let log = std::fs::File::create(root.join(&DIR).join(&self.log))?;
-        let mut command = std::process::Command::new(program.as_os_str());
-        command.args(["project", self.command, "--project"]).arg(root.as_os_str()).args(args);
-        command.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // A group of its own: a Ctrl-C in the terminal that started it is not its.
-            command.process_group(0);
-        }
+        let log = root.join(&DIR).join(&self.log);
+        // A group of its own: a Ctrl-C in the terminal that started it is not its, nor is that terminal's closing.
+        let started = pe2_io::Program::new(program)
+            .args(["project", self.command, "--project"])
+            .arg(root.as_os_str())
+            .args(args)
+            .streams(pe2_io::Stream::Null, pe2_io::Stream::Into(log.clone()), pe2_io::Stream::Into(log))
+            .own_group();
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            // A console of its own, with no window: not its starter's, so it does not end with that one's terminal -
-            // and not none at all (`DETACHED_PROCESS`, beside which Windows ignores the other), or every console
-            // program it came to start would be given a terminal window of its own.
-            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-            keep_output_to_ourselves();
-        }
-        let mut child = command.spawn().with_context(|| format!("starting {}", program.display()))?;
+        keep_output_to_ourselves();
+        let mut child = io.processes().spawn(&started).with_context(|| format!("starting {}", program.display()))?;
+        let clock = io.clock();
         let started = clock.now();
         loop {
-            if let Some(link) = self.connect(root) {
+            if let Some(link) = self.connect(root, io) {
                 return Ok(link);
             }
             // Ended at once: another won the race to be the one, or it failed - its log says.
             if let Some(status) = child.try_wait()? {
-                if let Some(link) = self.connect(root) {
+                if let Some(link) = self.connect(root, io) {
                     return Ok(link);
                 }
                 let said = std::fs::read_to_string(root.join(&DIR).join(&self.log)).unwrap_or_default();
@@ -167,14 +155,14 @@ impl Role {
         root: &HostPath,
         stopping: Arc<AtomicBool>,
         io: Arc<dyn pe2_io::Io>,
-        connection: impl Fn(Stream) + Send + Sync + 'static,
+        connection: impl Fn(Box<dyn pe2_io::Channel>) + Send + Sync + 'static,
     ) -> Result<Listening> {
-        let listener =
-            ListenerOptions::new().name(self.name(root)?).try_overwrite(true).reclaim_name(false).create_sync()?;
+        let listener = io.channels().listen(&self.name(root)?)?;
         let connection = Arc::new(connection);
         let stopped = stopping.clone();
         let thread = std::thread::Builder::new().name(self.command.into()).spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = listener.accept();
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
@@ -189,7 +177,7 @@ impl Role {
 
 /// A connection to one of a project's processes.
 pub struct Link {
-    stream: BufReader<Stream>,
+    stream: BufReader<Box<dyn pe2_io::Channel>>,
 }
 
 impl std::fmt::Debug for Link {
@@ -242,7 +230,8 @@ impl Drop for Listening {
         if !thread.is_finished()
             && let Ok(name) = self.role.name(&self.root)
         {
-            let wake = move || drop(Stream::connect(name));
+            let io = self.io.clone();
+            let wake = move || drop(io.channels().connect(&name));
             let _ = std::thread::Builder::new().name("wake".into()).spawn(wake);
         }
         // Waited for a moment only: where its socket is gone - the project's cache removed under it - nothing wakes

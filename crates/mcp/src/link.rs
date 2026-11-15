@@ -3,8 +3,6 @@
 //! a frame (`project::wire`). Only the process holding the project lock listens, so a socket left by an editor that crashed is
 //! taken over, never shared.
 
-use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ListenerOptions, Name, Stream};
 use sfs::HostPath;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -16,14 +14,14 @@ use crate::{Reply, Request};
 /// How long a request waits for the editor's answer: the editor answers between frames.
 const PATIENCE: Duration = Duration::from_secs(20);
 
-fn name(root: &HostPath) -> std::io::Result<Name<'static>> {
+fn name(root: &HostPath) -> std::io::Result<pe2_io::ChannelName> {
     project::host::local_name(root, project::cache::SOCKET, "pe2-editor")
 }
 
 /// Whether anything listens on the holder's link of the project in `root`: an editor or a host that answers.
 #[must_use]
-pub fn listens(root: &HostPath) -> bool {
-    name(root).ok().and_then(|name| Stream::connect(name).ok()).is_some()
+pub fn listens(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
+    name(root).ok().and_then(|name| io.channels().connect(&name).ok()).is_some()
 }
 
 /// Hand a request to the editor serving the project in `root`; none when no editor is.
@@ -62,10 +60,11 @@ enum Asked {
 /// whoever asked goes on as where nothing holds the project - an error where it goes on closing.
 fn until_answered(
     root: &HostPath,
-    clock: &dyn pe2_io::Clock,
+    io: &dyn pe2_io::Io,
     whose: &str,
     mut ask: impl FnMut() -> Option<Asked>,
 ) -> Option<Reply> {
+    let clock = io.clock();
     let asked = clock.now();
     loop {
         match ask()? {
@@ -75,7 +74,7 @@ fn until_answered(
             Asked::Closed if clock.now().saturating_duration_since(asked) < LEAVING => {
                 pe2_io::sleep(clock, Duration::from_millis(20));
             }
-            Asked::Closed if !listens(root) => return None,
+            Asked::Closed if !listens(root, io) => return None,
             Asked::Closed => return Some(Reply::Error(format!("{whose} closed its link without answering"))),
         }
     }
@@ -86,8 +85,8 @@ fn until_answered(
 /// where nothing listens, or the holder declines it.
 #[must_use]
 pub fn forward_patiently(root: &HostPath, io: &Arc<dyn pe2_io::Io>, request: &Request) -> Option<Reply> {
-    until_answered(root, io.clock(), "the holder", || {
-        let mut stream = BufReader::new(Stream::connect(name(root).ok()?).ok()?);
+    until_answered(root, &**io, "the holder", || {
+        let mut stream = BufReader::new(io.channels().connect(&name(root).ok()?).ok()?);
         let answered = (|| -> std::io::Result<Option<Reply>> {
             project::wire::send(stream.get_mut(), request)?;
             project::wire::receive(&mut stream)
@@ -106,8 +105,8 @@ fn forward_to_holder(
     request: &Request,
     patience: Duration,
 ) -> Option<Reply> {
-    until_answered(root, io.clock(), "the editor", || {
-        let stream = Stream::connect(name(root).ok()?).ok()?;
+    until_answered(root, &**io, "the editor", || {
+        let stream = io.channels().connect(&name(root).ok()?).ok()?;
         let request = request.clone();
         // Read on a thread of its own, so an editor that does not answer is given up on.
         let (send, receive) = pe2_io::channel(io.clone());
@@ -148,14 +147,14 @@ impl Listener {
         answer: impl Fn(Request) -> Reply + Send + Sync + 'static,
     ) -> std::io::Result<Listener> {
         // The name is not removed when this ends: by then it may be a newer holder's, which took it over.
-        let listener =
-            ListenerOptions::new().name(name(root)?).try_overwrite(true).reclaim_name(false).create_sync()?;
+        let listener = io.channels().listen(&name(root)?)?;
         let (end, ended) = pe2_io::channel(io.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let answer = Arc::new(answer);
         let stopped = stop.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = listener.accept();
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
@@ -177,7 +176,8 @@ impl Drop for Listener {
         // request reached it since it was told to stop), nobody answers the name any more, and on Windows connecting
         // to it then waits for as long as a connection of it is still open, which would be this never returning.
         if let Ok(name) = name(&self.root) {
-            std::thread::spawn(move || drop(Stream::connect(name)));
+            let io = self.io.clone();
+            std::thread::spawn(move || drop(io.channels().connect(&name)));
         }
         // Gone once it has stopped answering, for whoever holds the project next to answer - unless the name was taken
         // over meanwhile, and the wake reached the newer listener: then it is left, no longer reached.
@@ -185,7 +185,7 @@ impl Drop for Listener {
     }
 }
 
-fn serve(stream: Stream, answer: &dyn Fn(Request) -> Reply) {
+fn serve(stream: Box<dyn pe2_io::Channel>, answer: &dyn Fn(Request) -> Reply) {
     let mut stream = BufReader::new(stream);
     loop {
         let reply = match project::wire::receive::<Request>(&mut stream) {

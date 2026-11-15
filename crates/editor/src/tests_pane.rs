@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{self, RichText};
@@ -39,7 +38,7 @@ struct Test {
 
 /// The runner at work.
 struct Job {
-    child: Child,
+    child: Box<dyn pe2_io::Process>,
     lines: Receiver<String>,
     errors: Receiver<String>,
 }
@@ -106,25 +105,20 @@ impl Tests {
     }
 
     /// Start the runner with these arguments, what it reports read as it comes.
-    fn start(&mut self, ctx: &egui::Context, runner: &std::path::Path, arguments: &[String]) {
+    fn start(&mut self, ctx: &egui::Context, io: &dyn pe2_io::Io, runner: &std::path::Path, arguments: &[String]) {
         self.stop();
         self.trouble = None;
-        let mut command = Command::new(runner.as_os_str());
-        command.args(arguments).arg("--json").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = match command.spawn() {
+        let (null, piped) = (pe2_io::Stream::Null, pe2_io::Stream::Piped);
+        let command =
+            pe2_io::Program::new(runner.as_os_str()).args(arguments).arg("--json").streams(null, piped.clone(), piped);
+        let mut child = match io.processes().spawn(&command) {
             Ok(child) => child,
             Err(why) => {
                 self.trouble = Some(format!("{}: {why}", runner.display()));
                 return;
             }
         };
-        let (lines, errors) = (reading(child.stdout.take(), ctx), reading(child.stderr.take(), ctx));
+        let (lines, errors) = (reading(child.take_stdout(), ctx), reading(child.take_stderr(), ctx));
         self.job = Some(Job { child, lines, errors });
     }
 
@@ -171,7 +165,7 @@ impl Tests {
                     test.state = State::Idle;
                 }
             }
-            if status.is_some_and(|status| status.code().is_none()) {
+            if status.is_some_and(|status| status.exit_code().is_none()) {
                 self.trouble.get_or_insert_with(|| "the runner was stopped".to_string());
             }
         }
@@ -222,7 +216,14 @@ impl Tests {
         clippy::disallowed_methods,
         reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
     )]
-    fn run(&mut self, ctx: &egui::Context, runner: &std::path::Path, mut arguments: Vec<String>, names: &[String]) {
+    fn run(
+        &mut self,
+        ctx: &egui::Context,
+        io: &dyn pe2_io::Io,
+        runner: &std::path::Path,
+        mut arguments: Vec<String>,
+        names: &[String],
+    ) {
         for test in self.suites.values_mut().flatten() {
             if names.is_empty() || names.contains(&test.name) {
                 *test = Test {
@@ -244,7 +245,7 @@ impl Tests {
             let _ = std::fs::remove_dir_all(&artifacts);
         }
         arguments.extend(["--artifacts".to_string(), artifacts.display().to_string()]);
-        self.start(ctx, runner, &arguments);
+        self.start(ctx, io, runner, &arguments);
     }
 
     fn failed(&self) -> Vec<String> {
@@ -357,7 +358,7 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
         ws.tests.asked = true;
         let mut listing = arguments.clone();
         listing.push("--list".to_string());
-        ws.tests.start(&ctx, &runner, &listing);
+        ws.tests.start(&ctx, &*ws.project.io, &runner, &listing);
     }
     let busy = ws.tests.job.is_some();
     let failed = ws.tests.failed();
@@ -436,7 +437,7 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
         ws.tests.shown = None;
     }
     if let Some(names) = asked {
-        ws.tests.run(&ctx, &runner, arguments, &names);
+        ws.tests.run(&ctx, &*ws.project.io, &runner, arguments, &names);
     }
     details(ui, ws);
 }

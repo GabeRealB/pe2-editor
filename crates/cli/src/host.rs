@@ -186,7 +186,7 @@ pub fn run(
     host.stopping.store(true, Ordering::Relaxed);
     // Under its starter's lock it served its starter alone: what it had serve the folder ends with it.
     if host.inherited && lock(&host.server).is_some() {
-        let _ = project::server::stop(&p.root);
+        let _ = project::server::stop(&p.root, &*p.io);
     }
     // Ending in order, what it holds of the project is let go of as where it lends it: its history closed - what
     // its edits wrote had on disk, and the log needed for it no longer - before its lock is. A process that ends
@@ -445,8 +445,8 @@ impl Host {
         if server.is_none() {
             let root = &self.project.root;
             *server = match &self.serve {
-                Some(args) => Some(project::server::keep(root, WHO, &this_program()?, args, self.project.io.clock())?),
-                None => project::server::keep_running(root, WHO),
+                Some(args) => Some(project::server::keep(root, WHO, &this_program()?, args, &*self.project.io)?),
+                None => project::server::keep_running(root, WHO, &*self.project.io),
             };
         }
         Ok(server.is_some())
@@ -532,7 +532,7 @@ impl Host {
             if let Some(holder::files::State::Failed { why, .. }) = feed {
                 return FromHost::Error { why };
             }
-            match project::server::status(&self.project.root) {
+            match project::server::status(&self.project.root, &*self.project.io) {
                 Some(project::server::FromServer::Status { at, note, .. }) if !at.is_empty() => {
                     return FromHost::Kept { at, note };
                 }
@@ -676,7 +676,7 @@ impl Host {
                 continue;
             }
             // What is open in what is served keeps it too: the server stops after it, and no read is cut off.
-            let open = match serves.then(|| project::server::status(&self.project.root)).flatten() {
+            let open = match serves.then(|| project::server::status(&self.project.root, &*self.project.io)).flatten() {
                 Some(project::server::FromServer::Status { open, .. }) => open,
                 _ => 0,
             };
@@ -741,7 +741,7 @@ fn running(state: &State) -> String {
 /// One process talking to the host: a lease while it keeps the folder served or borrows the project, ended with the
 /// connection.
 #[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
-fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
+fn connection(host: &Arc<Host>, stream: Box<dyn pe2_io::Channel>) {
     let mut stream = BufReader::new(stream);
     let (mut leased, mut borrowing, mut leaving) = (false, false, None::<Instant>);
     loop {

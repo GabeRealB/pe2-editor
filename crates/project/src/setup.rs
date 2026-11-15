@@ -261,7 +261,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         crate::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let project = || Project::load(&dir).unwrap();
-        let lock = crate::lock::Lock::try_acquire(&dir, "a test").unwrap();
+        let lock = crate::lock::Lock::try_acquire(&dir, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Cache::open(&project(), &lock).unwrap()).unwrap();
         crate::stack::add_at(
             &project(),

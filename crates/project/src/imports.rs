@@ -1027,7 +1027,7 @@ mod attaching {
 
     fn open(root: &HostPath, extensions: &Extensions) -> (Index, super::Attached) {
         let project = Project::load(root).unwrap();
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let mut index = Index::open(&project, &cache).unwrap();
         let attached = Imports::open(&cache).unwrap().attach(&mut index, extensions);
@@ -1167,7 +1167,7 @@ mod attaching {
         let project = Project::load(&root).unwrap();
         let (mut index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.failed.len()), (2, 0), "{:?}", attached.failed);
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
         drop(lock);
         // Its first attach is what it learns what each read from.
@@ -1413,7 +1413,7 @@ mod attaching {
 
     fn opened(root: &HostPath) -> (Lock, Cache, Index) {
         let project = Project::load(root).unwrap();
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let index = Index::open(&project, &cache).unwrap();
         (lock, cache, index)
@@ -1592,7 +1592,7 @@ mod attaching {
             true,
         );
         let project = Project::load(&root).unwrap();
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let mut index = Index::open(&project, &cache).unwrap();
         let imports = Imports::open(&cache).unwrap();
@@ -1753,7 +1753,7 @@ mod attaching {
         );
         let project = Project::load(&root).unwrap();
         let (mut index, _) = open(&root, &extensions);
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
         drop(lock);
         let base = |p: &str| root.at(".layers/base").at(p);

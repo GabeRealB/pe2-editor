@@ -3413,7 +3413,7 @@ mod calling {
         );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let project = Opened::load(&root).unwrap();
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let lens = Lens { index: &index, extensions: &extensions, selection: None, revision: 0, chosen: None };
         let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();

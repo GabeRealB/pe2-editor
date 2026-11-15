@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-interprocess.workspace = true
 extensions.workspace = true
 pe2-ext.workspace = true
 project.workspace = true

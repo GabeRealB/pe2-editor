@@ -232,19 +232,19 @@ pub fn keep(
     who: &str,
     program: &std::path::Path,
     args: &[String],
-    clock: &dyn pe2_io::Clock,
+    io: &dyn pe2_io::Io,
 ) -> Result<Lease> {
-    let link = match ROLE.connect(root) {
+    let link = match ROLE.connect(root, io) {
         Some(link) => link,
-        None => ROLE.start(root, program, args, clock)?,
+        None => ROLE.start(root, program, args, io)?,
     };
     lease(link, who)
 }
 
 /// Keep the server of the project in `root` for `who`, where one runs.
 #[must_use]
-pub fn keep_running(root: &HostPath, who: &str) -> Option<Lease> {
-    lease(ROLE.connect(root)?, who).ok()
+pub fn keep_running(root: &HostPath, who: &str, io: &dyn pe2_io::Io) -> Option<Lease> {
+    lease(ROLE.connect(root, io)?, who).ok()
 }
 
 /// Whether a server runs for the project in `root`.
@@ -255,14 +255,14 @@ pub fn running(root: &HostPath) -> bool {
 
 /// What the server of the project in `root` says it is doing, where one listens.
 #[must_use]
-pub fn status(root: &HostPath) -> Option<FromServer> {
-    ROLE.connect(root)?.ask(&ToServer::Status).ok()
+pub fn status(root: &HostPath, io: &dyn pe2_io::Io) -> Option<FromServer> {
+    ROLE.connect(root, io)?.ask(&ToServer::Status).ok()
 }
 
 /// Tell the server of the project in `root` to stop, now: whether one was told.
 #[must_use]
-pub fn stop(root: &HostPath) -> bool {
-    let Some(mut server) = ROLE.connect(root) else { return false };
+pub fn stop(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
+    let Some(mut server) = ROLE.connect(root, io) else { return false };
     matches!(server.ask(&ToServer::Stop), Ok(FromServer::Stopping))
 }
 

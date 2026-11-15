@@ -14,8 +14,6 @@
 //! the project (`Lend`) is a lease while it stays open.
 
 use anyhow::{Context, Result};
-use interprocess::local_socket::Name;
-use interprocess::local_socket::prelude::*;
 use serde::{Deserialize, Serialize};
 use sfs::HostPath;
 use std::time::Duration;
@@ -97,10 +95,9 @@ fn hashed(root: &HostPath) -> String {
 ///
 /// # Errors
 /// The name cannot be made.
-pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::io::Result<Name<'static>> {
+pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::io::Result<pe2_io::ChannelName> {
     #[cfg(unix)]
     {
-        use interprocess::local_socket::GenericFilePath;
         // `sun_path`: 108 bytes on Linux, 104 on macOS, its terminating zero among them.
         let path = root.join(&crate::cache::DIR).join(file);
         let path = if path.as_os_str().len() < 100 {
@@ -115,13 +112,12 @@ pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::
             let folder = std::env::temp_dir();
             HostPath::new(&folder)?.join(name)
         };
-        path.into_path_buf().to_fs_name::<GenericFilePath>()
+        Ok(pe2_io::ChannelName::File(path))
     }
     #[cfg(windows)]
     {
-        use interprocess::local_socket::GenericNamespaced;
         let _ = file;
-        format!("{prefix}-{}", hashed(root)).to_ns_name::<GenericNamespaced>()
+        Ok(pe2_io::ChannelName::Named(format!("{prefix}-{}", hashed(root))))
     }
 }
 
@@ -134,8 +130,8 @@ pub struct Connection {
 impl Connection {
     /// Connect to the host of the project in `root`; none where none listens.
     #[must_use]
-    pub fn connect(root: &HostPath) -> Option<Connection> {
-        ROLE.connect(root).map(|link| Connection { link })
+    pub fn connect(root: &HostPath, io: &dyn pe2_io::Io) -> Option<Connection> {
+        ROLE.connect(root, io).map(|link| Connection { link })
     }
 
     /// Say something to the host, and read its answer.
@@ -161,8 +157,8 @@ pub struct Lease {
 /// Borrow the project from the host holding it, for `who`: the host lets go of the lock, and takes it back once the
 /// lease is dropped. None where no host holds it.
 #[must_use]
-pub fn borrow(root: &HostPath, who: &str) -> Option<Lease> {
-    let mut connection = Connection::connect(root)?;
+pub fn borrow(root: &HostPath, who: &str, io: &dyn pe2_io::Io) -> Option<Lease> {
+    let mut connection = Connection::connect(root, io)?;
     match connection.ask(&ToHost::Lend { who: who.to_string() }) {
         Ok(FromHost::Lent) => Some(Lease { _connection: connection }),
         _ => None,
@@ -189,19 +185,19 @@ pub fn serving(
     root: &HostPath,
     program: &std::path::Path,
     args: &[String],
-    clock: &dyn pe2_io::Clock,
+    io: &dyn pe2_io::Io,
 ) -> Result<(Connection, bool)> {
-    if let Some(mut host) = Connection::connect(root) {
+    if let Some(mut host) = Connection::connect(root, io) {
         match host.ask(&ToHost::Status) {
             Ok(FromHost::Status { serves: false, .. }) => {
                 let _ = host.ask(&ToHost::Stop);
                 drop(host);
-                let _ = ROLE.gone_within(root, STOPPING, clock);
+                let _ = ROLE.gone_within(root, STOPPING, io.clock());
             }
             _ => return Ok((host, false)),
         }
     }
-    Ok((start(root, program, args, clock)?, true))
+    Ok((start(root, program, args, io)?, true))
 }
 
 /// The program a host is started as, where this one starts hosts for what is asked of a project (`ensure`).
@@ -217,15 +213,14 @@ pub fn start_hosts_with(program: std::path::PathBuf) {
 /// started as (`start_hosts_with`), nor by one working under another's lock - which then does the work itself.
 #[must_use]
 pub fn ensure(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
-    let clock = io.clock();
     let Some(program) = STARTER.get() else { return false };
     if crate::lock::inherited(root, io.environment()) {
         return false;
     }
-    if Connection::connect(root).is_some() {
+    if Connection::connect(root, io).is_some() {
         return true;
     }
-    match start(root, program, &["--backend".to_string(), "none".to_string()], clock) {
+    match start(root, program, &["--backend".to_string(), "none".to_string()], io) {
         Ok(_) => true,
         Err(e) => {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -241,19 +236,19 @@ pub fn ensure(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
 ///
 /// # Errors
 /// None runs, and none could be started.
-pub fn stand_by(root: &HostPath, program: &std::path::Path, clock: &dyn pe2_io::Clock) -> Result<()> {
-    if Connection::connect(root).is_some() {
+pub fn stand_by(root: &HostPath, program: &std::path::Path, io: &dyn pe2_io::Io) -> Result<()> {
+    if Connection::connect(root, io).is_some() {
         return Ok(());
     }
-    start(root, program, &["--backend".to_string(), "none".to_string()], clock).map(drop)
+    start(root, program, &["--backend".to_string(), "none".to_string()], io).map(drop)
 }
 
 /// Tell the host standing by for the project in `root` that this process, which holds it, is about to let go of it:
 /// the host takes it the moment what this returns is dropped - which is to be after the project's lock - where it
 /// would else find it free when it next looked. None where no host listens.
 #[must_use]
-pub fn leaving(root: &HostPath, who: &str) -> Option<Lease> {
-    let mut connection = Connection::connect(root)?;
+pub fn leaving(root: &HostPath, who: &str, io: &dyn pe2_io::Io) -> Option<Lease> {
+    let mut connection = Connection::connect(root, io)?;
     match connection.ask(&ToHost::Leaving { who: who.to_string() }) {
         Ok(FromHost::Awaiting) => Some(Lease { _connection: connection }),
         _ => None,
@@ -263,21 +258,21 @@ pub fn leaving(root: &HostPath, who: &str) -> Option<Lease> {
 /// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.
 /// One something keeps - an editor it serves the folder for, `project serve` - is left.
 #[must_use]
-pub fn replace(root: &HostPath, clock: &dyn pe2_io::Clock) -> bool {
-    let Some(mut host) = Connection::connect(root) else { return !running(root) };
+pub fn replace(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
+    let Some(mut host) = Connection::connect(root, io) else { return !running(root) };
     if !matches!(host.ask(&ToHost::Status), Ok(FromHost::Status { leases: 0, .. })) {
         return false;
     }
     let _ = host.ask(&ToHost::Stop);
     drop(host);
-    ROLE.gone_within(root, STOPPING, clock)
+    ROLE.gone_within(root, STOPPING, io.clock())
 }
 
 /// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
 /// where it lent the project, or something else holds it.
 #[must_use]
-pub fn answers(root: &HostPath) -> bool {
-    let status = Connection::connect(root).and_then(|mut host| host.ask(&ToHost::Status).ok());
+pub fn answers(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
+    let status = Connection::connect(root, io).and_then(|mut host| host.ask(&ToHost::Status).ok());
     matches!(status, Some(FromHost::Status { holder, .. }) if holder == "the host" || holder == "nobody")
 }
 
@@ -286,13 +281,8 @@ pub fn answers(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.
-pub fn start(
-    root: &HostPath,
-    program: &std::path::Path,
-    args: &[String],
-    clock: &dyn pe2_io::Clock,
-) -> Result<Connection> {
-    ROLE.start(root, program, args, clock).map(|link| Connection { link })
+pub fn start(root: &HostPath, program: &std::path::Path, args: &[String], io: &dyn pe2_io::Io) -> Result<Connection> {
+    ROLE.start(root, program, args, io).map(|link| Connection { link })
 }
 
 /// Where `pe2-cli` is for a program beside it (the editor): in the same folder.

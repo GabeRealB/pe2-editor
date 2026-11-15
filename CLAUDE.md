@@ -64,9 +64,9 @@ What holds whatever is being changed:
   (`project::ext::forbid`), so that it may load what a process running an extension's code must not be one with.
 - **A backend is a module implementing `Backend` and a line of `backend::all`**; nothing else names one. One
   named in the settings that cannot do the job is refused with why, never replaced by another.
-- **On Windows, a program started without a console is started with `CREATE_NO_WINDOW`**, never
-  `DETACHED_PROCESS`: a process with no console at all has Windows open a terminal for every console program it
-  starts.
+- **On Windows, a program is started with `CREATE_NO_WINDOW`**, never `DETACHED_PROCESS`: a process with no console
+  at all has Windows open a terminal for every console program it starts. `pe2-io`'s `Processes` does it, for every
+  program the editor starts.
 - **What is transcribed from another project's header says so in its file** (Dokany's declarations in
   `crates/vfs/src/dokan.rs`), and is listed as bundled in `licenses/licenses.toml`.
 - **A dependency is settled when it is added**: the build fails by name on a crate under a license

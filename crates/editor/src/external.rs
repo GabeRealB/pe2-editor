@@ -3,7 +3,6 @@
 
 use sfs::HostPath;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::settings::Tools;
 
@@ -128,21 +127,15 @@ fn words(command: &str) -> Vec<String> {
 
 /// The system's way of opening a file in its default application.
 #[allow(clippy::disallowed_methods, reason = "a program the system starts for the user, found as the system finds it")]
-fn system_default(file: &Path) -> Command {
+fn system_default(file: &Path) -> pe2_io::Program {
     if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(file.as_os_str());
-        c
+        pe2_io::Program::new("cmd").args(["/C", "start", ""]).arg(file.as_os_str())
     } else if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(file.as_os_str());
-        c
+        pe2_io::Program::new("open").arg(file.as_os_str())
     } else {
         // Under WSL, wslview hands the file to Windows' default application.
         let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some();
-        let mut c = Command::new(if wsl && which("wslview") { "wslview" } else { "xdg-open" });
-        c.arg(file.as_os_str());
-        c
+        pe2_io::Program::new(if wsl && which("wslview") { "wslview" } else { "xdg-open" }).arg(file.as_os_str())
     }
 }
 
@@ -150,8 +143,8 @@ fn system_default(file: &Path) -> Command {
 ///
 /// # Errors
 /// The system's opener cannot be started.
-pub fn open_default(file: &Path) -> Result<(), String> {
-    system_default(file).spawn().map(drop).map_err(|e| format!("{}: {e}", file.display()))
+pub fn open_default(io: &dyn pe2_io::Io, file: &Path) -> Result<(), String> {
+    io.processes().spawn(&system_default(file)).map(drop).map_err(|e| format!("{}: {e}", file.display()))
 }
 
 #[allow(clippy::disallowed_methods, reason = "a program the system starts for the user, found as the system finds it")]
@@ -169,17 +162,23 @@ fn which(program: &str) -> bool {
 pub fn open(file: &HostPath, name: &str, tools: &Tools, io: &std::sync::Arc<dyn pe2_io::Io>) -> Result<String, String> {
     // A large file a layer holds as chunks is opened as assembled for it.
     let file = project::content::for_program(io, file).map_err(|e| format!("{}: {e}", file.display()))?;
-    open_as(&file, name, Category::of(&file), tools)
+    open_as(&**io, &file, name, Category::of(&file), tools)
 }
 
 /// Open a file with the tool for `category`, or the system's default.
 ///
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.
-pub fn open_as(file: &Path, name: &str, category: Category, tools: &Tools) -> Result<String, String> {
+pub fn open_as(
+    io: &dyn pe2_io::Io,
+    file: &Path,
+    name: &str,
+    category: Category,
+    tools: &Tools,
+) -> Result<String, String> {
     let target = openable(file, name)?;
     let command = category.command(tools).trim();
-    let mut process = if command.is_empty() {
+    let process = if command.is_empty() {
         system_default(&target)
     } else {
         let mut parts = words(command);
@@ -189,11 +188,9 @@ pub fn open_as(file: &Path, name: &str, category: Category, tools: &Tools) -> Re
         }
         let parts: Vec<String> = parts.iter().map(|w| w.replace("{file}", &file_text)).collect();
         let (program, args) = parts.split_first().ok_or("an empty command")?;
-        let mut c = Command::new(program);
-        c.args(args);
-        c
+        pe2_io::Program::new(program).args(args)
     };
-    process.spawn().map_err(|e| format!("{}: {e}", target.display()))?;
+    io.processes().spawn(&process).map_err(|e| format!("{}: {e}", target.display()))?;
     Ok(format!("opened {}", target.display()))
 }
 

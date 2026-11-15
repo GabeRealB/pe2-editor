@@ -273,9 +273,9 @@ pub struct GivenPath(HostPath);
 
 /// A program running for an unsandboxed extension's component. Dropped, it is stopped.
 pub struct HostProcess {
-    child: std::process::Child,
-    input: Option<std::process::ChildStdin>,
-    output: std::process::ChildStdout,
+    child: Box<dyn pe2_io::Process>,
+    input: Option<Box<dyn std::io::Write + Send>>,
+    output: Box<dyn std::io::Read + Send>,
     /// The end of what it says on its standard error, kept by a thread of its own: unread, it would stop the program.
     said: Arc<Mutex<Vec<u8>>>,
 }
@@ -1041,22 +1041,10 @@ impl unsandboxed::Host for State {
             }
             Err(e) => return Ok(Err(format!("{}: {e:#}", self.id))),
         };
-        let mut command = std::process::Command::new(program.as_os_str());
-        command
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        // Never a window of its own: what it reads and writes is piped. Started by a process that has no console - a
-        // host, an editor started from the desktop - Windows would open a terminal for each tool run otherwise, a
-        // build's hundreds of them.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let spawned = command.spawn();
+        let piped = pe2_io::Stream::Piped;
+        let command =
+            pe2_io::Program::new(program.as_os_str()).args(&args).streams(piped.clone(), piped.clone(), piped);
+        let spawned = self.io.processes().spawn(&command);
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
@@ -1076,7 +1064,7 @@ impl unsandboxed::Host for State {
                 return Ok(Err(format!("{program}: {e}{see}")));
             }
         };
-        let (input, output, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let (input, output, stderr) = (child.take_stdin(), child.take_stdout(), child.take_stderr());
         let (Some(output), Some(mut stderr)) = (output, stderr) else {
             let _ = child.kill();
             return Ok(Err(format!("{program}: no pipes")));

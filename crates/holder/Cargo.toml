@@ -13,7 +13,6 @@ workspace = true
 anyhow.workspace = true
 extensions.workspace = true
 mcp.workspace = true
-notify.workspace = true
 pe2-ext.workspace = true
 project.workspace = true
 pe2-path.workspace = true

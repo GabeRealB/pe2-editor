@@ -1576,14 +1576,14 @@ mod tests {
 
     fn history(root: &HostPath) -> (History, Option<String>) {
         let project = Project::load(root).unwrap();
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         History::open(&Cache::open(&project, &lock).unwrap()).unwrap()
     }
 
     /// The index of a project, for what undo reads of documents.
     fn index(root: &HostPath) -> Index {
         let project = Project::load(root).unwrap();
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap()
     }
 

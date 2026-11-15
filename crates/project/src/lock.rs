@@ -165,8 +165,8 @@ impl Lock {
     ///
     /// # Errors
     /// Another process holds the project, or the lock file cannot be made.
-    pub fn try_acquire(root: &HostPath, who: &str) -> Result<Lock, LockError> {
-        Lock::try_lock(root, who, true)
+    pub fn try_acquire(root: &HostPath, who: &str, io: &dyn pe2_io::Io) -> Result<Lock, LockError> {
+        Lock::try_lock(root, who, Some(io))
     }
 
     /// Lock the project in `root` for `who`, borrowing it from nobody: the host's own taking - or what the process
@@ -178,7 +178,7 @@ impl Lock {
         if inherited(root, io.environment()) {
             return Ok(Lock::lent());
         }
-        Lock::try_lock(root, who, false)
+        Lock::try_lock(root, who, None)
     }
 
     /// The lock a parent process lends: held by it, nothing to let go of here.
@@ -186,13 +186,14 @@ impl Lock {
         Lock { file: None, unprotected: None, _borrowed: None }
     }
 
-    fn try_lock(root: &HostPath, who: &str, borrowing: bool) -> Result<Lock, LockError> {
+    /// `borrowing`: what it is borrowed from the host through, where it is.
+    fn try_lock(root: &HostPath, who: &str, borrowing: Option<&dyn pe2_io::Io>) -> Result<Lock, LockError> {
         let file = open(root).map_err(LockError::Io)?;
         match file.try_lock() {
             Ok(()) => claim(root, file, who),
             // Held by the host: lent, it is taken at once - or by whoever was quicker.
             Err(TryLockError::WouldBlock)
-                if let Some(lease) = borrowing.then(|| crate::host::borrow(root, who)).flatten() =>
+                if let Some(lease) = borrowing.and_then(|io| crate::host::borrow(root, who, io)) =>
             {
                 match file.try_lock() {
                     Ok(()) => claim(root, file, who).map(|lock| Lock { _borrowed: Some(lease), ..lock }),
@@ -219,7 +220,7 @@ impl Lock {
         let clock = io.clock();
         let start = clock.now();
         loop {
-            match Lock::try_acquire(root, who) {
+            match Lock::try_acquire(root, who, io) {
                 Err(LockError::Held(_)) if clock.now().saturating_duration_since(start) < limit => {
                     pe2_io::sleep(clock, Duration::from_millis(25));
                 }
@@ -245,7 +246,7 @@ impl Lock {
         let clock = io.clock();
         let mut waiting = Some(waiting);
         loop {
-            match Lock::try_acquire(root, who) {
+            match Lock::try_acquire(root, who, io) {
                 Err(LockError::Held(owner)) => {
                     if let Some(waiting) = waiting.take() {
                         waiting(&owner);
@@ -271,16 +272,16 @@ mod tests {
     fn one_holder_at_a_time() {
         let root = crate::testing::scratch("lock");
         let _ = std::fs::remove_dir_all(&root);
-        let held = Lock::try_acquire(&root, "the first").unwrap();
+        let held = Lock::try_acquire(&root, "the first", &pe2_io::System).unwrap();
         // Locking a project with no cache yet makes one that git ignores.
         assert_eq!(std::fs::read_to_string(root.at(".cache/.gitignore")).unwrap(), "*\n");
         // A second handle on the file is a second holder to the OS, as another process would be.
-        match Lock::try_acquire(&root, "the second") {
+        match Lock::try_acquire(&root, "the second", &pe2_io::System) {
             Err(LockError::Held(owner)) => assert!(owner.starts_with("the first"), "{owner}"),
             other => panic!("{other:?}"),
         }
         drop(held);
-        let again = Lock::try_acquire(&root, "the second").unwrap();
+        let again = Lock::try_acquire(&root, "the second", &pe2_io::System).unwrap();
         drop(again);
         std::fs::remove_dir_all(&root).unwrap();
     }

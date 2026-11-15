@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use notify::event::ModifyKind;
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use pe2_io::{ChangeKind, Depth, Watching};
 use project::Project;
 
 /// How long the layers must be quiet before a batch goes.
@@ -33,7 +32,7 @@ pub enum Change {
 ///
 /// # Errors
 /// The folders cannot be watched - the system's limit of watches reached.
-pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> anyhow::Result<RecommendedWatcher> {
+pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> anyhow::Result<Box<dyn Watching>> {
     let roots: Vec<HostPath> = p.layers.iter().map(|l| l.path.clone()).collect();
     // Each layer's changeset sits beside its directory; `project.toml` in the project's own.
     let mut shallow: Vec<HostPath> = p.layers.iter().filter_map(|l| l.changeset.parent()).collect();
@@ -67,28 +66,28 @@ pub fn watch(
     shallow: &[HostPath],
     wanted: impl Fn(&HostPath) -> bool + Send + 'static,
     taken: impl Fn(Change) -> bool + Send + 'static,
-) -> anyhow::Result<RecommendedWatcher> {
+) -> anyhow::Result<Box<dyn Watching>> {
     let (events, received) = mpsc::channel();
     // Each event sent, and the batching told of it; told as well when the watcher goes, which drops this.
     let told = Told { waiter: io.clock().waiter() };
     let waiter = told.waiter.clone();
-    let handler = move |event: notify::Result<notify::Event>| {
-        let _ = events.send(event);
+    let tell = move |change: std::io::Result<pe2_io::Change>| {
+        let _ = events.send(change);
         told.waiter.wake();
     };
-    let mut watcher = RecommendedWatcher::new(handler, Config::default().with_follow_symlinks(false))?;
     let roots: Vec<&HostPath> = roots.iter().filter(|root| io.filesystem().is_folder(root)).collect();
     // A root inside another is watched with it.
-    for root in roots.iter().filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o))) {
-        watcher.watch(root, RecursiveMode::Recursive)?;
-    }
+    let mut places: Vec<(HostPath, Depth)> = roots
+        .iter()
+        .filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o)))
+        .map(|root| ((*root).clone(), Depth::All))
+        .collect();
     let mut shallow: Vec<&HostPath> =
         shallow.iter().filter(|d| io.filesystem().is_folder(d) && !roots.iter().any(|r| d.starts_with(r))).collect();
     shallow.sort();
     shallow.dedup();
-    for dir in shallow {
-        watcher.watch(dir, RecursiveMode::NonRecursive)?;
-    }
+    places.extend(shallow.into_iter().map(|dir| (dir.clone(), Depth::Own)));
+    let watcher = io.watch().watch(&places, Box::new(tell))?;
     let io = io.clone();
     std::thread::Builder::new()
         .name("watch".into())
@@ -112,7 +111,7 @@ impl Drop for Told {
 fn debounce(
     io: &dyn pe2_io::Io,
     woken: &dyn pe2_io::Waiter,
-    events: &Receiver<notify::Result<notify::Event>>,
+    events: &Receiver<std::io::Result<pe2_io::Change>>,
     wanted: &dyn Fn(&HostPath) -> bool,
     taken: &dyn Fn(Change) -> bool,
 ) {
@@ -139,11 +138,11 @@ fn debounce(
         match event {
             Some(Ok(event)) => {
                 // What is read is no change.
-                if !matches!(event.kind, EventKind::Access(_)) {
-                    // A folder told modified is what came or went in it, which its entries' own events say: Windows
+                if event.kind != ChangeKind::Read {
+                    // A folder told changed is what came or went in it, which its entries' own events say: Windows
                     // tells it so for every file made or removed in it - by the holder's own edits too, which would
-                    // take the folder for another program's change. Renamed, it is told so (`Name`), and kept.
-                    let listing = matches!(event.kind, EventKind::Modify(kind) if !matches!(kind, ModifyKind::Name(_)));
+                    // take the folder for another program's change. Renamed, it is told so, and kept.
+                    let listing = event.kind == ChangeKind::Changed;
                     let listed = |path: &HostPath| listing && io.filesystem().is_folder(path);
                     // What the system says changed is in the form of the folder watched, which is a HostPath's.
                     let changed = event.paths.into_iter().filter_map(HostPath::from_plain);

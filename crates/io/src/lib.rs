@@ -1,20 +1,27 @@
 //! The host's I/O, given rather than reached for. What code reads of the outside world - the time, randomness, the
-//! environment - it reads through an [`Io`] it is given, never from the system directly, so that any part of it can be
-//! another: the system's ([`system`]), one a test drives ([`Standing`], [`Seeded`], [`Fixed`]), or any other, mixed
-//! ([`Composed`]).
+//! environment, files - and does in it - watching files, starting programs, talking to other processes - it does
+//! through an [`Io`] it is given, never with the system directly, so that any part of it can be another: the system's
+//! ([`system`]), one a test drives ([`Standing`], [`Seeded`], [`Fixed`], [`Telling`], [`Scripted`], [`InMemory`]),
+//! or any other, mixed ([`Composed`]).
 //!
 //! Each part is a trait shaped like the WASI interface for it - [`Clock`] like `wasi:clocks`, [`Random`] like
-//! `wasi:random`, [`Environment`] like `wasi:cli`'s, [`Filesystem`] and its [`Descriptor`]s like `wasi:filesystem` - its model and operations, not its types: names are this
-//! workspace's checked paths, calls are synchronous, errors are `std::io`'s. The traits are object-safe: owners hold an
+//! `wasi:random`, [`Environment`] like `wasi:cli`'s, [`Filesystem`] and its [`Descriptor`]s like `wasi:filesystem` -
+//! its model and operations, not its types: names are this workspace's checked paths, calls are synchronous, errors
+//! are `std::io`'s. What WASI has no interface for is the host's own: [`Watch`], [`Processes`], [`Channels`]. The traits are object-safe: owners hold an
 //! `Arc<dyn Io>`, and a call costs one virtual call.
 //!
 //! A place on disk is a [`HostPath`].
 
+mod channels;
 mod clock;
 mod environment;
 mod filesystem;
 mod host;
+mod processes;
 mod random;
+mod watch;
+
+pub use channels::{Channel, ChannelListener, ChannelName, Channels, InMemory, SystemChannels};
 
 pub use clock::{Clock, Receiver, Sender, Signal, Standing, SystemClock, Waiter, channel, sleep};
 pub use environment::{Environment, Fixed, SystemEnvironment};
@@ -24,7 +31,9 @@ pub use filesystem::{
     sync_all, sync_file, write_all_at, write_file_at,
 };
 pub use host::{HostPath, NotWithin};
+pub use processes::{Exit, Output, Process, Processes, Program, Scripted, Stream, SystemProcesses};
 pub use random::{Random, Seeded, SystemRandom};
+pub use watch::{Change, ChangeKind, Depth, SystemWatch, Tell, Telling, Watch, Watching};
 
 use std::sync::Arc;
 
@@ -38,6 +47,12 @@ pub trait Io: Send + Sync + std::fmt::Debug {
     fn environment(&self) -> &dyn Environment;
     /// Where files are.
     fn filesystem(&self) -> &dyn Filesystem;
+    /// What tells of files as they change.
+    fn watch(&self) -> &dyn Watch;
+    /// What starts programs.
+    fn processes(&self) -> &dyn Processes;
+    /// What connects the processes of the machine.
+    fn channels(&self) -> &dyn Channels;
 }
 
 /// The system's I/O, every part of it.
@@ -59,6 +74,18 @@ impl Io for System {
 
     fn filesystem(&self) -> &dyn Filesystem {
         &SystemFilesystem
+    }
+
+    fn watch(&self) -> &dyn Watch {
+        &SystemWatch
+    }
+
+    fn processes(&self) -> &dyn Processes {
+        &SystemProcesses
+    }
+
+    fn channels(&self) -> &dyn Channels {
+        &SystemChannels
     }
 }
 
@@ -93,6 +120,9 @@ pub struct Composed {
     pub random: Arc<dyn Random>,
     pub environment: Arc<dyn Environment>,
     pub filesystem: Arc<dyn Filesystem>,
+    pub watch: Arc<dyn Watch>,
+    pub processes: Arc<dyn Processes>,
+    pub channels: Arc<dyn Channels>,
 }
 
 impl std::fmt::Debug for Composed {
@@ -110,6 +140,9 @@ impl Composed {
             random: Arc::new(SystemRandom),
             environment: Arc::new(SystemEnvironment),
             filesystem: Arc::new(SystemFilesystem),
+            watch: Arc::new(SystemWatch),
+            processes: Arc::new(SystemProcesses),
+            channels: Arc::new(SystemChannels),
         }
     }
 }
@@ -129,5 +162,17 @@ impl Io for Composed {
 
     fn filesystem(&self) -> &dyn Filesystem {
         &*self.filesystem
+    }
+
+    fn watch(&self) -> &dyn Watch {
+        &*self.watch
+    }
+
+    fn processes(&self) -> &dyn Processes {
+        &*self.processes
+    }
+
+    fn channels(&self) -> &dyn Channels {
+        &*self.channels
     }
 }

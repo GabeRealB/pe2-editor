@@ -900,15 +900,13 @@ fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[Stri
     if let Some(pid) = mcp::presence::claimed_by(root) {
         anyhow::bail!("{root}: the editor in process {pid} has it open");
     }
-    let mut command = std::process::Command::new(editor_program().as_os_str());
     // What it says goes where this says what goes wrong: this says its process alone.
-    command
+    let command = pe2_io::Program::new(editor_program().as_os_str())
         .arg(root.as_os_str())
         .args(wait_for_agent.then_some("--wait-for-agent"))
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::io::stderr());
-    let mut child = command.spawn().context("the editor could not be started")?;
+        .streams(pe2_io::Stream::Null, pe2_io::Stream::Errors, pe2_io::Stream::Inherit);
+    let mut child = p.io.processes().spawn(&command).context("the editor could not be started")?;
     let pid = child.id();
     let started = clock.now();
     let mut said = String::new();
@@ -1909,11 +1907,11 @@ fn serve_project(
     if stop {
         // The server first, and waited for: what programs wrote a moment ago it gives the project as it ends, and
         // whoever holds the project is there to take it.
-        let server = project::server::stop(&p.root);
+        let server = project::server::stop(&p.root, &*p.io);
         if server && !project::server::ROLE.gone_within(&p.root, std::time::Duration::from_secs(60), p.io.clock()) {
             eprintln!("what serves {} has not stopped yet", p.root);
         }
-        let host = Connection::connect(&p.root).is_some_and(|mut host| host.ask(&ToHost::Stop).is_ok());
+        let host = Connection::connect(&p.root, &*p.io).is_some_and(|mut host| host.ask(&ToHost::Stop).is_ok());
         match (host, server) {
             (_, true) => println!("what serves {} stops", p.root),
             (true, false) => println!("the host holding {} stops; nothing served it", p.root),
@@ -1928,7 +1926,7 @@ fn serve_project(
         }
     }
     args.extend(server::Strays::args(strays));
-    let (mut host, started) = project::host::serving(&p.root, &host::this_program()?, &args, p.io.clock())?;
+    let (mut host, started) = project::host::serving(&p.root, &host::this_program()?, &args, &*p.io)?;
     if !started && (backend.is_some() || address.is_some()) {
         eprintln!("a host keeps it served already, as it is: --backend and --address are for one started");
     }

@@ -307,7 +307,7 @@ mod tests {
             "[[stack]]\nop = \"test.requested@slow\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"transient\"\n",
         );
         let project = Project::load(&root).unwrap();
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let index = crate::index::Index::open(&project, &cache).unwrap();
         let extension = Extension {

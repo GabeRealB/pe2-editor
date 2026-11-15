@@ -63,4 +63,6 @@ disallowed-methods = [
     { path = "std::path::Path::symlink_metadata", reason = "what is on disk is the Io's to say (pe2_io::Filesystem)" },
     { path = "std::path::Path::read_dir", reason = "what is on disk is the Io's to say (pe2_io::Filesystem)" },
     { path = "std::path::Path::read_link", reason = "what is on disk is the Io's to say (pe2_io::Filesystem)" },
+    # Programs are started through the Io's `Processes`, which starts none with a window of its own on Windows.
+    { path = "std::process::Command::new", reason = "programs are started by the Io (pe2_io::Processes)" },
 ]

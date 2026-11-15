@@ -968,7 +968,7 @@ mod tests {
             .unwrap();
         }
         let project = project::Project::load(&root).unwrap();
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
         let index = project::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
@@ -1161,7 +1161,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         project::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let p = super::Project::load(&dir).unwrap();
-        let lock = project::lock::Lock::try_acquire(&p.root, "a test").unwrap();
+        let lock = project::lock::Lock::try_acquire(&p.root, "a test", &pe2_io::System).unwrap();
         let cache = project::cache::Cache::open(&p, &lock).unwrap();
         let (mut history, _) = project::history::History::open(&cache).unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();

@@ -4449,7 +4449,7 @@ mod tests {
     fn open(root: &HostPath) -> (Project, Index) {
         let project = Project::load(root).unwrap();
         // Held while opening; released for the test's next opening.
-        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let mut index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         // As whoever holds a project does: what the opening read is said in the project's model, and the space
         // it is in left in order.

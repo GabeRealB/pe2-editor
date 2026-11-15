@@ -448,7 +448,7 @@ fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>, io
         if ui.link(label).on_hover_text(file.display().to_string()).clicked() {
             // Handed to a program as a file: one a project holds, through the filesystem it is served as.
             let opened = project::content::for_program(io, &file).map_err(|e| format!("{}: {e}", file.display()));
-            if let Err(e) = opened.and_then(|file| crate::external::open_default(&file)) {
+            if let Err(e) = opened.and_then(|file| crate::external::open_default(&**io, &file)) {
                 *message = Some(e);
             }
         }

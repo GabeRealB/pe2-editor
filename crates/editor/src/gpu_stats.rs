@@ -87,15 +87,11 @@ fn at_work(readings: impl Iterator<Item = Reading>) -> Option<Reading> {
 }
 
 fn nvidia_smi() -> Option<Reading> {
-    let mut command = std::process::Command::new("nvidia-smi");
-    command.args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    parse_nvidia_smi(&String::from_utf8(command.output().ok()?.stdout).ok()?)
+    let command = pe2_io::Program::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]);
+    // The system's, as what it measures is: a reading shown, which decides nothing.
+    let done = pe2_io::Processes::output(&pe2_io::SystemProcesses, &command).ok()?;
+    parse_nvidia_smi(&String::from_utf8(done.stdout).ok()?)
 }
 
 fn parse_nvidia_smi(text: &str) -> Option<Reading> {

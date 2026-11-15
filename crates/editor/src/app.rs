@@ -1327,7 +1327,7 @@ impl Editor {
                 }
                 anyhow::Context::with_context(io.filesystem().write(&to, &bytes), || to.to_string())?;
                 if reveal && let Some(folder) = to.parent() {
-                    let _ = crate::external::open_default(&folder);
+                    let _ = crate::external::open_default(&*io, &folder);
                 }
                 Ok(to.to_string())
             })();

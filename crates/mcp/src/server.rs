@@ -73,7 +73,7 @@ pub fn execute(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>, request: &R
     // the work is done here, under the lock.
     if project::host::ensure(root, &**io) {
         let asked = clock.now();
-        while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root) {
+        while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root, &**io) {
             if let Some(reply) = link::forward(root, io, request) {
                 return reply;
             }
@@ -138,7 +138,7 @@ pub fn ask_holder(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>, request:
         return None;
     }
     let asked = clock.now();
-    while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root) {
+    while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root, &**io) {
         if let Some(reply) = link::forward_patiently(root, io, request) {
             return Some(reply);
         }
@@ -169,7 +169,7 @@ fn greet(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>) {
         return;
     }
     let Some(why) = holder.differs() else { return };
-    if project::host::replace(root, io.clock()) {
+    if project::host::replace(root, &**io) {
         eprintln!("note: the host holding the project (process {}) was stopped: {why}", holder.pid);
     } else {
         eprintln!("note: the host holding the project (process {}) answers, though {why}: it is kept", holder.pid);

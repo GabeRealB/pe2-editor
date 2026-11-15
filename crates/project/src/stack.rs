@@ -226,7 +226,7 @@ mod tests {
                     \n# mine\n[[layer]]\nname = \"mod\"\n";
         std::fs::write(root.at("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
-        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
         let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let history = &mut history;

@@ -472,7 +472,7 @@ impl Server {
     /// editor or a host still opening: no host started beside it would hold the project either.
     fn ready(&self) -> std::result::Result<(), Refusal> {
         let root = &self.project.root;
-        if mcp::link::listens(root) {
+        if mcp::link::listens(root, &*self.project.io) {
             return Ok(());
         }
         match project::lock::holder(root) {
@@ -680,7 +680,7 @@ fn clear_strays(
 
 /// One process talking to the server: a lease once it keeps it, ended with the connection; its feeder once it lists
 /// what is served, until the connection ends.
-fn connection(server: &Arc<Server>, id: u64, stream: interprocess::local_socket::Stream) {
+fn connection(server: &Arc<Server>, id: u64, stream: Box<dyn pe2_io::Channel>) {
     let mut stream = BufReader::new(stream);
     let (mut leased, mut who) = (false, "another process".to_string());
     loop {

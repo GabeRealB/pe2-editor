@@ -37,7 +37,6 @@ codecs.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 similar.workspace = true
-interprocess.workspace = true
 pollster.workspace = true
 # Large files stored as chunks (`chunks.rs`): cut where the content says, kept by hash.
 fastcdc = "5"

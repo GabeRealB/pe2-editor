@@ -141,7 +141,7 @@ mod tests {
         std::fs::create_dir_all(root.join(&super::DIR)).unwrap();
         std::fs::write(root.at("project.toml"), "").unwrap();
         let project = crate::Project::load(&root).unwrap();
-        let lock = crate::lock::Lock::try_acquire(&root, "a test").unwrap();
+        let lock = crate::lock::Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let left = pe2_path::Name::constant("left.before");
         for name in [&super::SOCKET, &left] {
             std::fs::write(root.join(&super::DIR).join(name), "").unwrap();
