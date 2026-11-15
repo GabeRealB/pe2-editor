@@ -8,7 +8,7 @@ What a user or an extension author needs is in the manual, `docs/`.
 
 ## Contents
 
-- [Architecture](architecture.md): programs, processes, crates, the life of an edit and of a read, principles
+- [Architecture](architecture.md): programs, processes, crates, the life of an edit and of a read, I/O, paths, principles
 - [Building, testing and measuring](engineering.md)
 
 **The project**

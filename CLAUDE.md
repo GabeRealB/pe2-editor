@@ -19,7 +19,7 @@ whoever works on the other side keeps the two in step from there.
 ## Where things are written
 
 How the editor is built is written in `design/`, a developer guide: `design/index.md` is its contents, starting
-with `architecture.md` (programs, processes, crates, the life of an edit and of a read, principles) and
+with `architecture.md` (programs, processes, crates, the life of an edit and of a read, I/O, paths, principles) and
 `engineering.md` (building, testing, measuring), then a folder per area:
 
 | Folder | What it covers |
@@ -78,14 +78,22 @@ What holds whatever is being changed:
   names within a folder, `VfsPath` for a path within a scope, `Uid` and `ResourcePath` for what a reference names.
 - **A place on disk is storage's or a plain path.** Where the filesystem is implemented - `sfs`, `vfs`, the project's
   storage, the holder, and what compares places across processes (the lock, presence, trust) - a place is an
-  `sfs::HostPath` (absolute, links resolved, in the plain form, so two of one place are equal), joined only of checked
-  names (`HostPath::join`). What is no storage's - an argument, a file the user picks, the program's own folders, a
+  `pe2_io::HostPath` (re-exported by `sfs`; absolute, links resolved, in the plain form, so two of one place are
+  equal), joined only of checked names (`HostPath::join`), or of an entry by the name the system listed it by
+  (`HostPath::entry`). What is no storage's - an argument, a file the user picks, the program's own folders, a
   program to start, the temporary folder - is a `Path` or `PathBuf`; a storage function given one takes a `&Path` and
   makes its `HostPath` itself, and an opened project carries its own. `Path::join`, `PathBuf::push` and `canonicalize`
-  are refused by the build (`clippy.toml`) but in `sfs`'s `HostPath`, build scripts, `xtask`, `pe2-setup` and the
+  are refused by the build (`clippy.toml`) but in `pe2-io`'s `HostPath`, build scripts, `xtask`, `pe2-setup` and the
   crates at the edges (the CLI, the editor, the MCP server, `extensions`), each saying why. Text goes back to a path's
   form only where it leaves - a message, a file written, a program's argument (`HostPath::argument`: the path within
   with `/`, as a program's patterns are written).
+- **No host code reaches for I/O: it is given an `Io`** (`pe2_io`) and does it through that - the time and waits,
+  randomness, the environment, files, watching, programs, channels between processes, HTTP and sockets. An owner
+  carries the `Io` it was made with (a project's, the writes', a holder's), and only a program makes one, as it starts.
+  The build refuses the system's own calls (`clippy.toml`); where one is right - a measurement, the window's pace,
+  what the processes of a machine find each other by, the program's own files, what only the system's own calls
+  reach, a test's fixtures - it is allowed where it is made, saying why. A test that needs another clock, network or
+  program composes an `Io` of its own (`pe2_io::Composed`) rather than reaching past one.
 - **A path that fails its check is refused, never replaced or passed over.** A conversion says why it failed
   (`PathError`, `NotWithin`: elsewhere, or within by a name no path takes), and its caller decides on each answer:
   it refuses the operation, or says the problem (`Problem::Refused`), or - only where nothing is lost by it - goes

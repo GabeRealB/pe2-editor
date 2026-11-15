@@ -121,18 +121,28 @@ on Linux and on Windows. Three kinds of test matter most:
 The concurrency-heavy parts have harnesses of their own: the shared filesystem's tests kill writers and readers at
 every step of a transaction, and run a second process against the same space.
 
+A test decides correctness, never time. What waits, waits on its `Io`'s clock, which a test moves
+(`pe2_io::Standing`): the writes' settling and what an edit joins in a history are tested so, without sleeping. A test reaches no network - the scenarios' `Io` serves nothing, setup's tests serve what they give - and a
+program it would start, a file change it would hear of and a channel it would open can be another's
+(`pe2_io::Scripted`, `Telling`, `InMemory`). How long something takes is a benchmark's to say.
+
 ## Measuring
 
 Coarse work carries `tracing` spans (an extension instantiated, a job, a plan operation, the window's own work).
 `pe2-cli --profile` prints what a run spent its time on; the editor reports the same to agents; the `tracy` feature
 streams spans to Tracy.
 
-Benchmarks that need a real project or folder are ignored tests, run by hand with `--release -- --ignored`
-(`vfs/tests/bench.rs` and a few in the shared filesystem and the model).
+Benchmarks are ignored tests, run by hand with `--release -- --ignored`: the shared filesystem's ring, log, tree and
+model (`sfs`: `bench_ring`, `bench_append`, `bench_tree`, `bench_model`), the writes through the folder (`vfs`:
+`bench_writes`), and a served scope and a project's tree read directly (`vfs/tests/bench.rs`, the tree from the project
+`PE2_BENCH_PROJECT` names). A change on a path they cover - the `Io` and what it reaches above all - is measured before
+and after, against the commit before it, and a run that differs is run again, alternating, before it is taken for a
+change.
 
 ## Platforms
 
 Linux and Windows are built and tested; macOS builds are not. Platform-specific code is mostly in the filesystem
-backends, in how paths are handed to extensions (Windows drives become roots in an extension's filesystem), and in
-how processes are started (`pe2-io`'s `Processes`, which sets `CREATE_NO_WINDOW` on every one). `PE2_TEST_SCOPES` runs the filesystem tests through a chosen backend,
-and `PE2_LICENSES_FOR` checks another platform's dependencies against the license policy.
+backends, in `pe2-io`'s system parts (how a file is opened, mapped and locked, how a link is made, how a program is
+started: `Processes` sets `CREATE_NO_WINDOW` on every one), and in how paths are handed to extensions (Windows drives
+become roots in an extension's filesystem, `/D:`). `PE2_TEST_SCOPES` runs the filesystem tests through a chosen
+backend, and `PE2_LICENSES_FOR` checks another platform's dependencies against the license policy.

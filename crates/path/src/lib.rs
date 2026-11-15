@@ -10,7 +10,7 @@
 //! - [`VfsPath`]: a path within a scope of the project's filesystem, typed by the kind of scope ([`Tree`], [`Run`],
 //!   [`Given`]), so that one kind's path is not taken for another's.
 //!
-//! A place on disk is no path of these: the filesystem's implementations keep it (`sfs::HostPath`).
+//! A place on disk is no path of these: the filesystem's implementations keep it (`pe2_io::HostPath`).
 
 /// A type's serde as its text: written as `Display` writes it, read through its `FromStr`, which checks it.
 #[macro_export]

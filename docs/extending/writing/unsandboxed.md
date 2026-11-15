@@ -11,6 +11,21 @@ in the extension's folder that runs, so if its component or a program it ships c
 Its manifest, docs, licenses and tests do not count. Nothing runs from the user's own extensions folder or from
 beside the editor, only from a project.
 
+## What it sees
+
+An unsandboxed extension reads and writes the disk with Rust's own `std::fs`, as a program does:
+
+- **Files.** The whole disk, at `/` on Linux and macOS; on Windows each drive is a root of its own, `/C:`, `/D:`. A
+  place the editor gives it (`HostPath`) is opened by `guest()`, written in this form. A path with `..` never reaches
+  above the root it starts from, and links are followed as the system follows them.
+- **The network.** Sockets to where the editor itself may reach. Where the editor runs without a network - its own
+  tests - none is reached, and a download is refused.
+- **Time, randomness and the environment.** The editor's: the time of day, random numbers, and the environment the
+  editor was started with.
+
+What it writes with `std::fs` is the user's disk, not the project: a project's files are changed through the
+editor's calls, never by writing into its folders.
+
 ## Programs
 
 `pe2_ext::process::spawn(tool, args)` starts a program and returns a `Process` to write to, read from and wait for.
