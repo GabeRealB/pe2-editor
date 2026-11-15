@@ -24,7 +24,11 @@ fn turning_an_extension_off_leaves_the_project_showing() {
     // Each frame has a workspace, or `workspace` says so, and none of them stops to open it.
     while editor.status("pe2.images") != Status::Disabled {
         editor.frame();
-        assert_eq!(editor.workspace().selected.as_deref(), Some("rig/skeleton"), "what was showing still is");
+        assert_eq!(
+            editor.workspace().selected.as_ref().map(project::TreePath::as_str),
+            Some("rig/skeleton"),
+            "what was showing still is"
+        );
         assert!(!editor.is_opening(), "the project is not opened again");
     }
     editor.settle();
@@ -55,7 +59,7 @@ fn a_project_toml_that_cannot_be_read_leaves_the_project_as_it_was() {
     std::fs::write(&file, "[[layer\n").expect("written");
     editor.take_in_outside_changes();
     editor.until("it to say so", |editor| editor.says("the project could not be read again"));
-    assert_eq!(editor.workspace().selected.as_deref(), Some("rig/skeleton"));
+    assert_eq!(editor.workspace().selected.as_ref().map(project::TreePath::as_str), Some("rig/skeleton"));
     std::fs::write(&file, good).expect("written");
     editor.take_in_outside_changes();
     editor.until("it to read it", |editor| editor.says("the project was read again"));
@@ -94,7 +98,7 @@ fn another_project_opens_without_waiting_for_the_one_left() {
     editor.frame();
     assert!(editor.is_opening());
     editor.release_reading().expect("let go");
-    assert!(editor.workspace().exists("notes"), "it opened");
+    assert!(editor.workspace().exists(&super::path("notes")), "it opened");
 }
 
 #[test]

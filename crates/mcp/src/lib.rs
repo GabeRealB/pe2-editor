@@ -177,11 +177,11 @@ impl Request {
 /// What the editor shows, where the editor answers: its selection, and an asset an agent asked it to show.
 #[derive(Default)]
 pub struct EditorState {
-    pub selection: Option<String>,
+    pub selection: Option<project::TreePath>,
     /// The look the selection is shown in, by name.
     pub variant: Option<String>,
     /// Set by a request: the asset to show.
-    pub show: Option<String>,
+    pub show: Option<project::TreePath>,
     /// What the editor is costing now.
     pub performance: serde_json::Value,
 }

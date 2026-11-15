@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// A picture asked for: the asset, the look, and the project to draw it from.
 struct Request {
-    path: String,
+    path: project::TreePath,
     look: usize,
     index: Arc<Index>,
     /// Which asking it answers: a picture forgotten meanwhile is asked again, and the older answer dropped.
@@ -39,10 +39,10 @@ enum Slot {
 }
 
 /// A picture as a thread answers: its asset and look, the asking it answers, and what was made.
-type Answer = (String, usize, u64, Made);
+type Answer = (project::TreePath, usize, u64, Made);
 
 pub struct Pictures {
-    slots: HashMap<(String, usize), Slot>,
+    slots: HashMap<(project::TreePath, usize), Slot>,
     requests: Option<Sender<Request>>,
     results: Receiver<Answer>,
     index: Arc<Index>,
@@ -105,7 +105,7 @@ impl Pictures {
     }
 
     /// An asset's picture in a look: drawn; or, while it is being drawn (asked now if it was not), none.
-    pub fn get(&mut self, path: &str, look: usize) -> Option<Drawn> {
+    pub fn get(&mut self, path: &project::TreePath, look: usize) -> Option<Drawn> {
         for (path, look, asked, made) in self.results.try_iter() {
             if let Some(slot) = self.slots.get_mut(&(path, look))
                 && matches!(slot, Slot::Drawing(a) if *a == asked)
@@ -113,7 +113,7 @@ impl Pictures {
                 *slot = Slot::Drawn(made);
             }
         }
-        let key = (path.to_string(), look);
+        let key = (path.clone(), look);
         match self.slots.get(&key) {
             Some(Slot::Drawn(made)) => return Some(made.picture.clone()),
             Some(Slot::Drawing(_)) => return None,
@@ -123,7 +123,7 @@ impl Pictures {
             return Some(Err("it has no picture".into()));
         }
         self.asked += 1;
-        let request = Request { path: path.to_string(), look, index: self.index.clone(), asked: self.asked };
+        let request = Request { path: path.clone(), look, index: self.index.clone(), asked: self.asked };
         if self.requests.as_ref().is_some_and(|r| r.send(request).is_ok()) {
             self.slots.insert(key, Slot::Drawing(self.asked));
         }
@@ -131,8 +131,8 @@ impl Pictures {
     }
 
     /// What is marked on a picture drawn.
-    pub fn marks(&self, path: &str, look: usize) -> Option<Arc<Marks>> {
-        match self.slots.get(&(path.to_string(), look)) {
+    pub fn marks(&self, path: &project::TreePath, look: usize) -> Option<Arc<Marks>> {
+        match self.slots.get(&(path.clone(), look)) {
             Some(Slot::Drawn(made)) => made.marks.clone(),
             _ => None,
         }

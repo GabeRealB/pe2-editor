@@ -5,6 +5,7 @@
 //! palette's colors; the bundle's files and the originals' sha1s close it.
 
 use eframe::egui::{self, Color32, RichText};
+use pe2_path::RelPath;
 use project::ext::Extensions;
 use project::index::{Asset, Index};
 
@@ -60,8 +61,8 @@ impl Sheet<'_> {
 pub fn inspector_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
-    subject: Option<&str>,
-    nav: &mut Option<String>,
+    subject: Option<&project::TreePath>,
+    nav: &mut Option<crate::workspace::Nav>,
     tools: &Tools,
     message: &mut Option<String>,
     edit: &mut Option<EditRequest>,
@@ -81,7 +82,7 @@ pub fn inspector_ui(
     let target = edit_target(ws, &asset);
     // A tab of its own for each, the room going to the one read. Something selected inside shows on its tab.
     let id = ui.scope_id().with("inspector tab");
-    let (mut tab, seen): (Tab, Option<(String, String)>) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let (mut tab, seen): (Tab, Option<(project::TreePath, String)>) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     if ws.inner != seen && ws.inner_of(&asset.path).is_some() {
         // Something in the stack shows there, and a part where it is, a tab of its own staying if one is up.
         tab = if ws.part_of(&asset.path).is_none() {
@@ -226,7 +227,7 @@ fn part_ui(
     ws: &mut Workspace,
     asset: &Arc<Asset>,
     target: &Result<String, String>,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     let Some(id) = ws.part_of(&asset.path).map(str::to_string) else { return };
@@ -285,7 +286,7 @@ fn properties_ui(
     ws: &mut Workspace,
     asset: &Asset,
     target: &Result<String, String>,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     {
@@ -340,7 +341,7 @@ pub(crate) fn edit_target(ws: &Workspace, asset: &Asset) -> Result<String, Strin
 
 /// The asset's declaration (`node.toml`) as text, to edit and save whole: refused while it is not TOML.
 fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut Option<EditRequest>) {
-    let Some(uid) = asset.uid.clone() else { return };
+    let Some(uid) = asset.uid else { return };
     if ws.declaration_draft.as_ref().is_some_and(|(a, _)| *a != asset.path) {
         ws.declaration_draft = None;
     }
@@ -360,10 +361,10 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
             ui.horizontal_wrapped(|ui| {
                 let save = ui.add_enabled(editable && changed && parsed.is_ok(), egui::Button::new("Save"));
                 if save.clicked() {
-                    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+                    let name = asset.path.name().unwrap_or_default();
                     *edit = Some(EditRequest::Write {
-                        uid: uid.clone(),
-                        file: project::index::NODE_FILE.to_string(),
+                        uid,
+                        file: RelPath::from(project::index::NODE_FILE),
                         bytes: draft.clone().into_bytes(),
                         label: format!("Edit {name}'s declaration"),
                         merge: None,
@@ -390,10 +391,10 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
 fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool) {
     if compact {
         let (icon, tint) = icons::for_type(&ws.extensions, ws.extensions.type_name(asset));
-        let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+        let name = asset.path.name().unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label(RichText::new(icon).color(tint));
-            ui.add(egui::Label::new(RichText::new(name).strong()).truncate()).on_hover_text(&asset.path);
+            ui.add(egui::Label::new(RichText::new(name).strong()).truncate()).on_hover_text(asset.path.as_str());
         });
         return;
     }
@@ -411,16 +412,16 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
             ui.label(RichText::new(icon).size(28.0).color(tint));
         }
         ui.vertical(|ui| {
-            let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+            let name = asset.path.name().unwrap_or_default();
             ui.label(RichText::new(name).heading().strong());
-            ui.label(RichText::new(&asset.path).small().color(theme::weak()));
+            ui.label(RichText::new(asset.path.as_str()).small().color(theme::weak()));
             ui.horizontal(|ui| {
                 badge(ui, ws.extensions.type_label(asset).unwrap_or("no type"));
                 if let Some(uid) = &asset.uid {
-                    ui.label(RichText::new(uid).monospace().small().color(theme::weak()));
+                    ui.label(RichText::new(uid.to_string()).monospace().small().color(theme::weak()));
                     let copy = ui.add(egui::Button::new(RichText::new("Copy").small()).frame(false));
                     if copy.on_hover_text("Copy the uid").clicked() {
-                        ui.ctx().copy_text(uid.clone());
+                        ui.ctx().copy_text(uid.to_string());
                     }
                 }
             });
@@ -486,7 +487,7 @@ fn property_sheet(
     target: &Result<String, String>,
     asset: &Asset,
     fields: &[(&String, &toml::Value)],
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     let editable = target.is_ok();
@@ -515,7 +516,7 @@ fn property_sheet(
         }
         if let Some(axes) = three_numbers(value).filter(|_| editable) {
             let id = ui.scope_id().with(("axes", &asset.path, sheet.path(key)));
-            let shown = (asset.path.as_str(), key.as_str());
+            let shown = (&asset.path, key.as_str());
             if let Some(new) = axes_editor(ui, id, shown, value, axes) {
                 *edit = set_field(asset, &sheet.within, key, inline(&new), &sheet.label(key));
             }
@@ -606,7 +607,12 @@ pub fn reference_filling(
         Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
     };
     let Some(Dragged::Asset(path)) = dnd::target(ui, rect.expand(4.0), verdict) else { return None };
-    sheet.index.assets.get(&path)?.uid.clone().map(toml::Value::String)
+    sheet.index.assets.get(&path)?.uid.map(|uid| toml::Value::String(uid.to_string()))
+}
+
+/// The uid an edit of an asset is made by; where it has none, the edit is refused, saying why.
+fn uid_to_edit(asset: &Asset) -> Result<pe2_path::Uid, EditRequest> {
+    asset.uid.ok_or_else(|| EditRequest::Refused(format!("{} has no uid to be edited by", asset.path)))
 }
 
 /// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
@@ -615,7 +621,7 @@ fn nested_sheet(
     sheet: &Sheet,
     key: &str,
     fields: &[(&String, &toml::Value)],
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
 ) {
     // Its own id, under the cell it is in: see `property_sheet`.
     egui::Grid::new(ui.scope_id().with(("nested sheet", key)))
@@ -713,7 +719,7 @@ fn field_editor(
 /// The edit setting a field of an asset's declaration - its own, or one of a table of it (`import`) - its layout kept;
 /// none where it changes nothing. Edits of the same field in a row merge into one step.
 fn set_field(asset: &Asset, within: &[String], key: &str, new: toml_edit::Value, label: &str) -> Option<EditRequest> {
-    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    let name = asset.path.name().unwrap_or_default();
     let label = format!("Set {} of {name}", label.to_lowercase());
     change_field(asset, within, key, Some(toml_edit::Item::Value(new)), label)
 }
@@ -745,9 +751,13 @@ fn change_field(
         return None;
     }
     let place = within.join(".");
+    let uid = match uid_to_edit(asset) {
+        Ok(uid) => uid,
+        Err(refused) => return Some(refused),
+    };
     Some(EditRequest::Write {
-        uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::NODE_FILE.to_string(),
+        uid,
+        file: RelPath::from(project::index::NODE_FILE),
         bytes: document.to_string().into_bytes(),
         label,
         merge: Some(format!("{}#{place}.{key}", asset.path)),
@@ -788,24 +798,28 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
         if file == project::index::NODE_FILE {
             return Err(format!("It would write {file} whole, which only its settings change"));
         }
+        // What an extension names as text: checked here, and refused with why where it is no file's name.
+        let file = RelPath::new(file).map_err(|why| format!("{file}: {why}"))?;
         let unchanged = asset
             .files
             .iter()
-            .find(|f| f.name == *file)
+            .find(|f| f.name == file)
             .and_then(|f| project::content::read(&f.path).ok())
             .is_some_and(|now| now == *bytes);
+        let uid = uid_to_edit(asset).map_err(|_| format!("{} has no uid to be edited by", asset.path))?;
         return Ok((!unchanged).then(|| EditRequest::Write {
-            uid: asset.uid.clone().unwrap_or_default(),
-            file: file.clone(),
+            uid,
+            file,
             bytes: bytes.clone(),
             label: outcome.label.clone(),
             merge: None,
         }));
     }
     let text = with_sets(asset.text(), &outcome.sets)?;
+    let uid = uid_to_edit(asset).map_err(|_| format!("{} has no uid to be edited by", asset.path))?;
     Ok((text != asset.text()).then(|| EditRequest::Write {
-        uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::NODE_FILE.to_string(),
+        uid,
+        file: RelPath::from(project::index::NODE_FILE),
         bytes: text.into_bytes(),
         label: outcome.label.clone(),
         merge: None,
@@ -822,7 +836,7 @@ pub fn reference_in(value: &toml::Value) -> Option<&toml::Value> {
 
 /// A reference written as this one is, naming another asset: of an output it keeps naming that output.
 fn retargeted(value: &toml::Value, asset: &Asset) -> Option<toml::Value> {
-    retarget_to(value, asset.uid.as_deref()?, &asset.path)
+    retarget_to(value, &asset.uid?.to_string(), asset.path.as_str())
 }
 
 fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value> {
@@ -843,8 +857,8 @@ fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value
 }
 
 /// What a reference field says of an asset dropped on it: it takes the type it names now.
-fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &str) -> Result<(), String> {
-    if path == holder.path {
+fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &project::TreePath) -> Result<(), String> {
+    if *path == holder.path {
         return Err("It would name itself".to_string());
     }
     let held = reference_in(value).and_then(project::index::reference);
@@ -951,10 +965,14 @@ pub fn set_fields(asset: &Asset, sets: &crate::ext_ui::Sets) -> Option<EditReque
     }
     let mut keys: Vec<&str> = sets.values.iter().map(|(k, _)| k.as_str()).collect();
     keys.dedup();
-    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    let name = asset.path.name().unwrap_or_default();
+    let uid = match uid_to_edit(asset) {
+        Ok(uid) => uid,
+        Err(refused) => return Some(refused),
+    };
     Some(EditRequest::Write {
-        uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::NODE_FILE.to_string(),
+        uid,
+        file: RelPath::from(project::index::NODE_FILE),
         bytes: document.to_string().into_bytes(),
         label: format!("Edit {} of {name}", keys.join(", ")),
         merge: (!sets.apart).then(|| format!("{}#{}", asset.path, keys.join(","))),
@@ -989,7 +1007,7 @@ fn choice_ui(
     let new = chosen.map(|choice| inline(&choice));
     let label = field.label.as_deref().unwrap_or(key);
     if remove {
-        let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+        let name = asset.path.name().unwrap_or_default();
         *edit = change_field(asset, &sheet.within, key, None, format!("Reset {} of {name}", label.to_lowercase()));
     } else if let Some(request) = new.and_then(|new| set_field(asset, &sheet.within, key, new, label)) {
         *edit = Some(request);
@@ -1043,7 +1061,7 @@ fn pressed_away(ui: &egui::Ui, field: &egui::Response) -> bool {
 fn axes_editor(
     ui: &mut egui::Ui,
     id: egui::Id,
-    (asset, key): (&str, &str),
+    (asset, key): (&project::TreePath, &str),
     value: &toml::Value,
     axes: [f64; 3],
 ) -> Option<toml::Value> {
@@ -1065,12 +1083,8 @@ fn axes_editor(
     if active {
         let frame = ui.ctx().cumulative_frame_nr();
         let differs = held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9);
-        let moved = differs.then(|| Edited {
-            asset: asset.to_string(),
-            key: key.to_string(),
-            value: vector(&held, whole),
-            frame,
-        });
+        let moved =
+            differs.then(|| Edited { asset: asset.clone(), key: key.to_string(), value: vector(&held, whole), frame });
         ui.data_mut(|data| {
             data.insert_temp(id, held);
             data.insert_temp(editing_id(), moved);
@@ -1098,7 +1112,7 @@ fn vector(held: &[f64; 3], whole: bool) -> toml::Value {
 /// A vector being dragged or typed in the sheet: the inspector draws after the views, so they read last frame's.
 #[derive(Clone)]
 struct Edited {
-    asset: String,
+    asset: project::TreePath,
     key: String,
     value: toml::Value,
     frame: u64,
@@ -1109,14 +1123,20 @@ fn editing_id() -> egui::Id {
 }
 
 /// What is being edited of an asset in the sheet: what ended, or went with its pane, stops showing the frame after.
-pub fn being_edited(ctx: &egui::Context, asset: &str) -> Option<(String, toml::Value)> {
+pub fn being_edited(ctx: &egui::Context, asset: &project::TreePath) -> Option<(String, toml::Value)> {
     let edited: Edited = ctx.data(|data| data.get_temp::<Option<Edited>>(editing_id())).flatten()?;
-    (edited.asset == asset && ctx.cumulative_frame_nr().saturating_sub(edited.frame) <= 1)
+    (edited.asset == *asset && ctx.cumulative_frame_nr().saturating_sub(edited.frame) <= 1)
         .then_some((edited.key, edited.value))
 }
 
 /// A value by its field's meaning: a depth, a size, an offset, a rectangle, a placement, a reference, a list.
-pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value, nav: &mut Option<String>) {
+pub fn value_ui(
+    ui: &mut egui::Ui,
+    sheet: &Sheet,
+    key: &str,
+    value: &toml::Value,
+    nav: &mut Option<crate::workspace::Nav>,
+) {
     if let Some(axes) = three_numbers(value) {
         axes_ui(ui, axes);
         return;
@@ -1208,13 +1228,13 @@ fn is_reference(value: &toml::Value) -> bool {
 }
 
 /// A reference as a chip: its asset's icon and short name, opening it on a click; red where it names nothing.
-pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav: &mut Option<String>) {
+pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav: &mut Option<crate::workspace::Nav>) {
     let (uid, path) = project::index::reference(value).unwrap_or_default();
     let target = path.clone().unwrap_or_else(|| uid.clone());
     match sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) {
         Some(asset) => {
             let (icon, tint) = icons::for_type(sheet.extensions, sheet.extensions.type_name(asset));
-            let mut parts = asset.path.rsplit('/');
+            let mut parts = asset.path.parts().rev();
             let name = parts.next().unwrap_or_default();
             let short = match parts.next() {
                 Some(parent) => format!("{parent}/{name}"),
@@ -1227,9 +1247,9 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
             };
             // Whole on hover, its output with it: the chip may be cut short.
             let whole = pe2_ext::output_of(value)
-                .map_or_else(|| asset.path.clone(), |output| format!("{}#{output}", asset.path));
+                .map_or_else(|| asset.path.to_string(), |output| format!("{}#{output}", asset.path));
             if chip(ui, icon, &short, tint).on_hover_text(whole).clicked() {
-                *nav = Some(asset.path.clone());
+                *nav = Some(crate::workspace::Nav::to(asset.path.clone()));
             }
         }
         None => {
@@ -1302,7 +1322,7 @@ fn collection_ui(
     parts: &mut crate::workspace::Parts,
     key: &str,
     items: &[toml::Value],
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
 ) {
     for (i, item) in items.iter().enumerate() {
         let title = title_of(item, i);
@@ -1340,7 +1360,7 @@ fn row_ui(
     parts: &mut crate::workspace::Parts,
     title: &str,
     item: &toml::Value,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(title).strong());
@@ -1381,7 +1401,13 @@ fn part_picture(ui: &mut egui::Ui, sheet: &Sheet, parts: &mut crate::workspace::
 }
 
 /// A field within a row: a reference as a chip, a flag as a badge, anything else its label and its reading.
-pub fn field_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value, nav: &mut Option<String>) {
+pub fn field_ui(
+    ui: &mut egui::Ui,
+    sheet: &Sheet,
+    key: &str,
+    value: &toml::Value,
+    nav: &mut Option<crate::workspace::Nav>,
+) {
     if is_reference(value) {
         reference_chip(ui, sheet, value, nav);
         return;
@@ -1410,7 +1436,7 @@ fn count(n: usize, plural: &str) -> String {
 /// Where an asset has unsaved changes: Save and Revert; and where its files changed on disk meanwhile, which to keep -
 /// the user's working copy, or the disk's.
 fn document_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, message: &mut Option<String>) {
-    let Some(uid) = asset.uid.clone() else { return };
+    let Some(uid) = asset.uid else { return };
     let warn = ui.visuals().warn_fg_color;
     // A point of the history shown: nothing is edited, saved or reverted until now is shown again.
     if ws.viewing.as_ref().is_some_and(|v| !v.now) {
@@ -1427,7 +1453,7 @@ fn document_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, message: &m
         ui.add_space(4.0);
         return;
     }
-    let Some(stale) = ws.history.document(&uid).map(|d| d.stale.is_some()) else { return };
+    let Some(stale) = ws.history.document(uid).map(|d| d.stale.is_some()) else { return };
     let mut asked = None;
     egui::Frame::new()
         .stroke(egui::Stroke::new(1.0, warn.gamma_multiply(0.6)))
@@ -1465,8 +1491,8 @@ fn document_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, message: &m
         });
     ui.add_space(4.0);
     match asked {
-        Some("keep") => ws.keep_mine(&uid),
-        Some("revert") => *message = Some(ws.revert(&uid)),
+        Some("keep") => ws.keep_mine(uid),
+        Some("revert") => *message = Some(ws.revert(uid)),
         Some(_) => {
             let said = |editor: &mut crate::app::Editor, saved: anyhow::Result<Vec<String>>| {
                 editor.say(saved.map_or_else(|e| format!("{e:#}"), |saved| saved.join(", ")));
@@ -1503,7 +1529,7 @@ fn stack_ui(
     ws: &mut Workspace,
     asset: &Asset,
     target: &Result<String, String>,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     let Some(layers) = asset.fields_toml().get("stack").and_then(toml::Value::as_array) else { return };
@@ -1637,7 +1663,7 @@ fn layer_target(ui: &egui::Ui, asset: &Asset, row: egui::Rect, at: usize, edit: 
         _ => Err("Only a layer of this stack goes here".to_string()),
     };
     if let Some(Dragged::Layer(_, from)) = dnd::target(ui, row, verdict) {
-        let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+        let name = asset.path.name().unwrap_or_default();
         *edit = layers_edit(
             asset,
             format!("Move a layer of {name}"),
@@ -1650,7 +1676,11 @@ fn layer_target(ui: &egui::Ui, asset: &Asset, row: egui::Rect, at: usize, edit: 
 /// offers what fits between the types made above and below it (`above`). Returns the cell.
 fn layer_cell(
     ui: &mut egui::Ui,
-    (extensions, index, inner): (&project::ext::Extensions, &project::index::Index, &mut Option<(String, String)>),
+    (extensions, index, inner): (
+        &project::ext::Extensions,
+        &project::index::Index,
+        &mut Option<(project::TreePath, String)>,
+    ),
     (asset, at, count): (&Asset, usize, usize),
     (selected, above): (Option<usize>, &[Option<pe2_ext::Type>]),
     editable: bool,
@@ -1691,7 +1721,7 @@ fn selected_ui(
     ws: &mut Workspace,
     asset: &Asset,
     target: &Result<String, String>,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     let Some(inner) = ws.inner_of(&asset.path).map(str::to_string) else { return };
@@ -1790,7 +1820,7 @@ fn layer_settings(
         graph::FILE => {
             let mut file = Field::new("file").label("File");
             let stored = asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
-            file.choices = stored.map(|f| (f.name.as_str().into(), f.name.clone())).collect();
+            file.choices = stored.map(|f| (f.name.as_str().into(), f.name.to_string())).collect();
             (vec![file], vec![set("file", "")])
         }
         graph::BELOW => (
@@ -1859,13 +1889,11 @@ pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<Str
         Ok(text) => text.into_bytes(),
         Err(why) => return Some(EditRequest::Refused(format!("{label}: {why:#}"))),
     };
-    Some(EditRequest::Write {
-        uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::NODE_FILE.to_string(),
-        bytes,
-        label,
-        merge: None,
-    })
+    let uid = match uid_to_edit(asset) {
+        Ok(uid) => uid,
+        Err(refused) => return Some(refused),
+    };
+    Some(EditRequest::Write { uid, file: RelPath::from(project::index::NODE_FILE), bytes, label, merge: None })
 }
 
 /// A layer's menu: moving it, removing it, and adding one over or under it.
@@ -1878,7 +1906,7 @@ fn layer_menu(
 ) {
     use project::graph::layers;
     let (asset, at) = (place.asset, place.at);
-    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    let name = asset.path.name().unwrap_or_default();
     ui.menu_button(icons::DOTS_THREE, |ui| {
         if ui.add_enabled(at > 0, egui::Button::new(format!("{}  Move up", icons::ARROW_UP))).clicked() {
             *edit = layers_edit(asset, format!("Move a layer of {name} up"), layers::shift(asset.text(), at, at - 1));
@@ -1914,7 +1942,7 @@ fn add_items(
     edit: &mut Option<EditRequest>,
 ) {
     use project::graph::{self, layers};
-    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    let name = asset.path.name().unwrap_or_default();
     let mut add = |ui: &mut egui::Ui, label: &str, says: &str, layer: toml::Table| {
         if ui.button(label).on_hover_text(says).clicked() {
             *edit = layers_edit(asset, format!("Add {label} to {name}"), layers::add(asset.text(), at, layer));
@@ -1955,7 +1983,7 @@ fn add_items(
         );
     } else {
         for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE) {
-            add(ui, &file.name, "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
+            add(ui, file.name.as_str(), "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
         }
         let version = asset.uid.as_ref().and_then(|uid| index.version(&format!("{}{uid}", project::index::BELOW)));
         if let Some(version) = version {
@@ -2066,14 +2094,20 @@ fn importer_row(
 // --- files ------------------------------------------------------------------------------------------------------------
 
 /// A plain file or a folder of the resolved project: where it comes from and where it is on disk.
-fn entry_ui(ui: &mut egui::Ui, path: &str, entry: &project::index::Entry, tools: &Tools, message: &mut Option<String>) {
-    let name = path.rsplit('/').next().unwrap_or(path);
+fn entry_ui(
+    ui: &mut egui::Ui,
+    path: &project::TreePath,
+    entry: &project::index::Entry,
+    tools: &Tools,
+    message: &mut Option<String>,
+) {
+    let name = path.name().unwrap_or_default();
     let (icon, kind) = match entry.kind {
         project::index::Kind::File => (icons::FILE, "file"),
         _ => (icons::FOLDER, "folder"),
     };
     ui.label(RichText::new(format!("{icon}  {name}")).heading());
-    ui.label(RichText::new(path).small().color(theme::weak()));
+    ui.label(RichText::new(path.as_str()).small().color(theme::weak()));
     theme::section(ui, "Entry", |ui| {
         egui::Grid::new("entry").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
             let mut row = |label: &str, value: String| {
@@ -2082,7 +2116,7 @@ fn entry_ui(ui: &mut egui::Ui, path: &str, entry: &project::index::Entry, tools:
                 ui.end_row();
             };
             row("Kind", kind.to_string());
-            row("Uid", entry.uid.clone());
+            row("Uid", entry.uid.to_string());
             row("Made by", entry.home.clone());
             if !entry.overrides.is_empty() {
                 row("Overridden in", entry.overrides.join(", "));
@@ -2097,7 +2131,7 @@ fn entry_ui(ui: &mut egui::Ui, path: &str, entry: &project::index::Entry, tools:
         });
         if entry.kind == project::index::Kind::File && ui.button(format!("{}  Open", icons::ARROW_SQUARE_OUT)).clicked()
         {
-            *message = Some(external::open(&entry.disk, path, tools).unwrap_or_else(|e| e));
+            *message = Some(external::open(&entry.disk, path.as_str(), tools).unwrap_or_else(|e| e));
         }
     });
 }
@@ -2113,7 +2147,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 let tool = Category::of(&f.path);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icons::FILE).color(theme::weak()));
-                    ui.label(&f.name);
+                    ui.label(f.name.as_str());
                 });
                 ui.label(RichText::new(size_text(f.size)).small().color(theme::weak()));
                 match &f.made_by {
@@ -2139,7 +2173,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 };
                 let open = ui.add(egui::Button::new(RichText::new(icons::ARROW_SQUARE_OUT)).frame(false));
                 if open.on_hover_text(hint).clicked() {
-                    *message = Some(external::open(&f.path, &asset.path, tools).unwrap_or_else(|e| e));
+                    *message = Some(external::open(&f.path, asset.path.as_str(), tools).unwrap_or_else(|e| e));
                 }
                 ui.end_row();
             }

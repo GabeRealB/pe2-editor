@@ -65,10 +65,10 @@ fn undo_takes_back_the_document_in_use_and_no_other() {
     let fixture = Fixture::rig().node("rig/notes", "[[stack]]\nop = \"settings\"\nnote = \"one\"\n");
     let mut editor = Scenario::open(fixture);
     move_pelvis(&mut editor, "-900");
-    let uid = editor.workspace().index.assets["rig/notes"].uid.clone().expect("a uid");
+    let uid = editor.workspace().index.assets[&super::path("rig/notes")].uid.expect("a uid");
     let request = EditRequest::Write {
         uid,
-        file: "node.toml".into(),
+        file: pe2_path::RelPath::from(project::index::NODE_FILE),
         bytes: b"[[stack]]\nop = \"settings\"\nnote = \"two\"\n".to_vec(),
         label: "Edit notes".into(),
         merge: None,
@@ -100,11 +100,11 @@ fn back_and_forward_go_through_the_documents_visited() {
     let mut editor = Scenario::open(fixture);
     editor.show("rig/skeleton");
     editor.show("rig/notes");
-    assert_eq!(editor.editor().document_in_use().as_deref(), Some("rig/notes"));
+    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/notes"));
     editor.alt(egui::Key::ArrowLeft);
-    assert_eq!(editor.editor().document_in_use().as_deref(), Some("rig/skeleton"));
+    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/skeleton"));
     editor.alt(egui::Key::ArrowRight);
-    assert_eq!(editor.editor().document_in_use().as_deref(), Some("rig/notes"));
+    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/notes"));
 }
 
 #[test]
@@ -123,10 +123,10 @@ fn a_point_of_the_history_is_shown_read_only_and_restored() {
     editor.click_topmost("Set translation of skeleton");
     editor.expect("Restore here");
     assert_eq!(pelvis(&editor.working("rig/skeleton")), [0, -900, 0]);
-    let uid = editor.workspace().index.assets["rig/skeleton"].uid.clone().expect("a uid");
+    let uid = editor.workspace().index.assets[&super::path("rig/skeleton")].uid.expect("a uid");
     let refused = editor.workspace().edit_now(&EditRequest::Write {
         uid,
-        file: "node.toml".into(),
+        file: pe2_path::RelPath::from(project::index::NODE_FILE),
         bytes: b"x = 1".to_vec(),
         label: "Edit".into(),
         merge: None,

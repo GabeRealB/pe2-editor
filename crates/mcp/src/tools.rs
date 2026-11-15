@@ -310,7 +310,7 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
         "project" => Ok(project(view)),
         "find_assets" => parse(arguments).map(|a| find_assets(view.index, view.extensions, &a)),
         "list_folder" => {
-            parse(arguments).map(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref()))
+            parse(arguments).and_then(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref()))
         }
         "get_asset" => parse(arguments).and_then(|a: AssetArgs| get_asset(view.index, view.extensions, &a.asset)),
         "references" => parse(arguments).and_then(|a: AssetArgs| references(view.index, &a.asset)),
@@ -363,18 +363,23 @@ pub fn read(view: &View, uri: &str) -> Result<ReadResourceResult, String> {
 /// An asset by its path (`res://` and `.node` allowed) or its uid.
 fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
     let name = name.trim();
-    if let Some(path) = index.by_uid.get(name) {
+    if name.starts_with("uid://") {
+        let uid = pe2_path::Uid::new(name).map_err(|e| format!("{name}: {e}"))?;
+        let path = index.by_uid.get(&uid).ok_or_else(|| format!("{name}: no asset has this uid"))?;
         return index.assets.get(path).map(|a| &**a).ok_or_else(|| format!("{name}: no asset"));
     }
-    let path = name.trim_start_matches("res://").trim_end_matches('/');
-    let path = path.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(path);
-    index.assets.get(path).map(|a| &**a).ok_or_else(|| {
-        if name.starts_with("uid://") {
-            format!("{name}: no asset has this uid")
-        } else {
-            format!("{name}: no asset has this path (find_assets searches by text)")
-        }
-    })
+    let path = tree(name.trim_start_matches("res://").trim_end_matches('/'))?;
+    let path = project::index::asset_named(&path).map_err(|e| format!("{name}: {e}"))?;
+    index
+        .assets
+        .get(&path)
+        .map(|a| &**a)
+        .ok_or_else(|| format!("{name}: no asset has this path (find_assets searches by text)"))
+}
+
+/// A path of the tree an agent names, checked as it comes in.
+fn tree(text: &str) -> Result<project::TreePath, String> {
+    project::TreePath::new(text).map_err(|e| format!("{text}: {e}"))
 }
 
 fn summary(extensions: &Extensions, asset: &Asset) -> Value {
@@ -399,7 +404,7 @@ fn project(view: &View) -> Value {
                 "name": info.name,
                 "kind": holds,
                 "fills": info.fills,
-                "mounted_at": (!info.at.is_empty()).then_some(&info.at),
+                "mounted_at": (!info.at.is_root()).then(|| info.at.to_string()),
                 "path": path.display().to_string(),
                 "read_only": info.read_only,
                 "entries": info.entries,
@@ -431,36 +436,36 @@ fn find_assets(index: &Index, extensions: &Extensions, args: &FindArgs) -> Value
         .assets
         .values()
         .map(|a| &**a)
-        .filter(|a| text.as_ref().is_none_or(|t| a.path.to_lowercase().contains(t.as_str())))
+        .filter(|a| text.as_ref().is_none_or(|t| a.path.as_str().to_lowercase().contains(t.as_str())))
         .filter(|a| args.node_type.as_ref().is_none_or(|wanted| is_of(extensions, a, wanted)))
-        .filter(|a| under.as_ref().is_none_or(|u| a.path.starts_with(u.as_str())))
+        .filter(|a| under.as_ref().is_none_or(|u| format!("{}/", a.path).starts_with(u.as_str())))
         .collect();
     let (offset, limit) = (args.offset.unwrap_or(0), args.limit.unwrap_or(50).min(500));
     let page: Vec<Value> = matches.iter().skip(offset).take(limit).map(|a| summary(extensions, a)).collect();
     json!({ "total": matches.len(), "offset": offset, "assets": page })
 }
 
-fn list_folder(index: &Index, extensions: &Extensions, path: Option<&str>) -> Value {
-    let path = path.unwrap_or_default().trim_matches('/');
-    let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+fn list_folder(index: &Index, extensions: &Extensions, path: Option<&str>) -> Result<Value, String> {
+    let folder = tree(path.unwrap_or_default().trim_matches('/'))?;
     let (mut folders, mut assets, mut files) = (vec![], vec![], vec![]);
-    for (key, entry) in index.entries.range(prefix.clone()..) {
-        let Some(name) = key.strip_prefix(&prefix) else { break };
-        if name.is_empty() || name.contains('/') {
+    // What is under it sits after it in the index's order, among others sharing its text (`a-b` after `a`).
+    let after = index.entries.range(folder.clone()..).take_while(|(key, _)| key.as_str().starts_with(folder.as_str()));
+    for (key, entry) in after {
+        let Some(name) = key.strip_prefix(&folder) else { continue };
+        if name.parts().count() != 1 {
             continue;
         }
         match entry.kind {
-            Kind::Folder => folders.push(json!(name)),
-            Kind::File => files.push(json!(name)),
+            Kind::Folder => folders.push(json!(name.as_str())),
+            Kind::File => files.push(json!(name.as_str())),
             Kind::Asset => {
-                let resolved = key.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(key);
-                if let Some(asset) = index.assets.get(resolved) {
+                if let Some(asset) = index.assets.get(&project::index::asset_of(key)) {
                     assets.push(summary(extensions, asset));
                 }
             }
         }
     }
-    json!({ "path": path, "folders": folders, "assets": assets, "files": files })
+    Ok(json!({ "path": folder.as_str(), "folders": folders, "assets": assets, "files": files }))
 }
 
 fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value, String> {
@@ -705,7 +710,7 @@ fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -
         extensions.tools().iter().find(|t| t.name.local() == name).ok_or_else(|| format!("no tool is named {name}"))?;
     let arguments: toml::Value =
         serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
-    let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());
+    let selection = view.editor.as_ref().and_then(|e| e.selection.as_ref());
     let lens = Lens { index: view.index, extensions, selection, chosen: None, revision: 0 };
     let answer = (tool.run)(&lens, &arguments).map_err(|e| format!("{e:#}"))?;
     serde_json::to_value(answer).map_err(|e| e.to_string())
@@ -715,7 +720,7 @@ const NO_EDITOR: &str = "the editor does not have the project open";
 
 fn editor_selection(view: &View) -> Result<Value, String> {
     let editor = view.editor.as_ref().ok_or(NO_EDITOR)?;
-    let asset = editor.selection.as_deref().and_then(|s| view.index.assets.get(s)).map(|a| &**a);
+    let asset = editor.selection.as_ref().and_then(|s| view.index.assets.get(s)).map(|a| &**a);
     Ok(json!({ "selected": asset.map(|asset| summary(view.extensions, asset)), "look": editor.variant }))
 }
 
@@ -723,5 +728,5 @@ fn editor_show(view: &mut View, name: &str) -> Result<Value, String> {
     let path = asset(view.index, name)?.path.clone();
     let editor = view.editor.as_mut().ok_or(NO_EDITOR)?;
     editor.show = Some(path.clone());
-    Ok(json!({ "shown": path }))
+    Ok(json!({ "shown": path.as_str() }))
 }

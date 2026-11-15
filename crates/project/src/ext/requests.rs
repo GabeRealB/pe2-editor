@@ -22,7 +22,7 @@ pub const SAY_AFTER: Duration = Duration::from_millis(100);
 const KEPT: usize = 16;
 const THREADS: usize = 2;
 
-type Key = (String, String);
+type Key = (crate::TreePath, String);
 type Wake = Box<dyn Fn(Duration) + Send>;
 type Maker = Arc<dyn Fn(&Index, &crate::index::Asset, &str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
@@ -66,7 +66,8 @@ impl Shared {
     fn make(&self, key: &Key, asked: u64) {
         let index = self.index.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let maker = self.maker.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let made = match (maker, index.assets.get(&key.0)) {
+        let asset = index.assets.get(&key.0);
+        let made = match (maker, asset) {
             (Some(maker), Some(asset)) => tracing::info_span!("request made", of = %format!("{}#{}", key.0, key.1))
                 .in_scope(|| maker(&index, asset, &key.1))
                 .map_err(|why| format!("{why:#}")),
@@ -168,7 +169,7 @@ impl Requests {
 
     /// Forget what these assets make: it is made again when it is next asked for. What is on its way is left to arrive to
     /// nobody.
-    pub fn forget(&self, paths: &impl Fn(&str) -> bool) {
+    pub fn forget(&self, paths: &impl Fn(&crate::TreePath) -> bool) {
         let mut state = self.shared.lock();
         state.slots.retain(|(path, _), _| !paths(path));
         state.kept.retain(|(path, _)| !paths(path));
@@ -194,7 +195,12 @@ impl Requests {
 
 impl Asking for Requests {
     fn request(&self, path: &str, address: &str) -> Requested {
-        let key = (path.to_string(), address.to_string());
+        // What was asked names its asset as text: checked here, and refused with why where it is no path.
+        let path = match crate::TreePath::new(path) {
+            Ok(path) => path,
+            Err(why) => return Requested::Failed(format!("{path}: {why}")),
+        };
+        let key = (path, address.to_string());
         let mut state = self.shared.lock();
         if !state.slots.contains_key(&key) {
             state.asked += 1;
@@ -228,7 +234,9 @@ impl Asking for Requests {
     }
 
     fn kept(&self, path: &str, address: &str) -> Option<Arc<Vec<u8>>> {
-        match self.shared.lock().slots.get(&(path.to_string(), address.to_string())) {
+        // What is no path was never made: `request` refused it.
+        let path = crate::TreePath::new(path).ok()?;
+        match self.shared.lock().slots.get(&(path, address.to_string())) {
             Some(Slot::Made(bytes)) => Some(bytes.clone()),
             _ => None,
         }

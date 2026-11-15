@@ -72,11 +72,11 @@ pub trait Node: Sync {
 /// files as its working copy has them, where it has unsaved changes.
 impl Node for crate::index::Asset {
     fn path(&self) -> &str {
-        &self.path
+        self.path.as_str()
     }
 
     fn uid(&self) -> Option<&str> {
-        self.uid.as_deref()
+        self.named.as_deref()
     }
 
     fn declaration(&self) -> &str {
@@ -93,7 +93,7 @@ impl Node for crate::index::Asset {
     }
 
     fn file_names(&self) -> Vec<String> {
-        self.files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.clone()).collect()
+        self.files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.to_string()).collect()
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {

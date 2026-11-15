@@ -16,7 +16,7 @@
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use holder::core::{Core, Queue};
-use pe2_path::HostPath;
+use pe2_path::{HostPath, Uid};
 use project::Project;
 use project::cache::Cache;
 use project::ext::Extensions;
@@ -38,7 +38,7 @@ pub enum Job {
     Hidden(BTreeSet<String>),
     /// The point of the history shown, read-only - after its first steps, of one document or all - or none: now.
     /// The index shows the documents' working copies as they were then.
-    Viewing(Option<(usize, Option<String>)>),
+    Viewing(Option<(usize, Option<Uid>)>),
     /// A project just opened: what its importers made attached.
     Attach,
     /// The project read again, as this changed; its files too where `whole`, as they are otherwise followed already.
@@ -68,7 +68,7 @@ pub struct Showing {
     pub viewing: bool,
     pub author: &'static str,
     /// The asset selected: what an extension's tool asked for by an agent works on where it names none.
-    pub selected: Option<String>,
+    pub selected: Option<project::TreePath>,
     /// The config in use: what an event signaled with none named is for.
     pub config: Option<project::Config>,
     /// Whether the window holds events back - a plan is filling a layer: they are signaled once it has.
@@ -197,7 +197,7 @@ pub struct Snapshot {
     pub tree: Arc<Node>,
     pub layers: Vec<LayerInfo>,
     /// The assets whose content or entry changed; every asset where `all`.
-    pub changed: BTreeSet<String>,
+    pub changed: BTreeSet<project::TreePath>,
     /// It took in files changed, assets or not.
     pub files: bool,
     pub all: bool,
@@ -212,7 +212,7 @@ pub struct Snapshot {
     /// It took in what other programs changed.
     pub others: bool,
     /// What was selected when a step undone or made again from outside the window was made: shown again.
-    pub select: Option<String>,
+    pub select: Option<project::TreePath>,
     /// What the work the window asked for came to (`TakeIn::ask`), by its ticket.
     pub outcomes: Vec<(u64, Outcome)>,
 }
@@ -250,7 +250,7 @@ pub struct Worker {
     /// The history as last shown (`History::view`), and which of its revisions that was.
     viewed: (u64, Arc<project::history::View>),
     /// The point of the history shown, where one is (`Job::Viewing`).
-    viewing: Option<(usize, Option<String>)>,
+    viewing: Option<(usize, Option<Uid>)>,
     /// What work on the history and the index came to and is not handed over yet.
     taken: holder::core::Taken,
     /// What the window shows that edits asked from outside it depend on.
@@ -264,7 +264,7 @@ pub struct Worker {
     /// Whether what the importers made is attached: an epoch works from the project with it.
     attached: bool,
     /// What a step undone from outside the window had selected, until it is handed over.
-    select: Option<String>,
+    select: Option<project::TreePath>,
     /// What the work the window asked for came to, until it is handed over.
     outcomes: Vec<(u64, Outcome)>,
     /// What went wrong off a take-in - the layers' watch failing - until it is handed over.
@@ -453,7 +453,7 @@ impl TakeIn {
 
     /// Show the documents as at this point of the history - after its first steps, of one document or all -
     /// or as they are now (none); returns the job's ticket.
-    pub fn viewing(&mut self, point: Option<(usize, Option<String>)>) -> u64 {
+    pub fn viewing(&mut self, point: Option<(usize, Option<Uid>)>) -> u64 {
         self.send(Job::Viewing(point))
     }
 
@@ -762,9 +762,9 @@ impl Worker {
 
     /// The working copies the index shows: the documents' as they are now, or as at the point of the history
     /// shown.
-    fn working(&self) -> HashMap<String, Working> {
+    fn working(&self) -> HashMap<Uid, Working> {
         match &self.viewing {
-            Some((point, scope)) => self.history.working_at(*point, scope.as_deref()),
+            Some((point, scope)) => self.history.working_at(*point, *scope),
             None => self.history.working(),
         }
     }
@@ -959,7 +959,7 @@ impl Worker {
     fn snapshot(
         &mut self,
         ticket: u64,
-        changed: BTreeSet<String>,
+        changed: BTreeSet<project::TreePath>,
         all: bool,
         error: Option<String>,
         (files, others): (bool, bool),

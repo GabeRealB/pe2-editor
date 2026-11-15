@@ -165,7 +165,13 @@ fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Op
 }
 
 /// What a drop on a row would do, for the place of it the pointer is over.
-fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, ws: &Workspace) -> Result<String, String> {
+fn says(
+    row: &ContentRow,
+    of: &project::TreePath,
+    dragged: &Dragged,
+    place: ContentPlace,
+    ws: &Workspace,
+) -> Result<String, String> {
     if let Dragged::Asset(path) = dragged {
         let node_type = ws.index.assets.get(path).and_then(|asset| ws.extensions.type_label(asset));
         let taken = node_type
@@ -199,7 +205,7 @@ fn row_target(
     ui: &egui::Ui,
     rect: egui::Rect,
     row: &ContentRow,
-    of: &str,
+    of: &project::TreePath,
     ws: &Workspace,
     ask: &mut Option<ContentRequest>,
 ) {
@@ -219,7 +225,10 @@ fn row_target(
             Some(Dragged::Row { id, .. }) => {
                 *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place });
             }
-            Some(Dragged::Asset(asset)) => *ask = Some(ContentRequest::Dropped { row: row.id.clone(), asset }),
+            // What leaves for the extension is the path's text.
+            Some(Dragged::Asset(asset)) => {
+                *ask = Some(ContentRequest::Dropped { row: row.id.clone(), asset: asset.to_string() });
+            }
             _ => {}
         }
     }
@@ -277,7 +286,7 @@ fn rows_ui(
     ws: &mut Workspace,
     asset: &Asset,
     (rows, right, editable): (&[ContentRow], f32, bool),
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
 ) -> Option<ContentRequest> {
     let selected = ws.inner_of(&asset.path).map(str::to_string);
     let mut ask = None;
@@ -331,7 +340,7 @@ fn rows_ui(
                 chosen = Some((inner.clone(), row.look.clone()));
             }
             if let Some(link) = row.link.as_ref().filter(|_| response.double_clicked()) {
-                *nav = Some(link.clone());
+                *nav = Some(crate::workspace::Nav::link(link));
             }
             if let Some(drag) = row.drag.as_ref().filter(|_| drawn.dragged) {
                 response.dnd_set_drag_payload(Dragged::Row {
@@ -425,8 +434,8 @@ fn stack_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, layers: &[Valu
 pub fn contents_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
-    subject: Option<&str>,
-    nav: &mut Option<String>,
+    subject: Option<&project::TreePath>,
+    nav: &mut Option<crate::workspace::Nav>,
     message: &mut Option<String>,
     edit: &mut Option<EditRequest>,
 ) {

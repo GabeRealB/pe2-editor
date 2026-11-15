@@ -1731,11 +1731,17 @@ fn outputs(
     let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
     extensions.keep_in(project::graph::store::Store::open(&cache)?);
     let engine = extensions.engine();
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths: Vec<project::TreePath> = Vec::new();
     for name in assets {
-        let path = index.by_uid.get(name).cloned().unwrap_or_else(|| name.clone());
-        anyhow::ensure!(index.assets.contains_key(&path), "the project has no asset {name}");
-        paths.push(path);
+        // An asset named by its uid or its path, as given on the command line.
+        let path = if name.starts_with("uid://") {
+            let uid = pe2_path::Uid::new(name).with_context(|| format!("{name}: no uid"))?;
+            index.by_uid.get(&uid).cloned()
+        } else {
+            Some(project::TreePath::new(name).with_context(|| format!("{name}: no path of the project"))?)
+        };
+        let path = path.filter(|path| index.assets.contains_key(path));
+        paths.push(path.with_context(|| format!("the project has no asset {name}"))?);
     }
     if let Some(of_type) = of_type {
         paths.extend(extensions.find(&index, of_type).map(|a| a.path.clone()));

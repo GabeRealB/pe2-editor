@@ -106,7 +106,7 @@ pub fn add_extension(
     }
     let mut tx = history.begin(label);
     if !held_already {
-        let record = crate::records::extension_path(&layer.path, &about.id);
+        let record = crate::records::extension_path(&layer.path, &about.id)?;
         tx.write(&record, crate::records::extension_record(Some(&tree)).as_bytes())?;
     }
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
@@ -140,10 +140,11 @@ pub fn remove_extension(project: &Project, id: &str, history: &mut History, labe
     }
     let mut tx = history.begin(label);
     for layer in saying.iter().filter(|layer| !layer.read_only) {
-        tx.remove(&crate::records::extension_path(&layer.path, id))?;
+        tx.remove(&crate::records::extension_path(&layer.path, id)?)?;
     }
     if let Some(layer) = off_in {
-        tx.write(&crate::records::extension_path(&layer.path, id), crate::records::extension_record(None).as_bytes())?;
+        let record = crate::records::extension_path(&layer.path, id)?;
+        tx.write(&record, crate::records::extension_record(None).as_bytes())?;
     }
     if required {
         tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;

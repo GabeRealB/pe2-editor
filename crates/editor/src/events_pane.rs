@@ -11,10 +11,10 @@ struct Row {
     id: String,
     label: String,
     /// Where it is an asset, its path.
-    asset: Option<String>,
+    asset: Option<project::TreePath>,
 }
 
-fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mut Option<String>) {
+fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mut Option<crate::workspace::Nav>) {
     let mut signaled = None;
     let wired = ws.last_epoch.as_ref().map(|epoch| &epoch.wired);
     let fired = ws.last_epoch.as_ref().map(|epoch| &epoch.report.signaled);
@@ -26,7 +26,7 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mu
             match &row.asset {
                 Some(path) => {
                     if ui.link(name).clicked() {
-                        *nav = Some(path.clone());
+                        *nav = Some(crate::workspace::Nav::to(path.clone()));
                     }
                 }
                 None => {
@@ -47,14 +47,20 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mu
     }
 }
 
-pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, message: &mut Option<String>) {
+pub fn events_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    nav: &mut Option<crate::workspace::Nav>,
+    message: &mut Option<String>,
+) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         let own: Vec<Row> = ws
             .extensions
             .find(&ws.index, "event")
             .filter_map(|asset| {
-                let uid = asset.uid.clone()?;
-                let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+                // An event is signaled by its uid's text, as a stack names it.
+                let uid = asset.uid?.to_string();
+                let name = asset.path.name().unwrap_or_default();
                 let label = asset.fields_toml().get("label").and_then(toml::Value::as_str).unwrap_or(name).to_string();
                 Some(Row { id: uid, label, asset: Some(asset.path.clone()) })
             })

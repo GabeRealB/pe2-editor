@@ -301,8 +301,11 @@ impl crate::graph::exec::Node for Written {
 
     fn file_names(&self) -> Vec<String> {
         // What a bundle holds by a name no path takes is none of its files: the index says so (`Problem::Refused`).
-        let mut names: Vec<String> =
-            self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).0.into_keys()).collect();
+        let mut names: Vec<String> = self
+            .dirs
+            .iter()
+            .flat_map(|d| crate::index::bundle_files(d).0.into_keys().map(|name| name.to_string()))
+            .collect();
         names.sort();
         names.dedup();
         names
@@ -385,8 +388,9 @@ pub(crate) fn assembled_sha1(
     let all = changeset
         .entries
         .iter()
-        .filter_map(|(uid, at)| Some((at.strip_suffix(crate::index::BUNDLE_SUFFIX)?.to_string(), uid.clone())))
-        .collect();
+        .filter(|(_, at)| at.as_str().ends_with(crate::index::BUNDLE_SUFFIX))
+        .map(|(uid, at)| Ok((crate::index::asset_named(at)?.to_string(), uid.to_string())))
+        .collect::<Result<_>>()?;
     let world = Layer::of(layers, all, &engine.ops, extensions);
     joined_sha1(&world, node, engine)
 }

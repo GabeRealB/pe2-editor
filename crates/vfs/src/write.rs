@@ -15,9 +15,10 @@
 use pe2_path::HostPath;
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{RelPath, Uid};
 use project::history::History;
-use project::index::{BUNDLE_SUFFIX, Index, Kind, NODE_FILE};
-use project::{Project, edit};
+use project::index::{BUNDLE_SUFFIX, Index, Kind, NODE_FILE, asset_of, bundle_named};
+use project::{Project, TreePath, edit};
 
 /// Where what a program wrote is, until it is applied.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -196,42 +197,49 @@ pub fn is_junk(path: &str) -> bool {
 /// What a path of the tree is in what the index resolves.
 enum Place<'a> {
     /// An entry, by its real path: a node (`x.node`), a folder or a plain file.
-    Entry(&'a str, &'a project::index::Entry),
+    Entry(&'a TreePath, &'a project::index::Entry),
     /// A file of a node (its real path, its entry), by its name in it.
-    File(&'a str, &'a project::index::Entry, String),
+    File(&'a TreePath, &'a project::index::Entry, RelPath),
     /// Nothing yet.
     New,
 }
 
 /// Where a path of the tree is: a node or entry of its own; a file of the nearest node it is in; or nothing yet. A
 /// folder or plain file on the way makes it a new path of that folder.
-fn place<'a>(index: &'a Index, path: &str) -> Place<'a> {
-    let entry = |real: &str| index.entries.get_key_value(real);
-    if let Some((key, found)) = entry(&format!("{path}{BUNDLE_SUFFIX}")).or_else(|| entry(path)) {
-        return Place::Entry(key.as_str(), found);
+fn place<'a>(index: &'a Index, path: &TreePath) -> Place<'a> {
+    if path.is_root() {
+        return Place::New;
     }
-    let mut at = path.len();
-    while let Some(slash) = path[..at].rfind('/') {
-        let prefix = &path[..slash];
-        if let Some((real, node)) = entry(&format!("{prefix}{BUNDLE_SUFFIX}")) {
-            return Place::File(real.as_str(), node, path[slash + 1..].to_string());
+    let entry = |real: &TreePath| index.entries.get_key_value(real);
+    if let Some((key, found)) = entry(&bundle_named(path)).or_else(|| entry(path)) {
+        return Place::Entry(key, found);
+    }
+    let mut above = path.parent().filter(|folder| !folder.is_root());
+    while let Some(folder) = above {
+        if let Some((real, node)) = entry(&bundle_named(&folder)) {
+            let within = path.strip_prefix(&folder).expect("a path is within the folders above it");
+            return Place::File(real, node, within);
         }
-        if entry(prefix).is_some() {
+        if entry(&folder).is_some() {
             return Place::New;
         }
-        at = slash;
+        above = folder.parent().filter(|folder| !folder.is_root());
     }
     Place::New
 }
 
+/// A path the served folder or a program names, as text: checked where it becomes an edit of the project.
+fn tree(text: &str) -> Result<TreePath> {
+    TreePath::new(text).with_context(|| format!("{text}: no path of the project"))
+}
+
 /// Whether something is at a path of the tree: an entry, or a file of the node it is in - or files under it there.
-fn there(index: &Index, path: &str) -> bool {
+fn there(index: &Index, path: &TreePath) -> bool {
     match place(index, path) {
         Place::Entry(..) => true,
         Place::File(real, _, file) => {
-            let asset = index.assets.get(real.strip_suffix(BUNDLE_SUFFIX).unwrap_or(real));
-            let inside = format!("{file}/");
-            asset.is_some_and(|a| a.on_disk().files.iter().any(|f| f.name == file || f.name.starts_with(&inside)))
+            let asset = index.assets.get(&asset_of(real));
+            asset.is_some_and(|a| a.on_disk().files.iter().any(|f| f.name.starts_with(&file)))
         }
         Place::New => false,
     }
@@ -244,10 +252,16 @@ fn there(index: &Index, path: &str) -> bool {
 /// written again as well as once.
 #[must_use]
 pub fn so_already(index: &Index, change: &Change) -> bool {
+    // A change naming what is no path is so in nothing: applying it says why.
+    let at = |text: &str| TreePath::new(text).ok();
     match change {
-        Change::Folder { path } => matches!(place(index, path), Place::Entry(_, entry) if entry.kind != Kind::File),
-        Change::Rename { from, to } => !there(index, from) && there(index, to),
-        Change::Remove { path } => !there(index, path),
+        Change::Folder { path } => at(path)
+            .is_some_and(|path| matches!(place(index, &path), Place::Entry(_, entry) if entry.kind != Kind::File)),
+        Change::Rename { from, to } => match (at(from), at(to)) {
+            (Some(from), Some(to)) => !there(index, &from) && there(index, &to),
+            _ => false,
+        },
+        Change::Remove { path } => at(path).is_some_and(|path| !there(index, &path)),
         Change::Write { .. } => false,
     }
 }
@@ -255,8 +269,10 @@ pub fn so_already(index: &Index, change: &Change) -> bool {
 /// Whether a path of the tree is a node, or inside one: what a folder made there waits on.
 #[must_use]
 pub fn in_node(index: &Index, path: &str) -> bool {
-    matches!(place(index, path), Place::File(..))
-        || index.entries.get(&format!("{path}{BUNDLE_SUFFIX}")).is_some_and(|e| e.kind == Kind::Asset)
+    // A path that is none is in nothing.
+    let Ok(path) = TreePath::new(path) else { return false };
+    matches!(place(index, &path), Place::File(..))
+        || index.entries.get(&bundle_named(&path)).is_some_and(|e| e.kind == Kind::Asset)
 }
 
 /// A name the tree does not take: what storage marks a node with.
@@ -287,29 +303,28 @@ pub fn apply(
         Change::Write { path, staged } => {
             keep_open(staged);
             let bytes = staged.read().with_context(|| staged.shown())?;
-            write(project, index, layer, path, &bytes, label, history)
+            write(project, index, layer, &tree(path)?, &bytes, label, history)
         }
-        Change::Remove { path } => match place(index, path) {
-            Place::Entry(_, entry) => edit::delete(project, index, layer, &entry.uid, history),
+        Change::Remove { path } => match place(index, &tree(path)?) {
+            Place::Entry(_, entry) => edit::delete(project, index, layer, entry.uid, history),
             Place::File(_, _, file) if file == NODE_FILE => {
                 bail!("{path}: a node's declaration is not removed; remove its folder to delete the node")
             }
             // A file of the node, or a folder of its files with all of them.
             Place::File(real, node, file) => {
-                let asset = index.assets.get(real.strip_suffix(BUNDLE_SUFFIX).unwrap_or(real));
-                let inside = format!("{file}/");
+                let asset = index.assets.get(&asset_of(real));
                 let files = asset.map_or(&[][..], |a| a.on_disk().files.as_slice());
-                let mut gone: Vec<(String, Option<Vec<u8>>)> =
-                    files.iter().filter(|f| f.name.starts_with(&inside)).map(|f| (f.name.clone(), None)).collect();
+                let inside = files.iter().filter(|f| f.name != file && f.name.starts_with(&file));
+                let mut gone: Vec<(RelPath, Option<Vec<u8>>)> = inside.map(|f| (f.name.clone(), None)).collect();
                 if gone.is_empty() {
                     gone.push((file, None));
                 }
-                edit::save(project, index, layer, &node.uid, &gone, label, history)
+                edit::save(project, index, layer, node.uid, &gone, label, history)
             }
             Place::New => bail!("{path}: nothing is there"),
         },
-        Change::Rename { from, to } => rename(project, index, layer, from, to, label, history),
-        Change::Folder { path } => edit::create_folder(project, index, layer, path, history),
+        Change::Rename { from, to } => rename(project, index, layer, &tree(from)?, &tree(to)?, label, history),
+        Change::Folder { path } => edit::create_folder(project, index, layer, &tree(path)?, history),
     }
 }
 
@@ -317,29 +332,30 @@ fn write(
     project: &Project,
     index: &Index,
     layer: &str,
-    path: &str,
+    path: &TreePath,
     bytes: &[u8],
     label: String,
     history: &mut History,
 ) -> Result<Vec<HostPath>> {
     // A declaration makes its folder a node, wherever it is - in a folder, or inside another node - unless that folder
     // is a node already: one there already is its folder of children.
-    if let Some(folder) = path.strip_suffix(&format!("/{NODE_FILE}")).filter(|f| !f.is_empty())
-        && !index.entries.contains_key(&format!("{folder}{BUNDLE_SUFFIX}"))
+    if path.name() == Some(NODE_FILE.as_str())
+        && let Some(folder) = path.parent().filter(|folder| !folder.is_root())
+        && !index.entries.contains_key(&bundle_named(&folder))
     {
         let declaration = std::str::from_utf8(bytes).context("a declaration is not text")?;
         let uid = new_uid(index)?;
-        return edit::create(project, index, layer, &uid, folder, (declaration, &[]), history);
+        return edit::create(project, index, layer, uid, &folder, (declaration, &[]), history);
     }
     match place(index, path) {
         Place::Entry(_, entry) if entry.kind == Kind::File => {
-            edit::write_file(project, index, layer, &entry.uid, "", bytes, label, None, history)
+            edit::write_file(project, index, layer, entry.uid, &RelPath::root(), bytes, label, None, history)
         }
         Place::Entry(..) => bail!("{path} is a folder"),
         Place::File(_, node, file) => {
-            edit::write_file(project, index, layer, &node.uid, &file, bytes, label, None, history)
+            edit::write_file(project, index, layer, node.uid, &file, bytes, label, None, history)
         }
-        Place::New if path == NODE_FILE => bail!("the top is no node"),
+        Place::New if *path == NODE_FILE.as_str() => bail!("the top is no node"),
         Place::New => edit::create_file(project, index, layer, path, bytes, history),
     }
 }
@@ -348,8 +364,8 @@ fn rename(
     project: &Project,
     index: &Index,
     layer: &str,
-    from: &str,
-    to: &str,
+    from: &TreePath,
+    to: &TreePath,
     label: String,
     history: &mut History,
 ) -> Result<Vec<HostPath>> {
@@ -357,11 +373,11 @@ fn rename(
         Place::Entry(real, entry) => {
             let mut touched = Vec::new();
             if let Place::Entry(_, there) = place(index, to) {
-                touched.extend(edit::delete(project, index, layer, &there.uid, history)?);
+                touched.extend(edit::delete(project, index, layer, there.uid, history)?);
             }
             // A node keeps being one: stored with its mark.
-            let to = if real.ends_with(BUNDLE_SUFFIX) { format!("{to}{BUNDLE_SUFFIX}") } else { to.to_string() };
-            touched.extend(edit::rename(project, index, layer, &entry.uid, &to, history)?);
+            let to = if real.as_str().ends_with(BUNDLE_SUFFIX) { bundle_named(to) } else { to.clone() };
+            touched.extend(edit::rename(project, index, layer, entry.uid, &to, history)?);
             Ok(touched)
         }
         // A file of a node renamed within it: written under its new name, removed under its old.
@@ -371,20 +387,20 @@ fn rename(
                 bail!("{from} can move only within its node, and a declaration not at all");
             }
             // Where the file is: the node's own, or one below it lets through.
-            let asset = index.assets.get(real.strip_suffix(BUNDLE_SUFFIX).unwrap_or(real));
+            let asset = index.assets.get(&asset_of(real));
             let disk = asset
                 .and_then(|a| a.on_disk().files.iter().find(|f| f.name == file).map(|f| f.path.clone()))
                 .with_context(|| format!("{from}: not there"))?;
             let bytes = project::content::read(&disk).with_context(|| disk.display().to_string())?;
             let files = [(new, Some(bytes)), (file, None)];
-            edit::save(project, index, layer, &node.uid, &files, label, history)
+            edit::save(project, index, layer, node.uid, &files, label, history)
         }
         Place::New => bail!("{from}: nothing is there"),
     }
 }
 
-fn new_uid(index: &Index) -> Result<String> {
-    Ok(project::uid::new(|uid| index.by_uid.contains_key(&uid.to_string()))?.to_string())
+fn new_uid(index: &Index) -> Result<Uid> {
+    Ok(project::uid::new(|uid| index.by_uid.contains_key(&uid))?)
 }
 
 #[cfg(test)]

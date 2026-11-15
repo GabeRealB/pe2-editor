@@ -284,8 +284,9 @@ impl Scenario {
     /// # Errors
     /// There is no such node.
     pub fn made(&mut self, path: &str, address: &str) -> Result<String, String> {
+        let at = tree(path)?;
         let ws = self.workspace();
-        let asset = ws.index.assets.get(path).cloned().ok_or_else(|| format!("no asset {path}"))?;
+        let asset = ws.index.assets.get(&at).cloned().ok_or_else(|| format!("no asset {path}"))?;
         let engine = project::graph::exec::Engine::new(ws.extensions.operations(), None);
         let made = ws.extensions.output(&engine, &ws.index, &asset, address, false);
         Ok(made.err().map_or_else(String::new, |why| format!("{why:#}")))
@@ -296,13 +297,9 @@ impl Scenario {
     /// # Errors
     /// There is no such entry.
     pub fn override_entry(&mut self, path: &str) -> Result<(), String> {
-        let uid = self
-            .workspace()
-            .index
-            .entries
-            .get(path)
-            .map(|entry| entry.uid.clone())
-            .ok_or_else(|| format!("no entry {path}"))?;
+        let at = tree(path)?;
+        let uid =
+            self.workspace().index.entries.get(&at).map(|entry| entry.uid).ok_or_else(|| format!("no entry {path}"))?;
         self.harness.state_mut().ask(&crate::workspace::EditRequest::Override(uid));
         self.settle();
         Ok(())
@@ -354,9 +351,10 @@ impl Scenario {
     /// Open an asset, as selecting it does.
     #[track_caller]
     pub fn show(&mut self, path: &str) {
+        let at = tree(path).unwrap_or_else(|why| panic!("{why}"));
         let ws = self.workspace();
-        assert!(ws.index.assets.contains_key(path), "no asset {path}");
-        ws.select(path.to_string());
+        assert!(ws.index.assets.contains_key(&at), "no asset {path}");
+        ws.select(at);
         self.settle();
     }
 
@@ -566,8 +564,8 @@ impl Scenario {
                 return self
                     .workspace()
                     .selected
-                    .clone()
-                    .map(Value::String)
+                    .as_ref()
+                    .map(|selected| Value::String(selected.to_string()))
                     .ok_or_else(|| "nothing is selected".to_string());
             }
             "override_entry" => self.override_entry(said)?,
@@ -585,7 +583,7 @@ impl Scenario {
             "pictured" => {
                 let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
                 let ws = self.workspace();
-                let asset = ws.index.assets.get(said).cloned().ok_or_else(|| format!("no asset {said}"))?;
+                let asset = ws.index.assets.get(&tree(said)?).cloned().ok_or_else(|| format!("no asset {said}"))?;
                 return Ok(Value::Boolean(
                     ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok()),
                 ));
@@ -655,7 +653,8 @@ impl Scenario {
             .filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
         let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
         for template in &templates {
-            self.workspace().new_node_now(template, None, "").map_err(|why| format!("{template}: {why}"))?;
+            let top = project::TreePath::root();
+            self.workspace().new_node_now(template, None, &top).map_err(|why| format!("{template}: {why}"))?;
             self.settle();
         }
         Ok(i64::try_from(templates.len()).unwrap_or(i64::MAX))
@@ -703,7 +702,7 @@ impl Scenario {
 
     /// The assets the project has, by path.
     pub fn assets(&mut self) -> Vec<String> {
-        self.workspace().index.assets.keys().cloned().collect()
+        self.workspace().index.assets.keys().map(ToString::to_string).collect()
     }
 
     /// What it has open.
@@ -810,7 +809,8 @@ impl Scenario {
     /// A node's declaration as the editor shows it: its working copy's, where it has unsaved changes.
     #[track_caller]
     pub fn working(&mut self, path: &str) -> toml::Table {
-        let text = self.workspace().index.assets.get(path).map(|a| a.text().to_string());
+        let at = tree(path).unwrap_or_else(|why| panic!("{why}"));
+        let text = self.workspace().index.assets.get(&at).map(|a| a.text().to_string());
         let text = text.unwrap_or_else(|| panic!("{path}: no such asset"));
         text.parse().unwrap_or_else(|e| panic!("{path}: {e}"))
     }
@@ -844,4 +844,16 @@ impl Scenario {
     pub fn problems(&mut self) -> Vec<String> {
         self.workspace().index.problems.iter().map(project::index::Problem::describe).collect()
     }
+}
+
+/// A path of the project a scenario names, as text: checked where the harness takes it.
+fn tree(text: &str) -> Result<project::TreePath, String> {
+    project::TreePath::new(text).map_err(|why| format!("{text}: {why}"))
+}
+
+/// A path of the project a test names.
+#[track_caller]
+#[must_use]
+pub fn path(text: &str) -> project::TreePath {
+    tree(text).unwrap_or_else(|why| panic!("{why}"))
 }

@@ -37,7 +37,7 @@ struct State {
 pub fn history_ui(ui: &mut egui::Ui, ws: &Workspace, ask: &mut Option<HistoryAsk>) {
     let id = ui.scope_id().with("history pane");
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
-    let document = ws.selected.as_deref().and_then(|p| ws.index.assets.get(p)).and_then(|a| a.uid.clone());
+    let document = ws.selected.as_ref().and_then(|p| ws.index.assets.get(p)).and_then(|a| a.uid);
     let (done, undone) = (ws.history.done(), ws.history.undone());
     bar(ui, &mut state, document.is_some(), done.iter().chain(undone), ask);
     if let Some(viewing) = &ws.viewing {
@@ -53,7 +53,7 @@ pub fn history_ui(ui: &mut egui::Ui, ws: &Workspace, ask: &mut Option<HistoryAsk
     }
     let scope = document.filter(|_| state.this_document);
     let shown = |step: &Step| {
-        scope.as_deref().is_none_or(|uid| step.edits_document(uid))
+        scope.is_none_or(|uid| step.edits_document(uid))
             && state.author.as_deref().is_none_or(|author| step.author == author)
     };
     // The point shown: after so many steps; now, the last.
@@ -65,12 +65,12 @@ pub fn history_ui(ui: &mut egui::Ui, ws: &Workspace, ask: &mut Option<HistoryAsk
             if response.clicked() {
                 let point = i + 1;
                 let now = point == done.len() && scope.is_none();
-                let viewing = (!now).then(|| Viewing { point, scope: scope.clone(), now: false });
+                let viewing = (!now).then_some(Viewing { point, scope, now: false });
                 *ask = Some(HistoryAsk::View(viewing));
             }
             response.context_menu(|ui| {
                 if ui.button("Show as after this").clicked() {
-                    *ask = Some(HistoryAsk::View(Some(Viewing { point: i + 1, scope: scope.clone(), now: false })));
+                    *ask = Some(HistoryAsk::View(Some(Viewing { point: i + 1, scope, now: false })));
                     ui.close();
                 }
                 let undoes = done[i + 1..].iter().filter(|s| s.undoable()).count();
@@ -187,9 +187,8 @@ fn banner(ui: &mut egui::Ui, ws: &Workspace, viewing: &Viewing, ask: &mut Option
         after.map_or_else(|| "as at the start of the session".to_string(), |s| format!("as after \"{}\"", s.label));
     let of = viewing
         .scope
-        .as_deref()
-        .and_then(|uid| ws.index.by_uid.get(uid))
-        .map_or_else(|| "The documents".to_string(), |path| path.rsplit('/').next().unwrap_or(path).to_string());
+        .and_then(|uid| ws.index.by_uid.get(&uid))
+        .map_or_else(|| "The documents".to_string(), |path| path.name().unwrap_or_default().to_string());
     egui::Frame::new()
         .stroke(egui::Stroke::new(1.0, warn.gamma_multiply(0.6)))
         .corner_radius(4.0)
@@ -226,15 +225,17 @@ fn changes_ui(ui: &mut egui::Ui, ws: &Workspace, step: &Step) {
         ui.add_space(indent);
         ui.vertical(|ui| {
             for edit in &step.edits {
-                let name = edit.path.rsplit('/').next().unwrap_or(&edit.path);
+                let name = edit.path.name().unwrap_or_default();
                 ui.label(RichText::new(format!("{name} · {}", edit.file)).small().strong());
                 // Each content read once, and kept: what a step changed is drawn every frame it shows.
                 let kept = |sha1: &Option<String>| sha1.as_deref().map(|s| ws.kept(s));
                 match (kept(&edit.before), kept(&edit.after)) {
                     (Some(Kept::Text(before)), Some(Kept::Text(after)))
-                        if std::path::Path::new(&edit.file)
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("toml")) =>
+                        if edit
+                            .file
+                            .name()
+                            .and_then(|name| name.rsplit_once('.'))
+                            .is_some_and(|(_, e)| e.eq_ignore_ascii_case("toml")) =>
                     {
                         let lines = field_changes(&before, &after);
                         for line in lines.iter().take(12) {

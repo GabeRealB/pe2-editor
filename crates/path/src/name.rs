@@ -272,6 +272,12 @@ impl RelPath {
         self.parts().next_back()
     }
 
+    /// Its last name as a name, unless it is the root: a part of a path is one already, checked as the path was.
+    #[must_use]
+    pub fn last(&self) -> Option<Name> {
+        self.name().map(|name| Name(Text::Shared(name.into())))
+    }
+
     /// What it is in, unless it is the root.
     #[must_use]
     pub fn parent(&self) -> Option<RelPath> {
@@ -370,6 +376,30 @@ impl PartialEq<Name> for &String {
 
 impl PartialEq<String> for Name {
     fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<str> for RelPath {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for RelPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<Name> for RelPath {
+    fn eq(&self, other: &Name) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<Name> for &RelPath {
+    fn eq(&self, other: &Name) -> bool {
         self.as_str() == other.as_str()
     }
 }

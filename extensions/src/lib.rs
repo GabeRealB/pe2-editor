@@ -1081,10 +1081,27 @@ mod tests {
                      ops.given = { op = \"input\", name = \"text\" }\nops.out = { op = \"output\", name = \"text\", from = { value = \"given\" } }\n";
         let template = "uid = \"uid://template\"\n\n[[stack]]\nop = \"pe2.graph@template\"\nlabel = \"Passed text\"\nfiles = [\"*.txt\"]\n\
                         makes = [{ op = \"file\", file = \"{file}\" }, { op = \"uid://group\" }, { op = \"output\", name = \"text\" }]\n";
-        project::edit::create(&p, &index, "project", "uid://group", "graph/passed", (group, &[]), &mut history)
-            .unwrap();
-        project::edit::create(&p, &index, "project", "uid://template", "graph/template", (template, &[]), &mut history)
-            .unwrap();
+        let (uid, tree) = (|text| pe2_path::Uid::new(text).unwrap(), |text| project::TreePath::new(text).unwrap());
+        project::edit::create(
+            &p,
+            &index,
+            "project",
+            uid("uid://group"),
+            &tree("graph/passed"),
+            (group, &[]),
+            &mut history,
+        )
+        .unwrap();
+        project::edit::create(
+            &p,
+            &index,
+            "project",
+            uid("uid://template"),
+            &tree("graph/template"),
+            (template, &[]),
+            &mut history,
+        )
+        .unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
         let extensions = super::for_project(&p);
         assert_eq!(extensions.take_definitions(&index), []);
@@ -1094,12 +1111,14 @@ mod tests {
         let stack = extensions.stamp(&found, "notes.txt").unwrap();
         assert!(stack.contains("file = \"notes.txt\""), "{stack}");
         let made = format!("uid = \"uid://made\"\n\n{stack}");
-        let files: [(&str, &[u8]); 1] = [("notes.txt", b"hello")];
-        project::edit::create(&p, &index, "project", "uid://made", "notes", (&made, &files), &mut history).unwrap();
+        let notes = pe2_path::RelPath::new("notes.txt").unwrap();
+        let files: [(&pe2_path::RelPath, &[u8]); 1] = [(&notes, b"hello")];
+        project::edit::create(&p, &index, "project", uid("uid://made"), &tree("notes"), (&made, &files), &mut history)
+            .unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
         let _ = extensions.take_definitions(&index);
         let engine = extensions.engine();
-        let given = extensions.output(&engine, &index, &index.assets["notes"], "text", true).unwrap();
+        let given = extensions.output(&engine, &index, &index.assets[&tree("notes")], "text", true).unwrap();
         let project::graph::Value::Typed(typed) = &*given.value.unwrap() else { panic!("no file") };
         assert_eq!(typed.files[0].name, "notes.txt");
         let _ = std::fs::remove_dir_all(&dir);

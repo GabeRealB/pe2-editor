@@ -8,17 +8,17 @@ use crate::theme;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dragged {
     /// An asset, by its path.
-    Asset(String),
+    Asset(project::TreePath),
     /// A layer of an asset's stack: the asset's path and its place.
-    Layer(String, usize),
+    Layer(project::TreePath, usize),
     /// A row of the contents: its asset's path, its id, its label and what its type says it is when dragged.
-    Row { asset: String, id: String, label: String, what: String },
+    Row { asset: project::TreePath, id: String, label: String, what: String },
 }
 
 impl Dragged {
     fn name(&self) -> String {
         match self {
-            Dragged::Asset(path) => path.rsplit('/').next().unwrap_or(path).to_string(),
+            Dragged::Asset(path) => path.name().unwrap_or_default().to_string(),
             Dragged::Layer(_, at) => format!("Layer {at}"),
             Dragged::Row { label, .. } => label.clone(),
         }

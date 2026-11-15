@@ -20,7 +20,7 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
-use pe2_path::HostPath;
+use pe2_path::{HostPath, RelPath, Tree, Uid, VfsPath};
 use std::collections::BTreeMap;
 
 use crate::cache::write_atomic;
@@ -40,11 +40,11 @@ pub enum Op {
     /// Its own version, at the entry's resolved path in the layer: the files it changes, by name (a plain file's own,
     /// ""), and `to` a move with it.
     Override {
-        files: BTreeMap<String, Base>,
-        to: Option<String>,
+        files: BTreeMap<RelPath, Base>,
+        to: Option<VfsPath<Tree>>,
     },
     Move {
-        to: String,
+        to: VfsPath<Tree>,
     },
     Delete,
 }
@@ -54,13 +54,24 @@ pub struct Changeset {
     pub read_only: bool,
     pub ignore: Vec<String>,
     /// What the layer creates: uid -> path.
-    pub entries: BTreeMap<String, String>,
+    pub entries: BTreeMap<Uid, VfsPath<Tree>>,
     /// What it does to entries from below, by uid.
-    pub ops: BTreeMap<String, Op>,
+    pub ops: BTreeMap<Uid, Op>,
 }
 
 fn string(value: &toml::Value, what: &str) -> Result<String> {
     value.as_str().map(str::to_string).with_context(|| format!("{what}: not a string"))
+}
+
+/// A path of the project's tree a changeset names, checked as it is read.
+fn tree_path(value: &toml::Value, what: &str) -> Result<VfsPath<Tree>> {
+    let text = string(value, what)?;
+    VfsPath::new(&text).with_context(|| format!("{what}: {text}"))
+}
+
+/// A uid a changeset names, checked as it is read.
+fn uid(text: &str) -> Result<Uid> {
+    Uid::new(text).with_context(|| format!("{text}: not a uid"))
 }
 
 impl Changeset {
@@ -90,17 +101,18 @@ impl Changeset {
         if let Some(ignore) = table.get("ignore").and_then(toml::Value::as_array) {
             changeset.ignore = ignore.iter().map(|v| string(v, "ignore")).collect::<Result<_>>()?;
         }
-        for (uid, path) in table.get("entries").and_then(toml::Value::as_table).into_iter().flatten() {
-            changeset.entries.insert(uid.clone(), string(path, uid)?);
+        for (named, path) in table.get("entries").and_then(toml::Value::as_table).into_iter().flatten() {
+            changeset.entries.insert(uid(named)?, tree_path(path, named)?);
         }
-        for (uid, op) in table.get("ops").and_then(toml::Value::as_table).into_iter().flatten() {
-            let op = op.as_table().with_context(|| format!("{uid}: not a table"))?;
-            let to = op.get("to").map(|v| string(v, uid)).transpose()?;
+        for (named, op) in table.get("ops").and_then(toml::Value::as_table).into_iter().flatten() {
+            let uid_text = named;
+            let op = op.as_table().with_context(|| format!("{uid_text}: not a table"))?;
+            let to = op.get("to").map(|v| tree_path(v, uid_text)).transpose()?;
             let op = if op.get("delete").and_then(toml::Value::as_bool) == Some(true) {
                 Op::Delete
             } else if let Some(files) = op.get("override") {
                 let Some(files) = files.as_table() else {
-                    bail!("{uid}: an override written by an older pe2 (`override = {files}`): it cannot be read");
+                    bail!("{uid_text}: an override written by an older pe2 (`override = {files}`): it cannot be read");
                 };
                 let mut bases = BTreeMap::new();
                 for (name, base) in files {
@@ -112,17 +124,18 @@ impl Changeset {
                             was: t.get("was").and_then(toml::Value::as_str).map(str::to_string),
                             removed: t.get("removed").and_then(toml::Value::as_bool).unwrap_or(false),
                         },
-                        _ => bail!("{uid}: {name}: neither a hash nor a table"),
+                        _ => bail!("{uid_text}: {name}: neither a hash nor a table"),
                     };
-                    bases.insert(name.clone(), base);
+                    let file = RelPath::new(name).with_context(|| format!("{uid_text}: {name}"))?;
+                    bases.insert(file, base);
                 }
                 Op::Override { files: bases, to }
             } else if let Some(to) = to {
                 Op::Move { to }
             } else {
-                bail!("{uid}: an op that neither overrides, moves nor deletes");
+                bail!("{uid_text}: an op that neither overrides, moves nor deletes");
             };
-            changeset.ops.insert(uid.clone(), op);
+            changeset.ops.insert(uid(uid_text)?, op);
         }
         Ok(changeset)
     }
@@ -140,12 +153,17 @@ impl Changeset {
             lines.push(format!("ignore = [{}]", self.ignore.iter().map(|i| quote(i)).collect::<Vec<_>>().join(", ")));
         }
         lines.extend([String::new(), "[entries]".into()]);
-        let mut entries: Vec<(&String, &String)> = self.entries.iter().collect();
+        let mut entries: Vec<(&Uid, &VfsPath<Tree>)> = self.entries.iter().collect();
         entries.sort_by(|a, b| a.1.cmp(b.1));
-        lines.extend(entries.into_iter().map(|(uid, path)| format!("{} = {}", quote(uid), quote(path))));
+        lines.extend(
+            entries.into_iter().map(|(uid, path)| format!("{} = {}", quote(&uid.to_string()), quote(path.as_str()))),
+        );
         if !self.ops.is_empty() {
             lines.extend([String::new(), "[ops]".into()]);
-            for (uid, op) in &self.ops {
+            // By the uid's text, as a reader of the file finds one.
+            let mut ops: Vec<(String, &Op)> = self.ops.iter().map(|(uid, op)| (uid.to_string(), op)).collect();
+            ops.sort_by(|a, b| a.0.cmp(&b.0));
+            for (uid, op) in ops {
                 let fields = match op {
                     Op::Override { files, to } => {
                         let files: Vec<String> = files
@@ -157,20 +175,20 @@ impl Changeset {
                                 } else {
                                     quote(was)
                                 };
-                                format!("{} = {base}", quote(name))
+                                format!("{} = {base}", quote(name.as_str()))
                             })
                             .collect();
                         let files =
                             if files.is_empty() { "{}".to_string() } else { format!("{{ {} }}", files.join(", ")) };
                         match to {
-                            Some(to) => format!("override = {files}, to = {}", quote(to)),
+                            Some(to) => format!("override = {files}, to = {}", quote(to.as_str())),
                             None => format!("override = {files}"),
                         }
                     }
-                    Op::Move { to } => format!("to = {}", quote(to)),
+                    Op::Move { to } => format!("to = {}", quote(to.as_str())),
                     Op::Delete => "delete = true".into(),
                 };
-                lines.push(format!("{} = {{ {fields} }}", quote(uid)));
+                lines.push(format!("{} = {{ {fields} }}", quote(&uid)));
             }
         }
         lines.join("\n") + "\n"
@@ -225,23 +243,22 @@ fn glob(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Base, Changeset, Op};
+    use crate::testing::{rel, tree, uid};
 
     #[test]
     fn round_trip() {
         let mut changeset = Changeset { read_only: true, ignore: vec!["*.swp".into()], ..Changeset::default() };
-        changeset.entries.insert("uid://b".into(), "z/b".into());
-        changeset.entries.insert("uid://a".into(), "y/a".into());
+        changeset.entries.insert(uid("uid://b"), tree("z/b"));
+        changeset.entries.insert(uid("uid://a"), tree("y/a"));
         let files = [
-            ("node.toml".to_string(), Base { was: Some("3f2a".into()), removed: false }),
-            ("new.txt".to_string(), Base { was: None, removed: false }),
-            ("old.bin".to_string(), Base { was: Some("77ab".into()), removed: true }),
+            (rel("node.toml"), Base { was: Some("3f2a".into()), removed: false }),
+            (rel("new.txt"), Base { was: None, removed: false }),
+            (rel("old.bin"), Base { was: Some("77ab".into()), removed: true }),
         ];
-        changeset
-            .ops
-            .insert("uid://o".into(), Op::Override { files: files.into_iter().collect(), to: Some("w".into()) });
-        changeset.ops.insert("uid://p".into(), Op::Override { files: std::collections::BTreeMap::default(), to: None });
-        changeset.ops.insert("uid://m".into(), Op::Move { to: "v".into() });
-        changeset.ops.insert("uid://d".into(), Op::Delete);
+        changeset.ops.insert(uid("uid://o"), Op::Override { files: files.into_iter().collect(), to: Some(tree("w")) });
+        changeset.ops.insert(uid("uid://p"), Op::Override { files: std::collections::BTreeMap::default(), to: None });
+        changeset.ops.insert(uid("uid://m"), Op::Move { to: tree("v") });
+        changeset.ops.insert(uid("uid://d"), Op::Delete);
         let text = changeset.render();
         assert!(text.find("y/a").unwrap() < text.find("z/b").unwrap());
         assert_eq!(Changeset::parse(&text).unwrap(), changeset);

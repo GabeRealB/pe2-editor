@@ -55,7 +55,7 @@ pub fn wiring(index: &Index, extensions: &Extensions, config: &Config) -> Wiring
     for asset in index.assets.values().filter(|asset| !config.disabled.contains(&asset.path)) {
         let (plan, _) = extensions.plan(asset);
         for output in &plan.outputs {
-            let target = (asset.path.clone(), output.name.clone());
+            let target = (asset.path.to_string(), output.name.clone());
             if !output.events.pull.is_empty() {
                 let action = Action::Pull { asset: target.0.clone(), output: target.1.clone() };
                 triggers.push(Trigger {
@@ -148,7 +148,10 @@ fn deployed(place: &str, config: &Name, file: &str) -> Result<RelPath> {
 impl Site<'_> {
     /// An output, with its plan.
     fn output<'b>(&'b self, asset: &str, output: &str) -> Result<(&'b Asset, Plan, usize)> {
-        let found = self.index.assets.get(asset).with_context(|| format!("{asset}: no such asset"))?;
+        let found = crate::TreePath::new(asset)
+            .ok()
+            .and_then(|at| self.index.assets.get(&at))
+            .with_context(|| format!("{asset}: no such asset"))?;
         let (plan, _) = self.extensions.plan(found);
         let at = plan
             .outputs

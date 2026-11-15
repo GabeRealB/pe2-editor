@@ -334,9 +334,12 @@ pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
     }
     // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
     let held = crate::records::held_at(dir).map(|(held, within)| held.list(&within));
-    for (name, folder) in held.into_iter().flatten().chain(crate::records::Set::list(dir).into_iter().flatten()) {
-        if seen.insert(name.clone()) {
-            out.push((Name::new(&name), dir.entry(std::ffi::OsStr::new(&name)), folder));
+    let held = held.into_iter().flatten().map(|(name, folder)| (Name::new(&name), folder));
+    let recorded = crate::records::Set::list(dir).into_iter().flatten().map(|(name, folder)| (Ok(name), folder));
+    for (name, folder) in held.chain(recorded) {
+        let text = shown(&name).to_owned();
+        if seen.insert(text.clone()) {
+            out.push((name, dir.entry(std::ffi::OsStr::new(&text)), folder));
         }
     }
     let packed = Pack::of(&dir.join(&FILE)).map(|(pack, _)| pack).filter(|pack| dir.starts_with(&pack.root));

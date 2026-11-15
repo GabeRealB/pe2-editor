@@ -4,13 +4,13 @@
 //! (`forget`, `adopt`, `remove-unlisted`) is a layer's own path, as the problem gives it. A file's content goes by the
 //! path of a file holding it (`from`), never inline: what applies it reads it there.
 
-use pe2_path::HostPath;
+use pe2_path::{HostPath, Uid};
 
 use anyhow::{Context, Result, bail};
-use project::Project;
 use project::edit::{self, Resolution};
 use project::history::History;
-use project::index::{BUNDLE_SUFFIX, Index};
+use project::index::{Index, bundle_named};
+use project::{Project, TreePath};
 use serde::{Deserialize, Serialize};
 
 use crate::write::Change;
@@ -137,9 +137,15 @@ impl Op {
 }
 
 /// The uid of the entry at a path of the tree: a node's (`x` for `x.node`), a folder's or a file's.
-fn uid_at(index: &Index, path: &str) -> Result<String> {
-    let entry = index.entries.get(&format!("{path}{BUNDLE_SUFFIX}")).or_else(|| index.entries.get(path));
-    entry.map(|e| e.uid.clone()).with_context(|| format!("{path}: nothing is there"))
+fn uid_at(index: &Index, path: &str) -> Result<Uid> {
+    let path = tree(path)?;
+    let entry = index.entries.get(&bundle_named(&path)).or_else(|| index.entries.get(&path));
+    entry.map(|e| e.uid).with_context(|| format!("{path}: nothing is there"))
+}
+
+/// A path an edit names, as text: checked where it becomes an edit of the project.
+fn tree(text: &str) -> Result<TreePath> {
+    TreePath::new(text).with_context(|| format!("{text}: no path of the project"))
 }
 
 /// Apply an edit to a layer, as a step of the history: the step's label, and the paths it touched for the index to take
@@ -157,20 +163,20 @@ pub fn apply(
 ) -> Result<(String, Vec<HostPath>)> {
     let touched = match op {
         _ if let Some(change) = op.as_change() => crate::write::apply(&change, project, index, layer, history)?,
-        Op::Override { path } => edit::override_entry(project, index, layer, &uid_at(index, path)?, history)?,
-        Op::Drop { path } => edit::resolve(project, index, layer, &uid_at(index, path)?, Resolution::Drop, history)?,
+        Op::Override { path } => edit::override_entry(project, index, layer, uid_at(index, path)?, history)?,
+        Op::Drop { path } => edit::resolve(project, index, layer, uid_at(index, path)?, Resolution::Drop, history)?,
         Op::KeepMine { path } => {
-            edit::resolve(project, index, layer, &uid_at(index, path)?, Resolution::KeepMine, history)?
+            edit::resolve(project, index, layer, uid_at(index, path)?, Resolution::KeepMine, history)?
         }
         Op::TakeBase { path } => {
-            edit::resolve(project, index, layer, &uid_at(index, path)?, Resolution::TakeBase, history)?
+            edit::resolve(project, index, layer, uid_at(index, path)?, Resolution::TakeBase, history)?
         }
         Op::Forget { layer: of, path } => {
-            let uid = index.listed(of, path).with_context(|| format!("{of} does not list {path}"))?.to_string();
-            edit::forget(project, index, of, &uid, history)?
+            let uid = index.listed(of, &tree(path)?).with_context(|| format!("{of} does not list {path}"))?;
+            edit::forget(project, index, of, uid, history)?
         }
-        Op::Adopt { layer: of, path } => edit::adopt(project, index, of, path, history)?,
-        Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, path, history)?,
+        Op::Adopt { layer: of, path } => edit::adopt(project, index, of, &tree(path)?, history)?,
+        Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, &tree(path)?, history)?,
         Op::Undo => {
             let step = history.undo(index, None, false).map_err(|e| anyhow::anyhow!("{e}"))?;
             return Ok((format!("Undid {}", step.label), step.paths()));

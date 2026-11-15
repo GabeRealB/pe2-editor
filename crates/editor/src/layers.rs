@@ -359,7 +359,12 @@ fn footer_ui(ui: &mut egui::Ui, ws: &Workspace, state: &mut LayersState, action:
 // --- the layer pane ---------------------------------------------------------------------------------------------------
 
 /// The Layer pane: the active layer's changeset.
-pub fn layer_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
+pub fn layer_ui(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    nav: &mut Option<crate::workspace::Nav>,
+    edit: &mut Option<EditRequest>,
+) {
     let Some(layer) = ws.active_layer().cloned() else {
         ui.label(RichText::new("The project has no layers").color(theme::weak()));
         return;
@@ -414,7 +419,7 @@ fn operations_ui(
     ui: &mut egui::Ui,
     ws: &Workspace,
     layer: &str,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     mut edit: Option<&mut Option<EditRequest>>,
 ) {
     let operations = ws.index.operations(layer);
@@ -431,8 +436,8 @@ fn operations_ui(
                 OpStatus::Conflict => (icons::X_CIRCLE, ui.visuals().error_fg_color, "conflict at its target"),
             };
             let (what, to) = match &op.op {
-                Op::Override { to, .. } => ("override", to.as_deref()),
-                Op::Move { to } => ("move", Some(to.as_str())),
+                Op::Override { to, .. } => ("override", to.as_ref()),
+                Op::Move { to } => ("move", Some(to)),
                 Op::Delete => ("delete", None),
             };
             ui.horizontal(|ui| {
@@ -441,7 +446,10 @@ fn operations_ui(
                 if let Some(edit) = edit.as_deref_mut() {
                     resolutions_ui(ui, op, edit);
                 }
-                path_link(ui, ws, op.path.as_deref().unwrap_or(&op.uid), nav);
+                match &op.path {
+                    Some(path) => path_link(ui, ws, path, nav),
+                    None => drop(ui.label(op.uid.to_string())),
+                }
             });
             if let Some(to) = to {
                 ui.horizontal(|ui| {
@@ -451,7 +459,7 @@ fn operations_ui(
                 });
             }
             if op.status == OpStatus::Stale {
-                stale_parts_ui(ui, &ws.index.stale_parts(layer, &op.uid), 88.0);
+                stale_parts_ui(ui, &ws.index.stale_parts(layer, op.uid), 88.0);
             }
         }
         if operations.len() > 500 {
@@ -479,7 +487,7 @@ pub fn stale_parts_ui(ui: &mut egui::Ui, parts: &[project::index::StalePart], in
                 let what = match &part.field {
                     Some(field) if part.file == project::index::NODE_FILE => field.clone(),
                     Some(field) => format!("{}: {field}", part.file),
-                    None => part.file.clone(),
+                    None => part.file.to_string(),
                 };
                 ui.label(RichText::new(what).small().color(ui.visuals().warn_fg_color));
                 ui.label(value(&part.mine));
@@ -497,7 +505,7 @@ fn resolutions_ui(ui: &mut egui::Ui, op: &project::index::OpView, edit: &mut Opt
     use project::edit::Resolution;
     let mut ask = |ui: &mut egui::Ui, text: &str, hint: &str, resolution| {
         if ui.small_button(text).on_hover_text(hint).clicked() {
-            *edit = Some(EditRequest::Resolve(op.uid.clone(), resolution));
+            *edit = Some(EditRequest::Resolve(op.uid, resolution));
         }
     };
     match (op.status, &op.op) {
@@ -521,7 +529,7 @@ fn resolutions_ui(ui: &mut egui::Ui, op: &project::index::OpView, edit: &mut Opt
 }
 
 /// The entries a layer creates, a row each (a game's nodes run to thousands, so only the rows in view are drawn).
-fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<String>) {
+fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<crate::workspace::Nav>) {
     let creates = ws.index.creates(layer);
     theme::section(ui, &format!("Creates ({})", creates.len()), |ui| {
         if creates.is_empty() {
@@ -543,9 +551,9 @@ fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<S
                             None => (icons::X_CIRCLE, ui.visuals().error_fg_color),
                         };
                         ui.label(RichText::new(icon).color(tint)).on_hover_text(if create.kind.is_none() {
-                            "missing from the layer"
+                            "missing from the layer".to_string()
                         } else {
-                            &create.uid
+                            create.uid.to_string()
                         });
                         path_link(ui, ws, &create.path, nav);
                     });
@@ -556,15 +564,16 @@ fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<S
 }
 
 /// A resolved path, a link where it is an entry of the view.
-fn path_link(ui: &mut egui::Ui, ws: &Workspace, real: &str, nav: &mut Option<String>) {
-    let shown = real.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(real);
-    let known = ws.index.assets.contains_key(shown) || ws.index.entries.contains_key(real);
+fn path_link(ui: &mut egui::Ui, ws: &Workspace, real: &project::TreePath, nav: &mut Option<crate::workspace::Nav>) {
+    // A bundle shows as its asset; one whose asset is no name is shown as it is.
+    let shown = project::index::asset_named(real).unwrap_or_else(|_| real.clone());
+    let known = ws.index.assets.contains_key(&shown) || ws.index.entries.contains_key(real);
     if known {
-        let target = if ws.index.assets.contains_key(shown) { shown } else { real };
-        if theme::short_link(ui, shown).clicked() {
-            *nav = Some(target.to_string());
+        let target = if ws.index.assets.contains_key(&shown) { &shown } else { real };
+        if theme::short_link(ui, shown.as_str()).clicked() {
+            *nav = Some(crate::workspace::Nav::to(target.clone()));
         }
     } else {
-        theme::short(ui, RichText::new(shown).color(theme::weak()));
+        theme::short(ui, RichText::new(shown.as_str()).color(theme::weak()));
     }
 }

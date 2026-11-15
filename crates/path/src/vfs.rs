@@ -87,6 +87,12 @@ impl<S: Scope> VfsPath<S> {
         self.path.name()
     }
 
+    /// Its last name as a name, unless it is the scope itself.
+    #[must_use]
+    pub fn last(&self) -> Option<crate::Name> {
+        self.path.last()
+    }
+
     /// What it is in, unless it is the scope itself.
     #[must_use]
     pub fn parent(&self) -> Option<VfsPath<S>> {
@@ -155,6 +161,18 @@ impl<S: Scope> PartialEq for VfsPath<S> {
 }
 
 impl<S: Scope> Eq for VfsPath<S> {}
+
+impl<S: Scope> PartialEq<str> for VfsPath<S> {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl<S: Scope> PartialEq<&str> for VfsPath<S> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 impl<S: Scope> PartialOrd for VfsPath<S> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

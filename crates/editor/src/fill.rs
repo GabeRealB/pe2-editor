@@ -40,7 +40,7 @@ pub struct Fill {
     /// Why the last run did not finish, shown until the next.
     failed: Option<String>,
     /// Where the discs are looked for, as being typed: by the mount it locates.
-    look_in: Option<(String, String)>,
+    look_in: Option<(project::TreePath, String)>,
     /// What a run wrote, being taken in: the take-in's ticket.
     settling: Option<u64>,
 }
@@ -205,7 +205,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
         }
     });
     if let Some((at, path)) = look_here {
-        match project::setup::locate(&ws.project, &at, &path) {
+        match project::setup::locate(&ws.project, at.as_str(), &path) {
             Ok(()) => {
                 ws.fill.look_in = None;
                 ws.reload_project("where the discs are changed");
@@ -313,7 +313,11 @@ fn discs_ui(ui: &mut egui::Ui, planned: &crate::plans::Planned) -> (Vec<String>,
 
 /// Where the discs are looked for, where that is an unmanaged mount: its place on this machine, to change. The mount and
 /// the place typed, once asked to look there.
-fn look_in_ui(ui: &mut egui::Ui, ws: &mut Workspace, planned: &crate::plans::Planned) -> Option<(String, String)> {
+fn look_in_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    planned: &crate::plans::Planned,
+) -> Option<(project::TreePath, String)> {
     let header = planned.header.as_ref().ok()?;
     let look_in = header.inputs.values().next()?.look_in.trim_start_matches("res://").trim_matches('/');
     let mount = ws.project.unmanaged.iter().find(|m| m.at == look_in)?;

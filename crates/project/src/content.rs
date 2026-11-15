@@ -137,6 +137,12 @@ static RECORDS: std::sync::Mutex<Vec<(HostPath, std::time::SystemTime, Arc<crate
 const RECORDS_HELD: usize = 256;
 
 /// The text a record holds for one of its files, read from the record's own file.
+/// A file of a record, by the name what serves it was told: a path within the record's entry.
+fn record_file(record: &HostPath, name: &str) -> io::Result<pe2_path::RelPath> {
+    pe2_path::RelPath::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {e}", record.display())))
+}
+
 fn record_text(record: &HostPath, name: &str) -> io::Result<Vec<u8>> {
     // A record that waits to be written is read as that leaves it: whoever holds the project said its files
     // served from it already.
@@ -145,7 +151,7 @@ fn record_text(record: &HostPath, name: &str) -> io::Result<Vec<u8>> {
             let text = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let parsed = crate::records::Record::parse(&text)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e:#}", record.display())))?;
-            return match parsed.files.get(name).and_then(|file| file.content.as_ref()) {
+            return match parsed.files.get(&record_file(record, name)?).and_then(|file| file.content.as_ref()) {
                 Some(crate::records::Content::Text(text)) => Ok(text.clone().into_bytes()),
                 _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: no text of `{name}`", record.display()))),
             };
@@ -169,7 +175,7 @@ fn record_text(record: &HostPath, name: &str) -> io::Result<Vec<u8>> {
         held.push((record.clone(), written, parsed.clone()));
         parsed
     };
-    match parsed.files.get(name).and_then(|file| file.content.as_ref()) {
+    match parsed.files.get(&record_file(record, name)?).and_then(|file| file.content.as_ref()) {
         Some(crate::records::Content::Text(text)) => Ok(text.clone().into_bytes()),
         _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: no text of `{name}`", record.display()))),
     }

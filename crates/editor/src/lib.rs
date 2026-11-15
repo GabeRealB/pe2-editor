@@ -246,17 +246,28 @@ pub fn run() -> Result {
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);
     let mut agents_drive = false;
+    // An argument that names nothing it can be is refused, as a program refuses a wrong argument.
+    let refused = |arg: &std::ffi::OsStr, why: &dyn std::fmt::Display| -> ! {
+        eprintln!("pe2-editor: {}: {why}", arg.to_string_lossy());
+        std::process::exit(2)
+    };
+    let place = |arg: &std::ffi::OsStr| HostPath::new(std::path::Path::new(arg)).unwrap_or_else(|e| refused(arg, &e));
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--select") => select = args.next().map(|a| a.to_string_lossy().into_owned()),
+            Some("--select") => {
+                let Some(asset) = args.next() else { refused(&arg, &"names no asset") };
+                let text = asset.to_str().unwrap_or_else(|| refused(&asset, &"is no text"));
+                select = Some(project::TreePath::new(text).unwrap_or_else(|e| refused(&asset, &e)));
+            }
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--screenshot") => {
-                screenshot = args.next().and_then(|to| HostPath::new(std::path::Path::new(&to)).ok());
+                let Some(to) = args.next() else { refused(&arg, &"names no file") };
+                screenshot = Some(place(&to));
             }
             Some("--agents-drive") => agents_drive = true,
             Some("--wait-for-agent") => workspace::wait_for_agent(),
             Some("--trust-everything") => extensions::trust::trust_everything(),
-            _ => project = HostPath::new(std::path::Path::new(&arg)).ok(),
+            _ => project = Some(place(&arg)),
         }
     }
     let project = project.or_else(|| {

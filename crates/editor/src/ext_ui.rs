@@ -31,7 +31,7 @@ pub struct Textures {
     /// The pictures drawn off the window's thread, which views ask for (`UiHost::picture`).
     pub pictures: Option<crate::pictures::Pictures>,
     /// By asset, what a view of it left for when it is made again.
-    pub notes: HashMap<String, String>,
+    pub notes: HashMap<project::TreePath, String>,
     /// What a gesture in a view has made of a part so far.
     pub live: Option<Live>,
 }
@@ -136,7 +136,7 @@ pub struct Sets {
 
 /// What a gesture has made so far of a part's fields, nothing being written yet: until the asset next changes.
 pub struct Live {
-    pub asset: String,
+    pub asset: project::TreePath,
     pub part: String,
     pub fields: Vec<(String, Value)>,
 }
@@ -146,7 +146,7 @@ pub struct Host<'a> {
     target: Target<'a>,
     lens: &'a Lens<'a>,
     textures: &'a mut Textures,
-    nav: &'a mut Option<String>,
+    nav: &'a mut Option<crate::workspace::Nav>,
     sets: &'a mut Sets,
     frame: Frame<'a>,
     /// The last widget drawn, for a tooltip.
@@ -166,7 +166,7 @@ impl<'a> Host<'a> {
         ui: &'a mut egui::Ui,
         lens: &'a Lens<'a>,
         textures: &'a mut Textures,
-        nav: &'a mut Option<String>,
+        nav: &'a mut Option<crate::workspace::Nav>,
         sets: &'a mut Sets,
         frame: Frame<'a>,
     ) -> Host<'a> {
@@ -603,7 +603,7 @@ impl UiHost for Host<'_> {
             .collect();
         let shown = self.frame.part.map(crate::workspace::part_name);
         let overlay = Overlay {
-            id: self.frame.asset.map_or_else(|| format!("{:?}", ui.scope_id()), |a| a.path.clone()),
+            id: self.frame.asset.map_or_else(|| format!("{:?}", ui.scope_id()), |a| a.path.to_string()),
             size: egui::vec2(canvas.width, canvas.height),
             pictures,
             // The selected one is the host's to mark, whatever view drew it.
@@ -625,13 +625,18 @@ impl UiHost for Host<'_> {
     }
 
     fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>> {
-        let look = self.lens.index.assets.get(path).map_or(0, |asset| self.lens.extensions.look_at(asset, look));
-        let drawn = self.textures.pictures.as_mut()?.get(path, look)?;
+        // A view asking for what is no path is told why, as for an asset that has no picture.
+        let path = match project::TreePath::new(path) {
+            Ok(path) => path,
+            Err(why) => return Some(Err(format!("{path}: {why}"))),
+        };
+        let look = self.lens.index.assets.get(&path).map_or(0, |asset| self.lens.extensions.look_at(asset, look));
+        let drawn = self.textures.pictures.as_mut()?.get(&path, look)?;
         Some(drawn.map(|image| Texture::shared(format!("{path}#{look}#picture"), image)))
     }
 
     fn navigate(&mut self, path: &str) {
-        *self.nav = Some(path.to_string());
+        *self.nav = Some(crate::workspace::Nav::link(path));
     }
 
     fn selected(&self) -> Option<String> {
@@ -649,7 +654,7 @@ impl UiHost for Host<'_> {
     }
 
     fn select(&mut self, part: &str) {
-        *self.nav = Some(format!("#{part}"));
+        *self.nav = Some(crate::workspace::Nav::Part(part.to_string()));
     }
 
     fn choose(&mut self, group: &str, member: &str) {

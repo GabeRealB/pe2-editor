@@ -32,19 +32,21 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
     let op = vfs::ops::Op::Folder { path: "made".into() };
     let (label, _) = editor.workspace().apply_edit(&op, None).expect("made");
     assert!(label.contains("made"), "{label}");
-    editor.until("the folder to be taken in", |e| e.workspace().index.entries.contains_key("made"));
+    editor.until("the folder to be taken in", |e| e.workspace().index.entries.contains_key(&super::path("made")));
     assert_eq!(records(&mut editor).len(), 1);
     // The node below overridden: its record says what it was made from.
     let op = vfs::ops::Op::Override { path: "notes".into() };
     editor.workspace().apply_edit(&op, None).expect("overridden");
-    editor.until("the override to be taken in", |e| e.workspace().index.assets["notes"].layers.len() == 2);
+    editor
+        .until("the override to be taken in", |e| e.workspace().index.assets[&super::path("notes")].layers.len() == 2);
     assert_eq!(records(&mut editor).len(), 2);
     // Both taken back, one step each: the layer holds nothing again.
     for _ in 0..2 {
         editor.workspace().apply_edit(&vfs::ops::Op::Undo, None).expect("undone");
     }
     editor.until("both to be gone", |e| {
-        !e.workspace().index.entries.contains_key("made") && e.workspace().index.assets["notes"].layers.len() == 1
+        !e.workspace().index.entries.contains_key(&super::path("made"))
+            && e.workspace().index.assets[&super::path("notes")].layers.len() == 1
     });
     assert!(records(&mut editor).is_empty(), "{:?}", records(&mut editor));
 }
@@ -64,7 +66,7 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
         answered.try_recv().is_ok_and(|reply| matches!(reply, mcp::Reply::Taken { count: 3 }))
     });
     // Answered once it is taken in, and said where it was due: nothing is due, each has its answer.
-    assert!(editor.workspace().index.entries.contains_key("made/inside"));
+    assert!(editor.workspace().index.entries.contains_key(&super::path("made/inside")));
     assert!(!vfs::due::any(&space.read().unwrap()));
     let became = vfs::due::settle(&space, &numbers, false).expect("read");
     assert!(matches!(&became[..], [Some(Ok(_)), Some(Ok(_)), Some(Ok(so))] if so.contains("already")), "{became:?}");
@@ -116,7 +118,7 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     // The window shows all of it once it draws again.
     editor.until("the window to show it", |e| {
         let entries = &e.workspace().index.entries;
-        entries.contains_key("made/inside") && !entries.contains_key("due")
+        entries.contains_key(&super::path("made/inside")) && !entries.contains_key(&super::path("due"))
     });
     assert_eq!(editor.workspace().history.done().len(), 2, "two steps left of the three made");
     // While a point of the history is shown, nothing is edited from outside either.

@@ -21,12 +21,12 @@ enum Thumb {
 }
 
 struct Job {
-    path: String,
+    path: project::TreePath,
     asset: Asset,
 }
 
 struct Done {
-    path: String,
+    path: project::TreePath,
     image: Option<egui::ColorImage>,
 }
 
@@ -35,7 +35,7 @@ pub struct Thumbs {
     done: mpsc::Receiver<Done>,
     /// The window to wake when a thumbnail is ready, once there is one.
     ctx: Arc<OnceLock<egui::Context>>,
-    shown: RefCell<HashMap<String, Thumb>>,
+    shown: RefCell<HashMap<project::TreePath, Thumb>>,
 }
 
 impl Thumbs {
@@ -93,7 +93,7 @@ impl Thumbs {
     }
 
     /// Forget the thumbnails of assets that changed: they are asked for again.
-    pub fn forget<'a>(&self, paths: impl IntoIterator<Item = &'a String>) {
+    pub fn forget<'a>(&self, paths: impl IntoIterator<Item = &'a project::TreePath>) {
         let mut shown = self.shown.borrow_mut();
         for path in paths {
             shown.remove(path);

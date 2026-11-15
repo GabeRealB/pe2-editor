@@ -15,12 +15,13 @@
 //! so a project opens without importing. Like the rest of the cache, any of it may be deleted at the cost of time only.
 
 use anyhow::{Context, Result};
-use pe2_path::HostPath;
+use pe2_path::{HostPath, RelPath};
 use pe2_value as V;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::TreePath;
 use crate::cache::Cache;
 use crate::ext::{Extensions, Origin, Status};
 use crate::extract::sha1_hex;
@@ -39,7 +40,7 @@ pub struct Attached {
     pub made: usize,
     pub kept: usize,
     /// Imports that failed, with why: their assets have no native files.
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<(TreePath, String)>,
 }
 
 /// The project's imports.
@@ -49,7 +50,7 @@ pub struct Imports {
     /// a refresh finds them here rather than on disk while that holds.
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The nodes each asset's last import read outputs of (as traces name them), by its path.
-    read_from: Mutex<HashMap<String, BTreeSet<String>>>,
+    read_from: Mutex<HashMap<TreePath, BTreeSet<String>>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from: kept
     /// in the cache (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
     addresses: Mutex<HashMap<String, Listed>>,
@@ -157,6 +158,11 @@ impl Known {
     }
 }
 
+/// The nodes an import read outputs of, by what it names them (`uid://...` or a path, without the output).
+fn nodes_read(reads: &Reads) -> BTreeSet<String> {
+    reads.outputs.keys().map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string()).collect()
+}
+
 impl Imports {
     /// The project's imports.
     ///
@@ -218,18 +224,19 @@ impl Imports {
     /// their outputs (`Extensions::dependents`), the others keeping theirs: their problems made again, and those of the
     /// references from or to them naming outputs. What it costs is what changed; imports no asset makes any more are
     /// removed by the next full attach.
-    pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
+    pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<TreePath>) -> Attached {
         let mut changed = changed.clone();
         let depending = tracing::info_span!("attach: what depends on what changed").entered();
         changed.extend(extensions.dependents(index, &changed));
         changed.extend(self.readers(index, &changed));
         drop(depending);
         // What failed may have failed for what another made, which it did not get to say it read: it is tried again.
+        // A problem says its asset's path as text: made of one, it is one.
         let failed = index.problems.iter().filter_map(|p| match p {
-            Problem::Import { asset, .. } => Some(asset.clone()),
+            Problem::Import { asset, .. } => TreePath::new(asset).ok(),
             _ => None,
         });
-        let failed: Vec<String> = failed.collect();
+        let failed: Vec<TreePath> = failed.collect();
         changed.extend(failed.iter().cloned());
         changed.extend(self.readers(index, &failed.into_iter().collect()));
         self.attach_some(index, extensions, Some(&changed), &|_, _, _| {})
@@ -237,10 +244,10 @@ impl Imports {
 
     /// The assets whose last import read an output of one of these, through others or not: what an operation reads of
     /// another node as it runs (`Call::output_of`), which no `references` layer says. These not among them.
-    fn readers(&self, index: &Index, changed: &BTreeSet<String>) -> BTreeSet<String> {
+    fn readers(&self, index: &Index, changed: &BTreeSet<TreePath>) -> BTreeSet<TreePath> {
         let read_from = self.read_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut found = BTreeSet::new();
-        let mut next: Vec<String> = changed.iter().cloned().collect();
+        let mut next: Vec<TreePath> = changed.iter().cloned().collect();
         while let Some(path) = next.pop() {
             let Some(asset) = index.assets.get(&path) else { continue };
             let node = graph::exec::id(&**asset);
@@ -264,11 +271,13 @@ impl Imports {
         &self,
         index: &mut Index,
         extensions: &Extensions,
-        only: Option<&BTreeSet<String>>,
+        only: Option<&BTreeSet<TreePath>>,
         report: &Report<'_>,
     ) -> Attached {
         let mut attached = Attached::default();
-        let of = |path: &str| only.is_none_or(|o| o.contains(path));
+        let of = |path: &TreePath| only.is_none_or(|o| o.contains(path));
+        // What a problem says of an asset, as text: of these where it is the text of one of them.
+        let said_of = |path: &str| only.is_none_or(|o| TreePath::new(path).is_ok_and(|path| o.contains(&path)));
         // What the project defines, for the stacks laying it in.
         let defined = definitions(index, extensions, only);
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
@@ -290,17 +299,17 @@ impl Imports {
         });
         let mut made = tracing::info_span!("attach: imports made")
             .in_scope(|| self.make(&world, &assets, &looked, extensions, reach, report));
-        let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
+        let mut found: Vec<(TreePath, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
         let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
-        let mut read_from: Vec<(String, BTreeSet<String>)> = Vec::new();
+        let mut read_from: Vec<(TreePath, BTreeSet<String>)> = Vec::new();
         if self.stopping() {
             return attached;
         }
         for (at, (asset, look)) in assets.into_iter().zip(looked).enumerate() {
             let Some(look) = look else { return attached };
             let wrong = |p: graph::Problem| Problem::Stack {
-                asset: asset.path.clone(),
+                asset: asset.path.to_string(),
                 error: format!("{}: {}", p.at, p.what),
             };
             stacks.extend(look.wrong.into_iter().map(wrong));
@@ -325,12 +334,7 @@ impl Imports {
                     } else {
                         attached.kept += 1;
                     }
-                    let nodes = reads
-                        .outputs
-                        .keys()
-                        .map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string())
-                        .collect();
-                    read_from.push((asset.path.clone(), nodes));
+                    read_from.push((asset.path.clone(), nodes_read(&reads)));
                     new.push((key.clone(), (reads, import.clone())));
                     found.push((asset.path.clone(), key, import));
                 }
@@ -350,7 +354,7 @@ impl Imports {
         let mut problems: Vec<Problem> = attached
             .failed
             .iter()
-            .map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() })
+            .map(|(asset, error)| Problem::Import { asset: asset.to_string(), error: error.clone() })
             .collect();
         problems.extend(stacks);
         problems.extend(tracing::info_span!("attach: given to the assets").in_scope(|| self.give(index, found)));
@@ -362,8 +366,8 @@ impl Imports {
             | Problem::Stack { asset, .. }
             | Problem::Overridden { asset, .. }
             | Problem::Orphan { asset, .. }
-            | Problem::Taken { asset, .. } => !of(asset),
-            Problem::MissingOutput { asset, target, .. } => !of(asset) && !of(target),
+            | Problem::Taken { asset, .. } => !said_of(asset),
+            Problem::MissingOutput { asset, target, .. } => !said_of(asset) && !said_of(target),
             Problem::Extension { .. } | Problem::Required { .. } => false,
             _ => true,
         });
@@ -375,7 +379,7 @@ impl Imports {
 
     /// What each asset's import comes to, given it: what they make among its files, and its settings resolved. Worked out
     /// at the same time, as that only reads. Returns what is wrong with them.
-    fn give(&self, index: &mut Index, found: Vec<(String, String, Arc<Known>)>) -> Vec<Problem> {
+    fn give(&self, index: &mut Index, found: Vec<(TreePath, String, Arc<Known>)>) -> Vec<Problem> {
         let mut problems = Vec::new();
         let resolved = crate::parallel(&found, |(path, _, import)| {
             let asset = index.assets.get(path)?;
@@ -387,11 +391,20 @@ impl Imports {
             else {
                 continue;
             };
-            asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
+            asset.files.retain(|f| !import.files.iter().any(|(name, _)| f.name == name.as_str()));
             for (name, blob, path) in self.kept_files(&import.files) {
+                // What an importer made is named as it said: one that is no path is said, and no file of the asset.
+                let name = match RelPath::new(name) {
+                    Ok(name) => name,
+                    Err(why) => {
+                        let error = format!("its import made a file named so no path takes it: {why}");
+                        problems.push(Problem::Import { asset: path.to_string(), error });
+                        continue;
+                    }
+                };
                 asset.files.push(BundleFile {
                     path,
-                    name: name.clone(),
+                    name,
                     size: blob.size,
                     modified: (0, 0),
                     layer: layer.clone(),
@@ -403,13 +416,14 @@ impl Imports {
                 resolved
                     .overridden
                     .iter()
-                    .map(|setting| Problem::Overridden { asset: path.clone(), setting: setting.clone() }),
+                    .map(|setting| Problem::Overridden { asset: path.to_string(), setting: setting.clone() }),
             );
             problems.extend(
-                resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }),
+                resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.to_string(), part: part.clone() }),
             );
-            problems
-                .extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
+            problems.extend(
+                resolved.notes.iter().map(|note| Problem::Taken { asset: path.to_string(), note: note.clone() }),
+            );
             asset.imported = Some(resolved);
         }
         problems
@@ -417,23 +431,30 @@ impl Imports {
 
     /// The references naming an output their asset does not have: with the settings resolved, as members an import makes
     /// are among them. An asset's outputs are listed again only when its settings change.
-    fn missing_outputs(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
+    fn missing_outputs(
+        &self,
+        index: &Index,
+        extensions: &Extensions,
+        only: Option<&BTreeSet<TreePath>>,
+    ) -> Vec<Problem> {
         let mut known = self.addresses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // What an earlier run listed, with these extensions.
         let builds = builds_of(extensions);
         if known.is_empty() {
             *known = listed_kept(&self.listed_at, &builds);
         }
-        let of = |path: &str| only.is_none_or(|o| o.contains(path));
+        let of = |path: &TreePath| only.is_none_or(|o| o.contains(path));
         // Of the assets attached: those referred to, and those they refer to.
         let targets: Vec<_> = match only {
             None => index.referenced_by.iter().collect(),
             Some(only) => {
-                let mut around: BTreeSet<String> = only.clone();
+                let mut around: BTreeSet<TreePath> = only.clone();
                 for reference in only.iter().flat_map(|path| index.references_from(path)) {
-                    // Named by its uid, or by its path where that names nothing.
-                    around.extend(index.by_uid.get(&reference.uid).cloned());
-                    around.insert(reference.target);
+                    // Named by its uid, or by its path where that names nothing - each as the declaration writes it:
+                    // what is neither names no asset, and the link says it dangles.
+                    let by_uid = pe2_path::Uid::new(&reference.uid).ok().and_then(|uid| index.by_uid.get(&uid));
+                    around.extend(by_uid.cloned());
+                    around.extend(TreePath::new(&reference.target).ok());
                 }
                 around.iter().filter_map(|target| index.referenced_by.get_key_value(target)).collect()
             }
@@ -451,7 +472,7 @@ impl Imports {
             families.sort_unstable();
             families.dedup();
             let digest = sha1_hex(format!("{}\n{}", families.join(" "), asset.settings_text()).as_bytes());
-            let addresses = held.get(*target).filter(|(d, _)| *d == digest).map_or_else(
+            let addresses = held.get(target.as_str()).filter(|(d, _)| *d == digest).map_or_else(
                 || {
                     Arc::new(
                         extensions
@@ -468,14 +489,14 @@ impl Imports {
                 .filter_map(|reference| {
                     let output = reference.output.as_ref().filter(|o| !addresses.contains(crate::ext::listed(o)))?;
                     Some(Problem::MissingOutput {
-                        asset: reference.from.clone(),
+                        asset: reference.from.to_string(),
                         slot: reference.slot.clone(),
-                        target: (*target).clone(),
+                        target: target.to_string(),
                         output: output.clone(),
                     })
                 })
                 .collect();
-            Some(((*target).clone(), digest, addresses, problems))
+            Some((target.to_string(), digest, addresses, problems))
         });
         let mut problems = Vec::new();
         let mut new = false;
@@ -545,7 +566,7 @@ impl Imports {
             return made;
         }
         report("Making what the importers make", 0, to_make.len());
-        let paths: Vec<&str> = to_make.iter().map(|(at, ..)| assets[*at].path.as_str()).collect();
+        let paths: Vec<&TreePath> = to_make.iter().map(|(at, ..)| &assets[*at].path).collect();
         for level in in_order(world.index, &paths) {
             let level: Vec<_> = level.into_iter().map(|at| to_make[at]).collect();
             let done = crate::parallel(&level, |(at, key, importer, plan, output)| {
@@ -579,7 +600,7 @@ impl Imports {
 /// What the project defines taken from its index (`Extensions::take_definitions`), and what is wrong with it:
 /// taken again where an asset that defines - or did - is among those that changed, and left as it was taken
 /// otherwise, nothing of the project looked through for it.
-fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
+fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<TreePath>>) -> Vec<Problem> {
     if only.is_some_and(|only| !extensions.definitions_among(index, only)) {
         return Vec::new();
     }
@@ -588,9 +609,9 @@ fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<St
 
 /// What earlier imports made of the assets `of` takes, gone. Copied where shared with a snapshot, and only where
 /// something goes.
-fn forget_imports(index: &mut Index, of: &dyn Fn(&str) -> bool) {
+fn forget_imports(index: &mut Index, of: &dyn Fn(&TreePath) -> bool) {
     let imported = |a: &Asset| a.imported.is_some() || a.files.iter().any(|f| f.made_by.is_some());
-    let going: Vec<String> =
+    let going: Vec<TreePath> =
         index.assets.values().filter(|a| of(&a.path) && imported(a)).map(|a| a.path.clone()).collect();
     if going.is_empty() {
         return;
@@ -607,13 +628,13 @@ fn forget_imports(index: &mut Index, of: &dyn Fn(&str) -> bool) {
 
 /// These nodes in rounds, by their places, each round after those holding what its nodes refer to. Nodes referring to each
 /// other in a circle go last: what they make of it is theirs to say.
-fn in_order(index: &Index, paths: &[&str]) -> Vec<Vec<usize>> {
-    let places: HashMap<&str, usize> = paths.iter().enumerate().map(|(at, path)| (*path, at)).collect();
+fn in_order(index: &Index, paths: &[&TreePath]) -> Vec<Vec<usize>> {
+    let places: HashMap<&TreePath, usize> = paths.iter().enumerate().map(|(at, path)| (*path, at)).collect();
     let reads = |at: usize| {
         index
             .references_from(paths[at])
             .into_iter()
-            .filter_map(|r| places.get(index.resolve(&r.uid, &r.target)?.path.as_str()).copied())
+            .filter_map(|r| places.get(&index.resolve(&r.uid, &r.target)?.path).copied())
     };
     let mut waiting: Vec<(usize, HashSet<usize>)> =
         (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();
@@ -700,7 +721,7 @@ fn import_output(plan: &Plan, extensions: &Extensions) -> Option<(String, usize)
 /// The file an asset's stack takes as its import's source, from its bundle.
 fn source_file(asset: &Asset) -> Option<&BundleFile> {
     let (name, _) = graph::import_of_fields(asset.fields())?;
-    asset.files.iter().find(|f| f.name == name && f.made_by.is_none())
+    asset.files.iter().find(|f| f.name.as_str() == name && f.made_by.is_none())
 }
 
 /// A path of `derives`, split: `cells.*.rect` to `["cells", "*", "rect"]`.
@@ -912,6 +933,7 @@ mod attaching {
     use crate::index::{Index, Problem};
     use crate::lock::Lock;
     use crate::testing::At as _;
+    use crate::testing::tree;
     use pe2_ext::ty::{self, Files, Registered};
     use pe2_ext::{Extension, File, Image, Registry, Result, Signature, Table, Typed, Value};
     use pe2_path::HostPath;
@@ -1120,7 +1142,7 @@ mod attaching {
         imports.attach(&mut index, &extensions);
         write(&root, ".layers/base/s.node/source.txt", "a b c");
         let refreshed = index.refresh(&project, &[root.at(".layers/base/s.node/source.txt")]).unwrap();
-        assert!(!refreshed.assets.contains("c"), "c's own files did not change");
+        assert!(!refreshed.assets.contains(&tree("c")), "c's own files did not change");
         imports.attach_changed(&mut index, &extensions, &refreshed.assets);
         let (fresh, _) = open(&root, &extensions);
         assert_eq!(shown(&index), shown(&fresh));
@@ -1385,7 +1407,7 @@ mod attaching {
         let (root, extensions) = staged("lasting", &nodes);
         let (_lock, cache, index) = opened(&root);
         let make = |engine: &crate::graph::exec::Engine, at: &str| {
-            extensions.output(engine, &index, &index.assets[at], "native", true).unwrap()
+            extensions.output(engine, &index, &index.assets[&tree(at)], "native", true).unwrap()
         };
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let run = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone())).for_a_run();
@@ -1413,7 +1435,7 @@ mod attaching {
             extensions.operations(),
             Some(crate::graph::store::Store::open(&cache).unwrap()),
         );
-        let given = extensions.output(&engine, &index, &index.assets["hop"], "native", true).unwrap();
+        let given = extensions.output(&engine, &index, &index.assets[&tree("hop")], "native", true).unwrap();
         let value = format!("{:?}", given.value.unwrap());
         assert!(value.contains("arrived"), "{value}");
         let _ = std::fs::remove_dir_all(&root);
@@ -1435,7 +1457,7 @@ mod attaching {
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let make = |at: &str| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-            extensions.output(&engine, &index, &index.assets[at], "native", true)
+            extensions.output(&engine, &index, &index.assets[&tree(at)], "native", true)
         };
         let value = format!("{:?}", make("chain").unwrap().value.unwrap());
         assert!(value.contains("arrived"), "the second read, named by the first: {value}");
@@ -1452,11 +1474,11 @@ mod attaching {
         );
         let index = Index::open(&Project::load(&root).unwrap(), &cache).unwrap();
         let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-        let followed = extensions.output(&engine, &index, &index.assets["followed"], "native", true).unwrap();
+        let followed = extensions.output(&engine, &index, &index.assets[&tree("followed")], "native", true).unwrap();
         let followed = format!("{:?}", followed.value.unwrap());
         assert!(followed.contains("[String(\"one\"), String(\"two\"), String(\"three\")]"), "{followed}");
         // A helper calling itself, a `for` with a cut in it.
-        let counted = extensions.output(&engine, &index, &index.assets["counted_on"], "native", true).unwrap();
+        let counted = extensions.output(&engine, &index, &index.assets[&tree("counted_on")], "native", true).unwrap();
         let counted = format!("{:?}", counted.value.unwrap());
         assert!(counted.contains("\"length\": Integer(3)"), "{counted}");
         assert!(counted.contains("[String(\"next\"), String(\"arrived\"), String(\"next\")]"), "{counted}");
@@ -1478,7 +1500,8 @@ mod attaching {
             extensions.operations(),
             Some(crate::graph::store::Store::open(&cache).unwrap()),
         );
-        let why = extensions.output(&engine, &index, &index.assets["a"], "native", true).err().expect("a circle");
+        let why =
+            extensions.output(&engine, &index, &index.assets[&tree("a")], "native", true).err().expect("a circle");
         assert!(format!("{why:#}").contains("reads, through others, itself"), "{why:#}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1491,8 +1514,11 @@ mod attaching {
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let make = |index: &Index| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-            let value =
-                extensions.output(&engine, index, &index.assets["whole"], "native", true).unwrap().value.unwrap();
+            let value = extensions
+                .output(&engine, index, &index.assets[&tree("whole")], "native", true)
+                .unwrap()
+                .value
+                .unwrap();
             format!("{value:?}")
         };
         let first = make(&index);
@@ -1545,7 +1571,7 @@ mod attaching {
         imports.stopper().store(true, std::sync::atomic::Ordering::Relaxed);
         let attached = imports.attach(&mut index, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (0, 0, 0));
-        assert!(index.assets["s"].files.iter().all(|file| file.made_by.is_none()), "nothing was made");
+        assert!(index.assets[&tree("s")].files.iter().all(|file| file.made_by.is_none()), "nothing was made");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1584,7 +1610,7 @@ mod attaching {
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (1, 0, 0));
-        let s = &index.assets["s"];
+        let s = &index.assets[&tree("s")];
         let made = s.files.iter().find(|f| f.name == "native.bin").unwrap();
         assert_eq!(made.made_by.as_deref(), Some("test.strips@line"));
         assert_eq!(std::fs::read(&made.path).unwrap(), b"b a");
@@ -1645,7 +1671,7 @@ mod attaching {
         );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, _) = open(&root, &extensions);
-        let settings = index.assets["s"].settings().to_toml();
+        let settings = index.assets[&tree("s")].settings().to_toml();
         assert_eq!(settings["cells"]["a"]["palette"].as_str(), Some("warm"));
         assert!(settings["cells"]["a"]["rect"].is_array(), "what the node says stays, what was made joins it");
         assert!(settings["cells"]["b"]["rect"].is_array());

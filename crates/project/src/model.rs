@@ -323,7 +323,7 @@ fn text(text: &str) -> Vec<u8> {
 pub enum Held {
     Folder,
     File(HostPath),
-    Bundle(BTreeMap<String, HostPath>),
+    Bundle(BTreeMap<pe2_path::RelPath, HostPath>),
     Refused(Box<str>),
 }
 
@@ -403,11 +403,11 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
         Kind::Folder => 1,
         Kind::File => 2,
     });
-    out.maybe(record.parent.as_deref());
-    out.maybe(record.name.as_deref());
+    out.maybe(record.parent.map(|parent| parent.to_string()).as_deref());
+    out.maybe(record.name.as_ref().map(pe2_path::Name::as_str));
     out.u32(u32::try_from(record.files.len()).unwrap_or(u32::MAX));
     for (file, held) in &record.files {
-        out.text(file);
+        out.text(file.as_str());
         match &held.content {
             None => out.u8(0),
             Some(Content::Text(text)) => {
@@ -437,12 +437,21 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
     let len = read.u64()?;
     let op = [Op::Create, Op::Override, Op::Move, Op::Delete].get(usize::from(read.u8()?)).copied()?;
     let kind = [Kind::Node, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
-    let (mut parent, mut name) = (None, None);
+    // Each name checked as it is read back: a model naming one that is none is no model to open over.
+    let (mut parent, mut name): (Option<String>, Option<String>) = (None, None);
     read.maybe(&mut parent)?;
     read.maybe(&mut name)?;
+    let parent = match parent {
+        Some(parent) => Some(pe2_path::Uid::new(&parent).ok()?),
+        None => None,
+    };
+    let name = match name {
+        Some(name) => Some(pe2_path::Name::new(&name).ok()?),
+        None => None,
+    };
     let mut files = BTreeMap::new();
     for _ in 0..read.u32()? {
-        let file = read.text()?;
+        let file = pe2_path::RelPath::new(&read.text()?).ok()?;
         let content = match read.u8()? {
             0 => None,
             1 => Some(Content::Text(read.text()?)),
@@ -477,7 +486,7 @@ fn held(root: &HostPath, held_name: &str, held: &Held) -> Vec<u8> {
             out.u8(long | 8);
             out.u32(u32::try_from(files.len()).unwrap_or(u32::MAX));
             for (file, path) in files {
-                out.text(file);
+                out.text(file.as_str());
                 out.text(&name(root, path));
             }
         }
@@ -500,8 +509,9 @@ fn held_of(root: &HostPath, value: &[u8]) -> Option<(Held, Option<String>)> {
         0 => Held::Folder,
         4 => Held::File(named(root, &read.text()?)?),
         8 => {
-            let files =
-                (0..read.u32()?).map(|_| Some((read.text()?, named(root, &read.text()?)?))).collect::<Option<_>>()?;
+            // Each name checked as it is read back: a model naming one that is none is no model to open over.
+            let file = |read: &mut In| Some((pe2_path::RelPath::new(&read.text()?).ok()?, named(root, &read.text()?)?));
+            let files = (0..read.u32()?).map(|_| file(&mut read)).collect::<Option<_>>()?;
             Held::Bundle(files)
         }
         0xC => Held::Refused(read.text()?.into()),
@@ -941,8 +951,10 @@ pub fn files(pages: &impl Pages, root: &HostPath) -> Result<HashMap<HostPath, Re
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::testing::At as _;
+    use crate::testing::{rel, uid};
     use pe2_path::HostPath;
 
     fn a_record(n: u64, declared: bool) -> Record {
@@ -985,9 +997,9 @@ mod tests {
     /// What two layers hold, as a walk of them finds it: folders, plain files, bundles - one of a name no key holds.
     fn held_by(root: &HostPath) -> Layers {
         let game = root.at(".layers/game");
-        let bundle = |n: u64| -> BTreeMap<String, HostPath> {
+        let bundle = |n: u64| -> BTreeMap<pe2_path::RelPath, HostPath> {
             let folder = game.at(&format!("rooms/r{n}.node"));
-            (0..=n % 3).map(|f| (format!("file{f}.bin"), folder.at(&format!("file{f}.bin")))).collect()
+            (0..=n % 3).map(|f| (rel(&format!("file{f}.bin")), folder.at(&format!("file{f}.bin")))).collect()
         };
         let mut holds: BTreeMap<String, Held> =
             (0..200u64).map(|n| (format!("rooms/r{n}.node"), Held::Bundle(bundle(n)))).collect();
@@ -1030,7 +1042,7 @@ mod tests {
         assert_eq!(layers(&space.read().unwrap(), root).unwrap(), now);
         // A bundle's files change, a folder goes, a layer's listing is made by something else, and a layer is no more.
         let mut delta = Delta::default();
-        let changed = Held::Bundle([("only.bin".to_string(), root.at(".layers/game/rooms/r7.node/only.bin"))].into());
+        let changed = Held::Bundle([(rel("only.bin"), root.at(".layers/game/rooms/r7.node/only.bin"))].into());
         delta.held(root, "game", "rooms/r7.node", Some(&changed));
         delta.held(root, "game", &format!("deep/{}", "long/".repeat(200)), None);
         delta.layer("game", Some("made by another"));
@@ -1066,23 +1078,23 @@ mod tests {
             if kind == Kind::Node {
                 let text = format!("type = \"data\"\n# {}\n", "y".repeat(usize::try_from(n * 131 % 4000).unwrap()));
                 files.insert(
-                    "node.toml".to_string(),
+                    rel("node.toml"),
                     File { content: Some(Content::Text(text)), was: (op == Op::Override).then(|| "3f2a".repeat(10)) },
                 );
                 files.insert(
-                    "native.bin".to_string(),
+                    rel("native.bin"),
                     File { content: Some(Content::Stored { sha1: "9c1e".repeat(10), size: n * 1000 }), was: None },
                 );
-                files.insert("gone.bin".to_string(), File { content: None, was: Some("77aa".repeat(10)) });
+                files.insert(rel("gone.bin"), File { content: None, was: Some("77aa".repeat(10)) });
             } else if op == Op::Create {
-                files.insert(String::new(), File { content: Some(Content::Text(String::new())), was: None });
+                files.insert(rel(""), File { content: Some(Content::Text(String::new())), was: None });
             }
             let placed = matches!(op, Op::Create | Op::Move);
             let record = Record {
                 op,
                 kind,
-                parent: (placed && n % 2 == 0).then(|| format!("uid://parent{n}")),
-                name: placed.then(|| format!("name {n}")),
+                parent: (placed && n % 2 == 0).then(|| uid(&format!("uid://parent{n}"))),
+                name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap()),
                 files,
             };
             (format!("uid://{n:012}"), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))

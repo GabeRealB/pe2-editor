@@ -1371,7 +1371,9 @@ mod tests {
         // There as pinned: nothing is downloaded.
         let mut entry = setup(members(&[(r"bin\x64\dxcompiler.dll", "dxcompiler.dll")]));
         let Take::Members(places) = &mut entry.take else { unreachable!() };
-        places.values_mut().for_each(|taken| taken.sha256 = sha(b"a compiler"));
+        for taken in places.values_mut() {
+            taken.sha256 = sha(b"a compiler");
+        }
         super::fetch_into(&entry, &into, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false)).unwrap();
         // Changed: fetched again - here, where downloads are off, it says so, and what is beside it is as it was.
         std::fs::write(into.at("dxcompiler.dll"), "changed").unwrap();

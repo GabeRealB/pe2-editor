@@ -8,6 +8,7 @@ many there are; click it to open the pane. Click a problem to go to the asset it
 | **An override is out of date**: the version below changed in a way that conflicts with yours. | Make its layer active, then **Keep mine** or **Take below**. See [Layers and overrides](layers.md). |
 | **A file was put in a layer's folder by hand.** | **Adopt** it into the project, or **Remove** it. |
 | **A file the layer expects is missing** from its folder. | **Forget it**, or take the version below. |
+| **A name some system cannot hold** is in a layer's folder (`aux.txt`, `a:b`): it and what is inside it are left out. | Rename it with another program; the project takes it in under its new name. |
 | **A reference leads nowhere**: an asset refers to one that is gone. | Point the field at another asset, or remove it. |
 | **An extension is not trusted, or could not be loaded**, so what it makes is missing. | See [Extensions](../extending/extensions.md). |
 | **A build failed**, or an output is out of date. | The problem says why; fix the asset and build again. See [Building](building.md). |

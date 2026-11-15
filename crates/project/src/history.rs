@@ -34,11 +34,12 @@
 //! Only the holder of the project lock writes (`lock.rs`).
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, Name};
+use pe2_path::{HostPath, Name, RelPath, Uid};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::TreePath;
 use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 use crate::index::{Index, Working, WorkingFile};
@@ -93,10 +94,10 @@ impl Change {
 /// A change to a document's working copy: one of its files, by hash before and after; none: absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
-    pub uid: String,
+    pub uid: Uid,
     /// Where the asset was when it was edited.
-    pub path: String,
-    pub file: String,
+    pub path: TreePath,
+    pub file: RelPath,
     pub before: Option<String>,
     pub after: Option<String>,
 }
@@ -132,7 +133,7 @@ pub struct Step {
     pub changes: Vec<Change>,
     #[serde(default)]
     pub edits: Vec<Edit>,
-    pub selection: Option<String>,
+    pub selection: Option<TreePath>,
     #[serde(skip)]
     merge: Option<(String, Instant)>,
 }
@@ -154,13 +155,13 @@ impl Step {
 
     /// The documents it edited, by uid.
     #[must_use]
-    pub fn documents(&self) -> BTreeSet<&str> {
-        self.edits.iter().map(|e| e.uid.as_str()).collect()
+    pub fn documents(&self) -> BTreeSet<Uid> {
+        self.edits.iter().map(|e| e.uid).collect()
     }
 
     /// Whether it edited this document.
     #[must_use]
-    pub fn edits_document(&self, uid: &str) -> bool {
+    pub fn edits_document(&self, uid: Uid) -> bool {
         self.edits.iter().any(|e| e.uid == uid)
     }
 
@@ -173,8 +174,7 @@ impl Step {
     /// Whether a new step drops it, undone: it touches what the new one does - a document both edit, or files.
     fn overtaken_by(&self, new: &Step) -> bool {
         let theirs = new.documents();
-        self.edits.iter().any(|e| theirs.contains(e.uid.as_str()))
-            || (!self.changes.is_empty() && !new.changes.is_empty())
+        self.edits.iter().any(|e| theirs.contains(&e.uid)) || (!self.changes.is_empty() && !new.changes.is_empty())
     }
 }
 
@@ -184,10 +184,10 @@ impl Step {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     /// Where the asset is.
-    pub path: String,
-    pub base: BTreeMap<String, Option<String>>,
-    pub working: BTreeMap<String, Option<String>>,
-    pub stale: Option<BTreeMap<String, Option<String>>>,
+    pub path: TreePath,
+    pub base: BTreeMap<RelPath, Option<String>>,
+    pub working: BTreeMap<RelPath, Option<String>>,
+    pub stale: Option<BTreeMap<RelPath, Option<String>>>,
 }
 
 /// What a session a crash ended left: its steps, and its documents with unsaved changes.
@@ -195,7 +195,7 @@ pub struct Document {
 pub struct Session {
     pub done: Vec<Step>,
     pub undone: Vec<Step>,
-    pub documents: BTreeMap<String, Document>,
+    pub documents: BTreeMap<Uid, Document>,
 }
 
 /// Why a step cannot be undone or redone.
@@ -223,13 +223,13 @@ impl std::fmt::Display for StepError {
 impl std::error::Error for StepError {}
 
 /// A file of an asset as it is on disk, by hash: none where it has no such file, or the index no such asset.
-fn on_disk(index: &Index, uid: &str, file: &str) -> Option<String> {
+fn on_disk(index: &Index, uid: Uid, file: &RelPath) -> Option<String> {
     disk_file(index, uid, file).map(|f| f.sha1.clone())
 }
 
-fn disk_file<'i>(index: &'i Index, uid: &str, file: &str) -> Option<&'i crate::index::BundleFile> {
-    let asset = index.by_uid.get(uid).and_then(|path| index.assets.get(path))?.on_disk();
-    asset.files.iter().find(|f| f.name == file && f.made_by.is_none())
+fn disk_file<'i>(index: &'i Index, uid: Uid, file: &RelPath) -> Option<&'i crate::index::BundleFile> {
+    let asset = index.by_uid.get(&uid).and_then(|path| index.assets.get(path))?.on_disk();
+    asset.files.iter().find(|f| f.name == *file && f.made_by.is_none())
 }
 
 /// What a history shows of itself - its steps done and undone, the documents with unsaved changes, a session a
@@ -240,7 +240,7 @@ pub struct View {
     dir: HostPath,
     done: Vec<Step>,
     undone: Vec<Step>,
-    documents: BTreeMap<String, Document>,
+    documents: BTreeMap<Uid, Document>,
     /// What a session a crash ended left, until it is taken up or let go.
     left: Option<Session>,
 }
@@ -294,31 +294,31 @@ impl View {
 
     /// The step undo takes back: the last, or the last editing this document.
     #[must_use]
-    pub fn to_undo(&self, scope: Option<&str>) -> Option<&Step> {
+    pub fn to_undo(&self, scope: Option<Uid>) -> Option<&Step> {
         self.done.iter().rev().find(|s| s.undoable() && scope.is_none_or(|uid| s.edits_document(uid)))
     }
 
     /// The step redo makes again: the last undone, or the last undone editing this document.
     #[must_use]
-    pub fn to_redo(&self, scope: Option<&str>) -> Option<&Step> {
+    pub fn to_redo(&self, scope: Option<Uid>) -> Option<&Step> {
         self.undone.iter().rev().find(|s| scope.is_none_or(|uid| s.edits_document(uid)))
     }
 
     /// The documents with unsaved changes, by uid.
     #[must_use]
-    pub fn documents(&self) -> &BTreeMap<String, Document> {
+    pub fn documents(&self) -> &BTreeMap<Uid, Document> {
         &self.documents
     }
 
     /// An asset's document, where it has unsaved changes.
     #[must_use]
-    pub fn document(&self, uid: &str) -> Option<&Document> {
-        self.documents.get(uid)
+    pub fn document(&self, uid: Uid) -> Option<&Document> {
+        self.documents.get(&uid)
     }
 
     /// The working copies, as the index shows them (`Index::set_working`).
     #[must_use]
-    pub fn working(&self) -> HashMap<String, Working> {
+    pub fn working(&self) -> HashMap<Uid, Working> {
         self.documents
             .iter()
             .map(|(uid, document)| {
@@ -329,7 +329,7 @@ impl View {
                         .and_then(|sha1| Some(WorkingFile { path: self.blob_path(sha1).ok()?, sha1: sha1.clone() }));
                     (name.clone(), file)
                 });
-                (uid.clone(), Working { files: files.collect() })
+                (*uid, Working { files: files.collect() })
             })
             .collect()
     }
@@ -346,11 +346,11 @@ impl View {
     /// since edited them: each by uid and name, by hash (none: absent). Of one document, or all. What steps did to
     /// files otherwise (a move, a new asset) is not taken back: a point is of the documents.
     #[must_use]
-    pub fn states_at(&self, point: usize, scope: Option<&str>) -> BTreeMap<(String, String), Option<String>> {
+    pub fn states_at(&self, point: usize, scope: Option<Uid>) -> BTreeMap<(Uid, RelPath), Option<String>> {
         let mut states = BTreeMap::new();
         for step in self.done[point.min(self.done.len())..].iter().rev() {
             for edit in step.edits.iter().rev().filter(|e| scope.is_none_or(|uid| e.uid == uid)) {
-                states.insert((edit.uid.clone(), edit.file.clone()), edit.before.clone());
+                states.insert((edit.uid, edit.file.clone()), edit.before.clone());
             }
         }
         states
@@ -359,7 +359,7 @@ impl View {
     /// The working copies as they were at a point of the log, for the index to show (`Index::set_working`): those of
     /// now, with what steps since changed as it was.
     #[must_use]
-    pub fn working_at(&self, point: usize, scope: Option<&str>) -> HashMap<String, Working> {
+    pub fn working_at(&self, point: usize, scope: Option<Uid>) -> HashMap<Uid, Working> {
         let mut working = self.working();
         for ((uid, file), sha1) in self.states_at(point, scope) {
             let file_at = sha1.and_then(|sha1| Some(WorkingFile { path: self.blob_path(&sha1).ok()?, sha1 }));
@@ -505,7 +505,7 @@ impl History {
     }
 
     /// Note what was selected when the last step was made: undoing it shows that again.
-    pub fn note_selection(&mut self, selection: Option<String>) {
+    pub fn note_selection(&mut self, selection: Option<TreePath>) {
         if let Some(step) = self.view.done.last_mut() {
             step.selection = selection;
         }
@@ -534,9 +534,9 @@ impl History {
     pub fn edit(
         &mut self,
         index: &Index,
-        uid: &str,
-        path: &str,
-        file: &str,
+        uid: Uid,
+        path: &TreePath,
+        file: &RelPath,
         bytes: &[u8],
         label: String,
         merge: Option<String>,
@@ -546,7 +546,7 @@ impl History {
         if before == after {
             return Ok(false);
         }
-        let edit = Edit { uid: uid.to_string(), path: path.to_string(), file: file.to_string(), before, after };
+        let edit = Edit { uid, path: path.clone(), file: file.clone(), before, after };
         self.set_working(index, &edit);
         let mut step = Step::new(label, self.author.clone());
         step.edits.push(edit);
@@ -556,8 +556,8 @@ impl History {
     }
 
     /// A file of an asset as its working copy has it, else as on disk.
-    fn current(&self, index: &Index, uid: &str, file: &str) -> Option<String> {
-        match self.view.documents.get(uid).and_then(|d| d.working.get(file)) {
+    fn current(&self, index: &Index, uid: Uid, file: &RelPath) -> Option<String> {
+        match self.view.documents.get(&uid).and_then(|d| d.working.get(file)) {
             Some(working) => working.clone(),
             None => on_disk(index, uid, file),
         }
@@ -567,16 +567,16 @@ impl History {
     /// is no longer unsaved.
     fn set_working(&mut self, index: &Index, edit: &Edit) {
         let path = index.by_uid.get(&edit.uid).cloned().unwrap_or_else(|| edit.path.clone());
-        let document = self.view.documents.entry(edit.uid.clone()).or_insert_with(|| Document {
+        let document = self.view.documents.entry(edit.uid).or_insert_with(|| Document {
             path,
             base: BTreeMap::new(),
             working: BTreeMap::new(),
             stale: None,
         });
         if !document.base.contains_key(&edit.file) {
-            document.base.insert(edit.file.clone(), on_disk(index, &edit.uid, &edit.file));
+            document.base.insert(edit.file.clone(), on_disk(index, edit.uid, &edit.file));
             // What it was on disk is kept: undone back to it, it is shown though the disk has changed since.
-            if let Some(file) = disk_file(index, &edit.uid, &edit.file)
+            if let Some(file) = disk_file(index, edit.uid, &edit.file)
                 && let Ok(bytes) = crate::content::read(&file.path)
             {
                 let _ = keep_in(&self.view.dir, &bytes);
@@ -592,38 +592,33 @@ impl History {
     ///
     /// # Errors
     /// A content is not kept.
-    pub fn to_save(&self, uid: &str) -> Result<Vec<(String, Option<Vec<u8>>)>> {
-        let Some(document) = self.view.documents.get(uid) else { return Ok(vec![]) };
+    pub fn to_save(&self, uid: Uid) -> Result<Vec<(RelPath, Option<Vec<u8>>)>> {
+        let Some(document) = self.view.documents.get(&uid) else { return Ok(vec![]) };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let changed = document.working.iter().filter(|(name, sha1)| disk.get(*name) != Some(*sha1));
         changed.map(|(name, sha1)| Ok((name.clone(), sha1.as_deref().map(|s| self.blob(s)).transpose()?))).collect()
     }
 
     /// A document was saved: its working copy is what is on disk.
-    pub fn saved(&mut self, uid: &str) {
-        self.view.documents.remove(uid);
+    pub fn saved(&mut self, uid: Uid) {
+        self.view.documents.remove(&uid);
         self.journal();
     }
 
     /// Put a document back as on disk, as a step: its unsaved changes undone, or - stale - the disk's taken.
-    pub fn revert(&mut self, uid: &str, label: String) {
-        let Some(document) = self.view.documents.get(uid).cloned() else { return };
+    pub fn revert(&mut self, uid: Uid, label: String) {
+        let Some(document) = self.view.documents.get(&uid).cloned() else { return };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let mut step = Step::new(label, self.author.clone());
         for (file, working) in &document.working {
             let after = disk.get(file).cloned().flatten();
             if *working != after {
-                let edit = Edit {
-                    uid: uid.to_string(),
-                    path: document.path.clone(),
-                    file: file.clone(),
-                    before: working.clone(),
-                    after,
-                };
+                let edit =
+                    Edit { uid, path: document.path.clone(), file: file.clone(), before: working.clone(), after };
                 step.edits.push(edit);
             }
         }
-        self.view.documents.remove(uid);
+        self.view.documents.remove(&uid);
         if step.edits.is_empty() {
             self.journal();
         } else {
@@ -632,8 +627,8 @@ impl History {
     }
 
     /// Keep a stale document's working copy: what is on disk now is what saving overwrites.
-    pub fn keep_mine(&mut self, uid: &str) {
-        if let Some(document) = self.view.documents.get_mut(uid)
+    pub fn keep_mine(&mut self, uid: Uid) {
+        if let Some(document) = self.view.documents.get_mut(&uid)
             && let Some(disk) = document.stale.take()
         {
             document.base = disk;
@@ -654,13 +649,13 @@ impl History {
                 document.path.clone_from(path);
                 changed = true;
             }
-            let now: BTreeMap<String, Option<String>> =
-                document.base.keys().map(|file| (file.clone(), on_disk(index, uid, file))).collect();
+            let now: BTreeMap<RelPath, Option<String>> =
+                document.base.keys().map(|file| (file.clone(), on_disk(index, *uid, file))).collect();
             let stale = if now == document.base { None } else { Some(now.clone()) };
             // What the disk has now is kept: taken, it is the working copy.
             if stale.is_some() && stale != document.stale {
                 for file in now.keys() {
-                    if let Some(file) = disk_file(index, uid, file)
+                    if let Some(file) = disk_file(index, *uid, file)
                         && let Ok(bytes) = crate::content::read(&file.path)
                     {
                         let _ = keep_in(&self.view.dir, &bytes);
@@ -668,7 +663,7 @@ impl History {
                 }
             }
             if now != document.base && now == document.working {
-                clean.push(uid.clone());
+                clean.push(*uid);
             } else if stale != document.stale {
                 document.stale = stale;
                 changed = true;
@@ -694,12 +689,16 @@ impl History {
 
     /// Put the documents back as they were at a point of the log - one, or all - as a new step: what was done since
     /// stays in the log, undone by undoing this. Whether anything changed.
-    pub fn restore(&mut self, index: &Index, point: usize, scope: Option<&str>, label: String) -> bool {
+    ///
+    /// # Panics
+    /// A step of the log edits an asset it does not say the path of: the log never holds one.
+    pub fn restore(&mut self, index: &Index, point: usize, scope: Option<Uid>, label: String) -> bool {
         let mut step = Step::new(label, self.author.clone());
         for ((uid, file), after) in self.states_at(point, scope) {
-            let before = self.current(index, &uid, &file);
+            let before = self.current(index, uid, &file);
             if before != after {
-                let path = self.edit_path(index, &uid);
+                // What is restored was edited in the log, which says where it was.
+                let path = self.edit_path(index, uid).expect("an edit of the log says where its asset was");
                 step.edits.push(Edit { uid, path, file, before, after });
             }
         }
@@ -721,8 +720,8 @@ impl History {
         let later = &self.view.done[at + 1..];
         for edit in &step.edits {
             let since = later.iter().any(|s| s.edits.iter().any(|e| e.uid == edit.uid && e.file == edit.file));
-            if since || self.current(index, &edit.uid, &edit.file) != edit.after {
-                let name = edit.path.rsplit('/').next().unwrap_or(&edit.path);
+            if since || self.current(index, edit.uid, &edit.file) != edit.after {
+                let name = edit.path.name().unwrap_or_default();
                 return Err(format!("{name} was edited since: restore an earlier point instead"));
             }
         }
@@ -751,14 +750,13 @@ impl History {
     }
 
     /// Where an asset is, for an edit of it: as the index has it, else as its document last had it.
-    fn edit_path(&self, index: &Index, uid: &str) -> String {
+    fn edit_path(&self, index: &Index, uid: Uid) -> Option<TreePath> {
         index
             .by_uid
-            .get(uid)
-            .or_else(|| self.view.documents.get(uid).map(|d| &d.path))
+            .get(&uid)
+            .or_else(|| self.view.documents.get(&uid).map(|d| &d.path))
             .cloned()
             .or_else(|| self.view.done.iter().flat_map(|s| &s.edits).find(|e| e.uid == uid).map(|e| e.path.clone()))
-            .unwrap_or_default()
     }
 
     // --- undo and redo ---------------------------------------------------------------------------------------------
@@ -768,7 +766,7 @@ impl History {
     ///
     /// # Errors
     /// There is nothing to undo, what it changed was changed since (unless forced), or files cannot be written.
-    pub fn undo(&mut self, index: &Index, scope: Option<&str>, force: bool) -> Result<&Step, StepError> {
+    pub fn undo(&mut self, index: &Index, scope: Option<Uid>, force: bool) -> Result<&Step, StepError> {
         let at = self.view.done.iter().rposition(|s| s.undoable() && scope.is_none_or(|uid| s.edits_document(uid)));
         let Some(at) = at else {
             return Err(StepError::Io(anyhow::anyhow!("nothing to undo")));
@@ -792,7 +790,7 @@ impl History {
     ///
     /// # Errors
     /// There is nothing to redo, what it changed was changed since (unless forced), or files cannot be written.
-    pub fn redo(&mut self, index: &Index, scope: Option<&str>, force: bool) -> Result<&Step, StepError> {
+    pub fn redo(&mut self, index: &Index, scope: Option<Uid>, force: bool) -> Result<&Step, StepError> {
         let at = self.view.undone.iter().rposition(|s| scope.is_none_or(|uid| s.edits_document(uid)));
         let Some(at) = at else {
             return Err(StepError::Io(anyhow::anyhow!("nothing to redo")));
@@ -814,14 +812,14 @@ impl History {
 
     /// Take a step out of the done (or undone) steps, whole - or, scoped to a document where it changed more, its part
     /// of it, the rest staying where it was.
-    fn take_part(&mut self, at: usize, scope: Option<&str>, done: bool) -> Step {
+    fn take_part(&mut self, at: usize, scope: Option<Uid>, done: bool) -> Step {
         let steps = if done { &mut self.view.done } else { &mut self.view.undone };
         let whole =
             scope.is_none_or(|uid| steps[at].changes.is_empty() && steps[at].edits.iter().all(|e| e.uid == uid));
-        if whole {
-            return steps.remove(at);
-        }
-        let uid = scope.unwrap_or_default();
+        let uid = match scope {
+            Some(uid) if !whole => uid,
+            _ => return steps.remove(at),
+        };
         let rest = &mut steps[at];
         let (mine, others): (Vec<Edit>, Vec<Edit>) = rest.edits.drain(..).partition(|e| e.uid == uid);
         rest.edits = others;
@@ -868,11 +866,11 @@ impl History {
 
     /// The documents' files not as a list of edits expects them, followed in order, each named by its asset's path.
     fn edited(&self, index: &Index, edits: &[Edit]) -> Vec<String> {
-        let mut state: HashMap<(&str, &str), Option<String>> = HashMap::new();
+        let mut state: HashMap<(Uid, &RelPath), Option<String>> = HashMap::new();
         let mut differing = vec![];
         for edit in edits {
-            let key = (edit.uid.as_str(), edit.file.as_str());
-            let now = state.get(&key).cloned().unwrap_or_else(|| self.current(index, &edit.uid, &edit.file));
+            let key = (edit.uid, &edit.file);
+            let now = state.get(&key).cloned().unwrap_or_else(|| self.current(index, edit.uid, &edit.file));
             if now != edit.before {
                 let path = index.by_uid.get(&edit.uid).unwrap_or(&edit.path);
                 differing.push(format!("{path}: {}", edit.file));
@@ -929,7 +927,7 @@ impl History {
             }
         }
         for edit in &mut step.edits {
-            let now = self.current(index, &edit.uid, &edit.file);
+            let now = self.current(index, edit.uid, &edit.file);
             if forwards { edit.before = now } else { edit.after = now }
         }
         Ok(())
@@ -1053,7 +1051,7 @@ impl History {
     /// these documents edited: appended to what its file holds, as the steps from the last it held on, the steps
     /// undone where their number changed, and those documents. Written whole where its file does not hold it yet, or
     /// has grown long.
-    fn journal_last(&self, documents: &[String]) {
+    fn journal_last(&self, documents: &[Uid]) {
         if !self.journaled {
             self.revision.set(self.revision.get() + 1);
             return;
@@ -1070,7 +1068,7 @@ impl History {
             from,
             done: &self.view.done[from..],
             undone: (undone != self.view.undone.len()).then_some(self.view.undone.as_slice()),
-            documents: documents.iter().map(|uid| (uid.as_str(), self.view.documents.get(uid))).collect(),
+            documents: documents.iter().map(|uid| (*uid, self.view.documents.get(uid))).collect(),
         };
         let appended = serde_json::to_string(&since).ok().and_then(|mut text| {
             use std::io::Write as _;
@@ -1130,7 +1128,7 @@ impl History {
             self.view.undone.retain(|undone| !undone.overtaken_by(&step));
         }
         // The documents it edited: written with it.
-        let edited: Vec<String> = step.edits.iter().map(|edit| edit.uid.clone()).collect();
+        let edited: Vec<Uid> = step.edits.iter().map(|edit| edit.uid).collect();
         if let (Some(last), Some((key, _))) = (self.view.done.last_mut(), &step.merge)
             && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < self.merge_within)
         {
@@ -1173,7 +1171,7 @@ impl History {
 struct SessionRef<'a> {
     done: &'a [Step],
     undone: &'a [Step],
-    documents: &'a BTreeMap<String, Document>,
+    documents: &'a BTreeMap<Uid, Document>,
 }
 
 /// A line of the session's file: the session whole, or what changed of it since the line before - its steps done
@@ -1182,12 +1180,7 @@ struct SessionRef<'a> {
 #[serde(rename_all = "snake_case")]
 enum Journaled<'a> {
     Whole(SessionRef<'a>),
-    Since {
-        from: usize,
-        done: &'a [Step],
-        undone: Option<&'a [Step]>,
-        documents: BTreeMap<&'a str, Option<&'a Document>>,
-    },
+    Since { from: usize, done: &'a [Step], undone: Option<&'a [Step]>, documents: BTreeMap<Uid, Option<&'a Document>> },
 }
 
 /// A line of the session's file, read.
@@ -1195,7 +1188,7 @@ enum Journaled<'a> {
 #[serde(rename_all = "snake_case")]
 enum JournaledLine {
     Whole(Session),
-    Since { from: usize, done: Vec<Step>, undone: Option<Vec<Step>>, documents: BTreeMap<String, Option<Document>> },
+    Since { from: usize, done: Vec<Step>, undone: Option<Vec<Step>>, documents: BTreeMap<Uid, Option<Document>> },
 }
 
 impl Session {
@@ -1246,7 +1239,7 @@ impl Transaction<'_> {
 
     /// What was selected, which undoing it shows again.
     #[must_use]
-    pub fn selecting(mut self, selection: Option<String>) -> Self {
+    pub fn selecting(mut self, selection: Option<TreePath>) -> Self {
         self.step.selection = selection;
         self
     }
@@ -1571,6 +1564,7 @@ mod tests {
     use crate::index::Index;
     use crate::lock::Lock;
     use crate::testing::At as _;
+    use crate::testing::{rel, tree, uid};
     use pe2_path::HostPath;
 
     fn project(name: &str) -> HostPath {
@@ -1882,7 +1876,7 @@ mod tests {
     }
 
     fn working_text(history: &History, uid: &str) -> Option<String> {
-        let sha1 = history.document(uid)?.working.get("node.toml")?.clone()?;
+        let sha1 = history.document(crate::testing::uid(uid))?.working.get(&rel("node.toml"))?.clone()?;
         Some(String::from_utf8(history.content(&sha1).unwrap()).unwrap())
     }
 
@@ -1893,7 +1887,8 @@ mod tests {
         let index = index(&root);
         let edit = |history: &mut History, uid: &str, text: &str| {
             let path = uid.trim_start_matches("uid://");
-            history.edit(&index, uid, path, "node.toml", text.as_bytes(), format!("Edit {path}"), None).unwrap()
+            let (uid, at) = (crate::testing::uid(uid), tree(path));
+            history.edit(&index, uid, &at, &rel("node.toml"), text.as_bytes(), format!("Edit {path}"), None).unwrap()
         };
         assert!(edit(&mut history, "uid://a", "uid = \"uid://a\"\nx = 2\n"));
         assert!(edit(&mut history, "uid://b", "uid = \"uid://b\"\ny = 2\n"));
@@ -1905,21 +1900,24 @@ mod tests {
         );
         let mut shown = index.clone();
         shown.set_working(history.working());
-        assert!(shown.assets["a"].text().contains("x = 3") && shown.assets["a"].on_disk().text().contains("x = 1"));
-        assert!(shown.assets["a"].unsaved() && !index.assets["a"].unsaved());
+        assert!(
+            shown.assets[&tree("a")].text().contains("x = 3")
+                && shown.assets[&tree("a")].on_disk().text().contains("x = 1")
+        );
+        assert!(shown.assets[&tree("a")].unsaved() && !index.assets[&tree("a")].unsaved());
         // Undone in `a`: its edits go back one by one, `b`'s stays.
-        history.undo(&index, Some("uid://a"), false).unwrap();
+        history.undo(&index, Some(uid("uid://a")), false).unwrap();
         assert!(working_text(&history, "uid://a").unwrap().contains("x = 2"));
-        history.undo(&index, Some("uid://a"), false).unwrap();
-        assert!(history.document("uid://a").is_none(), "back as on disk, it is not unsaved");
+        history.undo(&index, Some(uid("uid://a")), false).unwrap();
+        assert!(history.document(uid("uid://a")).is_none(), "back as on disk, it is not unsaved");
         assert!(working_text(&history, "uid://b").unwrap().contains("y = 2"));
-        assert!(history.to_undo(Some("uid://a")).is_none());
+        assert!(history.to_undo(Some(uid("uid://a"))).is_none());
         // Redone in `a`, then undone everywhere: the last step first, whichever document it edited.
-        history.redo(&index, Some("uid://a"), false).unwrap();
+        history.redo(&index, Some(uid("uid://a")), false).unwrap();
         history.undo(&index, None, false).unwrap();
-        assert!(history.document("uid://a").is_none());
+        assert!(history.document(uid("uid://a")).is_none());
         history.undo(&index, None, false).unwrap();
-        assert!(history.document("uid://b").is_none());
+        assert!(history.document(uid("uid://b")).is_none());
         crate::cache::remove_all(&root);
     }
 
@@ -1930,16 +1928,24 @@ mod tests {
         let index = index(&root);
         let a = root.at(".layers/top/a.node/node.toml");
         history
-            .edit(&index, "uid://a", "a", "node.toml", b"uid = \"uid://a\"\nx = 2\n", "Edit a".into(), None)
+            .edit(
+                &index,
+                uid("uid://a"),
+                &tree("a"),
+                &rel("node.toml"),
+                b"uid = \"uid://a\"\nx = 2\n",
+                "Edit a".into(),
+                None,
+            )
             .unwrap();
-        let files = history.to_save("uid://a").unwrap();
+        let files = history.to_save(uid("uid://a")).unwrap();
         assert_eq!(files.len(), 1);
         let mut tx = history.begin("Save a").kind(Kind::Save);
         tx.write(&a, files[0].1.as_deref().unwrap()).unwrap();
         tx.commit().unwrap();
-        history.saved("uid://a");
+        history.saved(uid("uid://a"));
         let index = self::index(&root);
-        assert!(history.document("uid://a").is_none());
+        assert!(history.document(uid("uid://a")).is_none());
         // Undone after the save: the edit is taken back from the working copy, which is unsaved again; the save stays.
         history.undo(&index, None, false).unwrap();
         assert!(working_text(&history, "uid://a").unwrap().contains("x = 1"));
@@ -1949,11 +1955,11 @@ mod tests {
         std::fs::write(&a, "uid = \"uid://a\"\nx = 9\n").unwrap();
         let index = self::index(&root);
         assert!(history.reconcile(&index));
-        assert!(history.document("uid://a").unwrap().stale.is_some());
-        history.keep_mine("uid://a");
-        assert!(history.document("uid://a").unwrap().stale.is_none());
-        history.revert("uid://a", "Revert a".into());
-        assert!(history.document("uid://a").is_none());
+        assert!(history.document(uid("uid://a")).unwrap().stale.is_some());
+        history.keep_mine(uid("uid://a"));
+        assert!(history.document(uid("uid://a")).unwrap().stale.is_none());
+        history.revert(uid("uid://a"), "Revert a".into());
+        assert!(history.document(uid("uid://a")).is_none());
         crate::cache::remove_all(&root);
     }
 
@@ -1964,18 +1970,19 @@ mod tests {
         let index = index(&root);
         for (uid, text) in [("uid://a", "x = 2"), ("uid://b", "y = 2"), ("uid://a", "x = 3")] {
             let path = uid.trim_start_matches("uid://");
-            history.edit(&index, uid, path, "node.toml", text.as_bytes(), format!("Edit {path}"), None).unwrap();
+            let (uid, at) = (crate::testing::uid(uid), tree(path));
+            history.edit(&index, uid, &at, &rel("node.toml"), text.as_bytes(), format!("Edit {path}"), None).unwrap();
         }
         history.checkpoint("Three edits".into());
         // As after the first step: `a` as it was, `b` not yet edited - as on disk.
         let states = history.states_at(1, None);
         assert_eq!(states.len(), 2);
         let shown = history.working_at(1, None);
-        let a = shown["uid://a"].files["node.toml"].as_ref().unwrap();
+        let a = shown[&uid("uid://a")].files[&rel("node.toml")].as_ref().unwrap();
         assert_eq!(std::fs::read_to_string(&a.path).unwrap(), "x = 2");
         // `b`'s step taken back alone; `a`'s first cannot be, as a later step edited `a` again.
         assert!(history.revert_step(&index, 1, "Revert b".into()).unwrap());
-        assert!(history.document("uid://b").is_none());
+        assert!(history.document(uid("uid://b")).is_none());
         assert!(history.revert_step(&index, 0, "Revert a".into()).is_err(), "a was edited since");
         // Restored to the start: a new step, the log keeping what was done.
         let steps = history.done().len();
@@ -1996,16 +2003,28 @@ mod tests {
             let (history, _) = history(&root);
             let mut history = history.journaled();
             for (n, text) in ["x = 1", "x = 2", "x = 3", "x = 4"].iter().enumerate() {
-                history.edit(&index, "uid://a", "a", "node.toml", text.as_bytes(), format!("Edit {n}"), None).unwrap();
+                history
+                    .edit(
+                        &index,
+                        uid("uid://a"),
+                        &tree("a"),
+                        &rel("node.toml"),
+                        text.as_bytes(),
+                        format!("Edit {n}"),
+                        None,
+                    )
+                    .unwrap();
             }
-            history.note_selection(Some("uid://a".into()));
+            history.note_selection(Some(tree("a")));
             // Appended to, not written again: a line the session whole, then one for each step and the note.
             let lines = std::fs::read_to_string(&session).unwrap().lines().count();
             assert_eq!(lines, 5, "the whole once, and what changed since");
             // One taken back: its shape changed, and it is written whole.
-            history.undo(&index, Some("uid://a"), false).unwrap();
+            history.undo(&index, Some(uid("uid://a")), false).unwrap();
             assert_eq!(std::fs::read_to_string(&session).unwrap().lines().count(), 1);
-            history.edit(&index, "uid://a", "a", "node.toml", b"x = 5", "Edit again".into(), None).unwrap();
+            history
+                .edit(&index, uid("uid://a"), &tree("a"), &rel("node.toml"), b"x = 5", "Edit again".into(), None)
+                .unwrap();
             // A crash: never closed - and its last line cut short.
             drop(history);
             let mut text = std::fs::read_to_string(&session).unwrap();
@@ -2031,7 +2050,9 @@ mod tests {
         {
             let (history, _) = history(&root);
             let mut history = history.journaled();
-            history.edit(&index, "uid://a", "a", "node.toml", b"x = 5", "Edit a".into(), None).unwrap();
+            history
+                .edit(&index, uid("uid://a"), &tree("a"), &rel("node.toml"), b"x = 5", "Edit a".into(), None)
+                .unwrap();
             // A crash: never closed.
             drop(history);
         }
@@ -2044,7 +2065,7 @@ mod tests {
         assert_eq!((left.done.len(), left.documents.len()), (1, 1));
         history.resume();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 5"));
-        history.undo(&index, Some("uid://a"), false).unwrap();
+        history.undo(&index, Some(uid("uid://a")), false).unwrap();
         history.close();
         let (history, _) = self::history(&root);
         assert!(history.left().is_none());

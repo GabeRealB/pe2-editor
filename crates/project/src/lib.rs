@@ -1,6 +1,9 @@
 //! Projects: what a `project.toml` declares - its layers, among them generated ones, each filled by its plan (`plan`)
 //! from the game's discs - and what is made of it.
 
+/// A path of the project's tree: what the index resolves, the layers list and the served folder shows (`assets/`).
+pub type TreePath = pe2_path::VfsPath<pe2_path::Tree>;
+
 pub mod build;
 pub mod cache;
 pub mod changeset;
@@ -93,7 +96,7 @@ pub struct Config {
     /// The target building it, what its `target.<name>` sections are for.
     pub target: Option<String>,
     /// The assets left out of it, by path: no event reaches them, and looking for a type's assets does not find them.
-    pub disabled: Vec<String>,
+    pub disabled: Box<[TreePath]>,
     /// The properties it sets (`[config.<name>.properties]`), as written: `Project::properties_of` gives them over
     /// what the project declares.
     pub properties: toml::Table,
@@ -389,8 +392,8 @@ pub struct Layer {
     pub kind: LayerKind,
     /// Its content's directory: in `.layers/`, or a mounted tree.
     pub path: HostPath,
-    /// Where its content appears in the resolved project: empty for a layer at the top, the mount point for a mount.
-    pub at: String,
+    /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
+    pub at: TreePath,
     /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
     pub changeset: HostPath,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
@@ -407,7 +410,7 @@ pub struct Layer {
 
 #[derive(Clone)]
 pub struct Mount {
-    pub at: String,
+    pub at: TreePath,
     pub path: HostPath,
     pub read_only: bool,
 }
@@ -422,16 +425,10 @@ impl Layer {
 
     /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree; joined part
     /// by part, so that it is in the system's own separators.
-    ///
-    /// # Errors
-    /// The path is no path (a name no system takes in it): it names no place, and is never taken for another.
-    pub fn disk(&self, path: &str) -> Result<HostPath, pe2_path::PathError> {
-        let rest = match path.strip_prefix(&self.at) {
-            _ if self.at.is_empty() => path,
-            Some(rest) => rest,
-            None => path,
-        };
-        Ok(self.path.join(&pe2_path::RelPath::new(rest.trim_start_matches('/'))?))
+    #[must_use]
+    pub fn disk(&self, path: &TreePath) -> HostPath {
+        let within = path.strip_prefix(&self.at).unwrap_or_else(|| path.rel().clone());
+        self.path.join(&within)
     }
 }
 
@@ -475,7 +472,11 @@ fn configs_of(
                 name: Name::new(&name).with_context(|| format!("the config {name}, which names its build's folder"))?,
                 release: c.release,
                 target: c.target,
-                disabled: c.disabled,
+                disabled: c
+                    .disabled
+                    .iter()
+                    .map(|path| TreePath::new(path).with_context(|| format!("the config {name} leaves out {path}")))
+                    .collect::<Result<_>>()?,
                 properties: c.properties,
             })
         })
@@ -612,11 +613,11 @@ fn storage_of(root: &HostPath, layer: &str, said: Option<&str>, generated: bool,
 fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
     let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
     for m in declared {
-        let at = m.at.trim_matches('/').to_string();
-        let path = match (m.unmanaged, local.mounts.get(&at), &m.path) {
+        let at = TreePath::new(m.at.trim_matches('/')).with_context(|| format!("the mount {}", m.at))?;
+        let path = match (m.unmanaged, local.mounts.get(at.as_str()), &m.path) {
             (true, Some(here), _) => resolve_path(root, here)?,
             (_, _, Some(path)) => resolve_path(root, path)?,
-            (true, None, None) => root.join(&pe2_path::RelPath::new(&at).with_context(|| format!("the mount {at}"))?),
+            (true, None, None) => root.join(&at),
             (false, _, None) => bail!("{}: the mount {at} says no path", root.join(&FILE)),
         };
         let mount = Mount { at, path, read_only: m.read_only || m.unmanaged };
@@ -642,11 +643,11 @@ impl Project {
             .iter()
             .map(|m| -> Result<Layer> {
                 Ok(Layer {
-                    name: m.at.clone(),
+                    name: m.at.to_string(),
                     kind: LayerKind::Files,
                     path: m.path.clone(),
                     at: m.at.clone(),
-                    changeset: root.join(&LAYERS).join(&layer_name(&m.at)?).with_suffix(&CHANGESET_SUFFIX),
+                    changeset: root.join(&LAYERS).join(&layer_name(m.at.as_str())?).with_suffix(&CHANGESET_SUFFIX),
                     read_only: m.read_only,
                     changeset_writable: true,
                     mounted: true,
@@ -661,7 +662,7 @@ impl Project {
                 None => root.join(&LAYERS).join(&layer_name(&l.name)?),
             };
             let changeset = path.with_suffix(&CHANGESET_SUFFIX);
-            if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at == l.name) {
+            if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at.as_str() == l.name) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
             }
             let kind = match l.kind.as_deref() {
@@ -682,7 +683,7 @@ impl Project {
                 name: l.name,
                 kind,
                 path,
-                at: String::new(),
+                at: TreePath::root(),
                 changeset,
                 read_only,
                 changeset_writable: !read_only,
@@ -761,7 +762,13 @@ impl Project {
                     continue;
                 }
                 let folder = tree.and_then(|tree| {
-                    let folder = records::held_folder(&layer.path, &id);
+                    let folder = match records::held_folder(&layer.path, &id) {
+                        Ok(folder) => folder,
+                        Err(why) => {
+                            eprintln!("{}: {id}: {why}", layer.name);
+                            return None;
+                        }
+                    };
                     if records::held(&folder).is_none() {
                         eprintln!("{}: {id}: its tree {tree} is not in the store", layer.name);
                         return None;
@@ -786,18 +793,15 @@ impl Project {
     /// `uri` is not a `res://` path.
     pub fn resolve(&self, uri: &str) -> Result<HostPath> {
         let Some(rel) = uri.strip_prefix("res://") else { bail!("{uri}: not a res:// path") };
-        let rel = rel.trim_matches('/');
+        let rel = TreePath::new(rel.trim_matches('/')).with_context(|| uri.to_string())?;
         let mut mounts: Vec<&Mount> = self.mounts.iter().chain(&self.unmanaged).collect();
-        mounts.sort_by_key(|m| std::cmp::Reverse(m.at.len()));
+        mounts.sort_by_key(|m| std::cmp::Reverse(m.at.as_str().len()));
         for m in mounts {
-            if rel == m.at {
-                return Ok(m.path.clone());
-            }
-            if let Some(rest) = rel.strip_prefix(&format!("{}/", m.at)) {
-                return Ok(m.path.join(&pe2_path::RelPath::new(rest)?));
+            if let Some(rest) = rel.strip_prefix(&m.at) {
+                return Ok(m.path.join(&rest));
             }
         }
-        Ok(self.root.join(&pe2_path::RelPath::new(rel)?))
+        Ok(self.root.join(&rel))
     }
 
     /// The generated layers, each with the plan that fills it.
@@ -819,6 +823,26 @@ impl Project {
 pub(crate) mod testing {
     use pe2_path::HostPath;
     pub use pe2_path::testing::{At, scratch};
+
+    /// A uid a test writes, checked.
+    pub fn uid(text: &str) -> pe2_path::Uid {
+        pe2_path::Uid::new(text).expect("a test writes a uid")
+    }
+
+    /// A path of the project's tree a test writes, checked.
+    pub fn tree(text: &str) -> crate::TreePath {
+        crate::TreePath::new(text).expect("a test writes a path")
+    }
+
+    /// A path within something a test writes, checked.
+    pub fn rel(text: &str) -> pe2_path::RelPath {
+        pe2_path::RelPath::new(text).expect("a test writes a path")
+    }
+
+    /// A name a test writes, checked.
+    pub fn name(text: &str) -> pe2_path::Name {
+        pe2_path::Name::new(text).expect("a test writes a name")
+    }
 
     /// Have a file or a folder say it was last changed then.
     pub fn set_modified(path: &HostPath, at: std::time::SystemTime) {

@@ -356,7 +356,7 @@ pub struct Extensions {
     /// The config being built.
     config: std::sync::RwLock<Option<pe2_ext::data::BuildConfig>>,
     /// The assets it leaves out.
-    disabled: std::sync::RwLock<std::collections::BTreeSet<String>>,
+    disabled: std::sync::RwLock<std::collections::BTreeSet<crate::TreePath>>,
     /// The events extensions declare, by name, with their labels.
     pub events: Vec<(String, String)>,
     /// What extensions run where events are signaled.
@@ -398,7 +398,7 @@ pub struct Extensions {
     definitions: RwLock<Arc<graph::Definitions>>,
     /// The assets that defined an operation or a template when the project's definitions were last taken, by
     /// path: one of them changing, or going, has them taken again.
-    defined_at: RwLock<std::collections::BTreeSet<String>>,
+    defined_at: RwLock<std::collections::BTreeSet<crate::TreePath>>,
     project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
     /// The project's generators (`graph::DEFINED_GENERATOR`), taken with its definitions.
     generators: RwLock<Vec<Arc<index::Asset>>>,
@@ -1326,12 +1326,12 @@ impl Extensions {
     pub fn dependents(
         &self,
         index: &index::Index,
-        paths: &std::collections::BTreeSet<String>,
-    ) -> std::collections::BTreeSet<String> {
+        paths: &std::collections::BTreeSet<crate::TreePath>,
+    ) -> std::collections::BTreeSet<crate::TreePath> {
         let mut found = std::collections::BTreeSet::new();
-        let mut next: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut next: Vec<&crate::TreePath> = paths.iter().collect();
         while let Some(path) = next.pop() {
-            let referrers = index.referenced_by.get(path).into_iter().flatten().map(|r| r.from.as_str());
+            let referrers = index.referenced_by.get(path).into_iter().flatten().map(|r| &r.from);
             for from in referrers {
                 if found.contains(from) {
                     continue;
@@ -1341,7 +1341,7 @@ impl Extensions {
                 let uses = index.assets.get(path).is_some_and(|defined| self.defines(defined));
                 let (plan, _) = self.plan(asset);
                 if uses || plan.steps.iter().any(|s| s.op == graph::REFERENCES) {
-                    found.insert(from.to_string());
+                    found.insert(from.clone());
                     next.push(from);
                 }
             }
@@ -1469,14 +1469,14 @@ impl Extensions {
     }
 
     /// The config what is made from now on is made for, with the assets left out of it.
-    pub fn set_config(&self, config: Option<pe2_ext::data::BuildConfig>, disabled: &[String]) {
+    pub fn set_config(&self, config: Option<pe2_ext::data::BuildConfig>, disabled: &[crate::TreePath]) {
         *self.config.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config;
         *self.disabled.write().unwrap_or_else(std::sync::PoisonError::into_inner) = disabled.iter().cloned().collect();
     }
 
     /// Whether the config being built leaves an asset out.
     #[must_use]
-    pub fn is_disabled(&self, path: &str) -> bool {
+    pub fn is_disabled(&self, path: &crate::TreePath) -> bool {
         self.disabled.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(path)
     }
 
@@ -2033,7 +2033,9 @@ impl Extensions {
     ) -> graph::Definitions {
         let mut made = graph::Definitions::new();
         for asset in generators {
-            let Some(uid) = &asset.uid else { continue };
+            // The graph names an operation by its uid's text.
+            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
+            let uid = uid.as_str();
             let (plan, problems) = graph::Plan::of_fields(asset.fields(), defined, &self.tail(asset));
             for problem in problems {
                 tracing::warn!("generator {}: {problem:?}", asset.path);
@@ -2075,7 +2077,8 @@ impl Extensions {
         let defining = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
             .into_iter()
             .flat_map(|defined| self.find(index, defined));
-        let defined_at: std::collections::BTreeSet<String> = defining.map(|asset| asset.path.clone()).collect();
+        let defined_at: std::collections::BTreeSet<crate::TreePath> =
+            defining.map(|asset| asset.path.clone()).collect();
         *self.defined_at.write().unwrap_or_else(std::sync::PoisonError::into_inner) = defined_at;
         // Its generators, made again for whatever configuration is built next.
         let generators =
@@ -2083,23 +2086,24 @@ impl Extensions {
         *self.generators.write().unwrap_or_else(std::sync::PoisonError::into_inner) = generators.collect();
         *self.generated.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         for asset in self.find(index, graph::DEFINED) {
-            let Some(uid) = asset.uid.clone() else { continue };
+            // The graph names an operation by its uid's text.
+            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
             let version = graph::exec::Node::declaration_sha1(asset);
             match graph::Definition::of(&uid, asset.fields_toml(), &version) {
                 Ok(definition) => {
                     definitions.insert(uid, Arc::new(definition));
                 }
-                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.clone(), error }),
+                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.to_string(), error }),
             }
         }
         let mut templates = std::collections::BTreeMap::new();
         for asset in self.find(index, graph::DEFINED_TEMPLATE) {
-            let Some(uid) = &asset.uid else { continue };
-            match project_template(uid, asset.fields_toml()) {
+            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
+            match project_template(&uid, asset.fields_toml()) {
                 Ok(template) => {
                     templates.insert(template.name.clone(), template);
                 }
-                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.clone(), error }),
+                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.to_string(), error }),
             }
         }
         let versions = |d: &graph::Definitions| -> std::collections::BTreeMap<String, String> {
@@ -2119,7 +2123,11 @@ impl Extensions {
     /// something when the definitions were last taken, or is of a type that defines. Where none did or is, they
     /// stand as taken, and nothing of the project is looked through for them.
     #[must_use]
-    pub fn definitions_among(&self, index: &index::Index, changed: &std::collections::BTreeSet<String>) -> bool {
+    pub fn definitions_among(
+        &self,
+        index: &index::Index,
+        changed: &std::collections::BTreeSet<crate::TreePath>,
+    ) -> bool {
         let defining: Vec<&str> = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
             .into_iter()
             .filter_map(|defined| self.node_type_named(defined).map(|(of, _)| of.name.as_str()))
@@ -2142,7 +2150,7 @@ impl Extensions {
     #[must_use]
     pub fn defines(&self, asset: &index::Asset) -> bool {
         let definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        asset.uid.as_ref().is_some_and(|uid| definitions.contains_key(uid))
+        asset.uid.is_some_and(|uid| definitions.contains_key(&uid.to_string()))
     }
 
     fn make_operations(&self) -> graph::Ops {
@@ -2278,7 +2286,7 @@ impl Extensions {
 
     fn recognize_now(&self, file: &index::BundleFile) -> Vec<(usize, Recognized)> {
         let head = crate::content::head(&file.path, HEAD);
-        recognize_head(&self.recognizers, &file.name, file.size, &head)
+        recognize_head(&self.recognizers, file.name.as_str(), file.size, &head)
     }
 }
 
@@ -2412,7 +2420,9 @@ impl Extensions {
     pub fn ops_for(&self, asset: &index::Asset) -> Vec<&pe2_ext::OpDef> {
         use pe2_ext::Type;
         let Some((source, _)) = graph::import_of_fields(asset.fields()) else { return vec![] };
-        let Some(file) = asset.files.iter().find(|f| f.name == source && f.made_by.is_none()) else { return vec![] };
+        let Some(file) = asset.files.iter().find(|f| f.name.as_str() == source && f.made_by.is_none()) else {
+            return vec![];
+        };
         let names = type_names(self.recognize(file).into_iter().map(|(t, _)| t));
         let given = Type::Union(names.into_iter().map(Type::Named).collect());
         let mut out: Vec<&pe2_ext::OpDef> = self
@@ -2445,14 +2455,14 @@ pub struct Exporter {
 }
 
 /// By (asset, family of its outputs), the member chosen: what is being looked at, never written.
-pub type Chosen = HashMap<(String, String), String>;
+pub type Chosen = HashMap<(crate::TreePath, String), String>;
 
 /// The project as extensions ask about it: the index, through the registry, with what the user selected and the members
 /// chosen (the editor's; none for a tool).
 pub struct Lens<'a> {
     pub index: &'a index::Index,
     pub extensions: &'a Extensions,
-    pub selection: Option<&'a str>,
+    pub selection: Option<&'a crate::TreePath>,
     /// The members of families assets are being looked at in.
     pub chosen: Option<&'a Chosen>,
     /// Which taking in of changes this is as of.
@@ -2461,7 +2471,7 @@ pub struct Lens<'a> {
 
 impl Project for Lens<'_> {
     fn asset(&self, path: &str) -> Option<Asset<'_>> {
-        self.index.assets.get(path).map(|a| self.extensions.lend(a))
+        self.index.asset_at(path).map(|a| self.extensions.lend(a))
     }
 
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>> {
@@ -2474,20 +2484,21 @@ impl Project for Lens<'_> {
     }
 
     fn selection(&self) -> Option<Asset<'_>> {
-        self.asset(self.selection?)
+        self.index.assets.get(self.selection?).map(|a| self.extensions.lend(a))
     }
 
     fn chosen(&self, path: &str, family: &str) -> Option<String> {
-        self.chosen?.get(&(path.to_string(), family.to_string())).cloned()
+        // What an extension names that is no path has nothing chosen, as it has no asset.
+        self.chosen?.get(&(crate::TreePath::new(path).ok()?, family.to_string())).cloned()
     }
 
     fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>> {
-        let asset = self.index.assets.get(path)?;
+        let asset = self.index.asset_at(path)?;
         self.extensions.picture(asset, self.extensions.look_at(asset, look))
     }
 
     fn image(&self, path: &str, address: &str) -> Option<Result<Image>> {
-        self.extensions.output_image(self.index.assets.get(path)?, address)
+        self.extensions.output_image(self.index.asset_at(path)?, address)
     }
 
     fn revision(&self) -> u64 {
@@ -2499,12 +2510,12 @@ impl Project for Lens<'_> {
     }
 
     fn table(&self, path: &str, address: &str) -> Option<Result<Table>> {
-        let asset = self.index.assets.get(path)?;
+        let asset = self.index.asset_at(path)?;
         Some(self.extensions.table(asset, self.index, address))
     }
 
     fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
-        let asset = self.index.assets.get(path)?;
+        let asset = self.index.asset_at(path)?;
         let requests = self.extensions.requests();
         if let Some(kept) = requests.as_ref().and_then(|requests| requests.kept(path, address)) {
             return Some(Ok(kept.to_vec()));
@@ -2542,7 +2553,7 @@ pub struct Graph<'a> {
 impl graph::exec::World for Graph<'_> {
     fn named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
         let (node, _) = self.node(reference)?;
-        let asset = self.index.assets.get(node.path())?;
+        let asset = self.index.asset_at(node.path())?;
         let types = self.extensions.node_types_of(asset).iter().map(|node_type| node_type.name.to_string()).collect();
         Some(pe2_ext::NodeNamed { path: node.path().to_string(), uid: node.uid().map(str::to_string), types })
     }
@@ -2551,7 +2562,7 @@ impl graph::exec::World for Graph<'_> {
         let asset: &index::Asset = if let Some(version) = reference.as_str().filter(|r| r.starts_with(index::BELOW)) {
             self.index.version(version)?
         } else if let Some(path) = reference.as_str().filter(|r| !r.starts_with("uid://")) {
-            self.index.assets.get(path)?
+            self.index.asset_at(path)?
         } else {
             let (uid, path) = index::reference(reference)?;
             self.index.resolve(&uid, path.as_deref().unwrap_or_default())?
@@ -2561,23 +2572,24 @@ impl graph::exec::World for Graph<'_> {
     }
 
     fn entries(&self, folder: &str) -> Vec<String> {
-        let within = format!("{}/", folder.trim_end_matches('/'));
-        let files = self.index.entries.range(within.clone()..).take_while(|(path, _)| path.starts_with(&within));
-        files.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.clone()).collect()
+        // A folder named as text: one that is no path holds nothing.
+        let Ok(folder) = crate::TreePath::new(folder.trim_end_matches('/')) else { return Vec::new() };
+        let inside = self.index.entries.iter().filter(|(path, _)| **path != folder && path.starts_with(&folder));
+        inside.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.to_string()).collect()
     }
 
     fn place(&self, path: &str) -> Option<HostPath> {
-        Some(self.index.entries.get(path)?.disk.clone())
+        Some(self.index.entry_at(path)?.disk.clone())
     }
 
     fn entry(&self, path: &str) -> Option<HostPath> {
-        self.index.entries.get(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
+        self.index.entry_at(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
     }
 
     fn assets_of(&self, node_type: &str) -> Vec<(String, String)> {
         let found =
             self.extensions.find(self.index, node_type).filter(|asset| !self.extensions.is_disabled(&asset.path));
-        found.map(|asset| (asset.path.clone(), asset.settings_text().to_string())).collect()
+        found.map(|asset| (asset.path.to_string(), asset.settings_text().to_string())).collect()
     }
 }
 
@@ -2796,11 +2808,11 @@ impl pe2_ext::CallHost for Hosted<'_> {
 
 impl Source for index::Asset {
     fn path(&self) -> &str {
-        &self.path
+        self.path.as_str()
     }
 
     fn uid(&self) -> Option<&str> {
-        self.uid.as_deref()
+        self.named.as_deref()
     }
 
     fn fields(&self) -> &toml::Table {

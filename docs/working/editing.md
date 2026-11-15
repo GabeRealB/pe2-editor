@@ -59,6 +59,10 @@ which to keep: **Keep mine** or **Take the disk's**.
 
 These changes take effect at once, without saving. Like every change, they can be undone.
 
+A name is one every system can hold: not `CON` or `aux` (with or without an extension), no `\ : * ? " < > |`, no
+ending in a dot or a space. Nor can it be one already beside it but for its case (`Notes` beside `notes`), which
+Windows and macOS do not tell apart. A name that cannot be is refused, and the window says why.
+
 Deleting an asset that comes from a layer below hides it in the active layer (**Delete in** *layer*); the layer
 below keeps it.
 

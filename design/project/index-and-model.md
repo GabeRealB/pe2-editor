@@ -28,6 +28,15 @@ An edit costs what it changes, not what the project holds:
 The index's maps are its own to change in place. The editor's window gets copies, made only for maps that changed,
 after the edit has been answered (see [The editor](../processes/editor.md)).
 
+### Names
+
+Paths of the project are `TreePath`s (`pe2_path::VfsPath<Tree>`), files within an asset `RelPath`s, uids `Uid`s:
+checked where they come in - a changeset or record read, an edit asked, a file a walk finds - and never text after.
+What a layer holds by a name no path takes is a problem of the project's (`Problem::Refused`), it and what is
+inside it left out; nothing is renamed or passed over unsaid. An edit making or moving an entry beside one named
+alike but for its case is refused (`edit::alone_but_for_case`), comparing a node by its asset's name; a project
+already holding such siblings is not yet said to.
+
 ## The model
 
 The model is what the index reads and derives, kept in the [shared space](../filesystem/shared.md) so the next

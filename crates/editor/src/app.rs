@@ -4,7 +4,8 @@
 
 use eframe::egui::{self, RichText};
 use egui_tiles::{Behavior as _, TileId};
-use pe2_path::HostPath;
+use pe2_path::{HostPath, Uid};
+use project::TreePath;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -67,11 +68,11 @@ enum Deferred {
     Step {
         redo: bool,
         force: bool,
-        scope: Option<String>,
+        scope: Option<Uid>,
     },
     /// A files layer made of this name, and the entry of this uid overridden in it.
     OverrideInNew {
-        uid: String,
+        uid: Uid,
         name: String,
     },
 }
@@ -86,7 +87,7 @@ enum Closing {
     /// A build or a clean, by its event.
     Signal(&'static str),
     /// A document's last tab: where it is, and the document's uid.
-    Tab { window: Option<u64>, tile: TileId, uid: String },
+    Tab { window: Option<u64>, tile: TileId, uid: Uid },
 }
 
 /// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
@@ -99,7 +100,7 @@ struct Opening {
     /// they ask of the window as ever, what they ask of the project with how far it is - then the workspace's.
     agents: std::sync::mpsc::Receiver<crate::workspace::AgentRequest>,
     /// Shown once it is open: the selection kept across a reopen, or asked on the command line.
-    select: Option<String>,
+    select: Option<TreePath>,
 }
 
 #[expect(clippy::struct_excessive_bools, reason = "each answers for itself")]
@@ -131,7 +132,7 @@ pub struct Editor {
     /// The directory a new project is to be made in, being typed.
     new_dialog: Option<String>,
     /// A step that what changed outside the editor blocks: redo (true) or undo, of which document, and why.
-    force: Option<(bool, Option<String>, String)>,
+    force: Option<(bool, Option<Uid>, String)>,
     /// What waits on unsaved documents being saved or let go, while it is asked.
     closing: Option<Closing>,
     /// The window closing, its documents saved or let go: it closes unasked.
@@ -143,14 +144,14 @@ pub struct Editor {
     /// Exports being made, off the window's thread: what each is, and what came of it once it has.
     exports: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// An entry being renamed: its uid, its real path, the new name being typed.
-    renaming: Option<(String, String, String)>,
+    renaming: Option<(Uid, TreePath, String)>,
     /// Code being overridden while an asset layer is active: which files layer takes it.
     choosing: Option<Choosing>,
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(HostPath, String)>,
     /// The selection last opened as a document.
-    opened: Option<String>,
+    opened: Option<TreePath>,
     /// Files being imported: their paths, a line each.
     import: Option<String>,
     /// Whether the assets are up in their drawer.
@@ -193,7 +194,7 @@ pub struct Editor {
 
 pub struct Start {
     pub project: Option<HostPath>,
-    pub select: Option<String>,
+    pub select: Option<TreePath>,
     pub show: Option<String>,
     pub screenshot: Option<HostPath>,
     pub max_surface: Option<u32>,
@@ -443,8 +444,7 @@ impl Editor {
                 // A layout outlives a project: tabs of what is not here close, and what is in front is what is selected.
                 self.layouts.close_documents(|path| !ws.exists(path));
                 self.opened = None;
-                let front =
-                    self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
+                let front = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).cloned();
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
@@ -530,7 +530,7 @@ impl Editor {
         if ws.reading_until().is_some() {
             return;
         }
-        let gone: Vec<String> = self
+        let gone: Vec<TreePath> = self
             .layouts
             .states
             .values()
@@ -547,24 +547,24 @@ impl Editor {
 
     /// Undo the last step, or redo - of them all, or of one document; forced over what changed outside the editor.
     /// Blocked by such changes, it asks.
-    fn step(&mut self, redo: bool, force: bool, scope: Option<String>) -> bool {
+    fn step(&mut self, redo: bool, force: bool, scope: Option<Uid>) -> bool {
         let Some(ws) = &mut self.workspace else { return false };
         if let Some(ticket) = ws.reading_until() {
             self.deferred.push((ticket, Deferred::Step { redo, force, scope }));
             return true;
         }
-        self.steps(redo, force, scope.as_deref(), 1)
+        self.steps(redo, force, scope, 1)
     }
 
     /// As `step`, this many of them: asked of the worker, the window going on - what came of it is said once the
     /// project as it left it is handed over. Whether it was asked.
-    fn steps(&mut self, redo: bool, force: bool, scope: Option<&str>, count: usize) -> bool {
+    fn steps(&mut self, redo: bool, force: bool, scope: Option<Uid>, count: usize) -> bool {
         let author = self.author();
         let Some(ws) = &mut self.workspace else { return false };
         ws.author = author;
         let verb = if redo { "Redo" } else { "Undo" };
-        let asked = scope.map(str::to_string);
-        let said = move |editor: &mut Editor, made: Result<(String, Option<String>), StepError>| match made {
+        let asked = scope;
+        let said = move |editor: &mut Editor, made: Result<(String, Option<TreePath>), StepError>| match made {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
             Ok((label, selection)) => {
                 editor.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
@@ -593,8 +593,8 @@ impl Editor {
     /// asset layer is active asks which files layer takes it.
     fn edit(&mut self, request: &EditRequest) {
         if let EditRequest::Rename(uid, real) = request {
-            let name = real.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(real);
-            self.renaming = Some((uid.clone(), real.clone(), name.to_string()));
+            let name = real.name().map_or("", |name| name.trim_end_matches(project::index::BUNDLE_SUFFIX));
+            self.renaming = Some((*uid, real.clone(), name.to_string()));
             return;
         }
         if matches!(request, EditRequest::ShowGraph) {
@@ -612,15 +612,18 @@ impl Editor {
         }
         ws.author = author;
         if let EditRequest::Override(uid) = request {
-            match ws.override_choice(uid) {
+            match ws.override_choice(*uid) {
                 Err(why) => {
                     self.message = Some(why);
                     return;
                 }
                 Ok(Some(layers)) => {
-                    let entry = ws.index.entries.iter().find(|(_, e)| e.uid == *uid);
-                    let (path, home) = entry.map_or_default(|(p, e)| (p.clone(), e.home.clone()));
-                    self.choosing = Some(Choosing { uid: uid.clone(), path, home, layers, name: String::new() });
+                    let Some((path, entry)) = ws.index.entries.iter().find(|(_, e)| e.uid == *uid) else {
+                        self.message = Some(format!("{uid}: no entry has it"));
+                        return;
+                    };
+                    let (path, home) = (path.clone(), entry.home.clone());
+                    self.choosing = Some(Choosing { uid: *uid, path, home, layers, name: String::new() });
                     return;
                 }
                 Ok(None) => {}
@@ -699,11 +702,11 @@ impl Editor {
         if cancel {
             self.choosing = None;
         } else if let Some(layer) = chosen {
-            let uid = choosing.uid.clone();
+            let uid = choosing.uid;
             self.choosing = None;
             self.edit(&EditRequest::OverrideIn(uid, layer));
         } else if create {
-            let (uid, name) = (choosing.uid.clone(), choosing.name.trim().to_string());
+            let (uid, name) = (choosing.uid, choosing.name.trim().to_string());
             self.choosing = None;
             self.override_in_new(uid, name);
         }
@@ -711,7 +714,7 @@ impl Editor {
 
     /// Make a files layer of this name and override the entry of this uid in it: once the project has been read,
     /// where it is being read - the window goes on meanwhile.
-    fn override_in_new(&mut self, uid: String, name: String) {
+    fn override_in_new(&mut self, uid: Uid, name: String) {
         let Some(ws) = &mut self.workspace else { return };
         if let Some(ticket) = ws.reading_until() {
             self.deferred.push((ticket, Deferred::OverrideInNew { uid, name }));
@@ -729,14 +732,22 @@ impl Editor {
     fn rename_dialog(&mut self, ctx: &egui::Context) {
         let Some((uid, real, name)) = &mut self.renaming else { return };
         let (mut go, mut cancel) = (false, false);
-        let valid = !name.trim().is_empty() && !name.contains('/') && !name.starts_with('.');
+        // A bundle keeps its `.node`: the name typed is its asset's.
+        let bundle = real.as_str().ends_with(project::index::BUNDLE_SUFFIX);
+        let named = |typed: &str| {
+            let typed = typed.trim();
+            let stored = if bundle { format!("{typed}{}", project::index::BUNDLE_SUFFIX) } else { typed.to_string() };
+            pe2_path::Name::new(&stored).map_err(|why| format!("{typed}: {why}"))
+        };
+        let checked = named(name);
+        let valid = checked.is_ok() && !name.trim().starts_with('.');
         egui::Window::new("Rename")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new(real.trim_end_matches(project::index::BUNDLE_SUFFIX).to_string())
+                    RichText::new(real.as_str().trim_end_matches(project::index::BUNDLE_SUFFIX).to_string())
                         .color(theme::weak()),
                 );
                 let output = egui::TextEdit::singleline(name).desired_width(320.0).show(ui);
@@ -757,15 +768,18 @@ impl Editor {
                     go = valid;
                 }
                 field.request_focus();
+                if let Err(why) = &checked
+                    && !name.trim().is_empty()
+                {
+                    ui.label(RichText::new(why).small().color(ui.visuals().warn_fg_color));
+                }
                 ui.horizontal(|ui| {
                     go |= ui.add_enabled(valid, egui::Button::new("Rename")).clicked();
                     cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
                 });
             });
-        if go {
-            let suffix = if real.ends_with(project::index::BUNDLE_SUFFIX) { project::index::BUNDLE_SUFFIX } else { "" };
-            let folder = real.rsplit_once('/').map_or_default(|(f, _)| format!("{f}/"));
-            let request = EditRequest::RenameTo(uid.clone(), format!("{folder}{}{suffix}", name.trim()));
+        if go && let Ok(named) = checked {
+            let request = EditRequest::RenameTo(*uid, real.parent().unwrap_or_default().join(&named));
             self.renaming = None;
             self.edit(&request);
         } else if cancel {
@@ -776,7 +790,7 @@ impl Editor {
     /// Steps blocked by files changed outside the editor: undone or redone anyway, or left.
     fn force_dialog(&mut self, ctx: &egui::Context) {
         let Some((redo, scope, why)) = &self.force else { return };
-        let (redo, scope, mut go, mut cancel) = (*redo, scope.clone(), false, false);
+        let (redo, scope, mut go, mut cancel) = (*redo, *scope, false, false);
         egui::Window::new("Changed outside the editor")
             .collapsible(false)
             .resizable(false)
@@ -908,7 +922,7 @@ impl Editor {
             Command::UndoAnywhere => ws.is_some_and(|ws| ws.history.to_undo(None).is_some()),
             Command::RedoAnywhere => ws.is_some_and(|ws| ws.history.to_redo(None).is_some()),
             Command::Save | Command::Revert => {
-                self.document_uid().zip(ws).is_some_and(|(uid, ws)| ws.history.document(&uid).is_some())
+                self.document_uid().zip(ws).is_some_and(|(uid, ws)| ws.history.document(uid).is_some())
             }
             Command::SaveAll => ws.is_some_and(|ws| !ws.history.documents().is_empty()),
             Command::Export => self.document_path().is_some(),
@@ -926,11 +940,11 @@ impl Editor {
                     self.visit_at(true).is_some()
                 }
             }
-            Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_empty()),
+            Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_root()),
             Command::CloseTab | Command::NextTab | Command::PreviousTab => self.layouts.has_tab(),
             // A view the document's asset has: not every asset has a graph, a preview or an extension's editor.
             Command::ShowIn(editor) => {
-                let path = document.and_then(|pane| self.layouts.states.get(&pane)?.pinned.as_deref());
+                let path = document.and_then(|pane| self.layouts.states.get(&pane)?.pinned.as_ref());
                 path.zip(ws).is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&editor))
             }
             Command::KeepTab => document.is_some(),
@@ -945,7 +959,7 @@ impl Editor {
                     state.editor == Some(EditorKind::Graph)
                         && state
                             .pinned
-                            .as_deref()
+                            .as_ref()
                             .zip(ws)
                             .is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&EditorKind::Graph))
                 })
@@ -1073,7 +1087,7 @@ impl Editor {
             Command::SaveAll => self.save_all(),
             Command::Revert => {
                 if let Some(uid) = self.document_uid() {
-                    self.revert(&uid);
+                    self.revert(uid);
                 }
             }
             _ => {}
@@ -1129,7 +1143,7 @@ impl Editor {
         let Some(pane) = self.layouts.focused.or_else(|| self.layouts.active_document()) else { return };
         let Some(state) = self.layouts.states.get(&pane) else { return };
         let Some(path) = state.pinned.clone() else { return };
-        let uid = ws.index.assets.get(&path).and_then(|a| a.uid.clone());
+        let uid = ws.index.assets.get(&path).and_then(|a| a.uid);
         let (visits, at) = &mut self.visits;
         if visits.get(*at).is_some_and(|v| v.path == path || (uid.is_some() && v.uid == uid)) {
             visits[*at].editor = state.editor;
@@ -1177,26 +1191,26 @@ impl Editor {
     }
 
     /// The uid of the document in use: the asset its tab in front shows, else the asset selected.
-    fn document_uid(&self) -> Option<String> {
+    fn document_uid(&self) -> Option<Uid> {
         let ws = self.workspace.as_ref()?;
-        ws.index.assets.get(&self.document_path()?)?.uid.clone()
+        ws.index.assets.get(&self.document_path()?)?.uid
     }
 
     /// The asset of the document in use: its tab in front's, else the asset selected.
-    fn document_path(&self) -> Option<String> {
+    fn document_path(&self) -> Option<TreePath> {
         let ws = self.workspace.as_ref()?;
         let shown = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane));
-        let path = shown.or(ws.selected.as_deref())?;
-        ws.index.assets.contains_key(path).then(|| path.to_string())
+        let path = shown.or(ws.selected.as_ref())?;
+        ws.index.assets.contains_key(path).then(|| path.clone())
     }
 
     /// The export of an asset to choose: its exporters, the first chosen, its file in the project's `exports` folder.
-    fn export_choice(&self, path: &str) -> Option<Exporting> {
+    fn export_choice(&self, path: &TreePath) -> Option<Exporting> {
         let ws = self.workspace.as_ref()?;
         let asset = ws.index.assets.get(path)?;
         let exporters = ws.extensions.exporters(asset);
         let mut exporting = Exporting {
-            path: path.to_string(),
+            path: path.clone(),
             exporters,
             chosen: 0,
             member: 0,
@@ -1212,7 +1226,7 @@ impl Editor {
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(exporting) = &mut self.exporting else { return };
         let Some(ws) = &self.workspace else { return };
-        let name = exporting.path.rsplit('/').next().unwrap_or(&exporting.path).to_string();
+        let name = exporting.path.name().unwrap_or_default().to_string();
         let (mut go, mut cancel) = (false, false);
         egui::Window::new(format!("Export {name}"))
             .collapsible(false)
@@ -1282,7 +1296,7 @@ impl Editor {
         };
         let (done, result) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
-        let what = format!("{} as {}", path.rsplit('/').next().unwrap_or(&path), exporter.label);
+        let what = format!("{} as {}", path.name().unwrap_or_default(), exporter.label);
         let reveal = exporting.reveal;
         let made = std::thread::Builder::new().name("export".into()).spawn(move || {
             let made = (|| -> anyhow::Result<String> {
@@ -1336,9 +1350,9 @@ impl Editor {
     /// project that edited no document - never another document's edit. None: nothing.
     fn step_scope(&self, redo: bool) -> Option<StepScope> {
         let ws = self.workspace.as_ref()?;
-        let next = |scope: Option<&str>| if redo { ws.history.to_redo(scope) } else { ws.history.to_undo(scope) };
+        let next = |scope: Option<Uid>| if redo { ws.history.to_redo(scope) } else { ws.history.to_undo(scope) };
         match self.document_uid() {
-            Some(uid) if next(Some(&uid)).is_some() => Some(StepScope::Document(uid)),
+            Some(uid) if next(Some(uid)).is_some() => Some(StepScope::Document(uid)),
             Some(_) => next(None).filter(|step| step.edits.is_empty()).map(|_| StepScope::Project),
             None => next(None).map(|_| StepScope::Project),
         }
@@ -1349,7 +1363,7 @@ impl Editor {
         let ws = self.workspace.as_ref()?;
         let step = if redo { ws.history.to_redo(None) } else { ws.history.to_undo(None) }?;
         let path = self.document_path()?;
-        let name = path.rsplit('/').next().unwrap_or(&path);
+        let name = path.name().unwrap_or_default();
         let (verb, anywhere) = if redo { ("redo", Command::RedoAnywhere) } else { ("undo", Command::UndoAnywhere) };
         Some(format!(
             "Nothing to {verb} in {name}. {} ({}): {}",
@@ -1363,7 +1377,7 @@ impl Editor {
     fn step_label(&self, redo: bool) -> Option<String> {
         let ws = self.workspace.as_ref()?;
         let scope = self.step_scope(redo)?.uid();
-        let step = if redo { ws.history.to_redo(scope.as_deref()) } else { ws.history.to_undo(scope.as_deref()) };
+        let step = if redo { ws.history.to_redo(scope) } else { ws.history.to_undo(scope) };
         step.map(|step| step.label.clone())
     }
 
@@ -1405,7 +1419,7 @@ impl Editor {
         match asked {
             Unsaved::SaveAll => self.save_all(),
             Unsaved::Save(uid) => self.save(&[uid], None),
-            Unsaved::Revert(uid) => self.revert(&uid),
+            Unsaved::Revert(uid) => self.revert(uid),
             Unsaved::Show(path) => {
                 if let Some(ws) = &mut self.workspace {
                     ws.navigate(path.clone());
@@ -1417,7 +1431,7 @@ impl Editor {
 
     /// Save documents; the first that cannot be stops it, said. What waited on them (`after`) is done once all
     /// are saved.
-    fn save(&mut self, uids: &[String], after: Option<(Closing, egui::Context)>) {
+    fn save(&mut self, uids: &[Uid], after: Option<(Closing, egui::Context)>) {
         let author = self.author();
         let Some(ws) = &mut self.workspace else { return };
         ws.author = author;
@@ -1440,7 +1454,7 @@ impl Editor {
     }
 
     /// Put a document back as on disk: its unsaved changes undone, or - stale - the disk's taken.
-    fn revert(&mut self, uid: &str) {
+    fn revert(&mut self, uid: Uid) {
         let author = self.author();
         if let Some(ws) = &mut self.workspace {
             ws.author = author;
@@ -1461,8 +1475,8 @@ impl Editor {
     fn asks_to_close(&mut self, window: Option<u64>, tile: TileId) -> bool {
         let Some(path) = self.layouts.last_tab_of(window, tile) else { return false };
         let Some(ws) = &self.workspace else { return false };
-        let Some(uid) = ws.index.assets.get(&path).and_then(|a| a.uid.clone()) else { return false };
-        if ws.history.document(&uid).is_none() {
+        let Some(uid) = ws.index.assets.get(&path).and_then(|a| a.uid) else { return false };
+        if ws.history.document(uid).is_none() {
             return false;
         }
         self.closing = Some(Closing::Tab { window, tile, uid });
@@ -1476,7 +1490,7 @@ impl Editor {
             self.closing = None;
             return;
         };
-        let documents: Vec<(String, String)> = match &closing {
+        let documents: Vec<(Uid, TreePath)> = match &closing {
             Closing::Tab { uid, .. } => ws.unsaved_documents().into_iter().filter(|(u, _)| u == uid).collect(),
             _ => ws.unsaved_documents(),
         };
@@ -1485,7 +1499,7 @@ impl Editor {
             self.go_on(closing, ctx);
             return;
         }
-        let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let name = |path: &TreePath| path.name().unwrap_or_default().to_string();
         let what = match (&closing, documents.as_slice()) {
             (_, [(_, path)]) => name(path),
             (_, many) => format!("{} documents", many.len()),
@@ -1524,12 +1538,12 @@ impl Editor {
         });
         if save {
             self.closing = None;
-            let uids: Vec<String> = documents.into_iter().map(|(uid, _)| uid).collect();
+            let uids: Vec<Uid> = documents.into_iter().map(|(uid, _)| uid).collect();
             self.save(&uids, Some((closing, ctx.clone())));
         } else if discard {
             self.closing = None;
             match &closing {
-                Closing::Tab { uid, .. } => self.revert(uid),
+                Closing::Tab { uid, .. } => self.revert(*uid),
                 _ => {
                     if let Some(ws) = &mut self.workspace {
                         ws.discard_unsaved();
@@ -1596,7 +1610,7 @@ impl Editor {
 
     /// What the document tab in use shows is what is selected.
     fn select_in_use(&mut self) {
-        let path = self.layouts.focused.and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
+        let path = self.layouts.focused.and_then(|pane| self.layouts.subject(pane)).cloned();
         if let (Some(ws), Some(path)) = (self.workspace.as_mut(), path) {
             ws.navigate(path);
             self.opened.clone_from(&ws.selected);
@@ -1995,7 +2009,7 @@ impl Editor {
             return;
         }
         self.opened.clone_from(&ws.selected);
-        if let Some(path) = self.opened.as_deref().filter(|path| ws.is_document(path)) {
+        if let Some(path) = self.opened.as_ref().filter(|path| ws.is_document(path)) {
             self.layouts.open(path, false);
         }
     }
@@ -2059,23 +2073,22 @@ impl Editor {
         if let Some(ws) = self.workspace.as_mut() {
             if let Some(pane) = outcome.focus {
                 self.layouts.focused = Some(pane);
-                if let Some(path) = self.layouts.subject(pane).map(str::to_string) {
+                if let Some(path) = self.layouts.subject(pane).cloned() {
                     ws.navigate(path);
                     self.opened.clone_from(&ws.selected);
                 }
             }
             // Asked for, it opens even selected already: its tab may have been closed.
             // A part named is selected in what is shown: what the preview's boxes ask.
-            if let Some(name) = outcome.nav.as_deref().and_then(|path| path.strip_prefix('#')) {
+            if let Some(crate::workspace::Nav::Part(name)) = &outcome.nav {
                 ws.select_part(name);
-            } else if let Some(path) = outcome.nav {
-                // An asset with a part after `#`: the asset opened, the part selected in it.
-                match path.split_once('#') {
-                    Some((asset, part)) => {
-                        ws.navigate(asset.to_string());
-                        ws.select_part(part);
-                    }
-                    None => ws.navigate(path),
+            } else if let Some(crate::workspace::Nav::Refused(why)) = &outcome.nav {
+                self.message = Some(format!("Not opened: {why}"));
+            } else if let Some(crate::workspace::Nav::Asset(path, part)) = outcome.nav {
+                // An asset with a part: the asset opened, the part selected in it.
+                ws.navigate(path);
+                if let Some(part) = part {
+                    ws.select_part(&part);
                 }
                 self.opened = None;
             } else if let Some(pick) = outcome.pick {
@@ -2097,7 +2110,7 @@ impl Editor {
             if closed
                 && let Some(pane) = self.layouts.focused
                 && let Some(ws) = self.workspace.as_mut()
-                && let Some(path) = self.layouts.subject(pane).map(str::to_string)
+                && let Some(path) = self.layouts.subject(pane).cloned()
             {
                 ws.navigate(path);
                 self.opened.clone_from(&ws.selected);
@@ -2187,8 +2200,8 @@ impl Editor {
     fn new_node(&mut self, template: &str, file: Option<&HostPath>) {
         let in_use = self.document_path();
         let Some(ws) = &mut self.workspace else { return };
-        let folder = ws.new_node_folder(in_use.as_deref());
-        let place = if folder.is_empty() { "the project".to_string() } else { folder.clone() };
+        let folder = ws.new_node_folder(in_use.as_ref());
+        let place = if folder.is_root() { "the project".to_string() } else { folder.to_string() };
         let then = move |editor: &mut Editor, made: Result<crate::workspace::NewNode, String>| match made {
             Ok(made) => {
                 editor.message = Some(format!("New {} in {place}", made.label.to_lowercase()));
@@ -2198,8 +2211,8 @@ impl Editor {
                 {
                     ws.navigate(made.path.clone());
                 }
-                let name = made.path.rsplit('/').next().unwrap_or(&made.path).to_string();
-                let real = format!("{}{}", made.path, project::index::BUNDLE_SUFFIX);
+                let name = made.path.name().unwrap_or_default().to_string();
+                let real = project::index::bundle_named(&made.path);
                 editor.renaming = Some((made.uid, real, name));
             }
             Err(why) => editor.error = Some(why),
@@ -2296,7 +2309,7 @@ impl Editor {
             let Some(ws) = &self.workspace else { return };
             for (command, icon) in [(Command::Back, icons::ARROW_LEFT), (Command::Forward, icons::ARROW_RIGHT)] {
                 let at = self.visit_at(command == Command::Forward);
-                let to = at.map(|at| self.visits.0[at].path.rsplit('/').next().unwrap_or_default().to_string());
+                let to = at.map(|at| self.visits.0[at].path.name().unwrap_or_default().to_string());
                 let tip = to.map_or_else(|| hint(command), |to| what(command, &to));
                 if ui.add_enabled(at.is_some(), egui::Button::new(icon)).on_hover_text(tip).clicked() {
                     step = Some(command);
@@ -2315,7 +2328,7 @@ impl Editor {
             }
             ui.add_space(8.0);
             if let Some(path) = ws.selected.clone() {
-                let parts: Vec<&str> = path.split('/').collect();
+                let parts: Vec<&str> = path.parts().collect();
                 let first = theme::fitting_steps(ui, &parts, ui.available_width());
                 if first > 0 {
                     ui.label(RichText::new("…").color(theme::weak()));
@@ -2333,7 +2346,8 @@ impl Editor {
                             .on_hover_text("Show this folder")
                             .clicked()
                         {
-                            folder = Some(parts[..=i].join("/"));
+                            let above = parts.len() - 1 - i;
+                            folder = (0..above).try_fold(path.clone(), |up, _| up.parent());
                         }
                         ui.label(RichText::new("/").color(theme::border().gamma_multiply(3.0)));
                     }
@@ -2741,7 +2755,7 @@ impl Editor {
                     cancel = ui.button("Cancel").clicked();
                     return;
                 };
-                let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+                let name = asset.path.name().unwrap_or_default();
                 let missing =
                     files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
                 let name_of =
@@ -2940,9 +2954,9 @@ impl Editor {
     }
 
     /// The asset the document in use shows.
-    pub fn document_in_use(&self) -> Option<String> {
+    pub fn document_in_use(&self) -> Option<TreePath> {
         let pane = self.layouts.active_document()?;
-        self.layouts.subject(pane).map(str::to_string)
+        self.layouts.subject(pane).cloned()
     }
 
     /// Undo, as the command does: the last edit of the document in use, or the project's last change.
@@ -3119,7 +3133,7 @@ impl eframe::App for Editor {
 /// An export being chosen: the asset, its exporters, the one chosen and its member, and where its file goes - written
 /// by the user (`typed`), or following what is chosen.
 struct Exporting {
-    path: String,
+    path: TreePath,
     exporters: Vec<project::ext::Exporter>,
     chosen: usize,
     member: usize,
@@ -3133,7 +3147,7 @@ impl Exporting {
     /// Where its file goes unless told: the project's `exports` folder, named after the asset and its member.
     fn default_to(&self, root: &HostPath) -> String {
         let exporter = &self.exporters.get(self.chosen);
-        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let name = self.path.name().unwrap_or_default();
         let member = exporter.and_then(|e| e.members.get(self.member)).map(|(_, label)| format!("-{label}"));
         let extension = exporter.map_or("", |e| e.extension.as_str());
         let file: String = format!("{name}{}.{extension}", member.unwrap_or_default())
@@ -3147,13 +3161,13 @@ impl Exporting {
 
 /// What undo and redo take back: a document's last edit, or the project's last change.
 enum StepScope {
-    Document(String),
+    Document(Uid),
     Project,
 }
 
 impl StepScope {
     /// The document's uid; none: the project's.
-    fn uid(self) -> Option<String> {
+    fn uid(self) -> Option<Uid> {
         match self {
             StepScope::Document(uid) => Some(uid),
             StepScope::Project => None,
@@ -3167,14 +3181,14 @@ const VISITS: usize = 100;
 /// A document brought into focus: its path, its uid (which finds it where it moved), and how it was shown.
 #[derive(Clone, Debug)]
 struct Visit {
-    path: String,
-    uid: Option<String>,
+    path: TreePath,
+    uid: Option<Uid>,
     editor: Option<EditorKind>,
 }
 
 impl Visit {
     /// Where it is now: by its uid, else its path; none where it is gone.
-    fn place(&self, ws: &Workspace) -> Option<String> {
+    fn place(&self, ws: &Workspace) -> Option<TreePath> {
         if let Some(path) = self.uid.as_ref().and_then(|uid| ws.index.by_uid.get(uid)) {
             return Some(path.clone());
         }
@@ -3185,31 +3199,31 @@ impl Visit {
 /// What is asked of the documents with unsaved changes, in the status bar.
 enum Unsaved {
     SaveAll,
-    Save(String),
-    Revert(String),
+    Save(Uid),
+    Revert(Uid),
     /// Its path: shown.
-    Show(String),
+    Show(TreePath),
 }
 
 /// The unsaved documents' count in the status bar, opening their list: each shown, saved or reverted, or all saved.
-fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(String, String)]) -> Option<Unsaved> {
+fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, TreePath)]) -> Option<Unsaved> {
     let mut asked = None;
     let n = documents.len();
     let text = RichText::new(format!("{n} unsaved")).small().color(ui.visuals().warn_fg_color);
     ui.menu_button(text, |ui| {
         for (uid, path) in documents {
-            let stale = ws.history.document(uid).is_some_and(|d| d.stale.is_some());
+            let stale = ws.history.document(*uid).is_some_and(|d| d.stale.is_some());
             ui.horizontal(|ui| {
-                let name = path.rsplit('/').next().unwrap_or(path);
+                let name = path.name().unwrap_or_default();
                 let label = if stale { format!("{name}  (changed on disk)") } else { name.to_string() };
-                if ui.link(label).on_hover_text(path).clicked() {
+                if ui.link(label).on_hover_text(path.as_str()).clicked() {
                     asked = Some(Unsaved::Show(path.clone()));
                 }
                 if ui.small_button("Save").clicked() {
-                    asked = Some(Unsaved::Save(uid.clone()));
+                    asked = Some(Unsaved::Save(*uid));
                 }
                 if ui.small_button("Revert").clicked() {
-                    asked = Some(Unsaved::Revert(uid.clone()));
+                    asked = Some(Unsaved::Revert(*uid));
                 }
             });
         }
@@ -3228,8 +3242,8 @@ fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(String, String)
 
 /// Code being overridden: its uid, path and own layer, the files layers that can take it, a new one's name.
 struct Choosing {
-    uid: String,
-    path: String,
+    uid: Uid,
+    path: TreePath,
     home: String,
     layers: Vec<String>,
     name: String,
@@ -3238,7 +3252,7 @@ struct Choosing {
 /// What the layouts asked for in a frame: where to go, a message, windows to dock back, tab actions by window.
 #[derive(Default)]
 struct Outcome {
-    nav: Option<String>,
+    nav: Option<crate::workspace::Nav>,
     pick: Option<panes::Pick>,
     focus: Option<Pane>,
     message: Option<String>,

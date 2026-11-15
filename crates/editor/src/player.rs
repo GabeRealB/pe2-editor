@@ -388,7 +388,7 @@ impl Player {
         &mut self,
         ui: &mut egui::Ui,
         (_, index): (&Extensions, &Arc<Index>),
-        (path, look): (&str, Option<&str>),
+        (path, look): (&project::TreePath, Option<&str>),
         view: &mut Preview,
         mut body: Option<&mut Body<'_>>,
     ) {

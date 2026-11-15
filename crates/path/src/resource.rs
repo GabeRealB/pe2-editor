@@ -49,8 +49,10 @@ impl Uid {
     }
 }
 
-impl fmt::Display for Uid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Uid {
+    /// Its digits alone, without `uid://`: what names it where it is stored by its uid (a record's file).
+    #[must_use]
+    pub fn digits(self) -> String {
         let mut n = self.0.unsigned_abs();
         let mut digits = [0u8; 13];
         let mut at = digits.len();
@@ -62,8 +64,14 @@ impl fmt::Display for Uid {
                 break;
             }
         }
+        digits[at..].iter().map(|&d| char::from(d)).collect()
+    }
+}
+
+impl fmt::Display for Uid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(UID_PREFIX)?;
-        f.write_str(std::str::from_utf8(&digits[at..]).map_err(|_| fmt::Error)?)
+        f.write_str(&self.digits())
     }
 }
 

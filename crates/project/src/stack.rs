@@ -191,7 +191,7 @@ mod tests {
         LayerInfo {
             name: name.into(),
             kind: LayerKind::Assets,
-            at: String::new(),
+            at: crate::TreePath::root(),
             read_only: false,
             writable: true,
             mounted: false,

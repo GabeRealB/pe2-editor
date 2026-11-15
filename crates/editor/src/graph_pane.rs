@@ -693,7 +693,7 @@ fn canvas_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &m
 /// Over the canvas: which layer this is, fitting it and arranging it.
 fn toolbar_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &mut Option<EditRequest>) {
     ui.horizontal(|ui| {
-        let name = canvas.asset.path.rsplit('/').next().unwrap_or(&canvas.asset.path);
+        let name = canvas.asset.path.name().unwrap_or_default();
         ui.label(name);
         ui.label(RichText::new(format!("layer {}", canvas.at)).color(theme::weak()));
         ui.separator();
@@ -723,7 +723,12 @@ fn arrange(canvas: &Canvas<'_>, state: &mut State, edit: &mut Option<EditRequest
 }
 
 /// The pane.
-pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, edit: &mut Option<EditRequest>) {
+pub fn graph_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    subject: Option<&project::TreePath>,
+    edit: &mut Option<EditRequest>,
+) {
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)).cloned() else {
         ui.label(RichText::new("Select an asset with a graph layer.").color(theme::weak()));
         return;
@@ -750,7 +755,8 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
     // An operation the project defines is laid out alone, its settings their defaults: what its boxes make, and what
     // is wrong with it. A graph layer is its node's plan.
     let defined = layer.get("op").and_then(Value::as_str) == Some(graph::DEFINED);
-    let found = asset.uid.as_deref().and_then(|uid| ws.extensions.definition(uid)).filter(|_| defined);
+    // A stack names an operation the project defines by its uid's text.
+    let found = asset.uid.and_then(|uid| ws.extensions.definition(&uid.to_string())).filter(|_| defined);
     let (plan, wrong, prefix) = if let Some(definition) = &found {
         let ops = ws.extensions.operations();
         let (plan, wrong) = graph::Plan::of_definition(definition, &toml::Table::new(), &ops, &format!("stack[{at}]"));

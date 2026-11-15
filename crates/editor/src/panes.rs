@@ -252,7 +252,7 @@ impl Pane {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneState {
     #[serde(default)]
-    pub pinned: Option<String>,
+    pub pinned: Option<project::TreePath>,
     #[serde(default)]
     pub preview: bool,
     /// The editor a document was switched to; none: the entry's first.
@@ -260,7 +260,7 @@ pub struct PaneState {
     pub editor: Option<EditorKind>,
     /// Its asset's uid: what finds it again once it has moved.
     #[serde(default)]
-    pub uid: Option<String>,
+    pub uid: Option<pe2_path::Uid>,
 }
 
 /// How a document shows its entry.
@@ -280,7 +280,7 @@ pub enum EditorKind {
 
 impl EditorKind {
     /// Its icon on a document of an entry: an extension's editor says its own.
-    pub fn icon(self, ws: &Workspace, path: &str) -> &'static str {
+    pub fn icon(self, ws: &Workspace, path: &project::TreePath) -> &'static str {
         match self {
             EditorKind::Preview => icons::IMAGE,
             EditorKind::Tap(_) => icons::EYE,
@@ -314,7 +314,7 @@ impl EditorKind {
 }
 
 /// The editors an entry opens in, the one it opens in first. A plain file has its viewer alone.
-pub fn editors_of(ws: &Workspace, path: &str) -> Vec<EditorKind> {
+pub fn editors_of(ws: &Workspace, path: &project::TreePath) -> Vec<EditorKind> {
     let Some(asset) = ws.index.assets.get(path) else { return vec![] };
     let mut editors = vec![];
     if crate::player::Player::plays(&ws.extensions, asset) || !ws.previews_of(asset).is_empty() {
@@ -344,30 +344,30 @@ pub fn editors_of(ws: &Workspace, path: &str) -> Vec<EditorKind> {
 
 /// A document's asset, followed by its uid: once it has moved, the tab shows it where it went and, the selection having
 /// gone with it, selects it there.
-fn follow_asset(ws: &Workspace, state: &mut PaneState, nav: &mut Option<String>) {
+fn follow_asset(ws: &Workspace, state: &mut PaneState, nav: &mut Option<crate::workspace::Nav>) {
     let Some(path) = &state.pinned else { return };
     if let Some(asset) = ws.index.assets.get(path) {
-        state.uid.clone_from(&asset.uid);
+        state.uid = asset.uid;
     } else if let Some(moved) = state.uid.as_ref().and_then(|uid| ws.index.by_uid.get(uid)) {
         state.pinned = Some(moved.clone());
         if ws.selected.is_none() {
-            *nav = Some(moved.clone());
+            *nav = Some(crate::workspace::Nav::to(moved.clone()));
         }
     }
 }
 
 /// Where dropping an asset on a folder moves it: the edit, or why not.
-fn move_into(ws: &Workspace, path: &str, folder: &str) -> Result<EditRequest, String> {
+fn move_into(ws: &Workspace, path: &project::TreePath, folder: &project::TreePath) -> Result<EditRequest, String> {
     let asset = ws.index.assets.get(path).ok_or("It is gone")?;
-    let uid = asset.uid.clone().ok_or("It has no uid to be moved by")?;
-    if folder == path || folder.starts_with(&format!("{path}/")) {
+    let uid = asset.uid.ok_or("It has no uid to be moved by")?;
+    if folder.starts_with(path) {
         return Err("A folder cannot go inside itself".to_string());
     }
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    if parent == folder {
+    if path.parent().as_ref() == Some(folder) {
         return Err("It is in this folder already".to_string());
     }
-    let to = format!("{folder}/{name}{}", project::index::BUNDLE_SUFFIX);
+    let name = path.name().unwrap_or_default();
+    let to = project::index::bundle_named(&crate::workspace::child_path(folder, name));
     if ws.index.entries.contains_key(&to) {
         return Err(format!("{name} is there already"));
     }
@@ -375,12 +375,15 @@ fn move_into(ws: &Workspace, path: &str, folder: &str) -> Result<EditRequest, St
 }
 
 /// What tells one path from others of the same name: the nearest folder they differ in.
-fn telling_apart<'a>(path: &'a str, others: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let mine: Vec<&str> = path.rsplit('/').collect();
+fn telling_apart<'a>(
+    path: &'a project::TreePath,
+    others: impl Iterator<Item = &'a project::TreePath>,
+) -> Option<&'a str> {
+    let mine: Vec<&str> = path.parts().rev().collect();
     let depth = others
         .filter(|other| *other != path)
         .filter_map(|other| {
-            let theirs: Vec<&str> = other.rsplit('/').collect();
+            let theirs: Vec<&str> = other.parts().rev().collect();
             (theirs[0] == mine[0]).then(|| (1..mine.len()).find(|&at| theirs.get(at) != mine.get(at)))
         })
         .flatten()
@@ -391,13 +394,13 @@ fn telling_apart<'a>(path: &'a str, others: impl Iterator<Item = &'a str>) -> Op
 /// A click on an entry of the tree: the entry, and whether it was a double click, which keeps its tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pick {
-    pub path: String,
+    pub path: project::TreePath,
     pub keep: bool,
 }
 
 impl Pick {
-    fn of(response: &egui::Response, path: &str) -> Pick {
-        Pick { path: path.to_string(), keep: response.double_clicked() }
+    fn of(response: &egui::Response, path: &project::TreePath) -> Pick {
+        Pick { path: path.clone(), keep: response.double_clicked() }
     }
 }
 
@@ -407,7 +410,7 @@ pub enum PaneAction {
     /// Another instance of its kind, beside it.
     Another,
     /// Show this entry, whatever is selected.
-    Pin(String),
+    Pin(project::TreePath),
     /// A document tab no entry replaces.
     Keep,
     /// A document shown in this editor.
@@ -480,7 +483,7 @@ pub const MODES: [&str; 2] = ["Edit", "Changes"];
 /// (the asset tree then reveals the asset), `pick` for a click in the tree itself (which must not scroll it).
 pub struct Panes<'a> {
     pub workspace: Option<&'a mut Workspace>,
-    pub nav: Option<String>,
+    pub nav: Option<crate::workspace::Nav>,
     pub pick: Option<Pick>,
     /// The document tab used, by a click on it or in it.
     pub focus: Option<Pane>,
@@ -611,11 +614,11 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let mut contents = |ui: &mut egui::Ui| {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
-                if let Some(pinned) = pinned.as_deref().filter(|p| !ws.exists(p)) {
+                if let Some(pinned) = pinned.as_ref().filter(|p| !ws.exists(p)) {
                     ui.label(RichText::new(format!("{pinned} is no longer in the project")).color(theme::weak()));
                     return;
                 }
-                let subject = subject.as_deref();
+                let subject = subject.as_ref();
                 match pane.kind {
                     PaneKind::Assets => assets_ui(ui, ws, pick, edit),
                     PaneKind::Contents => crate::contents::contents_ui(ui, ws, subject, nav, message, edit),
@@ -657,19 +660,16 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             && let Some(state) = self.states.get(pane)
             && let Some(path) = &state.pinned
         {
-            let name = path.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(path);
-            let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path.as_str())?)));
+            let name = path.name().map_or("", |name| name.trim_end_matches(project::index::BUNDLE_SUFFIX));
+            let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path)?)));
             let icon = asset
                 .map_or(icons::FILE, |(ws, asset)| icons::for_type(&ws.extensions, ws.extensions.type_name(asset)).0);
             // As its graph where it is shown as one: the view asked for, where the asset has it.
             let graph = state.editor == Some(EditorKind::Graph)
                 && asset.is_some_and(|(_, asset)| crate::graph_pane::has_graph(asset));
             let icon = if graph { icons::TREE_STRUCTURE } else { icon };
-            let others = self
-                .states
-                .iter()
-                .filter(|(p, _)| p.kind == PaneKind::Document)
-                .filter_map(|(_, s)| s.pinned.as_deref());
+            let others =
+                self.states.iter().filter(|(p, _)| p.kind == PaneKind::Document).filter_map(|(_, s)| s.pinned.as_ref());
             // A star: unsaved changes.
             let unsaved = if self.workspace.as_ref().is_some_and(|ws| ws.unsaved(path)) { " *" } else { "" };
             let text = match telling_apart(path, others) {
@@ -679,8 +679,8 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             return if state.preview { text.italics() } else { text }.into();
         }
         let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
-        let pinned = self.states.get(pane).and_then(|s| s.pinned.as_deref()).map_or_else(String::new, |pinned| {
-            let name = pinned.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(pinned);
+        let pinned = self.states.get(pane).and_then(|s| s.pinned.as_ref()).map_or_else(String::new, |pinned| {
+            let name = pinned.name().map_or("", |name| name.trim_end_matches(project::index::BUNDLE_SUFFIX));
             format!("  {}  {name}", icons::PUSH_PIN)
         });
         format!("{}  {}{number}{pinned}", pane.kind.icon(), pane.kind.title()).into()
@@ -746,7 +746,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             self.actions.push((tile_id, PaneAction::Keep));
         }
         match self.states.get(&pane).and_then(|s| s.pinned.clone()) {
-            Some(path) => response.on_hover_text(path),
+            Some(path) => response.on_hover_text(path.as_str()),
             None => response,
         }
     }
@@ -798,7 +798,7 @@ impl Panes<'_> {
                     ask(PaneAction::Follow);
                 }
             } else if let Some(selected) = selected {
-                let name = selected.rsplit('/').next().unwrap_or(&selected).to_string();
+                let name = selected.name().unwrap_or_default().to_string();
                 let hint = "Keep showing it whatever is selected";
                 if ui.button(format!("{}  Pin to {name}", icons::PUSH_PIN)).on_hover_text(hint).clicked() {
                     ask(PaneAction::Pin(selected));
@@ -852,12 +852,12 @@ fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<Pick>, edi
         if filter.is_empty() {
             let view = TreeView {
                 ws,
-                reveal: ws.reveal.as_deref(),
+                reveal: ws.reveal.as_ref(),
                 edit: std::cell::RefCell::new(None),
                 folders: None,
                 follow: false,
             };
-            view.ui(ui, &ws.tree, "", pick, &mut chosen);
+            view.ui(ui, &ws.tree, &project::TreePath::root(), pick, &mut chosen);
             *edit = view.edit.into_inner().or(edit.take());
         } else {
             filtered_ui(ui, ws, &filter, pick);
@@ -885,8 +885,8 @@ fn browser_ui(
     mut opened: Option<Opened>,
 ) {
     let reveal = ws.reveal.take();
-    if let Some((folder, _)) = reveal.as_deref().and_then(|path| path.rsplit_once('/')) {
-        ws.open_folder(folder.to_string());
+    if let Some(folder) = reveal.as_ref().and_then(project::TreePath::parent) {
+        ws.open_folder(folder);
     }
     let follow = std::mem::take(&mut ws.folder_moved) || reveal.is_some();
     ws.in_browser |= ui.rect_contains_pointer(ui.max_rect());
@@ -898,10 +898,9 @@ fn browser_ui(
         scroll(ui, "asset folders", |ui| {
             let folders = Some(std::cell::RefCell::new(None));
             // The folder the grid went to, as what reveals it.
-            let going = format!("{}/", shown.asset_folder);
-            let reveal = reveal.as_deref().or(follow.then_some(going.as_str()));
+            let reveal = reveal.as_ref().or(follow.then_some(&shown.asset_folder));
             let view = TreeView { ws: shown, reveal, edit: std::cell::RefCell::new(None), folders, follow };
-            view.ui(ui, &shown.tree, "", pick, &mut chosen);
+            view.ui(ui, &shown.tree, &project::TreePath::root(), pick, &mut chosen);
             *edit = view.edit.into_inner().or(edit.take());
             opened = view.folders.and_then(std::cell::RefCell::into_inner).map(Opened::Folder).or(opened.take());
         });
@@ -934,9 +933,9 @@ fn answer_browser(ws: &mut Workspace, opened: Option<Opened>) {
 
 /// What was asked of the browser while it was drawn.
 enum Opened {
-    Folder(String),
+    Folder(project::TreePath),
     /// A folder marked by a click, not opened.
-    Marked(String),
+    Marked(project::TreePath),
     Back,
     Forward,
     Up,
@@ -956,7 +955,7 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
         if button(ui, forward, icons::CARET_RIGHT, "Forward") {
             *opened = Some(Opened::Forward);
         }
-        if button(ui, !folder.is_empty(), icons::CARET_UP, "Up a folder") {
+        if button(ui, !folder.is_root(), icons::CARET_UP, "Up a folder") {
             *opened = Some(Opened::Up);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -976,7 +975,7 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
                     ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
                 let mut steps = vec!["The project"];
-                steps.extend(folder.split('/').filter(|part| !part.is_empty()));
+                steps.extend(folder.parts());
                 let first = theme::fitting_steps(ui, &steps, ui.available_width());
                 if first > 0 {
                     ui.label(RichText::new("…").small().color(theme::weak()));
@@ -986,7 +985,9 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
                         ui.label(RichText::new("/").small().color(theme::weak()));
                     }
                     if step(ui, name) {
-                        *opened = Some(Opened::Folder(steps[1..=at].join("/")));
+                        let above = folder.parts().count() - at;
+                        let to = (0..above).try_fold(folder.clone(), |up, _| up.parent()).unwrap_or_default();
+                        *opened = Some(Opened::Folder(to));
                     }
                 }
             });
@@ -1002,7 +1003,7 @@ fn assets_grid_ui(
     edit: &mut Option<EditRequest>,
     opened: &mut Option<Opened>,
 ) {
-    let folder = ws.asset_folder.as_str();
+    let folder = &ws.asset_folder;
     let Some(node) = ws.tree.at(folder) else { return };
     ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
     ui.horizontal_wrapped(|ui| {
@@ -1010,18 +1011,17 @@ fn assets_grid_ui(
             if child.entry.is_some() {
                 continue;
             }
-            let path = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
+            let path = crate::workspace::child_path(folder, name);
             let is_folder = !child.children.is_empty();
-            let marked = ws.marked_folder.as_deref() == Some(&path);
+            let marked = ws.marked_folder.as_ref() == Some(&path);
             let response = grid_cell(ui, ws, name, child, marked);
-            if let Some(asset) = child.asset.as_deref() {
-                response.dnd_set_drag_payload(Dragged::Asset(asset.to_string()));
+            if let Some(asset) = &child.asset {
+                response.dnd_set_drag_payload(Dragged::Asset(asset.clone()));
             }
             // A click chooses, as anywhere; a double click goes in, or keeps a tab open.
             if response.clicked() {
-                let entry = child.asset.as_deref().or(child.path.as_deref().filter(|_| !is_folder));
-                *pick =
-                    entry.map(|path| Pick { path: path.to_string(), keep: response.double_clicked() && !is_folder });
+                let entry = child.asset.as_ref().or(child.path.as_ref().filter(|_| !is_folder));
+                *pick = entry.map(|path| Pick { path: path.clone(), keep: response.double_clicked() && !is_folder });
                 if is_folder && entry.is_none() {
                     *opened = Some(Opened::Marked(path.clone()));
                 }
@@ -1034,7 +1034,7 @@ fn assets_grid_ui(
             {
                 *edit = Some(request);
             }
-            if let Some(real) = child.path.as_deref() {
+            if let Some(real) = &child.path {
                 response.context_menu(|ui| {
                     if let Some(request) = entry_menu(ui, ws, real) {
                         *edit = Some(request);
@@ -1044,11 +1044,12 @@ fn assets_grid_ui(
             }
         }
         // A node shown: its files, by the first step of their names (a font's folder once), each choosing the node.
-        let files = node.asset.as_deref().filter(|_| ws.browsing.show_files).and_then(|a| ws.index.assets.get(a));
+        let files = node.asset.as_ref().filter(|_| ws.browsing.show_files).and_then(|a| ws.index.assets.get(a));
         if let Some(asset) = files {
             let mut tops: Vec<(&str, bool)> = Vec::new();
             for file in asset.on_disk().files.iter().filter(|f| f.made_by.is_none()) {
-                let (top, deeper) = file.name.split_once('/').map_or((file.name.as_str(), false), |(t, _)| (t, true));
+                let mut parts = file.name.parts();
+                let (top, deeper) = (parts.next().unwrap_or_default(), parts.next().is_some());
                 if !tops.iter().any(|(t, _)| *t == top) && !node.children.contains_key(top) {
                     tops.push((top, deeper));
                 }
@@ -1076,7 +1077,7 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    let asset = node.asset.as_deref().and_then(|path| ws.index.assets.get(path));
+    let asset = node.asset.as_ref().and_then(|path| ws.index.assets.get(path));
     let selected = marked || (node.asset.is_some() && ws.selected == node.asset);
     let visuals = ui.style().interact_selectable(&response, selected);
     if selected || response.hovered() {
@@ -1102,14 +1103,14 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         ui.painter().text(picture.center(), egui::Align2::CENTER_CENTER, icon, font, tint);
     }
     // A star: unsaved changes.
-    let unsaved = node.asset.as_deref().is_some_and(|path| ws.unsaved(path));
+    let unsaved = node.asset.as_ref().is_some_and(|path| ws.unsaved(path));
     let mut job = egui::text::LayoutJob::simple_singleline(
         if unsaved { format!("{name} *") } else { name.to_string() },
         egui::TextStyle::Small.resolve(ui.style()),
         theme::text(),
     );
     // Marked where a layer that can be edited holds it, as in the tree.
-    let own = node.asset.as_deref().or(node.path.as_deref()).is_some_and(|path| ws.is_editable(path));
+    let own = node.asset.as_ref().or(node.path.as_ref()).is_some_and(|path| ws.is_editable(path));
     if own {
         mark_own(&mut job, ui.style());
     }
@@ -1121,8 +1122,8 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
 }
 
 /// A folder, what is dropped on it moving into it; the edit, once it is.
-fn folder_target(ui: &egui::Ui, ws: &Workspace, rect: egui::Rect, folder: &str) -> Option<EditRequest> {
-    let name = folder.rsplit('/').next().unwrap_or(folder);
+fn folder_target(ui: &egui::Ui, ws: &Workspace, rect: egui::Rect, folder: &project::TreePath) -> Option<EditRequest> {
+    let name = folder.name().unwrap_or("the project");
     let verdict = |dragged: &Dragged| match dragged {
         Dragged::Asset(path) => move_into(ws, path, folder).map(|_| format!("Move into {name}")),
         Dragged::Layer(..) | Dragged::Row { .. } => Err("It stays in its asset".to_string()),
@@ -1136,19 +1137,25 @@ fn folder_target(ui: &egui::Ui, ws: &Workspace, rect: egui::Rect, folder: &str) 
 /// The asset tree as drawn: the workspace for kinds and the selection, and an asset to reveal once.
 struct TreeView<'a> {
     ws: &'a Workspace,
-    reveal: Option<&'a str>,
+    reveal: Option<&'a project::TreePath>,
     /// An edit an entry's menu asked for.
     edit: std::cell::RefCell<Option<EditRequest>>,
     /// Beside a grid, folders only: the one opened, once one is.
-    folders: Option<std::cell::RefCell<Option<String>>>,
+    folders: Option<std::cell::RefCell<Option<project::TreePath>>>,
     /// Whether the grid went to another folder: the tree goes there too, this once.
     follow: bool,
 }
 
 impl TreeView<'_> {
-    fn ui(&self, ui: &mut egui::Ui, node: &Node, prefix: &str, pick: &mut Option<Pick>, chosen: &mut Option<Entry>) {
+    fn ui(
+        &self,
+        ui: &mut egui::Ui,
+        node: &Node,
+        prefix: &project::TreePath,
+        pick: &mut Option<Pick>,
+        chosen: &mut Option<Entry>,
+    ) {
         for (name, child) in node.sorted_children() {
-            let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
             let has_files = self.folders.is_none() && !self.files_of(child).is_empty();
             if child.children.is_empty() && !has_files {
                 if self.folders.is_some() {
@@ -1165,12 +1172,14 @@ impl TreeView<'_> {
             }
             // Beside a grid, what is in a folder is the grid's: one with no folder in it has nothing to unfold.
             if self.folders.is_some() && !child.children.values().any(|inner| !inner.children.is_empty()) {
-                self.folder_leaf(ui, name, child, &path);
+                self.folder_leaf(ui, name, child, &crate::workspace::child_path(prefix, name));
                 continue;
             }
+            // What has something in it is a folder or an asset of the tree: named as a path is.
+            let path = crate::workspace::child_path(prefix, name);
             let id = ui.make_persistent_id(&path);
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-            if self.reveal.is_some_and(|r| r.starts_with(&format!("{path}/"))) {
+            if self.reveal.is_some_and(|r| *r != path && r.starts_with(&path)) {
                 state.set_open(true);
             }
             let open = state.is_open();
@@ -1219,19 +1228,19 @@ impl TreeView<'_> {
     }
 
     /// A node's files, where the browser shows them: by their names in it.
-    fn files_of(&self, node: &Node) -> Vec<String> {
+    fn files_of(&self, node: &Node) -> Vec<pe2_path::RelPath> {
         if !self.ws.browsing.show_files {
             return vec![];
         }
-        let Some(asset) = node.asset.as_deref().and_then(|a| self.ws.index.assets.get(a)) else { return vec![] };
+        let Some(asset) = node.asset.as_ref().and_then(|a| self.ws.index.assets.get(a)) else { return vec![] };
         asset.on_disk().files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.clone()).collect()
     }
 
     /// A node's files, folded under one row so a node of many (a font's glyphs) costs nothing until it is opened; each
     /// chooses its node.
-    fn files_ui(&self, ui: &mut egui::Ui, node: &Node, path: &str, pick: &mut Option<Pick>) {
+    fn files_ui(&self, ui: &mut egui::Ui, node: &Node, path: &project::TreePath, pick: &mut Option<Pick>) {
         let files = self.files_of(node);
-        let Some(asset) = node.asset.as_deref().filter(|_| !files.is_empty()) else { return };
+        let Some(asset) = node.asset.as_ref().filter(|_| !files.is_empty()) else { return };
         let id = ui.make_persistent_id(("files", path));
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
             .show_header(ui, |ui| {
@@ -1249,11 +1258,11 @@ impl TreeView<'_> {
     }
 
     /// A folder's name: beside a grid, the one the grid shows is marked.
-    fn folder_label(&self, ui: &mut egui::Ui, icon: &str, name: &str, path: &str) -> egui::Response {
+    fn folder_label(&self, ui: &mut egui::Ui, icon: &str, name: &str, path: &project::TreePath) -> egui::Response {
         let own = if self.ws.is_editable(path) { format!("  {}", icons::DOT) } else { String::new() };
         let text = RichText::new(format!("{icon}  {name}{own}")).color(theme::weak());
         if self.folders.is_some() {
-            let shown = self.ws.asset_folder == path;
+            let shown = self.ws.asset_folder == *path;
             let text = if shown { text.color(theme::text()) } else { text };
             let response = ui.add(egui::Button::selectable(shown, text).truncate());
             if shown && self.follow {
@@ -1266,7 +1275,7 @@ impl TreeView<'_> {
     }
 
     /// A folder with nothing to unfold, beside a grid, in line with the names of those that have.
-    fn folder_leaf(&self, ui: &mut egui::Ui, name: &str, node: &Node, path: &str) {
+    fn folder_leaf(&self, ui: &mut egui::Ui, name: &str, node: &Node, path: &project::TreePath) {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().icon_width);
             let response = self.folder_label(ui, icons::FOLDER, name, path);
@@ -1276,12 +1285,12 @@ impl TreeView<'_> {
     }
 
     /// A folder's row: what is dropped on it moves into it, and beside a grid a click opens it there.
-    fn folder_row(&self, ui: &egui::Ui, response: &egui::Response, folder: &str) {
+    fn folder_row(&self, ui: &egui::Ui, response: &egui::Response, folder: &project::TreePath) {
         if let Some(request) = folder_target(ui, self.ws, response.rect, folder) {
             *self.edit.borrow_mut() = Some(request);
         }
         if let Some(opened) = self.folders.as_ref().filter(|_| response.clicked()) {
-            *opened.borrow_mut() = Some(folder.to_string());
+            *opened.borrow_mut() = Some(folder.clone());
         }
     }
 
@@ -1302,14 +1311,14 @@ impl TreeView<'_> {
         node: &Node,
         pick: &mut Option<Pick>,
     ) -> Option<egui::Response> {
-        let asset = node.asset.as_deref()?;
+        let asset = node.asset.as_ref()?;
         let found = self.ws.index.assets.get(asset);
         let kind = found.and_then(|a| self.ws.extensions.type_name(a));
         // A star: unsaved changes.
         let starred = self.ws.unsaved(asset).then(|| format!("{name} *"));
         let name = starred.as_deref().unwrap_or(name);
         let own = self.ws.is_editable(asset);
-        let selected = self.ws.selected.as_deref() == Some(asset);
+        let selected = self.ws.selected.as_ref() == Some(asset);
         // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.
         let thumbnail = found
             .filter(|a| self.ws.attached() && self.ws.extensions.has_thumbnail(a))
@@ -1328,7 +1337,7 @@ impl TreeView<'_> {
             None => egui::Button::selectable(selected, labelled(&self.ws.extensions, ui.style(), kind, name, own)),
         };
         let response = ui.add(button.truncate().sense(egui::Sense::click_and_drag()));
-        response.dnd_set_drag_payload(Dragged::Asset(asset.to_string()));
+        response.dnd_set_drag_payload(Dragged::Asset(asset.clone()));
         if self.reveal == Some(asset) {
             response.scroll_to_me(Some(egui::Align::Center));
         }
@@ -1342,11 +1351,11 @@ impl TreeView<'_> {
 
     /// A plain file, or a folder with nothing in it: selected by its real path.
     fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<Pick>) {
-        let Some(path) = node.path.as_deref() else { return };
+        let Some(path) = &node.path else { return };
         let icon = if node.file { icons::FILE } else { icons::FOLDER };
         let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, self.ws.is_editable(path));
         ui.horizontal(|ui| {
-            let response = ui.add(egui::Button::selectable(self.ws.selected.as_deref() == Some(path), job).truncate());
+            let response = ui.add(egui::Button::selectable(self.ws.selected.as_ref() == Some(path), job).truncate());
             if self.reveal == Some(path) {
                 response.scroll_to_me(Some(egui::Align::Center));
             }
@@ -1360,7 +1369,7 @@ impl TreeView<'_> {
 
     /// An entry's menu: its edits in the active layer.
     fn menu(&self, response: &egui::Response, node: &Node) {
-        let Some(real) = node.path.as_deref() else { return };
+        let Some(real) = &node.path else { return };
         response.context_menu(|ui| {
             if let Some(request) = entry_menu(ui, self.ws, real) {
                 *self.edit.borrow_mut() = Some(request);
@@ -1371,14 +1380,14 @@ impl TreeView<'_> {
 
     /// Beside an entry's name: the layer that overrode, moved or made it, where that is worth saying.
     fn badge(&self, ui: &mut egui::Ui, node: &Node) {
-        if let Some(text) = node.path.as_deref().and_then(|p| self.ws.badge(p)) {
+        if let Some(text) = node.path.as_ref().and_then(|p| self.ws.badge(p)) {
             ui.label(RichText::new(text).small().color(theme::accent()));
         }
     }
 }
 
 /// The edits of an entry (by its real path) the active layer can make: override, rename, delete, take back.
-fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &str) -> Option<EditRequest> {
+fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &project::TreePath) -> Option<EditRequest> {
     let entry = ws.index.entries.get(real)?;
     let layer = match ws.editable_layer() {
         Ok(layer) => layer,
@@ -1390,20 +1399,20 @@ fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &str) -> Option<EditReque
     let name = &layer.name;
     let own = entry.home == *name;
     let overridden = entry.overrides.iter().any(|l| l == name);
-    let uid = entry.uid.clone();
+    let uid = entry.uid;
     let mut request = None;
     ui.label(RichText::new(format!("In the layer {name}")).small().color(theme::weak()));
     if entry.kind != project::index::Kind::Folder && !own && !overridden {
         let hint = "Copy the version below into the layer, to edit it there";
         if ui.button(format!("Override in {name}")).on_hover_text(hint).clicked() {
-            request = Some(EditRequest::Override(uid.clone()));
+            request = Some(EditRequest::Override(uid));
         }
     }
     if overridden && ui.button("Take the version below").on_hover_text("Drop the layer's copy").clicked() {
-        request = Some(EditRequest::Resolve(uid.clone(), project::edit::Resolution::TakeBase));
+        request = Some(EditRequest::Resolve(uid, project::edit::Resolution::TakeBase));
     }
     if ui.button("Rename…").clicked() {
-        request = Some(EditRequest::Rename(uid.clone(), real.to_string()));
+        request = Some(EditRequest::Rename(uid, real.clone()));
     }
     let delete = if own { "Delete".to_string() } else { format!("Delete in {name}") };
     let hint = if own { "Remove it from the layer" } else { "The layer hides it: the layers below keep it" };
@@ -1458,16 +1467,16 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
         .assets
         .values()
         .map(|a| &**a)
-        .filter(|a| a.path.to_lowercase().contains(filter) || ws.extensions.type_label(a) == Some(filter))
+        .filter(|a| a.path.as_str().to_lowercase().contains(filter) || ws.extensions.type_label(a) == Some(filter))
         .collect();
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
     for asset in matches.iter().take(SHOWN) {
-        let selected = ws.selected.as_deref() == Some(asset.path.as_str());
+        let selected = ws.selected.as_ref() == Some(&asset.path);
         let job = labelled(
             &ws.extensions,
             ui.style(),
             ws.extensions.type_name(asset),
-            &asset.path,
+            asset.path.as_str(),
             ws.is_editable(&asset.path),
         );
         let response = ui.add(egui::Button::selectable(selected, job).truncate().sense(egui::Sense::click_and_drag()));
@@ -1489,9 +1498,9 @@ fn document_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     pane: Pane,
-    (editor, subject): (Option<EditorKind>, Option<&str>),
+    (editor, subject): (Option<EditorKind>, Option<&project::TreePath>),
     preview: &mut Preview,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     edit: &mut Option<EditRequest>,
 ) {
     let editors = subject.map_or_default(|path| editors_of(ws, path));
@@ -1518,8 +1527,8 @@ fn preview_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     pane: Pane,
-    subject: Option<&str>,
-    nav: &mut Option<String>,
+    subject: Option<&project::TreePath>,
+    nav: &mut Option<crate::workspace::Nav>,
     view: &mut Preview,
 ) {
     // A plain file: its text or bytes.
@@ -1561,7 +1570,7 @@ fn files_view_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
     }
     ui.horizontal_wrapped(|ui| {
         for file in &asset.files {
-            ui.selectable_value(&mut chosen, file.name.clone(), &file.name);
+            ui.selectable_value(&mut chosen, file.name.clone(), file.name.as_str());
         }
     });
     ws.viewed_file.insert(asset.path.clone(), chosen.clone());
@@ -1578,9 +1587,9 @@ fn views_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     pane: egui::Id,
-    nav: &mut Option<String>,
+    nav: &mut Option<crate::workspace::Nav>,
     view: &mut Preview,
-    shown: Vec<(Option<String>, String)>,
+    shown: Vec<(Option<String>, project::TreePath)>,
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Upscaling").small().color(theme::weak()));
@@ -1595,8 +1604,8 @@ fn views_ui(
             |ui| {
                 if let Some(slot) = &slot {
                     ui.label(RichText::new(slot).strong());
-                    if theme::short_link(ui, &path).clicked() {
-                        *nav = Some(path.clone());
+                    if theme::short_link(ui, path.as_str()).clicked() {
+                        *nav = Some(crate::workspace::Nav::to(path.clone()));
                     }
                 }
             },
@@ -1616,7 +1625,7 @@ pub fn upscale_picker(ui: &mut egui::Ui, upscale: &mut Upscale) {
 }
 
 /// For an image with several variants - its other looks: the one it is shown in.
-fn variant_picker(ui: &mut egui::Ui, ws: &mut Workspace, path: &str) {
+fn variant_picker(ui: &mut egui::Ui, ws: &mut Workspace, path: &project::TreePath) {
     let variants = ws.variants_of(path);
     if variants.len() < 2 {
         return;
@@ -1733,7 +1742,7 @@ fn boxes_toggle(ui: &mut egui::Ui, overlay: &Overlay, show_boxes: &mut bool) {
 
 /// An overlay drawn: each picture, a box over each named rectangle, the legend; hovering an entry of either highlights
 /// it in both, hovering the canvas names what is under the pointer. Returns the link of a picture clicked.
-pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) -> Option<String> {
+pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) -> Option<crate::workspace::Nav> {
     let (path, boxes, layout_size) = (overlay.id.as_str(), &overlay.boxes, overlay.size);
     let plain = theme::weak().gamma_multiply(0.6);
     let color = |i: usize, highlight: bool| {
@@ -1807,9 +1816,10 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
         }
         if response.clicked() {
             // What is there to go to, else what is there to select: `#` and a box's name.
-            let part = under.first().filter(|_| show_boxes).map(|&i| format!("#{}", boxes[i].0));
-            let face = trace.and_then(|trace| overlay.traces[trace].link.clone());
-            clicked = face.or_else(|| pictures.iter().find_map(|(_, _, _, link)| link.clone())).or(part);
+            let part = under.first().filter(|_| show_boxes).map(|&i| crate::workspace::Nav::Part(boxes[i].0.clone()));
+            let face = trace.and_then(|trace| overlay.traces[trace].link.as_deref());
+            let link = face.or_else(|| pictures.iter().find_map(|(_, _, _, link)| link.as_deref()));
+            clicked = link.map(crate::workspace::Nav::link).or(part);
         }
         response.clone().on_hover_text_at_pointer(lines.join("\n"));
     }
@@ -2006,7 +2016,12 @@ fn zoom_pan(
 
 // --- references -------------------------------------------------------------------------------------------------------
 
-pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&str>, nav: &mut Option<String>) {
+pub(crate) fn references_ui(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    subject: Option<&project::TreePath>,
+    nav: &mut Option<crate::workspace::Nav>,
+) {
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)) else {
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
@@ -2020,8 +2035,8 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
             // The output it names, where it names one.
             let output = r.output.as_ref().map_or_default(|o| format!("  #{o}"));
             let slot = RichText::new(format!("slot {}{output}", r.slot)).color(theme::weak());
-            if theme::link_row(ui, &r.from, slot).clicked() {
-                *nav = Some(r.from.clone());
+            if theme::link_row(ui, r.from.as_str(), slot).clicked() {
+                *nav = Some(crate::workspace::Nav::to(r.from.clone()));
             }
         }
     });
@@ -2038,8 +2053,8 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
         }
         for (slot, target) in &outgoing {
             let slot = RichText::new(format!("slot {slot}")).color(theme::weak());
-            if theme::link_row(ui, &target.path, slot).clicked() {
-                *nav = Some(target.path.clone());
+            if theme::link_row(ui, target.path.as_str(), slot).clicked() {
+                *nav = Some(crate::workspace::Nav::to(target.path.clone()));
             }
         }
     });
@@ -2048,7 +2063,7 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
 // --- problems ---------------------------------------------------------------------------------------------------------
 
 /// What the last build found wrong, where it did: its wiring, what failed and what is stale, each a link to where.
-fn build_problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+fn build_problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<crate::workspace::Nav>) {
     if let Some(epoch) = ws.last_epoch.as_ref().filter(|epoch| epoch.is_wrong()) {
         theme::section(ui, &format!("Build  ·  {}", epoch.config), |ui| {
             let wiring = epoch.problems.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
@@ -2065,7 +2080,7 @@ fn build_problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icons::WARNING).color(tint));
                         if ui.link(at.as_str()).clicked() {
-                            *nav = Some(at.clone());
+                            *nav = Some(crate::workspace::Nav::link(at));
                         }
                     });
                     ui.label(RichText::new(why).monospace().color(theme::weak()));
@@ -2084,6 +2099,14 @@ fn unlisted_repairs(
     edit: &mut Option<EditRequest>,
 ) {
     let project::index::Problem::Unlisted { layer, path } = problem else { return };
+    // A problem names its path as text: one that is no path is said, and nothing is offered for it.
+    let path = match project::TreePath::new(path) {
+        Ok(path) => path,
+        Err(why) => {
+            ui.label(RichText::new(format!("{path}: {why}")).color(theme::weak()));
+            return;
+        }
+    };
     let Some(shown) = ws.layers.iter().find(|l| l.name == *layer && l.writable) else { return };
     ui.horizontal(|ui| {
         let adopt = ui.small_button("Adopt").on_hover_text(
@@ -2106,17 +2129,17 @@ fn unlisted_repairs(
 fn stale_repairs(ui: &mut egui::Ui, ws: &Workspace, problem: &project::index::Problem, edit: &mut Option<EditRequest>) {
     use project::edit::Resolution;
     let project::index::Problem::Stale { layer, path } = problem else { return };
-    let Some(entry) = ws.index.entries.get(path) else { return };
+    let Some(entry) = ws.index.entry_at(path) else { return };
     if ws.editable_layer().is_ok_and(|active| active.name == *layer) {
         ui.horizontal(|ui| {
             let keep = ui
                 .small_button("Keep mine")
                 .on_hover_text("Keep the layer's version: its base becomes the version below now");
             if keep.clicked() {
-                *edit = Some(EditRequest::Resolve(entry.uid.clone(), Resolution::KeepMine));
+                *edit = Some(EditRequest::Resolve(entry.uid, Resolution::KeepMine));
             }
             if ui.small_button("Take below").on_hover_text("Drop the layer's version for the one below").clicked() {
-                *edit = Some(EditRequest::Resolve(entry.uid.clone(), Resolution::TakeBase));
+                *edit = Some(EditRequest::Resolve(entry.uid, Resolution::TakeBase));
             }
         });
     } else {
@@ -2126,12 +2149,17 @@ fn stale_repairs(ui: &mut egui::Ui, ws: &Workspace, problem: &project::index::Pr
                 .color(theme::weak()),
         );
     }
-    crate::layers::stale_parts_ui(ui, &ws.index.stale_parts(layer, &entry.uid), 0.0);
+    crate::layers::stale_parts_ui(ui, &ws.index.stale_parts(layer, entry.uid), 0.0);
 }
 
 /// What the index finds wrong, each with the assets it is about; the references that resolve to nothing; whether the
 /// layers are watched and agents can connect.
-fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
+fn problems_ui(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    nav: &mut Option<crate::workspace::Nav>,
+    edit: &mut Option<EditRequest>,
+) {
     if let Some(e) = &ws.watch_error {
         theme::section(ui, "Watching", |ui| {
             ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
@@ -2182,7 +2210,7 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                         if theme::short_link(ui, path).clicked()
                             && let Some(asset) = asset
                         {
-                            *nav = Some(asset.to_string());
+                            *nav = Some(crate::workspace::Nav::link(asset));
                         }
                     });
                 }
@@ -2191,13 +2219,14 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                 // list is written, so a read-only mount forgets too.
                 if let project::index::Problem::Missing { layer, path, .. } = problem
                     && ws.layers.iter().any(|l| l.name == *layer && l.writable)
-                    && let Some(uid) = ws.index.listed(layer, path)
+                    && let Ok(path) = project::TreePath::new(path)
+                    && let Some(uid) = ws.index.listed(layer, &path)
                     && ui
                         .small_button("Forget it")
                         .on_hover_text("Take it out of the layer's list (an undoable step)")
                         .clicked()
                 {
-                    *edit = Some(EditRequest::Forget(layer.clone(), uid.to_string()));
+                    *edit = Some(EditRequest::Forget(layer.clone(), uid));
                 }
                 unlisted_repairs(ui, ws, problem, edit);
                 stale_repairs(ui, ws, problem, edit);
@@ -2212,8 +2241,8 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
         }
         for r in dangling {
             let slot = RichText::new(format!("slot {}", r.slot)).color(theme::weak());
-            if theme::link_row(ui, &r.from, slot).clicked() {
-                *nav = Some(r.from.clone());
+            if theme::link_row(ui, r.from.as_str(), slot).clicked() {
+                *nav = Some(crate::workspace::Nav::to(r.from.clone()));
             }
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
@@ -2276,7 +2305,7 @@ fn project_extensions_ui(ui: &mut egui::Ui, ws: &Workspace) {
     });
 }
 
-fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<crate::workspace::Nav>) {
     let p = &ws.project;
     ui.label(
         RichText::new(
@@ -2334,8 +2363,8 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         theme::section(ui, &format!("Dangling references ({})", ws.index.dangling.len()), |ui| {
             for r in &ws.index.dangling {
                 let detail = RichText::new(format!("{} → {}", r.slot, r.target)).color(ui.visuals().error_fg_color);
-                if theme::link_row(ui, &r.from, detail).clicked() {
-                    *nav = Some(r.from.clone());
+                if theme::link_row(ui, r.from.as_str(), detail).clicked() {
+                    *nav = Some(crate::workspace::Nav::to(r.from.clone()));
                 }
             }
         });
@@ -2960,12 +2989,13 @@ mod tests {
 
     #[test]
     fn tabs_of_one_name_are_told_by_the_folder_they_differ_in() {
-        let a = "stages/akropolis/rooms/cafeteria/movies/movie_100";
-        let b = "stages/akropolis/rooms/bridge/movies/movie_100";
+        let tree = |text| project::TreePath::new(text).unwrap();
+        let a = &tree("stages/akropolis/rooms/cafeteria/movies/movie_100");
+        let b = &tree("stages/akropolis/rooms/bridge/movies/movie_100");
         assert_eq!(telling_apart(a, [a, b].into_iter()), Some("cafeteria"));
         assert_eq!(telling_apart(b, [a, b].into_iter()), Some("bridge"));
         // Its own, shown twice, and another name say nothing.
         assert_eq!(telling_apart(a, [a, a].into_iter()), None);
-        assert_eq!(telling_apart(a, [a, "stages/image"].into_iter()), None);
+        assert_eq!(telling_apart(a, [a, &tree("stages/image")].into_iter()), None);
     }
 }
