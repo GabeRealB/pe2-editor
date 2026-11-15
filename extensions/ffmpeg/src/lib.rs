@@ -12,6 +12,8 @@
 //! ffmpeg says what it has, not what goes with what, and listing every pair would take a run each: `check` tries the one
 //! chosen, on a frame of its real size, as an encoder may refuse a size.
 
+#![allow(clippy::disallowed_methods, reason = "an extension's files are the WASI the host gives it")]
+
 use pe2_ext::media::{AudioData, PixelFormat, SampleFormat};
 use pe2_ext::process::{Process, spawn};
 use pe2_ext::ty::{self, Files, Registered};

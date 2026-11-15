@@ -92,7 +92,7 @@ impl Plans {
             let mut layers = BTreeMap::new();
             for layer in project.generated() {
                 let plan = layer.plan();
-                let header = project::plan::header(&plan).map_err(|e| format!("{e:#}"));
+                let header = project::plan::header(extensions.io().filesystem(), &plan).map_err(|e| format!("{e:#}"));
                 let state = project::plan::state(&plan, &layer.path, &extensions).map_err(|e| format!("{e:#}"));
                 // A generated layer fills one: the project refuses it otherwise.
                 let Some(fills) = layer.fills.clone() else { continue };

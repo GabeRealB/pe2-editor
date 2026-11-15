@@ -104,6 +104,10 @@ pub fn read(bytes: &[u8]) -> Result<Wav> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn a_wav_reads_back_as_written() {

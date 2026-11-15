@@ -864,6 +864,7 @@ fn room(at: &HostPath) -> (u64, u64) {
 ///
 /// # Errors
 /// Dokany is not installed, or would not mount there.
+#[allow(clippy::disallowed_methods, reason = "the folder mounted at: what the system mounts, as the system has it")]
 pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str) -> io::Result<Mounted> {
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "Dokany is not installed"))?;
     let at = at.clone();
@@ -1048,6 +1049,7 @@ impl Backend for AsBackend {
         crate::backend::unjoin(&at);
     }
 
+    #[allow(clippy::disallowed_methods, reason = "the folder mounted at: what the system mounts, as the system has it")]
     fn retire(&self, at: &HostPath, name: &str) {
         // Nothing of it is on disk but the folder itself, mounted on: a junction to a volume that is gone. One that
         // leads to a folder is another backend's, kept apart, and stays.

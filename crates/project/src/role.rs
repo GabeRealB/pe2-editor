@@ -45,6 +45,10 @@ impl Role {
 
     /// Whether one runs for the project in `root`: one has its lock.
     #[must_use]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+    )]
     pub fn running(&self, root: &HostPath) -> bool {
         let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(&DIR).join(&self.lock)) else {
             return false;
@@ -60,6 +64,10 @@ impl Role {
     ///
     /// # Errors
     /// One runs already - a second one started in a race ends here, and its starter finds the first.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+    )]
     pub fn claim(&self, root: &HostPath) -> Result<std::fs::File> {
         crate::cache::make(&pe2_io::SystemFilesystem, root)?;
         let one = std::fs::OpenOptions::new()
@@ -95,6 +103,10 @@ impl Role {
     ///
     /// # Errors
     /// It could not be started, or did not listen in time.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+    )]
     pub fn start(
         &self,
         root: &HostPath,

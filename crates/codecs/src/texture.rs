@@ -337,6 +337,10 @@ pub fn render(page: &Page, bpp: u8, palette: Option<&[u16]>) -> (usize, Vec<u8>)
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod color_tests {
     use super::{color, rgba};
 

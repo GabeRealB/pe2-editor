@@ -35,6 +35,8 @@ fn is_zero(bytes: &u64) -> bool {
 #[derive(Debug)]
 pub struct Access {
     file: Option<HostPath>,
+    /// The I/O its record is kept through.
+    io: std::sync::Arc<dyn pe2_io::Io>,
     read: Mutex<(BTreeMap<Arc<RelPath>, Read>, bool)>,
 }
 
@@ -49,7 +51,7 @@ fn now() -> u64 {
 impl Access {
     /// What was read of a use of a project, by its name: as remembered from the last time, nothing where it is new.
     #[must_use]
-    pub fn of(project: &HostPath, what: &str) -> Access {
+    pub fn of(project: &HostPath, what: &str, io: std::sync::Arc<dyn pe2_io::Io>) -> Access {
         const ACCESS: &pe2_path::Name = pe2_path::Name::constant("access");
         let name = project::extract::sha1_hex(what.as_bytes());
         let file = pe2_path::Name::new(&format!("{name}.json"))
@@ -57,16 +59,16 @@ impl Access {
             .map(|file| project.join(&project::cache::DIR).join(&ACCESS).join(&file));
         let read = file
             .as_ref()
-            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|file| io.filesystem().read(file).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Access { file, read: Mutex::new((read, false)) }
+        Access { file, io, read: Mutex::new((read, false)) }
     }
 
     /// A record remembered nowhere: of what is served for no project.
     #[must_use]
     pub fn unkept() -> Access {
-        Access { file: None, read: Mutex::default() }
+        Access { file: None, io: pe2_io::system(), read: Mutex::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, (BTreeMap<Arc<RelPath>, Read>, bool)> {
@@ -133,10 +135,10 @@ impl Access {
         let old = now().saturating_sub(90 * 24 * 3600);
         state.0.retain(|_, read| read.kept > 0 || read.last >= old);
         if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            let _ = self.io.filesystem().create_folder_all(&dir);
         }
         if let Ok(text) = serde_json::to_vec(&state.0) {
-            let _ = std::fs::write(file, text);
+            let _ = self.io.filesystem().write(file, &text);
         }
     }
 }
@@ -164,6 +166,10 @@ pub fn bytes(text: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Access, bytes};
 

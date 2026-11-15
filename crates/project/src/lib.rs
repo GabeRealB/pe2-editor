@@ -359,13 +359,13 @@ impl Filesystem {
 /// How this machine serves the project at a folder, read from its `project.local.toml` alone: for what serves a
 /// project's files without loading it. One that cannot be read says nothing.
 #[must_use]
-pub fn local_filesystem(root: &HostPath) -> Filesystem {
-    Filesystem::of(root, read_local(root).map_or_default(|local| local.filesystem))
+pub fn local_filesystem(root: &HostPath, fs: &dyn pe2_io::Filesystem) -> Filesystem {
+    Filesystem::of(root, read_local(fs, root).map_or_default(|local| local.filesystem))
 }
 
-fn read_local(root: &HostPath) -> Result<LocalFile> {
+fn read_local(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<LocalFile> {
     let path = root.join(&LOCAL);
-    match std::fs::read_to_string(&path) {
+    match fs.read_to_string(&path) {
         Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
         Err(_) => Ok(LocalFile::default()),
     }
@@ -573,27 +573,27 @@ const EMPTY: &str = "# A project. `res://` paths are absolute from this director
 ///
 /// # Errors
 /// A project is there already, or the folder cannot be written.
-pub fn create(directory: &Path) -> Result<()> {
+pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
     const OWN: &Name = Name::constant("project");
     const IGNORE: &Name = Name::constant(".gitignore");
     let directory = HostPath::new(directory).with_context(|| directory.display().to_string())?;
     let file = directory.join(&FILE);
-    anyhow::ensure!(!file.as_path().exists(), "{directory} holds a project already");
+    anyhow::ensure!(!fs.exists(&file), "{directory} holds a project already");
     let own = directory.join(&LAYERS).join(&OWN);
-    std::fs::create_dir_all(&own).with_context(|| directory.to_string())?;
+    fs.create_folder_all(&own).with_context(|| directory.to_string())?;
     // Its own layer is records (`records`).
-    records::mark(&pe2_io::SystemFilesystem, &own, &records::Settings::default())?;
-    std::fs::write(&file, EMPTY).with_context(|| file.to_string())?;
+    records::mark(fs, &own, &records::Settings::default())?;
+    fs.write(&file, EMPTY.as_bytes()).with_context(|| file.to_string())?;
     // Where it is served is no part of it, nor what was set aside from there.
     let ignore = directory.join(&IGNORE);
-    let mut text = std::fs::read_to_string(&ignore).unwrap_or_default();
+    let mut text = fs.read_to_string(&ignore).unwrap_or_default();
     for folder in [SERVED, SET_ASIDE] {
         if !text.lines().any(|l| l.trim() == format!("/{folder}/")) {
             let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
             text = format!("{text}{separator}/{folder}/\n");
         }
     }
-    std::fs::write(&ignore, text).with_context(|| ignore.to_string())
+    fs.write(&ignore, text.as_bytes()).with_context(|| ignore.to_string())
 }
 
 /// How a layer's content is stored (`storage` in `project.toml`).
@@ -661,9 +661,9 @@ impl Project {
     pub fn load_with(directory: &Path, io: Arc<dyn pe2_io::Io>) -> Result<Project> {
         let root = HostPath::new(directory).with_context(|| format!("{}", directory.display()))?;
         let path = root.join(&FILE);
-        let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
+        let text = io.filesystem().read_to_string(&path).with_context(|| format!("{}", path.display()))?;
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
-        let local = read_local(&root)?;
+        let local = read_local(io.filesystem(), &root)?;
         let (mounts, unmanaged) = mounts_of(&root, file.mount, &local)?;
         // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
         let mut layers: Vec<Layer> = mounts
@@ -773,14 +773,14 @@ impl Project {
     pub fn held_extensions(&self) -> Vec<HostPath> {
         let mut held: std::collections::BTreeMap<String, Option<HostPath>> = std::collections::BTreeMap::new();
         for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            if layer.path.join(&ext::folder::HELD).is_dir() {
+            if self.io.filesystem().is_folder(&layer.path.join(&ext::folder::HELD)) {
                 eprintln!(
                     "{} holds extensions as folders, as layers held them before records: \
                      `pe2-cli project store convert --layer {}` holds them as records",
                     layer.name, layer.name
                 );
             }
-            let records = match records::extensions_of(&layer.path) {
+            let records = match records::extensions_of(self.io.filesystem(), &layer.path) {
                 Ok(records) => records,
                 Err(e) => {
                     eprintln!("the extensions {} holds: {e:#}", layer.name);
@@ -849,6 +849,10 @@ impl Project {
 
 /// What tests of a project share.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 pub(crate) mod testing {
     /// The system's I/O, as every test that is given none reads and writes with.
     pub(crate) fn io() -> std::sync::Arc<dyn pe2_io::Io> {
@@ -900,15 +904,19 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn an_empty_project_loads_and_is_made_once() {
         let dir = crate::testing::scratch("new-project");
         let _ = std::fs::remove_dir_all(&dir);
-        super::create(&dir).unwrap();
+        super::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let project = super::Project::load(&dir).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["project"]);
-        assert!(super::create(&dir).is_err());
+        assert!(super::create(&dir, &pe2_io::SystemFilesystem).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -916,7 +924,7 @@ mod tests {
     fn configs_have_the_properties_declared_and_say_what_is_not_as_declared() {
         let dir = crate::testing::scratch("properties");
         let _ = std::fs::remove_dir_all(&dir);
-        super::create(&dir).unwrap();
+        super::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let file = dir.join(&super::FILE);
         let mut text = std::fs::read_to_string(&file).unwrap();
         text.push_str(

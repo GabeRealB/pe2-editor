@@ -374,6 +374,10 @@ fn list_ui(ui: &mut egui::Ui, all: &[Present], state: &mut State) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{State, asked_for, chains, left_off_too, requirement, through_providers};
     use project::ext::{Origin, Present, Status};

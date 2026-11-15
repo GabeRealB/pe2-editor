@@ -198,6 +198,10 @@ pub fn open_as(file: &Path, name: &str, category: Category, tools: &Tools) -> Re
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn words_split_and_unquote() {

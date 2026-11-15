@@ -169,11 +169,23 @@ impl Header {
 ///
 /// # Errors
 /// The file cannot be read, or its first line is no plan's.
-pub fn header(plan: &HostPath) -> Result<Header> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(plan).with_context(|| plan.display().to_string())?;
-    let mut line = String::new();
-    std::io::BufReader::new(file).read_line(&mut line).with_context(|| plan.display().to_string())?;
+pub fn header(fs: &dyn pe2_io::Filesystem, plan: &HostPath) -> Result<Header> {
+    let file = fs.open(plan, pe2_io::Open::READ).with_context(|| plan.display().to_string())?;
+    // Read a piece at a time until the line ends: a plan's operations, after it, are not read.
+    let (mut line, mut piece, mut at) = (Vec::new(), vec![0u8; 64 << 10], 0);
+    loop {
+        let read = file.read_at(&mut piece, at).with_context(|| plan.display().to_string())?;
+        if let Some(end) = piece[..read].iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&piece[..end]);
+            break;
+        }
+        line.extend_from_slice(&piece[..read]);
+        if read == 0 {
+            break;
+        }
+        at += read as u64;
+    }
+    let line = String::from_utf8(line).with_context(|| plan.display().to_string())?;
     Header::parse(&line).with_context(|| plan.display().to_string())
 }
 
@@ -182,8 +194,8 @@ impl Plan {
     ///
     /// # Errors
     /// A line is no JSON, or no plan's, or takes what no line before it makes.
-    pub fn read(path: &HostPath) -> Result<Plan> {
-        let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
+    pub fn read(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Result<Plan> {
+        let text = fs.read_to_string(path).with_context(|| path.display().to_string())?;
         Self::parse(&text).with_context(|| path.display().to_string())
     }
 
@@ -432,7 +444,7 @@ fn found_releases(
         })
         .collect();
     let found = crate::parallel(&discs, |(_, (name, size, sha1), look_in)| {
-        look_in.as_ref().and_then(|dir| discs::find_disc(dir, name, *size, sha1).ok())
+        look_in.as_ref().and_then(|dir| discs::find_disc(&project.io, dir, name, *size, sha1).ok())
     });
     let (mut available, mut paths, mut missing) = (std::collections::BTreeSet::new(), HashMap::new(), Vec::new());
     for &release in &asked {
@@ -480,8 +492,8 @@ struct Record {
     releases: Option<std::collections::BTreeSet<String>>,
 }
 
-fn read_record(path: &HostPath) -> Record {
-    let Ok(text) = std::fs::read_to_string(path) else { return Record::default() };
+fn read_record(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Record {
+    let Ok(text) = fs.read_to_string(path) else { return Record::default() };
     let mut record = Record::default();
     let head = text.lines().next().and_then(|line| serde_json::from_str::<Value>(line).ok());
     record.releases = head
@@ -679,7 +691,8 @@ pub fn discs(project: &crate::Project, header: &Header) -> Vec<Disc> {
         // A place `res://`, or one written as the system writes it.
         let look_in = project.resolve(&input.look_in).ok().or_else(|| HostPath::new(Path::new(&input.look_in)).ok());
         for (name, size, sha1) in &input.discs {
-            let found = look_in.as_ref().and_then(|look_in| discs::find_disc(look_in, name, *size, sha1).ok());
+            let found =
+                look_in.as_ref().and_then(|look_in| discs::find_disc(&project.io, look_in, name, *size, sha1).ok());
             out.push(Disc {
                 release: release.clone(),
                 name: name.clone(),
@@ -710,6 +723,8 @@ struct Observing {
     /// The operations whose bytes are kept, by kind: all where empty.
     kinds: Vec<String>,
     seen: Mutex<Vec<Observed>>,
+    /// The I/O what it keeps is written through.
+    io: std::sync::Arc<dyn pe2_io::Io>,
 }
 
 impl Observing {
@@ -717,8 +732,9 @@ impl Observing {
         let sha1 = sha1_hex(bytes);
         if let Some(keep) = self.keep.as_ref().filter(|_| self.kinds.is_empty() || self.kinds.contains(&op.kind)) {
             let path = keep.join(&Name::new(&sha1)?);
-            if !path.exists() {
-                std::fs::write(&path, bytes).with_context(|| path.display().to_string())?;
+            let fs = self.io.filesystem();
+            if !fs.exists(&path) {
+                fs.write(&path, bytes).with_context(|| path.display().to_string())?;
             }
         }
         let seen = Observed { id: op.id.clone(), sha1: Some(sha1), size: Some(bytes.len() as u64), error: None };
@@ -755,7 +771,7 @@ pub fn observe(
     kinds: &[String],
 ) -> Result<Vec<Observed>> {
     let place = |path: &std::path::Path| HostPath::new(path).with_context(|| path.display().to_string());
-    let plan = Plan::read(&place(plan_file)?)?;
+    let plan = Plan::read(extensions.io().filesystem(), &place(plan_file)?)?;
     let look_in = |release: &str| place(&look_in(release)?);
     let keep = keep.map(place).transpose()?;
     let keep = keep.as_ref();
@@ -772,9 +788,14 @@ pub fn observe(
         }
     }
     if let Some(keep) = keep {
-        std::fs::create_dir_all(keep).with_context(|| keep.display().to_string())?;
+        extensions.io().filesystem().create_folder_all(keep).with_context(|| keep.display().to_string())?;
     }
-    let observing = Observing { keep: keep.cloned(), kinds: kinds.to_vec(), seen: Mutex::new(Vec::new()) };
+    let observing = Observing {
+        keep: keep.cloned(),
+        kinds: kinds.to_vec(),
+        seen: Mutex::new(Vec::new()),
+        io: extensions.io().clone(),
+    };
     let progress = Progress::default();
     let state = RunState {
         plan: &plan,
@@ -842,7 +863,7 @@ fn share_alike(io: &std::sync::Arc<dyn pe2_io::Io>, plan: &Plan, layer: &HostPat
         let path = file_path(layer, node, file);
         let _ = crate::content::remove(io, &path);
         if let Some(folder) = path.parent() {
-            let _ = std::fs::remove_dir(folder);
+            let _ = io.filesystem().remove_folder(&folder);
         }
         if let Some(written) = record.files.get_mut(&(node.clone(), file.clone())) {
             written.shared = true;
@@ -964,13 +985,13 @@ pub fn run(
     // What the nodes are, read as any layer's: a records layer's through its records.
     crate::records::Set::open(project)?;
     let layer = &generated.path;
-    let mut plan = Plan::read(&generated.plan())?;
+    let mut plan = Plan::read(project.io.filesystem(), &generated.plan())?;
     let unmet = plan.unmet(extensions);
     anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
     let (available, found) = found_releases(project, &plan, releases)?;
     let possible = plan.resolve(&available);
-    let old = read_record(&layer.join(&RECORD));
+    let old = read_record(project.io.filesystem(), &layer.join(&RECORD));
     let mut record = Record::default();
     let in_order = plan.releases().into_iter().filter(|r| available.contains(r)).collect();
     let mut ran = Ran { releases: in_order, ..Ran::default() };
@@ -1259,7 +1280,7 @@ impl RunState<'_> {
                 (_, Some(bytes)) => bytes.to_vec(),
                 (crate::graph::Content::Stored { sha1, .. }, None) => {
                     let path = self.engine.store().context("no store")?.blob_path(sha1)?;
-                    std::fs::read(&path).with_context(|| path.display().to_string())?
+                    self.extensions.io().filesystem().read(&path).with_context(|| path.display().to_string())?
                 }
                 (_, None) => bail!("{}: its content is held nowhere", file.name),
             };
@@ -1319,12 +1340,17 @@ impl RunState<'_> {
                     slots,
                 };
                 if let Some(path) = self.found.get(&layout.sha1) {
-                    return Ok(Made::Disc(Arc::new(OpenDisc::open_at(path.clone(), &op.id, &layout)?)));
+                    return Ok(Made::Disc(Arc::new(OpenDisc::open_at(
+                        self.extensions.io(),
+                        path.clone(),
+                        &op.id,
+                        &layout,
+                    )?)));
                 }
                 let release = text("release")?;
                 let look_in =
                     self.inputs.get(release).with_context(|| format!("the plan reads no release {release}"))?;
-                return Ok(Made::Disc(Arc::new(OpenDisc::open(look_in, &op.id, &layout)?)));
+                return Ok(Made::Disc(Arc::new(OpenDisc::open(self.extensions.io(), look_in, &op.id, &layout)?)));
             }
             "slot" => self.disc(op)?.slot(text("name")?)?,
             "container" => {
@@ -1438,11 +1464,12 @@ impl Plan {
 /// # Errors
 /// The plan cannot be read.
 pub fn state(plan_file: &HostPath, layer: &HostPath, extensions: &crate::ext::Extensions) -> Result<State> {
-    if !plan_file.is_file() {
+    if !extensions.io().filesystem().is_file(plan_file) {
         return Ok(State::NoPlan);
     }
-    let mut plan = Plan::read(plan_file)?;
-    let record = read_record(&layer.join(&RECORD));
+    let fs = extensions.io().filesystem();
+    let mut plan = Plan::read(fs, plan_file)?;
+    let record = read_record(fs, &layer.join(&RECORD));
     if record.files.is_empty() && record.checks.is_empty() {
         return Ok(State::Empty);
     }
@@ -1529,9 +1556,10 @@ pub fn verify(
     versions: &dyn Fn(&str) -> String,
     io: &std::sync::Arc<dyn pe2_io::Io>,
 ) -> Result<Checked> {
-    let mut plan = Plan::read(plan_file)?;
+    let fs = io.filesystem();
+    let mut plan = Plan::read(fs, plan_file)?;
     let keys = plan.keys(versions);
-    let record = read_record(&layer.join(&RECORD));
+    let record = read_record(fs, &layer.join(&RECORD));
     let releases = plan.as_recorded(&record);
     let possible = plan.resolve(&releases);
     // Each file given, as recorded: a folder's, every file recorded in it - none being one missing.
@@ -1589,6 +1617,10 @@ pub fn verify(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::Plan;
     use crate::extract::sha1_of;

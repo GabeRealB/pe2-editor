@@ -346,6 +346,10 @@ impl fmt::Display for NotWithin {
 impl std::error::Error for NotWithin {}
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::HostPath;
     use pe2_path::RelPath;

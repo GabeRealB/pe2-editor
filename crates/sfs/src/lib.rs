@@ -31,7 +31,6 @@ pub mod storage;
 pub mod testing;
 pub mod tree;
 
-
 pub use content::Content;
 pub use header::Header;
 pub use log::{Log, Record};
@@ -45,6 +44,10 @@ pub use storage::Stored;
 /// by with it - so a test asserting a space alone would else fail by what another test started at that moment. The
 /// program asks as it does: where a process is being started, a space is attached elsewhere, and is not said clean.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 pub(crate) mod forks {
     use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 

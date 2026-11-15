@@ -294,7 +294,6 @@ fn overlaps(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
-
 /// Whether a glyph has a cell of its own on the page: with art, or without where the page has no blank cell.
 fn placed_by_layout(page: &PageSpec, glyph: &Glyph) -> bool {
     glyph.art.is_some() || page.blank.is_none()
@@ -1125,6 +1124,10 @@ fn shelves(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Art, FaceSpec, Flow, Format, Glyph, Layout, PageSpec, RECORD, Row, decode, flow, generate, pack};
     use crate::encoding::Encoding;

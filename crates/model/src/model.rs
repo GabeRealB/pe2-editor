@@ -877,6 +877,10 @@ pub fn encode(model: &Model, bindings: &[Binding], address: u32) -> Result<Vec<u
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod encoding {
     use super::*;
 

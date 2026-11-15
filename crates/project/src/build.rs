@@ -167,7 +167,7 @@ impl Site<'_> {
         match &file.content {
             Content::Stored { sha1, .. } => {
                 let store = self.engine.store().context("no store holds it")?;
-                std::fs::read(store.blob_path(sha1)?).with_context(|| sha1.to_string())
+                self.project.io.filesystem().read(&store.blob_path(sha1)?).with_context(|| sha1.to_string())
             }
             held => Ok(held.held().unwrap_or_default().to_vec()),
         }
@@ -182,14 +182,14 @@ impl Site<'_> {
             let relative = deployed(place, &self.config_name, file.name.as_str())?;
             let to = self.project.root.join(&relative);
             if let Some(folder) = to.parent() {
-                std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
+                self.project.io.filesystem().create_folder_all(&folder).with_context(|| folder.to_string())?;
             }
-            if std::fs::read(&to).ok().as_deref() != Some(&bytes) {
+            if self.project.io.filesystem().read(&to).ok().as_deref() != Some(&bytes) {
                 crate::cache::write_atomic(self.project.io.filesystem(), &to, &bytes)?;
             }
             for (link, target) in &self.project.links {
                 if RelPath::new(target).is_ok_and(|target| *target == *relative) {
-                    link_to(&to, &crate::resolve_path(&self.project.root, link)?)?;
+                    link_to(self.project.io.filesystem(), &to, &crate::resolve_path(&self.project.root, link)?)?;
                 }
             }
         }
@@ -255,7 +255,7 @@ impl Site<'_> {
         {
             for place in &plan.outputs[at].events.deploy {
                 if let Ok(relative) = deployed(place, &self.config_name, file.name.as_str()) {
-                    let _ = std::fs::remove_file(self.project.root.join(&relative));
+                    let _ = self.project.io.filesystem().remove_file(&self.project.root.join(&relative));
                 }
             }
         }
@@ -305,16 +305,16 @@ pub fn epoch(
 }
 
 /// Put a link to a file where it is looked for, or where links take a permission, a copy. One there already and right is left.
-fn link_to(file: &HostPath, at: &HostPath) -> Result<()> {
+fn link_to(fs: &dyn pe2_io::Filesystem, file: &HostPath, at: &HostPath) -> Result<()> {
     #[cfg(unix)]
-    if std::fs::read_link(at).is_ok_and(|now| now == **file) {
+    if fs.read_link(at).is_ok_and(|now| now == **file) {
         return Ok(());
     }
-    let _ = std::fs::remove_file(at);
+    let _ = fs.remove_file(at);
     #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(file, at);
+    let linked = fs.symlink(file, at);
     #[cfg(not(unix))]
-    let linked = std::fs::copy(file, at).map(|_| ());
+    let linked = fs.copy(file, at).map(|_| ());
     linked.with_context(|| at.to_string())
 }
 

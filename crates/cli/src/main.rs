@@ -819,42 +819,62 @@ fn asked(text: &str) -> Result<Arc<pe2_path::Asked>, pe2_path::PathError> {
     pe2_path::Asked::new(text).map(Arc::from)
 }
 
-fn write_png(output: &Path, width: usize, height: usize, color: png::ColorType, pixels: &[u8]) -> Result<()> {
-    let file = std::io::BufWriter::new(std::fs::File::create(output)?);
-    let mut encoder = png::Encoder::new(file, u32::try_from(width)?, u32::try_from(height)?);
+/// A file the user names, read whole.
+fn read_named(io: &dyn pe2_io::Io, path: &Path) -> Result<Vec<u8>> {
+    let place = sfs::HostPath::new(path).with_context(|| path.display().to_string())?;
+    io.filesystem().read(&place).with_context(|| path.display().to_string())
+}
+
+fn write_png(
+    io: &dyn pe2_io::Io,
+    output: &Path,
+    (width, height): (usize, usize),
+    color: png::ColorType,
+    pixels: &[u8],
+) -> Result<()> {
+    let place = sfs::HostPath::new(output).with_context(|| output.display().to_string())?;
+    let mut written = Vec::new();
+    let mut encoder = png::Encoder::new(&mut written, u32::try_from(width)?, u32::try_from(height)?);
     encoder.set_color(color);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(pixels)?;
-    Ok(())
+    io.filesystem().write(&place, &written).with_context(|| output.display().to_string())
 }
 
-fn bs_to_png(input: &Path, output: &Path) -> Result<()> {
-    let picture = codecs::bs::decode(&std::fs::read(input)?)?;
-    write_png(output, picture.width, picture.height, png::ColorType::Rgb, &picture.rgb)
+fn bs_to_png(io: &dyn pe2_io::Io, input: &Path, output: &Path) -> Result<()> {
+    let picture = codecs::bs::decode(&read_named(io, input)?)?;
+    write_png(io, output, (picture.width, picture.height), png::ColorType::Rgb, &picture.rgb)
 }
 
-fn texture_to_png(input: &Path, output: &Path, bpp: u8, palette: Option<(&Path, usize, usize)>) -> Result<()> {
-    let pages = codecs::texture::pages(&std::fs::read(input)?)?;
+fn texture_to_png(
+    io: &dyn pe2_io::Io,
+    input: &Path,
+    output: &Path,
+    bpp: u8,
+    palette: Option<(&Path, usize, usize)>,
+) -> Result<()> {
+    let pages = codecs::texture::pages(&read_named(io, input)?)?;
     let page = pages.first().context("an image without pages")?;
     let colors = match palette {
         Some((path, row, column)) => {
-            let palette = codecs::texture::palette(&std::fs::read(path)?)?;
+            let palette = codecs::texture::palette(&read_named(io, path)?)?;
             Some(palette.rows.get(row).context("no such palette row")?.get(column..).unwrap_or_default().to_vec())
         }
         None => None,
     };
     let (width, rgba) = codecs::texture::render(page, bpp, colors.as_deref());
-    write_png(output, width, page.rows, png::ColorType::Rgba, &rgba)
+    write_png(io, output, (width, page.rows), png::ColorType::Rgba, &rgba)
 }
 
-fn palette_to_png(input: &Path, output: &Path) -> Result<()> {
-    let palette = codecs::texture::palette(&std::fs::read(input)?)?;
+fn palette_to_png(io: &dyn pe2_io::Io, input: &Path, output: &Path) -> Result<()> {
+    let palette = codecs::texture::palette(&read_named(io, input)?)?;
     let rgba: Vec<u8> = palette.rows.iter().flatten().flat_map(|&c| codecs::texture::rgba(c)).collect();
-    write_png(output, palette.width.max(1), palette.rows.len().max(1), png::ColorType::Rgba, &rgba)
+    write_png(io, output, (palette.width.max(1), palette.rows.len().max(1)), png::ColorType::Rgba, &rgba)
 }
 
 /// Run an epoch for each of these events, in turn, and say what came of them.
 /// The editor's program: beside this one, else as the system finds it.
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 fn editor_program() -> PathBuf {
     let name = format!("pe2-editor{}", std::env::consts::EXE_SUFFIX);
     let beside = host::this_program().ok().map(|exe| exe.with_file_name(name));
@@ -1165,7 +1185,9 @@ fn fetched(command: FetchedCommand) -> Result<()> {
 /// Where an extension to add is: a folder or an archive given, or one of that id kept to be added.
 fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
     let given = PathBuf::from(what);
-    if given.is_dir() || extensions::archive::is_archive(&given) {
+    if sfs::HostPath::new(&given).is_ok_and(|place| p.io.filesystem().is_folder(&place))
+        || extensions::archive::is_archive(p.io.filesystem(), &given)
+    {
         return Ok(given);
     }
     extensions::kept_apart(what).with_context(|| {
@@ -1191,7 +1213,7 @@ fn add_from(
     history: &mut project::history::History,
     label: String,
 ) -> Result<project::ext::component::About> {
-    if extensions::archive::is_archive(from) {
+    if extensions::archive::is_archive(p.io.filesystem(), from) {
         let unpacked = extensions::archive::unpack(from, &p.io).with_context(|| from.display().to_string())?;
         return project::switches::add_extension(p, &unpacked.folder, into, history, label);
     }
@@ -1505,10 +1527,10 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 }
 
 /// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
-fn setup_command(command: ProjectCommand) -> Result<()> {
+fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
     match command {
         ProjectCommand::New { directory } => {
-            project::create(&directory)?;
+            project::create(&directory, io.filesystem())?;
             println!("an empty project in {}", directory.display());
         }
         ProjectCommand::Layer { command: LayerCommand::Add { name, files, bottom, generated: _, fills, project } } => {
@@ -1599,7 +1621,12 @@ fn run_plan(
     releases: &project::plan::Releases,
 ) -> Result<()> {
     let plan = layer.plan();
-    anyhow::ensure!(plan.is_file(), "{} has no plan ({}): nothing says what to extract", layer.name, plan.display());
+    anyhow::ensure!(
+        p.io.filesystem().is_file(&plan),
+        "{} has no plan ({}): nothing says what to extract",
+        layer.name,
+        plan.display()
+    );
     let extensions = project_extensions(p);
     let cache = project::cache::Cache::open(p, lock)?;
     let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
@@ -1630,7 +1657,7 @@ fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Exte
 
 /// Check generated layers against their plans, exiting with failure where one is not what its plan makes.
 /// A project command serving it, editing it, or saying its problems.
-fn project_command(command: &ProjectCommand) -> Result<()> {
+fn project_command(command: &ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
     match command {
         ProjectCommand::Problems { project } => return problems(project),
         ProjectCommand::Serve { project, backend, address, forget, stop, set_aside, take_in } => {
@@ -1660,7 +1687,7 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
     if let (ProjectCommand::Write { from: None, .. }, vfs::ops::Op::Write { from, .. }) = (command, &op)
         && let vfs::write::Written::File(from) = from
     {
-        let _ = std::fs::remove_file(from);
+        let _ = io.filesystem().remove_file(from);
     }
     done
 }
@@ -2081,6 +2108,8 @@ fn observe_plan(plan: &Path, roms: &Path, keep: Option<&Path>, keep_kinds: &[Str
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // The I/O what this run does that no project gives is done through.
+    let io = pe2_io::system();
     if cli.trust_everything {
         extensions::trust::trust_everything();
         eprintln!("warning: trusting every extension in this run");
@@ -2089,11 +2118,13 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Plan { command: PlanCommand::Observe { plan, roms, keep, keep_kinds } } => {
             observe_plan(&plan, &roms, keep.as_deref(), &keep_kinds)?;
         }
-        Tool::Convert { command: ConvertCommand::Bs { input, output } } => bs_to_png(&input, &output)?,
+        Tool::Convert { command: ConvertCommand::Bs { input, output } } => bs_to_png(&*io, &input, &output)?,
         Tool::Convert { command: ConvertCommand::Texture { input, output, bpp, palette, row, column } } => {
-            texture_to_png(&input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
+            texture_to_png(&*io, &input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
         }
-        Tool::Convert { command: ConvertCommand::Palette { input, output } } => palette_to_png(&input, &output)?,
+        Tool::Convert { command: ConvertCommand::Palette { input, output } } => {
+            palette_to_png(&*io, &input, &output)?;
+        }
         Tool::Editor { command: EditorCommand::Start { project, wait_for_agent, timeout, args } } => {
             start_editor(&project, wait_for_agent, timeout, &args)?;
         }
@@ -2112,7 +2143,7 @@ fn run(cli: Cli) -> Result<()> {
                 | ProjectCommand::Config { .. }
                 | ProjectCommand::Link { .. }
                 | ProjectCommand::Status { .. }),
-        } => setup_command(command)?,
+        } => setup_command(command, &*io)?,
         Tool::Project { command: ProjectCommand::Verify { project, layer } } => {
             verify_layer(&project, layer.as_deref())?;
         }
@@ -2177,12 +2208,16 @@ fn run(cli: Cli) -> Result<()> {
             mcp::server::serve_stdio(p.root, p.io)?;
         }
         // What is left of the project's commands serve it, edit it, and say its problems.
-        Tool::Project { command } => project_command(&command)?,
+        Tool::Project { command } => project_command(&command, &*io)?,
     }
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     /// Every command parses: names unique, arguments well formed (clap's own checks, which otherwise run only when
     /// a command is used).

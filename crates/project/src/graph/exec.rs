@@ -476,7 +476,7 @@ impl Drop for Call<'_> {
     fn drop(&mut self) {
         let temps = std::mem::take(self.temps.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner));
         for path in temps {
-            let _ = std::fs::remove_file(path);
+            let _ = self.io.filesystem().remove_file(&path);
         }
     }
 }
@@ -510,7 +510,9 @@ fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, asked: &pe2
         let path = match (reach.engine.store(), node.content_path(&sha1)) {
             (_, Some(path)) => path,
             // What a node's own output made is in no file of its: the store has it already.
-            (Some(store), None) if store.blob_path(&sha1).is_ok_and(|path| path.exists()) => store.blob_path(&sha1)?,
+            (Some(store), None) if store.blob_path(&sha1).is_ok_and(|path| store.io().filesystem().exists(&path)) => {
+                store.blob_path(&sha1)?
+            }
             (Some(store), None) => {
                 store.blob_path(&store.keep(&node.read_content(&reach.engine.ops.io, &sha1)?)?.sha1)?
             }
@@ -869,7 +871,7 @@ impl<'a> Call<'a> {
     pub fn keep(&self, path: &HostPath, name: &pe2_ext::RelPath) -> Result<File> {
         let store = self.store.context("no store to keep it in")?;
         let sha1 = crate::extract::sha1_file(self.io.filesystem(), path).with_context(|| path.display().to_string())?;
-        let size = std::fs::metadata(path).with_context(|| path.display().to_string())?.len();
+        let size = self.io.filesystem().stat(path).with_context(|| path.display().to_string())?.size;
         store.adopt(path, &sha1)?;
         Ok(File { name: name.to_owned(), content: Content::Stored { sha1, size } })
     }
@@ -910,7 +912,7 @@ impl<'a> Call<'a> {
             Some(store) => store.tmp(),
             None => self.io.environment().temp_dir().context("the system's folder of temporary files")?,
         };
-        written_for_program(&folder, content.held().unwrap_or_default())
+        written_for_program(self.io, &folder, content.held().unwrap_or_default())
     }
 
     /// Where a stored content is: in the store, or among its node's files.
@@ -919,7 +921,7 @@ impl<'a> Call<'a> {
         let other = || self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha1).cloned();
         self.store
             .and_then(|s| s.blob_path(sha1).ok())
-            .filter(|p| p.exists())
+            .filter(|p| self.io.filesystem().exists(p))
             .or_else(other)
             .or_else(|| self.recorder.node.content_path(sha1))
     }
@@ -1001,7 +1003,7 @@ pub struct Writer {
     name: Arc<pe2_ext::RelPath>,
     store: Option<Store>,
     memory: Vec<u8>,
-    spilled: Option<(std::fs::File, HostPath)>,
+    spilled: Option<(Box<dyn pe2_io::Descriptor>, HostPath)>,
     hasher: Sha1,
     size: u64,
 }
@@ -1011,15 +1013,15 @@ impl std::io::Write for Writer {
         self.hasher.update(bytes);
         self.size += bytes.len() as u64;
         if let Some((file, _)) = &mut self.spilled {
-            file.write_all(bytes)?;
+            file.append(bytes)?;
             return Ok(bytes.len());
         }
         self.memory.extend_from_slice(bytes);
         if self.memory.len() > SPILL
             && let Some(store) = &self.store
         {
-            let (mut file, path) = store.spill().map_err(std::io::Error::other)?;
-            file.write_all(&self.memory)?;
+            let (file, path) = store.spill().map_err(std::io::Error::other)?;
+            file.append(&self.memory)?;
             self.memory = Vec::new();
             self.spilled = Some((file, path));
         }
@@ -1027,7 +1029,8 @@ impl std::io::Write for Writer {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.spilled.as_mut().map_or(Ok(()), |(file, _)| file.flush())
+        // Every append is written as it comes: nothing is held back here.
+        Ok(())
     }
 }
 
@@ -1038,30 +1041,31 @@ impl Writer {
     /// What was spilled cannot be written or kept.
     pub fn finish(mut self) -> Result<File> {
         let name = self.name.clone();
-        let Some((mut file, path)) = self.spilled.take() else {
+        let Some((file, path)) = self.spilled.take() else {
             return Ok(File { name, content: Content::owning(std::mem::take(&mut self.memory)) });
         };
         // Its file is the store's from here, whatever comes of keeping it: removed where it cannot be kept.
         let kept = (|| {
-            std::io::Write::flush(&mut file)?;
             drop(file);
             let sha1 = pe2_ext::Sha1::from_bytes(std::mem::take(&mut self.hasher).finalize().into());
             self.store.as_ref().context("spilled with no store")?.adopt(&path, &sha1)?;
             Ok(File { name, content: Content::Stored { sha1, size: self.size } })
         })();
-        if kept.is_err() {
-            let _ = std::fs::remove_file(&path);
+        if kept.is_err()
+            && let Some(store) = &self.store
+        {
+            let _ = store.io().filesystem().remove_file(&path);
         }
         kept
     }
 }
 
 /// A file written for a program, removed when this is dropped.
-pub struct Written(HostPath);
+pub struct Written(HostPath, Arc<dyn pe2_io::Io>);
 
 impl Drop for Written {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = self.1.filesystem().remove_file(&self.0);
     }
 }
 
@@ -1069,14 +1073,19 @@ impl Drop for Written {
 ///
 /// # Errors
 /// It cannot be written.
-pub fn written_for_program(folder: &HostPath, bytes: &[u8]) -> Result<(HostPath, Option<Written>)> {
+pub fn written_for_program(
+    io: &Arc<dyn pe2_io::Io>,
+    folder: &HostPath,
+    bytes: &[u8],
+) -> Result<(HostPath, Option<Written>)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITTEN: AtomicU64 = AtomicU64::new(0);
-    std::fs::create_dir_all(folder).with_context(|| folder.to_string())?;
+    let fs = io.filesystem();
+    fs.create_folder_all(folder).with_context(|| folder.to_string())?;
     let name = format!("placed-{}-{}", std::process::id(), WRITTEN.fetch_add(1, Ordering::Relaxed));
     let path = folder.join(pe2_path::Name::new(&name)?);
-    std::fs::write(&path, bytes).with_context(|| path.to_string())?;
-    Ok((path.clone(), Some(Written(path))))
+    fs.write(&path, bytes).with_context(|| path.to_string())?;
+    Ok((path.clone(), Some(Written(path, io.clone()))))
 }
 
 /// A writer dropped unfinished - its operation failed, stopped to read what was not made yet, or was cancelled - leaves
@@ -1085,7 +1094,9 @@ impl Drop for Writer {
     fn drop(&mut self) {
         if let Some((file, path)) = self.spilled.take() {
             drop(file);
-            let _ = std::fs::remove_file(path);
+            if let Some(store) = &self.store {
+                let _ = store.io().filesystem().remove_file(&path);
+            }
         }
     }
 }
@@ -1714,7 +1725,7 @@ impl Evaluation<'_> {
         match content {
             Content::Stored { sha1, .. } => {
                 let path = self.store.context("no store")?.blob_path(sha1)?;
-                std::fs::read(&path).with_context(|| path.to_string())
+                self.ops.io.filesystem().read(&path).with_context(|| path.to_string())
             }
             held => Ok(held.held().unwrap_or_default().to_vec()),
         }

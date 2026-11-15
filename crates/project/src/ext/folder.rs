@@ -137,6 +137,10 @@ pub fn checked_text(text: &str, name: &str, bytes: &[u8]) -> Result<About> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{About, checked_text, id_named, read_only};
 

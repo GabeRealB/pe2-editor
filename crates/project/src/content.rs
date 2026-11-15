@@ -822,6 +822,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod serving {
     use super::Given;
     use crate::testing::At as _;

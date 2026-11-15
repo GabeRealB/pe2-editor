@@ -60,7 +60,8 @@ impl Speakers {
     /// The plate standing for a number: a named one before an unseen placeholder.
     #[must_use]
     pub fn plate(&self, number: u8) -> Option<String> {
-        let mut found: Vec<&String> = self.numbers.iter().filter(|(_, n)| n.contains(&number)).map(|(p, _)| p).collect();
+        let mut found: Vec<&String> =
+            self.numbers.iter().filter(|(_, n)| n.contains(&number)).map(|(p, _)| p).collect();
         found.sort_by_key(|p| p.starts_with("unseen"));
         found.first().map(|p| (*p).clone())
     }
@@ -126,9 +127,16 @@ fn command_values(bytes: &[u8; 12]) -> BTreeMap<&'static str, Value> {
     }
     out.insert("flag_bits", int(u32::from(bytes[1] & !0x07)));
     out.insert("game_flag", int(u32::from(bytes[3]) | u32::from(bytes[7]) << 8));
-    for (name, at) in
-        [("limit", 2), ("counter", 4), ("tally_first", 5), ("tally_count", 6), ("next", 8), ("tail_0", 9), ("tail_1", 10), ("tail_2", 11)]
-    {
+    for (name, at) in [
+        ("limit", 2),
+        ("counter", 4),
+        ("tally_first", 5),
+        ("tally_count", 6),
+        ("next", 8),
+        ("tail_0", 9),
+        ("tail_1", 10),
+        ("tail_2", 11),
+    ] {
         out.insert(name, int(u32::from(bytes[at])));
     }
     out
@@ -159,7 +167,8 @@ fn game_flag_text(value: &Value) -> Value {
 /// A command as named fields (its records apart).
 #[must_use]
 pub fn command_named(bytes: &[u8; 12], highest_key: u8) -> Table {
-    let opcode = OPCODES.get(usize::from(bytes[0])).map_or_else(|| int(u32::from(bytes[0])), |o| Value::String((*o).into()));
+    let opcode =
+        OPCODES.get(usize::from(bytes[0])).map_or_else(|| int(u32::from(bytes[0])), |o| Value::String((*o).into()));
     let name = opcode.as_str().unwrap_or("");
     let (values, defaults, reads) = (command_values(bytes), command_defaults(name, highest_key), command_reads(name));
     let (mut out, mut unread) = (Table::new(), Table::new());
@@ -429,12 +438,20 @@ pub fn record_bytes(named: &Table, speakers: &Speakers) -> Result<[u8; 8], Strin
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Speakers, command_bytes, command_named, record_bytes, record_named};
 
     #[test]
     fn commands_read_back_as_written() {
-        for bytes in [[1u8, 3, 2, 0xF3, 4, 0, 1, 0, 2, 0, 0, 0], [4, 4, 3, 0, 0, 7, 3, 0, 1, 0, 0, 0], [0, 0, 5, 0, 0, 0, 0, 0, 0, 9, 0, 0]] {
+        for bytes in [
+            [1u8, 3, 2, 0xF3, 4, 0, 1, 0, 2, 0, 0, 0],
+            [4, 4, 3, 0, 0, 7, 3, 0, 1, 0, 0, 0],
+            [0, 0, 5, 0, 0, 0, 0, 0, 0, 9, 0, 0],
+        ] {
             let named = command_named(&bytes, 2);
             assert_eq!(command_bytes(&named, 2), Ok(bytes), "{named:?}");
         }

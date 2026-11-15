@@ -196,6 +196,10 @@ pub fn sweep_if_due<S: BuildHasher>(store: &Path, keep: &HashSet<String, S>) -> 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{GRACE, UNUSED_FOR, list, sweep, sweep_if_due};
     use crate::{One, Setup, Take};

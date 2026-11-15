@@ -366,6 +366,10 @@ pub fn published(call: &mut Call) -> Result<Typed> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn a_units_object_is_named_by_its_package_and_place() {

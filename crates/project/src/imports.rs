@@ -79,8 +79,8 @@ fn builds_of(extensions: &Extensions) -> String {
 }
 
 /// The addresses kept in the cache, where these extensions listed them.
-fn listed_kept(at: &HostPath, builds: &str) -> HashMap<String, Listed> {
-    let Ok(text) = std::fs::read_to_string(at) else { return HashMap::new() };
+fn listed_kept(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str) -> HashMap<String, Listed> {
+    let Ok(text) = fs.read_to_string(at) else { return HashMap::new() };
     let Ok(kept) = serde_json::from_str::<serde_json::Value>(&text) else { return HashMap::new() };
     if kept["builds"].as_str() != Some(builds) {
         return HashMap::new();
@@ -171,8 +171,8 @@ impl Imports {
     /// The store cannot be opened.
     pub fn open(cache: &Cache) -> Result<Imports> {
         let old = cache.path(OLD);
-        if old.exists() {
-            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
+        if cache.io.filesystem().exists(&old) {
+            cache.io.filesystem().remove_all(&old).with_context(|| old.display().to_string())?;
         }
         Ok(Imports {
             store: Store::open(cache)?,
@@ -443,7 +443,7 @@ impl Imports {
         // What an earlier run listed, with these extensions.
         let builds = builds_of(extensions);
         if known.is_empty() {
-            *known = listed_kept(&self.listed_at, &builds);
+            *known = listed_kept(index.io().filesystem(), &self.listed_at, &builds);
         }
         let of = |path: &TreePath| only.is_none_or(|o| o.contains(path));
         // Of the assets attached: those referred to, and those they refer to.

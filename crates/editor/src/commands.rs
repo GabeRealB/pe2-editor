@@ -466,6 +466,10 @@ pub fn shortcuts_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Binding, Command, rank};
     use crate::settings::EditorSettings;

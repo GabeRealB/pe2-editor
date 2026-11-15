@@ -1135,6 +1135,10 @@ fn unpack_zip(setup: &Setup, members: &BTreeMap<String, String>, file: &Path, in
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{One, Setup, Take, Taken, fetch, unpack};
     use std::path::{Path, PathBuf};

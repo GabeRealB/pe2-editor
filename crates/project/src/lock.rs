@@ -67,6 +67,10 @@ fn paths(root: &HostPath) -> (HostPath, HostPath) {
     (dir.join(&LOCK), dir.join(&OWNER))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+)]
 fn open(root: &HostPath) -> Result<File> {
     let (lock, _) = paths(root);
     crate::cache::make(&pe2_io::SystemFilesystem, root)?;
@@ -79,11 +83,19 @@ fn open(root: &HostPath) -> Result<File> {
 }
 
 /// Who holds the project, as its owner file says.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+)]
 fn owner(root: &HostPath) -> String {
     std::fs::read_to_string(&paths(root).1).map_or_else(|_| "another process".into(), |s| s.trim().to_string())
 }
 
 /// Record who holds the lock now.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+)]
 fn claim(root: &HostPath, file: File, who: &str) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {})", std::process::id());
     std::fs::write(&paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
@@ -105,6 +117,10 @@ fn unsupported(e: &std::io::Error) -> bool {
 }
 
 /// The project, held without a lock where its file system cannot lock: who works on it is still recorded.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+)]
 fn unprotected(root: &HostPath, lock: &HostPath, who: &str, e: &std::io::Error) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {}, without a lock)", std::process::id());
     std::fs::write(&paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
@@ -120,6 +136,10 @@ fn unprotected(root: &HostPath, lock: &HostPath, who: &str, e: &std::io::Error) 
 /// let go of at once, which writes nothing: a process taking the project at that same instant is refused, and tries
 /// again as it would on any holder.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
+)]
 pub fn holder(root: &HostPath) -> Option<String> {
     let (lock, _) = paths(root);
     let file = OpenOptions::new().read(true).open(&lock).ok()?;
@@ -239,6 +259,10 @@ impl Lock {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Lock, LockError};
     use crate::testing::At as _;

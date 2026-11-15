@@ -237,6 +237,10 @@ fn hex_row(offset: usize, bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Content, Viewed, hex_row};
 

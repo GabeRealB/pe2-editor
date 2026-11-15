@@ -2225,6 +2225,10 @@ pub fn size_text(bytes: u64) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod path_tests {
     use super::{table_at, with_sets};
 
@@ -2292,6 +2296,10 @@ mod path_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn a_reference_is_retargeted_as_it_is_written() {

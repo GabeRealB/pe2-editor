@@ -566,6 +566,10 @@ pub fn encode(bank: &Bank) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     /// The banks in a folder (`PE2_SOUND_BANKS`, each file a bank as a disc stores it): each read into its parts and
     /// written back byte for byte, and each sample decoded to input re-encoding to it.

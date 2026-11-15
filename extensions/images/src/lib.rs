@@ -782,6 +782,10 @@ fn decode_bs(bytes: &[u8]) -> Result<Image> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{TexelImage, cells, draw, has_picture, looks, palette_colors};
     use pe2_ext::{Asset, Result, Source, Table, anyhow};

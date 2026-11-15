@@ -358,10 +358,10 @@ pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + S
 /// (`%LOCALAPPDATA%\pe2-editor\served`: this machine's, not what roams with the user). None where nothing says and
 /// the system has no such place.
 #[must_use]
-pub fn apart_for(at: &HostPath) -> Option<HostPath> {
+pub fn apart_for(at: &HostPath, fs: &dyn pe2_io::Filesystem) -> Option<HostPath> {
     // Places a setting or the environment names, as the system names them.
     let place = |text: &std::ffi::OsStr| HostPath::new(std::path::Path::new(text)).ok();
-    let project = at.parent().and_then(|root| project::local_filesystem(&root).cache);
+    let project = at.parent().and_then(|root| project::local_filesystem(&root, fs).cache);
     let machine = || APART.get().and_then(|machine| machine()).and_then(|cache| place(cache.as_os_str()));
     let default = || {
         #[allow(
@@ -401,6 +401,10 @@ pub fn why_none(needs: Can, at: &HostPath) -> String {
 
 /// Whether a folder is a junction: a link to a folder elsewhere, not one of its own.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a junction and its volume: the system's reparse points, which only its own calls make and read"
+)]
 pub(crate) fn joined(at: &HostPath) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -409,6 +413,10 @@ pub(crate) fn joined(at: &HostPath) -> bool {
 
 /// Where a junction leads, plainly written; none where the folder is none.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a junction and its volume: the system's reparse points, which only its own calls make and read"
+)]
 pub(crate) fn joined_to(at: &HostPath) -> Option<HostPath> {
     if !joined(at) {
         return None;
@@ -422,6 +430,10 @@ pub(crate) fn joined_to(at: &HostPath) -> Option<HostPath> {
 /// Make a folder a plain one again where it is a junction: removed as the junction it is - what it led to is not
 /// touched - and made again.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a junction and its volume: the system's reparse points, which only its own calls make and read"
+)]
 pub(crate) fn unjoin(at: &HostPath) {
     if joined(at) && std::fs::remove_dir(at).is_ok() {
         let _ = std::fs::create_dir(at);
@@ -435,6 +447,10 @@ pub(crate) fn unjoin(at: &HostPath) {
 /// The folder cannot be made or opened, or Windows refuses the junction (a volume that takes none, a folder that
 /// holds something).
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a junction and its volume: the system's reparse points, which only its own calls make and read"
+)]
 pub(crate) fn join_to(at: &HostPath, to: &HostPath) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
@@ -489,6 +505,10 @@ pub(crate) fn volume_filesystem(at: &HostPath) -> Option<String> {
 
 /// The volume a path is on, as Windows names its root (`E:\`); the path need not be there yet.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a junction and its volume: the system's reparse points, which only its own calls make and read"
+)]
 pub(crate) fn volume_of(at: &HostPath) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
@@ -510,6 +530,10 @@ pub fn unmount_all() {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Backend, Can, Job, Mount, Setting, Use, choose_among, setting};
     use sfs::HostPath;

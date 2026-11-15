@@ -106,7 +106,7 @@ impl<'a, 'h> Out<'a, 'h> {
         index: &'a Index,
         layer: &'a Layer,
     ) -> Self {
-        let records = crate::records::is_records(&layer.path).then(BTreeMap::new);
+        let records = crate::records::is_records(project.io.filesystem(), &layer.path).then(BTreeMap::new);
         Out { tx, project, index, layer, records }
     }
 
@@ -908,6 +908,10 @@ pub fn resolve(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Resolution, delete, forget, override_entry, rename, resolve};
     use crate::Project;

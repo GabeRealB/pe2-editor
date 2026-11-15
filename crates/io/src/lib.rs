@@ -19,8 +19,9 @@ mod random;
 pub use clock::{Clock, Receiver, Sender, Signal, Standing, SystemClock, Waiter, channel, sleep};
 pub use environment::{Environment, Fixed, SystemEnvironment};
 pub use filesystem::{
-    Descriptor, DirEntry, Filesystem, Kind, LockKind, Mapped, Mapping, Open, Stat, SystemDescriptor, SystemFilesystem,
-    create_directory_all_at, read_file_at, read_whole, remove_all_at, write_all_at, write_file_at,
+    Appending, Descriptor, DirEntry, Filesystem, Kind, LockKind, Mapped, Mapping, Open, Stat, SystemDescriptor,
+    SystemFilesystem, copy_all, create_directory_all_at, is_empty_folder, read_file_at, read_whole, remove_all_at,
+    sync_all, sync_file, write_all_at, write_file_at,
 };
 pub use host::{HostPath, NotWithin};
 pub use random::{Random, Seeded, SystemRandom};

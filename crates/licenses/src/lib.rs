@@ -228,6 +228,10 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::listing;
 
@@ -260,7 +264,10 @@ mod tests {
         let (document, kept) = (listing.document(None), listing.texts.iter().filter(|t| t.contains(terms)).count());
         let under = listing.crates.iter().filter(|c| c.texts.iter().any(|t| listing.text(t).contains(terms))).count();
         // A file may hold it twice: as often as the texts kept have it.
-        assert_eq!(document.matches(terms).count(), listing.texts.iter().map(|t| t.matches(terms).count()).sum::<usize>());
+        assert_eq!(
+            document.matches(terms).count(),
+            listing.texts.iter().map(|t| t.matches(terms).count()).sum::<usize>()
+        );
         assert!(kept * 4 < under, "{kept} wordings for {under} crates");
         assert!(document.contains("Phosphor Icons"));
     }

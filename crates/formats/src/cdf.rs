@@ -474,6 +474,10 @@ pub fn image_payload(table: &[u8], strips: &[Vec<u8>], sector_len: u16) -> Vec<u
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

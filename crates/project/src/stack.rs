@@ -15,9 +15,9 @@ use crate::index::LayerInfo;
 use crate::{FILE, LAYERS, LayerKind, Project};
 use pe2_path::Name;
 
-pub(crate) fn read(root: &HostPath) -> Result<DocumentMut> {
+pub(crate) fn read(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<DocumentMut> {
     let path = root.join(&FILE);
-    let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
+    let text = fs.read_to_string(&path).with_context(|| format!("{}", path.display()))?;
     text.parse().with_context(|| format!("{}", path.display()))
 }
 
@@ -64,7 +64,7 @@ pub fn reorder(
     if let Some(why) = order_breaks(layers, order) {
         bail!("{why}");
     }
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let tables = layer_tables(&mut document)?;
     let mut current: Vec<Table> = tables.iter().cloned().collect();
     // Tables are written where their positions say: the new order takes the old positions, in turn.
@@ -119,7 +119,7 @@ pub fn add(project: &Project, name: &Name, kind: LayerKind, history: &mut Histor
 /// The name is not one a layer may take, or the files cannot be written.
 pub fn add_at(project: &Project, name: &Name, kind: LayerKind, bottom: bool, history: &mut History) -> Result<()> {
     check_name(project, name)?;
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let mut table = Table::new();
     table.insert("name", value(name.as_str()));
     table.insert("path", value(format!("{LAYERS}/{name}")));
@@ -172,7 +172,7 @@ pub fn remove(project: &Project, layers: &[LayerInfo], name: &Name, history: &mu
     {
         bail!("{}, so it cannot be taken out", dependency.describe(&layer.name));
     }
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let tables = layer_tables(&mut document)?;
     let at = tables
         .iter()
@@ -183,6 +183,10 @@ pub fn remove(project: &Project, layers: &[LayerInfo], name: &Name, history: &mu
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use crate::Project;
     use crate::cache::Cache;

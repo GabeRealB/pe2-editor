@@ -9,26 +9,43 @@ use formats::iso::{self, Image};
 use pe2_path::Name;
 use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 
 use crate::extract::sha1_file;
 
+/// A file read by position, as a disc image reads one.
+struct Read(Box<dyn pe2_io::Descriptor>);
+
+impl iso::ReadAt for Read {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.0.read_at(buf, offset)
+    }
+}
+
 /// A disc image in `roms`, by size and sha1 (its name may differ).
-pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &pe2_ext::Sha1) -> Result<HostPath> {
+pub(crate) fn find_disc(
+    io: &std::sync::Arc<dyn pe2_io::Io>,
+    roms: &HostPath,
+    name: &str,
+    size: u64,
+    sha1: &pe2_ext::Sha1,
+) -> Result<HostPath> {
+    let fs = io.filesystem();
     let named = roms.join(&Name::new(name)?);
     let mut candidates = vec![];
-    if named.is_file() {
+    if fs.is_file(&named) {
         candidates.push(named.clone());
     }
-    let mut others: Vec<HostPath> = fs::read_dir(roms)
+    let mut others: Vec<HostPath> = fs
+        .read_directory(roms)
         .with_context(|| format!("{}", roms.display()))?
-        .filter_map(|e| e.ok().map(|e| roms.entry(&e.file_name())))
-        .filter(|p| p.is_file() && *p != named)
+        .iter()
+        .map(|e| roms.entry(&e.name))
+        .filter(|p| fs.is_file(p) && *p != named)
         .collect();
     others.sort();
     candidates.extend(others);
     for p in candidates {
-        if fs::metadata(&p)?.len() == size && sha1_file(&pe2_io::SystemFilesystem, &p)? == *sha1 {
+        if fs.stat(&p)?.size == size && sha1_file(fs, &p)? == *sha1 {
             return Ok(p);
         }
     }
@@ -58,16 +75,23 @@ impl OpenDisc {
     ///
     /// # Errors
     /// It is not there, or it holds other files.
-    pub fn open(roms: &HostPath, name: &str, layout: &Layout) -> Result<OpenDisc> {
-        Self::open_at(find_disc(roms, &layout.image, layout.size, &layout.sha1)?, name, layout)
+    pub fn open(io: &std::sync::Arc<dyn pe2_io::Io>, roms: &HostPath, name: &str, layout: &Layout) -> Result<OpenDisc> {
+        Self::open_at(io, find_disc(io, roms, &layout.image, layout.size, &layout.sha1)?, name, layout)
     }
 
     /// A disc image found already (`find_disc`), held to its layout.
     ///
     /// # Errors
     /// It cannot be read, or its files are not the layout's.
-    pub fn open_at(path: HostPath, name: &str, layout: &Layout) -> Result<OpenDisc> {
-        let image = Image::open(&path)?;
+    pub fn open_at(
+        io: &std::sync::Arc<dyn pe2_io::Io>,
+        path: HostPath,
+        name: &str,
+        layout: &Layout,
+    ) -> Result<OpenDisc> {
+        let file = io.filesystem().open(&path, pe2_io::Open::READ)?;
+        let len = file.stat()?.size;
+        let image = Image::of(Box::new(Read(file)), len, &path.display().to_string())?;
         let mut entries = image.root()?;
         if let Some(d) = entries.iter().find(|e| e.directory) {
             bail!("{name}: the directory {} - the layout knows a flat root only", d.name);

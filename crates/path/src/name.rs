@@ -687,6 +687,10 @@ impl<'de> serde::Deserialize<'de> for Box<RelPath> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Name, RelPath};
     use crate::Why;

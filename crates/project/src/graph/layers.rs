@@ -337,6 +337,10 @@ pub fn place(text: &str, at: usize, id: &str, place: [f64; 2]) -> Result<String>
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{add, add_operation, connect, disconnect, free_id, place, remove, remove_operation, set_result, shift};
     use toml::Table;

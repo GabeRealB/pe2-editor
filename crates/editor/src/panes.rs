@@ -3005,6 +3005,10 @@ fn property_editor(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{inside, trace_at};
     use pe2_ext::Traced;

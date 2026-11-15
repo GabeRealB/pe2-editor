@@ -102,6 +102,10 @@ pub fn encode(call: &Call<'_>, stream: &StreamInput, original: &Typed) -> Result
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::Differences;
     use pe2_ext::Buffer;

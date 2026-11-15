@@ -149,6 +149,10 @@ impl Drop for Ring {
 
 /// Remove the rings of names beginning so that no process has: what one that died left in the memory the system
 /// keeps by name, which stays taken until it is removed. Nothing to do where such memory goes with its last handle.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "memory the system keeps by name for processes to share: the system's, as every process finds it"
+)]
 pub fn sweep(names: &str) {
     if cfg!(windows) {
         return;
@@ -200,6 +204,10 @@ impl Ring {
     ///
     /// # Errors
     /// The memory cannot be had, or a ring of that name is there of another length.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "memory the system keeps by name for processes to share: the system's, as every process finds it"
+    )]
     pub fn shared(name: &str, bytes: u64) -> io::Result<Ring> {
         #[cfg(windows)]
         {
@@ -241,6 +249,10 @@ impl Ring {
     ///
     /// # Errors
     /// The file cannot be made or mapped.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a ring in a file of the system's shared memory, a test's or a measurement's"
+    )]
     pub fn open(path: &Path, bytes: u64) -> io::Result<Ring> {
         let slots = slots_in(bytes);
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
@@ -270,6 +282,10 @@ impl Ring {
 
     /// Let go of the memory it is in, where that is kept by name: removed if no other process has it. For a
     /// process to say as it stops; what it has mapped stays as it is until it ends.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "memory the system keeps by name for processes to share: the system's, as every process finds it"
+    )]
     pub fn let_go(&self) {
         if let Some((file, path)) = &self.shared {
             let _ = file.unlock();

@@ -198,11 +198,11 @@ fn who(environment: &dyn pe2_io::Environment) -> &'static str {
 }
 
 /// `pe2-cli`, which the server is: this program where it is that, else the one beside it.
-fn cli(environment: &dyn pe2_io::Environment) -> anyhow::Result<std::path::PathBuf> {
-    let program = environment.current_exe()?.into_path_buf();
+fn cli(io: &dyn pe2_io::Io) -> anyhow::Result<std::path::PathBuf> {
+    let program = io.environment().current_exe()?.into_path_buf();
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned());
     let cli = if name.as_deref() == Some("pe2-cli") { program } else { project::host::cli_beside(&program) };
-    if !cli.is_file() {
+    if !sfs::HostPath::new(&cli).is_ok_and(|place| io.filesystem().is_file(&place)) {
         anyhow::bail!("{} is not there: the server serving the files is `pe2-cli`", cli.display());
     }
     Ok(cli)
@@ -214,7 +214,7 @@ fn kept(project: &project::Project, args: &[String]) -> Kept {
     let environment = project.io.environment();
     let kept = match project::server::keep_running(&project.root, who(environment)) {
         Some(lease) => Ok(lease),
-        None => cli(environment).and_then(|program| {
+        None => cli(&*project.io).and_then(|program| {
             project::server::keep(&project.root, who(environment), &program, args, project.io.clock())
         }),
     };
@@ -232,7 +232,7 @@ fn strays_in(project: &project::Project) -> usize {
     let at = &project.filesystem.at;
     let how = project::content::Use::general();
     let serving = vfs::backend::choose(&says, vfs::backend::Can::WRITTEN, at, &how, false).ok().flatten();
-    serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
+    serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(project.io.filesystem(), at, b).len())
 }
 
 /// Tell the server that what is served was said, as it is: in the filesystem the project's processes share

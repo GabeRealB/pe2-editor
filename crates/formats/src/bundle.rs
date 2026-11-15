@@ -37,7 +37,11 @@ fn size(end: usize) -> usize {
 pub fn parse(data: &[u8]) -> Result<Bundle, String> {
     let resources: BTreeMap<usize, (u8, Vec<u8>)> =
         resources(data).into_iter().map(|(n, (kind, bytes))| (n, (kind, bytes.to_vec()))).collect();
-    let base = (0..SLOTS).filter(|n| data.get(n * ENTRY).is_some_and(|k| *k != 0)).filter_map(|n| u32_at(data, n * ENTRY + 8)).min().unwrap_or(0);
+    let base = (0..SLOTS)
+        .filter(|n| data.get(n * ENTRY).is_some_and(|k| *k != 0))
+        .filter_map(|n| u32_at(data, n * ENTRY + 8))
+        .min()
+        .unwrap_or(0);
     let usual = write(&Bundle { resources: resources.clone(), base, extra_sectors: 0 });
     let extra_sectors = data.len().saturating_sub(usual.len()) / SECTOR;
     let bundle = Bundle { resources, base, extra_sectors };
@@ -97,6 +101,10 @@ pub fn resources(data: &[u8]) -> BTreeMap<usize, (u8, &[u8])> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Bundle, parse, write};
 

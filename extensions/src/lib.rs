@@ -125,10 +125,10 @@ pub fn load_without(
         // What is kept to be added runs only once a project holds it.
         let kept_apart = matches!(found.origin, Origin::User(_) | Origin::Install(_));
         // An archive of one is read without unpacking it.
-        if kept_apart && archive::is_archive(&found.file) {
-            unloadable.push(match archive::read(&found.file) {
+        if kept_apart && archive::is_archive(io.filesystem(), &found.file) {
+            unloadable.push(match archive::read(io.filesystem(), &found.file) {
                 Ok((about, component)) => shown(about, found, &component, Status::Available, None),
-                Err(e) => unreadable(found, format!("{e:#}")),
+                Err(e) => unreadable(io.filesystem(), found, format!("{e:#}")),
             });
             continue;
         }
@@ -144,7 +144,7 @@ pub fn load_without(
                     if !kept_apart {
                         failed.push(format!("{}: {e}", found.origin.said()));
                     }
-                    unloadable.push(unreadable(found, e));
+                    unloadable.push(unreadable(io.filesystem(), found, e));
                 }
             }
             continue;
@@ -202,7 +202,7 @@ pub fn load_without(
                 if !kept_apart {
                     failed.push(format!("{}: {e}", found.origin.said()));
                 }
-                unloadable.push(unreadable(found, e));
+                unloadable.push(unreadable(io.filesystem(), found, e));
             }
         }
     }
@@ -384,7 +384,7 @@ static TEST_HOST: OnceLock<fn() -> pe2_ext::Extension> = OnceLock::new();
 
 /// An extension that cannot be loaded at all, as it is shown: named by where it is - the id its folder is named for,
 /// the file's name - as who it says it is may not be readable, and is no claim on an id.
-fn unreadable(found: &Found, why: String) -> Present {
+fn unreadable(fs: &dyn pe2_io::Filesystem, found: &Found, why: String) -> Present {
     let name = match found.origin.folder().and_then(folder::id_of) {
         Some(id) => id.to_string(),
         None => found.file.file_name().map_or_default(|n| n.to_string_lossy().into_owned()),
@@ -399,7 +399,7 @@ fn unreadable(found: &Found, why: String) -> Present {
         provides: vec![],
         linked: vec![],
         status: Status::Refused(why),
-        size: std::fs::metadata(&found.file).ok().and_then(|m| usize::try_from(m.len()).ok()),
+        size: fs.stat(&found.file).ok().and_then(|stat| usize::try_from(stat.size).ok()),
         contract: None,
         load: None,
         registers: vec![],
@@ -603,7 +603,10 @@ pub fn found(project: &Project) -> Vec<Found> {
         found.extend(tests);
     }
     // What the user enabled - and turned off of what is fetched - changes what each runs as.
-    let enabled = trust::file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    let enabled = trust::file()
+        .and_then(|f| HostPath::new(&f).ok())
+        .and_then(|f| project.io.filesystem().read_to_string(&f).ok())
+        .unwrap_or_default();
     for found in &mut found {
         found.stamp.push_str(&enabled);
     }
@@ -734,7 +737,7 @@ fn components_in(folder: &Path, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.sort();
     let archived = |entry: HostPath| {
-        archive::is_archive(&entry).then(|| Found {
+        archive::is_archive(io.filesystem(), &entry).then(|| Found {
             origin: origin(entry.clone()),
             stamp: file_stamp(&entry, io),
             file: entry,
@@ -784,7 +787,8 @@ pub fn kept_apart(id: &str) -> Option<PathBuf> {
         }
         let listed = std::fs::read_dir(&place).into_iter().flatten().flatten();
         let mut archives: Vec<PathBuf> = listed.map(|entry| entry.path()).collect();
-        archives.retain(|file| archive::is_archive(file) && archive::id_of(file) == Some(id));
+        archives
+            .retain(|file| archive::is_archive(&pe2_io::SystemFilesystem, file) && archive::id_of(file) == Some(id));
         archives.sort();
         archives.pop()
     };
@@ -792,6 +796,10 @@ pub fn kept_apart(id: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{COMPONENTS, linked};
     use project::ext::component;
@@ -1151,7 +1159,7 @@ mod tests {
     fn a_template_the_project_defines_is_offered_for_its_files_and_makes_a_node_using_its_operation() {
         let dir = sfs::testing::scratch("ext-project-template");
         let _ = std::fs::remove_dir_all(&dir);
-        project::create(&dir).unwrap();
+        project::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let p = super::Project::load(&dir).unwrap();
         let lock = project::lock::Lock::try_acquire(&p.root, "a test").unwrap();
         let cache = project::cache::Cache::open(&p, &lock).unwrap();

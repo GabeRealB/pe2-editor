@@ -563,6 +563,10 @@ impl Drop for Mounted {
 /// new no longer known missing. What watches the mount (an editor's inotify) hears only of what passes through it, so
 /// each file changed, and the folder of each node gone or new, is touched through the mount (its time set: `ATTRIB`),
 /// for the watcher to look again. Until `stop`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "touched through the mount, for the kernel and what watches it to hear: only the system's own calls reach it"
+)]
 fn tell_kernel(
     served: &Served,
     notifier: &fuser::Notifier,
@@ -747,12 +751,14 @@ pub fn windows_cannot_reach() -> Option<String> {
 
 /// Whether `/etc/fuse.conf` lets a user mount for others than themselves (`user_allow_other`): without it, asking to
 /// fails the mount.
+#[allow(clippy::disallowed_methods, reason = "the system's own configuration")]
 fn users_may_allow_others() -> bool {
     std::fs::read_to_string("/etc/fuse.conf").is_ok_and(|text| text.lines().any(|l| l.trim() == "user_allow_other"))
 }
 
 /// Unmount what a process that ended without unmounting left at a folder: a mount no one serves, which every access
 /// fails as not connected.
+#[allow(clippy::disallowed_methods, reason = "a mount the system holds, asked of the system")]
 pub fn clear_stale(at: &HostPath) {
     if std::fs::metadata(at).is_err_and(|e| e.raw_os_error() == Some(libc::ENOTCONN)) {
         unmount(at);
@@ -778,6 +784,7 @@ impl crate::backend::Backend for AsBackend {
         crate::backend::Can { write: true, folder: true }
     }
 
+    #[allow(clippy::disallowed_methods, reason = "the system's own devices")]
     fn available(&self, _at: &HostPath) -> Result<(), String> {
         // macOS has no device to look for: a mount that fails says why.
         if cfg!(target_os = "linux") && !Path::new("/dev/fuse").exists() {
@@ -787,7 +794,7 @@ impl crate::backend::Backend for AsBackend {
     }
 
     fn mount(&self, job: &crate::backend::Job) -> std::io::Result<Box<dyn crate::backend::Mount>> {
-        std::fs::create_dir_all(job.at)?;
+        job.io.filesystem().create_folder_all(job.at)?;
         let writes = match &job.owner {
             Some(owner) => Some(Writes::new(job.served, owner.clone(), job.staging)?),
             None => None,

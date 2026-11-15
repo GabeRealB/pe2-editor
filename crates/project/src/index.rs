@@ -1378,9 +1378,9 @@ impl LayerState {
         taken: bool,
         io: &Arc<dyn pe2_io::Io>,
     ) -> Result<(LayerState, Option<Scan>)> {
-        let records = crate::records::is_records(&layer.path);
-        let changeset = LayerState::changeset_of(layer)?;
-        let tree_ignore = if layer.mounted { tree_ignores(&layer.path) } else { vec![] };
+        let records = crate::records::is_records(io.filesystem(), &layer.path);
+        let changeset = LayerState::changeset_of(layer, io.filesystem())?;
+        let tree_ignore = if layer.mounted { tree_ignores(io.filesystem(), &layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
         ignore.extend(tree_ignore.iter().cloned());
         let assets = layer.kind != LayerKind::Files;
@@ -1405,7 +1405,7 @@ impl LayerState {
             mounted: layer.mounted,
             listing: if layer.mounted {
                 Listing::Always
-            } else if records || layer.changeset.exists() {
+            } else if records || io.filesystem().exists(&layer.changeset) {
                 Listing::Adopted
             } else {
                 Listing::Once
@@ -1417,20 +1417,20 @@ impl LayerState {
     }
 
     /// A layer's changeset: as its file says, or, for a records layer, as its records say (`records::Set::changeset`).
-    fn changeset_of(layer: &Layer) -> Result<Changeset> {
-        if crate::records::is_records(&layer.path) {
+    fn changeset_of(layer: &Layer, fs: &dyn pe2_io::Filesystem) -> Result<Changeset> {
+        if crate::records::is_records(fs, &layer.path) {
             return crate::records::Set::changeset(&layer.path)
                 .with_context(|| format!("{}: its records are not read", layer.name));
         }
-        Changeset::load(&layer.changeset)
+        Changeset::load(fs, &layer.changeset)
     }
 
     /// Its changeset read again, and the names it leaves out with it.
     fn reload_changeset(&mut self) -> Result<()> {
-        self.changeset = if crate::records::is_records(&self.place.root) {
+        self.changeset = if crate::records::is_records(self.place.io.filesystem(), &self.place.root) {
             crate::records::Set::changeset(&self.place.root).context("its records are not read")?
         } else {
-            Changeset::load(&self.changeset_path)?
+            Changeset::load(self.place.io.filesystem(), &self.changeset_path)?
         };
         self.place.ignore = self.changeset.ignore.iter().chain(&self.tree_ignore).cloned().collect();
         Ok(())
@@ -1439,15 +1439,15 @@ impl LayerState {
 
 /// The names a mounted tree's own rules leave out: its `.gitignore`, and the one at the top of the repository it lies
 /// in (by name only: `changeset::gitignore_names`).
-fn tree_ignores(tree: &HostPath) -> Vec<String> {
+fn tree_ignores(fs: &dyn pe2_io::Filesystem, tree: &HostPath) -> Vec<String> {
     let mut names = Vec::new();
     let mut read = |dir: &HostPath| {
-        if let Ok(text) = std::fs::read_to_string(dir.join(&crate::cache::GITIGNORE)) {
+        if let Ok(text) = fs.read_to_string(&dir.join(&crate::cache::GITIGNORE)) {
             names.extend(changeset::gitignore_names(&text));
         }
     };
     read(tree);
-    if let Some(repository) = tree.ancestors().skip(1).find(|d| d.join(&Name::constant(".git")).exists()) {
+    if let Some(repository) = tree.ancestors().skip(1).find(|d| fs.exists(&d.join(&Name::constant(".git")))) {
         read(&repository);
     }
     names
@@ -2606,7 +2606,9 @@ impl Index {
         let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             // A layer whose records are as they were says of itself what it said.
-            if !crate::records::is_records(&layer.place.root) || differences.same.contains(&layer.place.root) {
+            if !crate::records::is_records(self.io.filesystem(), &layer.place.root)
+                || differences.same.contains(&layer.place.root)
+            {
                 continue;
             }
             let was = layer.changeset.clone();
@@ -2622,7 +2624,7 @@ impl Index {
         if placed && let Some(lowest) = lowest_changed {
             let paths: BTreeSet<&TreePath> = changed.iter().flat_map(|(_, paths)| paths).map(|path| &**path).collect();
             for (i, layer) in self.layers.iter().enumerate().skip(lowest + 1) {
-                if crate::records::is_records(&layer.place.root) {
+                if crate::records::is_records(self.io.filesystem(), &layer.place.root) {
                     wanted.extend(paths.iter().map(|path| (i, (*path).to_owned())));
                 }
             }
@@ -2780,7 +2782,7 @@ impl Index {
             || was.read_only != now.read_only
             || was.ignore != now.ignore
             || layer.kind == LayerKind::Generated
-            || !crate::records::is_records(&layer.place.root)
+            || !crate::records::is_records(self.io.filesystem(), &layer.place.root)
             || self.filled_by(at).is_some()
             || !self.layers[at + 1..].iter().all(silent)
         {
@@ -3290,9 +3292,9 @@ impl Index {
                 }
             }
         };
-        if let Ok(text) = std::fs::read_to_string(&memo)
+        if let Ok(text) = self.io.filesystem().read_to_string(&memo)
             && let Ok(remembered) = serde_json::from_str::<Memo>(&text)
-            && (remembered.sha1 == mine_sha1 || at(&remembered.sha1).is_file())
+            && (remembered.sha1 == mine_sha1 || self.io.filesystem().is_file(&at(&remembered.sha1)))
         {
             return Some((at(&remembered.sha1), remembered.conflicts));
         }
@@ -3308,7 +3310,7 @@ impl Index {
         };
         let remembered = Memo { sha1, conflicts: merged.conflicts };
         if let Ok(text) = serde_json::to_string(&remembered) {
-            let _ = std::fs::create_dir_all(memo.parent().expect("in a folder"));
+            let _ = self.io.filesystem().create_folder_all(&memo.parent().expect("in a folder"));
             let _ = crate::cache::write_atomic(self.io.filesystem(), &memo, text.as_bytes());
         }
         Some((path, remembered.conflicts))
@@ -4372,6 +4374,10 @@ impl Index {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Index, Problem};
     use crate::Project;
@@ -4453,7 +4459,7 @@ mod tests {
     }
 
     fn changeset(root: &HostPath, layer: &str) -> Changeset {
-        Changeset::load(&root.at(&format!(".layers/{layer}.toml"))).unwrap()
+        Changeset::load(&pe2_io::SystemFilesystem, &root.at(&format!(".layers/{layer}.toml"))).unwrap()
     }
 
     #[test]

@@ -131,7 +131,7 @@ impl Sourcing<'_> {
         match content {
             crate::graph::Content::Stored { sha1, .. } => {
                 let path = self.engine.store().context("no store")?.blob_path(sha1)?;
-                std::fs::read(&path).with_context(|| path.display().to_string())
+                self.extensions.io().filesystem().read(&path).with_context(|| path.display().to_string())
             }
             held => Ok(held.held().unwrap_or_default().to_vec()),
         }
@@ -391,7 +391,7 @@ pub(crate) fn assembled_sha1(
     // A records layer's changeset is what its records say.
     let changeset = match crate::records::Set::changeset(layers[0]) {
         Some(changeset) => changeset,
-        None => Changeset::load(&layers[0].with_suffix(crate::CHANGESET_SUFFIX))?,
+        None => Changeset::load(extensions.io().filesystem(), &layers[0].with_suffix(crate::CHANGESET_SUFFIX))?,
     };
     let all = changeset
         .entries

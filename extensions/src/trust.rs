@@ -52,12 +52,20 @@ pub(crate) fn file() -> Option<std::path::PathBuf> {
 }
 
 /// What the file holds.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "what the user trusts: the program's own file, which every process reads and writes as the system has it"
+)]
 pub(crate) fn read() -> Table {
     let text = file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
     toml::from_str(&text).unwrap_or_default()
 }
 
 /// Write what the file holds.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "what the user trusts: the program's own file, which every process reads and writes as the system has it"
+)]
 pub(crate) fn write(table: &Table) -> std::io::Result<()> {
     let file = file().ok_or_else(|| std::io::Error::other("no data folder"))?;
     if let Some(parent) = file.parent() {
@@ -108,6 +116,10 @@ fn store(all: &[Trusted]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// One is not there, or what is trusted cannot be written.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "what the user trusts: the program's own file, which every process reads and writes as the system has it"
+)]
 pub fn trust(project: &HostPath, places: &[impl AsRef<Path>]) -> std::io::Result<()> {
     if let Some(place) = places.iter().map(AsRef::as_ref).find(|place| !place.exists()) {
         let place = place.display();
@@ -257,6 +269,10 @@ pub fn allowed_by(origin: &Origin) -> Option<Allowed> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Allowed, Origin, Trusted, allowed};
     use sfs::HostPath;

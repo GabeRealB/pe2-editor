@@ -5,9 +5,7 @@
 //! is its sectors without sync and header, 2336 bytes each (subheader, data, error-correction tail), which is how
 //! a disc dump keeps the streams' interleaving; the license data in the system area is kept the same way.
 
-use std::fs::File;
 use std::io;
-use std::path::Path;
 
 pub const RAW_SECTOR: usize = 2352;
 pub const DATA: usize = 2048;
@@ -37,31 +35,25 @@ impl Entry {
     }
 }
 
-/// Read `buf.len()` bytes at `offset`, without moving a cursor of the file's: an image is read by many at once.
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        let mut done = 0;
-        while done < buf.len() {
-            match std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], offset + done as u64)? {
-                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-                n => done += n,
-            }
+/// Where an image's bytes are read from, by position, from any number of threads at once: a file, or whatever reads one.
+pub trait ReadAt: Send + Sync {
+    /// Read into `buf` from `offset`: how many bytes, none at the end.
+    ///
+    /// # Errors
+    /// It cannot be read.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+/// Read `buf.len()` bytes at `offset`, without moving a cursor: an image is read by many at once.
+fn read_exact_at(source: &dyn ReadAt, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match source.read_at(&mut buf[done..], offset + done as u64)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => done += n,
         }
-        Ok(())
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        // One thread, where neither is: the file's own cursor.
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = file;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(buf)
-    }
+    Ok(())
 }
 
 /// Slices joined, each copied whole: a byte at a time, a disc's hundreds of megabytes take seconds.
@@ -75,7 +67,7 @@ fn joined<'a>(slices: impl Iterator<Item = &'a [u8]>, capacity: usize) -> Vec<u8
 
 /// A disc image, read by sector from any number of threads at once.
 pub struct Image {
-    file: File,
+    source: Box<dyn ReadAt>,
     sectors: u32,
 }
 
@@ -84,17 +76,17 @@ fn invalid(message: String) -> io::Error {
 }
 
 impl Image {
+    /// The image of `len` bytes read from `source`; `name` says which, where it is not one.
+    ///
     /// # Errors
-    /// The file cannot be read, or is not a whole number of raw sectors.
-    pub fn open(path: &Path) -> io::Result<Image> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        if len % RAW_SECTOR as u64 != 0 {
-            return Err(invalid(format!("{}: not a whole number of 2352-byte sectors", path.display())));
+    /// It is not a whole number of raw sectors.
+    pub fn of(source: Box<dyn ReadAt>, len: u64, name: &str) -> io::Result<Image> {
+        if !len.is_multiple_of(RAW_SECTOR as u64) {
+            return Err(invalid(format!("{name}: not a whole number of 2352-byte sectors")));
         }
         let sectors = u32::try_from(len / RAW_SECTOR as u64)
-            .map_err(|_| invalid(format!("{}: too many sectors for a disc", path.display())))?;
-        Ok(Image { file, sectors })
+            .map_err(|_| invalid(format!("{name}: too many sectors for a disc")))?;
+        Ok(Image { source, sectors })
     }
 
     #[must_use]
@@ -111,7 +103,7 @@ impl Image {
             return Err(invalid(format!("sectors {lba}+{count} are past the image's end ({})", self.sectors)));
         }
         let mut buf = vec![0; count as usize * RAW_SECTOR];
-        read_exact_at(&self.file, &mut buf, u64::from(lba) * RAW_SECTOR as u64)?;
+        read_exact_at(&*self.source, &mut buf, u64::from(lba) * RAW_SECTOR as u64)?;
         Ok(buf)
     }
 

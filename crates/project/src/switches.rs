@@ -24,7 +24,7 @@ use crate::{FILE, Project, Requirement};
 /// # Errors
 /// `project.toml` cannot be read or written.
 pub fn set_disabled(project: &Project, disabled: &[String], history: &mut History, label: String) -> Result<()> {
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let mut ids: Vec<&str> = disabled.iter().map(String::as_str).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -54,8 +54,8 @@ enum Says {
 }
 
 /// What a layer's records say of an extension; nothing where they say nothing of it.
-fn held_in(layer: &crate::Layer, id: &str) -> Option<Says> {
-    let said = crate::records::extensions_of(&layer.path).ok()?.remove(id)?;
+fn held_in(layer: &crate::Layer, id: &str, fs: &dyn pe2_io::Filesystem) -> Option<Says> {
+    let said = crate::records::extensions_of(fs, &layer.path).ok()?.remove(id)?;
     Some(said.map_or(Says::LeavesOff, Says::Holds))
 }
 
@@ -80,11 +80,16 @@ pub fn add_extension(
         folder::checked_alone(from, &project.io).with_context(|| from.display().to_string())?
     } else {
         let component = from.join(&EXTENSION_COMPONENT);
-        let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
+        let bytes = project.io.filesystem().read(&component).with_context(|| component.display().to_string())?;
         folder::checked(from, &bytes, &project.io).with_context(|| from.display().to_string())?
     };
-    let holding =
-        || project.layers.iter().rev().find(|l| !l.mounted && matches!(held_in(l, &about.id), Some(Says::Holds(_))));
+    let holding = || {
+        project
+            .layers
+            .iter()
+            .rev()
+            .find(|l| !l.mounted && matches!(held_in(l, &about.id, project.io.filesystem()), Some(Says::Holds(_))))
+    };
     let layer = match into {
         Some(into) => project.layer(into)?,
         None => {
@@ -97,8 +102,8 @@ pub fn add_extension(
         layer.name
     );
     let (tree, _) = crate::chunks::Store::at(&project.root, project.io.clone()).put_folder(from)?;
-    let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree));
-    let mut document = read(&project.root)?;
+    let held_already = held_in(layer, &about.id, project.io.filesystem()) == Some(Says::Holds(tree));
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let before = document.to_string();
     let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
     require(&mut document, &Requirement { id: about.id.clone(), version: Some(format!("^{line}")) })?;
@@ -124,9 +129,12 @@ pub fn add_extension(
 /// The project neither holds nor requires it, a layer the project does not write holds it and none written can leave it
 /// off, or what holds it cannot be removed or `project.toml` written.
 pub fn remove_extension(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
-    let saying: Vec<&crate::Layer> =
-        project.layers.iter().filter(|layer| !layer.mounted && held_in(layer, id).is_some()).collect();
-    let holding = |layer: &crate::Layer| matches!(held_in(layer, id), Some(Says::Holds(_)));
+    let saying: Vec<&crate::Layer> = project
+        .layers
+        .iter()
+        .filter(|layer| !layer.mounted && held_in(layer, id, project.io.filesystem()).is_some())
+        .collect();
+    let holding = |layer: &crate::Layer| matches!(held_in(layer, id, project.io.filesystem()), Some(Says::Holds(_)));
     let fixed = saying.iter().find(|layer| holding(layer) && layer.read_only);
     let off_in = match fixed {
         Some(fixed) => {
@@ -135,7 +143,7 @@ pub fn remove_extension(project: &Project, id: &str, history: &mut History, labe
         }
         None => None,
     };
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let required = unrequire(&mut document, id);
     if !saying.iter().any(|layer| holding(layer)) && !required {
         bail!("the project neither holds nor requires {id}");
@@ -196,7 +204,7 @@ pub fn set_setting(
     history: &mut History,
     label: String,
 ) -> Result<()> {
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     match setting {
         Some(setting) => {
             let parsed: toml_edit::Value = setting.to_string().parse().context("a setting's value as TOML")?;
@@ -229,6 +237,10 @@ pub fn set_setting(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{add_extension, remove_extension, set_disabled, set_setting};
     use crate::Project;

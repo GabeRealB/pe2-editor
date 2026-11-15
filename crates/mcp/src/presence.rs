@@ -6,6 +6,11 @@
 //! A process also says whether its program was rebuilt since it started, by the program's time then and now: one that
 //! was runs the code it started with, which may read and write a project as that code did.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "how the editors on this computer find each other: files every process reads as the system has them"
+)]
+
 use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -234,6 +239,10 @@ pub fn note_start() {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Keeper, Presence, rebuilt, running, sweep};
     use sfs::testing::At as _;

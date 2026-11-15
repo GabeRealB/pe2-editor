@@ -15,9 +15,9 @@ use project::ext::{EXTENSION_COMPONENT, folder};
 
 /// Whether a file is an extension's archive, by its name.
 #[must_use]
-pub fn is_archive(path: &std::path::Path) -> bool {
+pub fn is_archive(fs: &dyn pe2_io::Filesystem, path: &std::path::Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.ends_with(folder::ARCHIVE_SUFFIX))
-        && path.is_file()
+        && HostPath::new(path).is_ok_and(|place| fs.is_file(&place))
 }
 
 /// The id an archive is named for: `<id>` of `<id>-<version>.extension.zip`.
@@ -60,8 +60,8 @@ fn open(bytes: &[u8]) -> Result<codecs::zip::Archive<'_>> {
 ///
 /// # Errors
 /// It cannot be read, is no extension's archive, or its manifest is not its component's.
-pub fn read(file: &HostPath) -> Result<(About, Vec<u8>)> {
-    let bytes = std::fs::read(file).with_context(|| file.display().to_string())?;
+pub fn read(fs: &dyn pe2_io::Filesystem, file: &HostPath) -> Result<(About, Vec<u8>)> {
+    let bytes = fs.read(file).with_context(|| file.display().to_string())?;
     let archive = open(&bytes)?;
     let top = top(&archive)?;
     let entry = |name: &str| {
@@ -79,11 +79,13 @@ pub struct Unpacked {
     place: HostPath,
     /// Its extension's folder.
     pub folder: HostPath,
+    /// The I/O it was unpacked through, which removes it.
+    io: std::sync::Arc<dyn pe2_io::Io>,
 }
 
 impl Drop for Unpacked {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.place);
+        let _ = self.io.filesystem().remove_all(&self.place);
     }
 }
 
@@ -94,37 +96,37 @@ impl Drop for Unpacked {
 /// component's, or it cannot be written.
 pub fn unpack(file: &std::path::Path, io: &std::sync::Arc<dyn pe2_io::Io>) -> Result<Unpacked> {
     static UNPACKED: AtomicUsize = AtomicUsize::new(0);
-    let bytes = std::fs::read(file).with_context(|| file.display().to_string())?;
+    let fs = io.filesystem();
+    let file = HostPath::new(file).with_context(|| file.display().to_string())?;
+    let bytes = fs.read(&file).with_context(|| file.display().to_string())?;
     let archive = open(&bytes)?;
     let top = top(&archive)?;
     let n = UNPACKED.fetch_add(1, Ordering::Relaxed);
     let temporary = io.environment().temp_dir().context("the system's folder of temporary files")?;
     let place = temporary.join(&pe2_path::Name::new(&format!("pe2-unpacked-{}-{n}", std::process::id()))?);
-    let _ = std::fs::remove_dir_all(&place);
-    let unpacked = Unpacked { folder: place.join(&pe2_path::Name::new(&top)?), place };
+    let _ = fs.remove_all(&place);
+    let unpacked = Unpacked { folder: place.join(&pe2_path::Name::new(&top)?), place, io: io.clone() };
     for name in archive.names() {
         // An entry is a path within the archive, whatever it says: one that is not is refused.
         let within = pe2_path::RelPath::new(name.trim_end_matches('/'))
             .with_context(|| format!("{name}: not a place within the archive"))?;
         let to = unpacked.place.join(&within);
         if name.ends_with('/') {
-            std::fs::create_dir_all(&to).with_context(|| to.display().to_string())?;
+            fs.create_folder_all(&to).with_context(|| to.display().to_string())?;
             continue;
         }
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
+            fs.create_folder_all(&parent).with_context(|| parent.to_string())?;
         }
         let data = archive.read(name).with_context(|| name.to_string())?.map_err(|e| anyhow!("{e}"))?;
-        std::fs::write(&to, data).with_context(|| to.display().to_string())?;
-        #[cfg(unix)]
-        if let Some(mode) = archive.mode(name) {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode))
-                .with_context(|| to.display().to_string())?;
+        fs.write(&to, &data).with_context(|| to.display().to_string())?;
+        // What runs, as it says: a program its owner runs (on Unix; elsewhere nothing).
+        if archive.mode(name).is_some_and(|mode| mode & 0o100 != 0) {
+            fs.set_executable(&to, true).with_context(|| to.display().to_string())?;
         }
     }
     let component = unpacked.folder.join(&EXTENSION_COMPONENT);
-    let component = std::fs::read(&component).with_context(|| format!("{top} has no {EXTENSION_COMPONENT}"))?;
+    let component = fs.read(&component).with_context(|| format!("{top} has no {EXTENSION_COMPONENT}"))?;
     folder::checked(&unpacked.folder, &component, io)?;
     Ok(unpacked)
 }
@@ -189,7 +191,7 @@ mod tests {
                 ("pe2.events.extension/linux-x86_64/tool", b"#!/bin/sh\n", 0o755),
             ],
         );
-        let (about, component) = read(&file).unwrap();
+        let (about, component) = read(&pe2_io::SystemFilesystem, &file).unwrap();
         assert_eq!((about.id.as_str(), component.as_slice()), ("pe2.events", bytes));
         let unpacked = unpack(&file, &pe2_io::system()).unwrap();
         assert!(unpacked.folder.ends_with("pe2.events.extension"));

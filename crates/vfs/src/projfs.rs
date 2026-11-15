@@ -183,6 +183,10 @@ fn not_virtualized(at: &HostPath, why: HRESULT) -> io::Error {
 ///
 /// # Errors
 /// Windows has no Projected File System turned on, or the folder cannot be made or virtualized.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the virtualization root and what ProjFS keeps of it on disk: the system's, as only its own calls see it"
+)]
 pub fn serve(served: &Served, at: &HostPath) -> io::Result<Projected> {
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no Projected File System here"))?;
     std::fs::create_dir_all(at)?;
@@ -458,6 +462,10 @@ impl crate::backend::Backend for AsBackend {
         Ok(Box::new(serve(job.served, job.at)?))
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the virtualization root and what ProjFS keeps of it on disk: the system's, as only its own calls see it"
+    )]
     fn clear(&self, at: &HostPath, _name: &str) {
         // What it kept on disk of what was read: plain files to Windows once nothing virtualizes the folder.
         let _ = std::fs::remove_dir_all(at);
@@ -469,6 +477,10 @@ impl crate::backend::Mount for Projected {
         self.at.to_string()
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the virtualization root and what ProjFS keeps of it on disk: the system's, as only its own calls see it"
+    )]
     fn released(&self, path: &pe2_path::RelPath) {
         // What was read of it is kept on disk until removed.
         let _ = std::fs::remove_dir_all(self.at.join(path));

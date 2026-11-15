@@ -217,6 +217,10 @@ pub fn binding(fields: &Table, place: impl Fn(&Value, Option<i64>) -> Result<Pla
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

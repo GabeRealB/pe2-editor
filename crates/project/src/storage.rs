@@ -161,11 +161,11 @@ pub fn folder_waits(folder: &HostPath) -> bool {
 ///
 /// # Errors
 /// It is there and cannot be read.
-pub fn read(path: &HostPath) -> std::io::Result<Option<Vec<u8>>> {
+pub fn read(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> std::io::Result<Option<Vec<u8>>> {
     if let Some(waits) = waiting(path) {
         return Ok(waits);
     }
-    match std::fs::read(path) {
+    match fs.read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -175,21 +175,21 @@ pub fn read(path: &HostPath) -> std::io::Result<Option<Vec<u8>>> {
 /// A file's length and time of change, as what waits to be written leaves it: what its file will say once it is
 /// written, for whoever is to know that writing as its own. None where it is absent.
 #[must_use]
-pub fn stamp(path: &HostPath) -> Option<(u64, std::time::SystemTime)> {
+pub fn stamp(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Option<(u64, std::time::SystemTime)> {
     match waiting_since(path) {
         Some((at, Some(bytes))) => Some((bytes.len() as u64, at)),
         Some((_, None)) => None,
         None => {
-            let meta = std::fs::metadata(path).ok()?;
-            Some((meta.len(), meta.modified().ok()?))
+            let stat = fs.stat(path).ok()?;
+            Some((stat.size, stat.modified?))
         }
     }
 }
 
 /// Whether a file is there, as what waits to be written leaves it.
 #[must_use]
-pub fn is_file(path: &HostPath) -> bool {
-    waiting(path).map_or_else(|| path.is_file(), |waits| waits.is_some())
+pub fn is_file(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> bool {
+    waiting(path).map_or_else(|| fs.is_file(path), |waits| waits.is_some())
 }
 
 /// A file of a set written behind: its path, what it comes to hold (none: removed), and the hash of what the set
@@ -299,7 +299,7 @@ impl Shared {
             state.since = state.open;
             std::mem::take(&mut state.unsynced)
         };
-        sync(&paths);
+        sync(self.io.filesystem(), &paths);
         let mut state = self.lock();
         self.log.header().set_storage(state.since);
         state.synced += 1;
@@ -321,7 +321,7 @@ impl Shared {
             state.writing = true;
             state.behind.drain(..).collect()
         };
-        crate::chunks::sync_written(&self.root);
+        crate::chunks::sync_written(self.io.filesystem(), &self.root);
         let flushed = (|| {
             if self.header_unflushed.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 self.log.header().flush()?;
@@ -391,14 +391,14 @@ impl Shared {
     /// take it in as it is.
     fn write_one(&self, label: &str, file: &Behind) {
         if file.folder {
-            if !file.path.is_dir()
-                && let Err(e) = std::fs::create_dir_all(&file.path)
+            if !self.io.filesystem().is_folder(&file.path)
+                && let Err(e) = self.io.filesystem().create_folder_all(&file.path)
             {
                 eprintln!("{}: {label}: the folder could not be made: {e}", file.path.display());
             }
             return;
         }
-        let now = std::fs::read(&file.path).ok().map(|bytes| crate::extract::sha1_of(&bytes));
+        let now = self.io.filesystem().read(&file.path).ok().map(|bytes| crate::extract::sha1_of(&bytes));
         // As the set leaves it already - written again from the log by whoever took the project meanwhile.
         if now != file.before && now == file.after.as_ref().map(|bytes| crate::extract::sha1_of(bytes)) {
             return;
@@ -410,9 +410,9 @@ impl Shared {
             let kept = file.after.as_ref().map(|bytes| -> std::io::Result<HostPath> {
                 let aside = conflicts.join(&file.path.within(&self.root).map_err(std::io::Error::other)?);
                 if let Some(folder) = aside.parent() {
-                    std::fs::create_dir_all(&folder)?;
+                    self.io.filesystem().create_folder_all(&folder)?;
                 }
-                std::fs::write(&aside, bytes)?;
+                self.io.filesystem().write(&aside, bytes.as_ref())?;
                 Ok(aside)
             });
             eprintln!(
@@ -425,7 +425,9 @@ impl Shared {
                 }
             );
             // Looked at again by whoever watches the project's files.
-            if let Ok(theirs) = std::fs::File::options().write(true).open(&file.path) {
+            if let Ok(theirs) =
+                self.io.filesystem().open(&file.path, pe2_io::Open { write: true, ..pe2_io::Open::default() })
+            {
                 let _ = theirs.set_modified(self.io.clock().wall());
             }
             return;
@@ -434,11 +436,13 @@ impl Shared {
             Some(bytes) => crate::cache::write_atomic(self.io.filesystem(), &file.path, bytes)
                 .map_err(|e| format!("{e:#}"))
                 .map(|()| {
-                    if let Ok(written) = std::fs::File::options().write(true).open(&file.path) {
+                    if let Ok(written) =
+                        self.io.filesystem().open(&file.path, pe2_io::Open { write: true, ..pe2_io::Open::default() })
+                    {
                         let _ = written.set_modified(file.at);
                     }
                 }),
-            None => match std::fs::remove_file(&file.path) {
+            None => match self.io.filesystem().remove_file(&file.path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
                 _ => Ok(()),
             },
@@ -555,7 +559,7 @@ impl Storage {
         // In the order they were said: what was to be written behind is written before this is.
         self.settle();
         // What the store was given for these changes is on disk before the records that name it.
-        crate::chunks::sync_written(&self.root);
+        crate::chunks::sync_written(self.shared.io.filesystem(), &self.root);
         let began = match self.begin(false) {
             // As much in the log as it may hold, some of it this side's: had on disk, it is let go of.
             Err(e) if e.kind() == std::io::ErrorKind::StorageFull => {
@@ -752,32 +756,21 @@ impl Drop for Storage {
     }
 }
 
-/// Have a file on disk: best effort - one gone since is nothing to have. Opened to read where that lets it be
-/// flushed, which a file kept read-only is too.
-pub(crate) fn sync_file(path: &HostPath) {
-    let opened =
-        if cfg!(unix) { std::fs::File::open(path) } else { std::fs::OpenOptions::new().write(true).open(path) };
-    if let Ok(file) = opened {
-        let _ = file.sync_all();
-    }
-}
-
 /// Have files and folders on disk, each with the folder it is in.
-fn sync(paths: &BTreeSet<HostPath>) {
+fn sync(fs: &dyn pe2_io::Filesystem, paths: &BTreeSet<HostPath>) {
     let mut folders = BTreeSet::new();
     for path in paths {
         folders.extend(path.parent());
-        if path.is_dir() {
+        if fs.is_folder(path) {
             folders.insert(path.clone());
         } else {
-            sync_file(path);
+            pe2_io::sync_file(fs, path);
         }
     }
-    // A folder's entries - a file made, renamed, removed - are on disk once the folder is: where a folder can be
-    // opened to be asked.
-    if cfg!(unix) {
-        for folder in folders {
-            let _ = std::fs::File::open(folder).and_then(|folder| folder.sync_all());
+    // A folder's entries - a file made, renamed, removed - are on disk once the folder is, where the system says so.
+    for folder in folders {
+        if let Ok(folder) = fs.open(&folder, pe2_io::Open::FOLDER) {
+            let _ = folder.sync();
         }
     }
 }
@@ -791,7 +784,7 @@ fn sync(paths: &BTreeSet<HostPath>) {
 pub fn redo(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Result<Option<String>> {
     let dir = log_dir(root);
     // No log, nothing was ever written through one: none is made to find that out.
-    if !dir.join(&sfs::header::FILE).is_file() {
+    if !filesystem.is_file(&dir.join(&sfs::header::FILE)) {
         return Ok(None);
     }
     let log =
@@ -808,7 +801,7 @@ pub fn redo(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Result<Opti
                 .with_context(|| format!("writing again what `{label}` changed"))?;
         }
     }
-    sync(&written);
+    sync(filesystem, &written);
     log.header().set_storage(None);
     log.keep();
     forget_waiting(root, filesystem);
@@ -828,7 +821,7 @@ pub fn redo(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Result<Opti
 /// still, is taken out.
 fn forget_waiting(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) {
     let dir = root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&crate::shared::SPACE);
-    if !dir.is_dir() {
+    if !filesystem.is_folder(&dir) {
         return;
     }
     let forgotten = crate::shared::space(root, filesystem).map_err(sfs::space::Error::Io).and_then(|space| {
@@ -868,14 +861,14 @@ fn again(
         Stored::Put { path, bytes } => {
             let path = at(path)?;
             if let Some(folder) = path.parent() {
-                std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
+                fs.create_folder_all(&folder).with_context(|| folder.to_string())?;
             }
             crate::cache::write_atomic(fs, &path, bytes)?;
             written.insert(path);
         }
         Stored::Delete { path } => {
             let path = at(path)?;
-            match std::fs::remove_file(&path) {
+            match fs.remove_file(&path) {
                 Err(e) if !gone(&e) => return Err(e).context(path.to_string()),
                 _ => drop(written.insert(path)),
             }
@@ -883,26 +876,26 @@ fn again(
         Stored::Move { from, to } => {
             let (from, to) = (at(from)?, at(to)?);
             // Moved already where nothing is left to move; else what is in its way - what a move replaces - goes.
-            if from.exists() {
-                if to.is_file() {
-                    std::fs::remove_file(&to).with_context(|| to.display().to_string())?;
+            if fs.exists(&from) {
+                if fs.is_file(&to) {
+                    fs.remove_file(&to).with_context(|| to.display().to_string())?;
                 }
                 if let Some(folder) = to.parent() {
-                    std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
+                    fs.create_folder_all(&folder).with_context(|| folder.to_string())?;
                 }
-                std::fs::rename(&from, &to).with_context(|| format!("{} -> {}", from.display(), to.display()))?;
+                fs.rename(&from, &to).with_context(|| format!("{} -> {}", from.display(), to.display()))?;
             }
             written.extend([from, to]);
         }
         Stored::MakeDir { path } => {
             let path = at(path)?;
-            std::fs::create_dir_all(&path).with_context(|| path.to_string())?;
+            fs.create_folder_all(&path).with_context(|| path.to_string())?;
             written.insert(path);
         }
         Stored::RemoveDir { path } => {
             let path = at(path)?;
-            if std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
-                std::fs::remove_dir(&path).with_context(|| path.display().to_string())?;
+            if pe2_io::is_empty_folder(fs, &path) {
+                fs.remove_folder(&path).with_context(|| path.display().to_string())?;
             }
             written.insert(path);
         }
@@ -912,6 +905,10 @@ fn again(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Storage, Stored, log_dir};
     use crate::testing::At as _;

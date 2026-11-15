@@ -300,8 +300,8 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
 }
 
 /// A failure's picture, as a texture.
-fn picture(ctx: &egui::Context, file: &std::path::Path) -> Option<egui::TextureHandle> {
-    let decoded = codecs::ora::decode_png(&std::fs::read(file).ok()?).ok()?;
+fn picture(ctx: &egui::Context, fs: &dyn pe2_io::Filesystem, file: &std::path::Path) -> Option<egui::TextureHandle> {
+    let decoded = codecs::ora::decode_png(&crate::workspace::read_named(fs, file).ok()?).ok()?;
     let codecs::ora::Pixels::Rgba(pixels) = decoded.pixels else { return None };
     let bytes: Vec<u8> = pixels.into_iter().flatten().collect();
     let image = egui::ColorImage::from_rgba_unmultiplied([decoded.width, decoded.height], &bytes);
@@ -453,15 +453,18 @@ fn details(ui: &mut egui::Ui, ws: &mut Workspace) {
         ui.label(RichText::new(why).monospace().color(ui.visuals().error_fg_color));
         if let Some(file) = file {
             if ws.tests.shown.as_ref().is_none_or(|(known, _)| *known != file) {
-                ws.tests.shown = picture(ui.ctx(), &file).map(|texture| (file.clone(), texture));
+                ws.tests.shown =
+                    picture(ui.ctx(), ws.project.io.filesystem(), &file).map(|texture| (file.clone(), texture));
             }
             if let Some((_, texture)) = &ws.tests.shown {
                 let width = ui.available_width().min(texture.size_vec2().x);
                 ui.add(egui::Image::new(texture).max_width(width));
             }
         }
-        if let Some(text) = said.and_then(|file| std::fs::read_to_string(file).ok()) {
-            ui.collapsing("What the window said", |ui| ui.label(RichText::new(text).small().monospace()));
+        if let Some(bytes) = said.and_then(|file| crate::workspace::read_named(ws.project.io.filesystem(), &file).ok())
+        {
+            let words = String::from_utf8_lossy(&bytes);
+            ui.collapsing("What the window said", |ui| ui.label(RichText::new(words).small().monospace()));
         }
     });
 }

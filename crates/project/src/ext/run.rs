@@ -72,12 +72,14 @@ struct Laid {
     input: HostPath,
     output: HostPath,
     files: Vec<Arc<RelPath>>,
+    /// The I/O it is laid out through.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Drop for Laid {
     fn drop(&mut self) {
         if let Some(folder) = &self.folder {
-            let _ = std::fs::remove_dir_all(folder);
+            let _ = self.io.filesystem().remove_all(folder);
         }
     }
 }
@@ -116,7 +118,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
         .transpose()?;
     for name in &outputs {
         if let Some(parent) = laid.output.join(name).parent() {
-            std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
+            call.io().filesystem().create_folder_all(&parent).with_context(|| parent.to_string())?;
         }
     }
     let values = settings.get("values").and_then(Toml::as_table).cloned().unwrap_or_default();
@@ -172,7 +174,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
     }
     for name in &outputs {
         let file = laid.output.join(name);
-        let mut bytes = std::fs::read(&file).with_context(|| format!("{program} made no {name}"))?;
+        let mut bytes = call.io().filesystem().read(&file).with_context(|| format!("{program} made no {name}"))?;
         if rewrite.iter().any(|r| named(r, first, &told) == name.as_str()) {
             bytes = rewritten(&String::from_utf8_lossy(&bytes), &laid).into_bytes();
         }
@@ -200,18 +202,25 @@ fn lay_out(call: &exec::Call<'_>, given: &[File]) -> Result<Laid> {
     let run = format!("pe2-run-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
     let run = Name::new(&run)?;
     let folder = call.io().environment().temp_dir().context("the system's folder of temporary files")?.join(&run);
-    let _ = std::fs::remove_dir_all(&folder);
-    let laid = Laid { input: folder.join(&IN), output: folder.join(&OUT), folder: Some(folder), files: Vec::new() };
-    std::fs::create_dir_all(&laid.output).with_context(|| laid.output.to_string())?;
-    std::fs::create_dir_all(&laid.input).with_context(|| laid.input.to_string())?;
+    let fs = call.io().filesystem();
+    let _ = fs.remove_all(&folder);
+    let laid = Laid {
+        input: folder.join(&IN),
+        output: folder.join(&OUT),
+        folder: Some(folder),
+        files: Vec::new(),
+        io: call.io().clone(),
+    };
+    fs.create_folder_all(&laid.output).with_context(|| laid.output.to_string())?;
+    fs.create_folder_all(&laid.input).with_context(|| laid.input.to_string())?;
     let mut laid = laid;
     for file in given {
         let name = &file.name;
         let path = laid.input.join(name);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
+            fs.create_folder_all(&parent).with_context(|| parent.to_string())?;
         }
-        std::fs::write(&path, call.read(&file.content)?).with_context(|| path.to_string())?;
+        fs.write(&path, &call.read(&file.content)?).with_context(|| path.to_string())?;
         laid.files.push(name.clone());
     }
     Ok(laid)
@@ -389,6 +398,10 @@ fn scalar(value: &Toml) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Laid, Places};
     use crate::testing::At as _;
@@ -398,6 +411,7 @@ mod tests {
     fn placeholders_fill_an_argument_or_make_one_of_each_item() {
         let run = crate::testing::scratch("run-places");
         let laid = Laid {
+            io: pe2_io::system(),
             folder: None,
             input: run.at("in"),
             output: run.at("out"),

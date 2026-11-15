@@ -96,6 +96,10 @@ impl Scopes {
 }
 
 impl Drop for Scopes {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+    )]
     fn drop(&mut self) {
         let scopes = std::mem::take(&mut self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner).scopes);
         for (_, scope) in scopes {
@@ -120,7 +124,7 @@ fn expose(held: &mut Held, io: &std::sync::Arc<dyn pe2_io::Io>, disk: &HostPath)
     // small one is as well copied.
     let how = Use { ranges: true, often: false };
     let written = project::content::len(io, disk).unwrap_or(u64::MAX);
-    let backend = chosen(&root, &machine, &how, written)?;
+    let backend = chosen(io.filesystem(), &root, &machine, &how, written)?;
     let scope = scope_of(&mut held.scopes, &root);
     let sha1 = project::content::sha1(io, disk)?;
     let name = disk.file_name().map_or_else(|| "content".into(), |n| n.to_string_lossy().into_owned());
@@ -161,7 +165,7 @@ fn serve(
     let mut scopes = held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let machine = (scopes.machine)();
     // Laid out instead where that suits better: nothing is served, and whoever asked lays them out.
-    let backend = chosen(&root, &machine, how, project::content::written_to_lay_out(io, files))?;
+    let backend = chosen(io.filesystem(), &root, &machine, how, project::content::written_to_lay_out(io, files))?;
     let run = Name::new(&format!("run-{}", RUN.fetch_add(1, Ordering::Relaxed))).map_err(io::Error::other)?.to_owned();
     let scope = scope_of(&mut scopes.scopes, &root);
     for (name, given) in files {
@@ -180,8 +184,8 @@ fn serve(
 }
 
 /// How much laying files out for a program may write, for a project: as it says, else the machine, else the default.
-fn copies(root: &HostPath, machine: &Machine) -> u64 {
-    let says = project::local_filesystem(root).copies;
+fn copies(fs: &dyn pe2_io::Filesystem, root: &HostPath, machine: &Machine) -> u64 {
+    let says = project::local_filesystem(root, fs).copies;
     backend::budget(&[says.as_deref(), machine.copies.as_deref()], backend::COPIES)
 }
 
@@ -191,10 +195,16 @@ fn copies(root: &HostPath, machine: &Machine) -> u64 {
 ///
 /// # Errors
 /// Copies suit better, or the backend named cannot serve it: laid out either way, by whoever asked.
-fn chosen(root: &HostPath, machine: &Machine, how: &Use, written: u64) -> io::Result<&'static dyn Backend> {
-    let says = project::local_filesystem(root).scopes;
+fn chosen(
+    fs: &dyn pe2_io::Filesystem,
+    root: &HostPath,
+    machine: &Machine,
+    how: &Use,
+    written: u64,
+) -> io::Result<&'static dyn Backend> {
+    let says = project::local_filesystem(root, fs).scopes;
     let setting = backend::setting(&[says.as_deref(), machine.scopes.as_deref()]);
-    let light = written <= copies(root, machine);
+    let light = written <= copies(fs, root, machine);
     backend::choose(&setting, Can::BY_PATH, &Scopes::at(root), how, light)
         .map_err(|why| io::Error::other(format!("a project's scopes: {why}")))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "copies suit this better than a scope"))
@@ -226,6 +236,10 @@ impl Drop for Unserve {
 
 /// Remove the scopes processes that have ended left in a project's cache: each cleared by the backend that served it,
 /// or by every one that could have where nothing says which.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+)]
 fn sweep(root: &HostPath) {
     let Some(dir) = Scopes::at(root).parent() else { return };
     let mine = std::process::id().to_string();
@@ -268,6 +282,10 @@ impl Marker {
     }
 
     /// Say this process serves its scope in `dir`, by a backend, until dropped.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+    )]
     fn hold(dir: &HostPath, by: &str) -> io::Result<Marker> {
         use std::io::Write;
         let path = Marker::path(dir, &std::process::id().to_string());
@@ -282,6 +300,10 @@ impl Marker {
     }
 
     /// What the process a scope is named after left; where whether it runs cannot be told, it is taken to.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+    )]
     fn left(dir: &HostPath, pid: &str) -> Left {
         let said = std::fs::read_to_string(Marker::path(dir, pid));
         let by = |said: io::Result<String>| said.ok().map(|by| by.trim().to_string()).filter(|by| !by.is_empty());
@@ -301,6 +323,10 @@ impl Marker {
 }
 
 impl Drop for Marker {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+    )]
     fn drop(&mut self) {
         drop(self.held.take());
         let _ = std::fs::remove_file(&self.path);
@@ -324,6 +350,10 @@ struct Mounted {
 }
 
 impl Drop for Mounted {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+    )]
     fn drop(&mut self) {
         drop(self.mount.take());
         self.backend.clear(&self.at, &self.name);
@@ -332,6 +362,10 @@ impl Drop for Mounted {
 }
 
 /// A scope's mount, made where it has none, by a backend; one it has already serves on, whichever it is by.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a scope's mount point, its staging and the marker saying which process serves it: what the system mounts, and how the project's processes find each other, as the system has them"
+)]
 fn mount(scope: &mut Scope, root: &HostPath, backend: &'static dyn Backend) -> io::Result<()> {
     if scope.mounted.is_none() {
         let pid = std::process::id().to_string();

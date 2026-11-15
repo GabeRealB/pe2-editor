@@ -157,7 +157,8 @@ pub fn lay_out(
     let cast: Vec<(u16, [u8; 4])> =
         by_number(atlas, "cast")?.into_iter().map(|(n, v)| Ok((n, rect(v)?))).collect::<Result<_, String>>()?;
     let highest = cells.keys().chain(cast.iter().map(|(n, _)| n)).max().map_or(0, |n| usize::from(*n) + 1);
-    let length = highest.max(atlas.get("cells").and_then(Value::as_integer).and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+    let length =
+        highest.max(atlas.get("cells").and_then(Value::as_integer).and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
     let mut table: Vec<[u8; 4]> = vec![[0; 4]; length];
     if let Some(stored) = atlas.get("stored_cells").and_then(Value::as_array) {
         table = stored.iter().map(rect).collect::<Result<_, _>>()?;
@@ -240,6 +241,10 @@ pub fn crop(page: &[u8], width: usize, cell: [u8; 4]) -> Picture {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -258,7 +263,8 @@ mod tests {
         font.faces.entry("speakers".into()).or_default().insert("Aya".into(), glyph(20, 9));
         let texts = vec!["Hi".to_string(), "iH".to_string()];
         let speakers: BTreeMap<u8, String> = [(0, "Aya".to_string())].into();
-        let laid = lay_out(&texts, &vec![Some(0), None], &speakers, &|_| None, &pe2_ext::Table::new(), &font).expect("laid");
+        let laid =
+            lay_out(&texts, &vec![Some(0), None], &speakers, &|_| None, &pe2_ext::Table::new(), &font).expect("laid");
         assert_eq!(laid.texts, vec![vec![25, 26], vec![26, 25]]);
         assert_eq!(laid.cells[25], [0, 0, 8, 12]);
         assert_eq!(laid.cells[26], [0, 14, 250, 12], "a glyph past the edge starts a row");

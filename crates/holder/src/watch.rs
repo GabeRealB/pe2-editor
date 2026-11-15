@@ -77,13 +77,13 @@ pub fn watch(
         told.waiter.wake();
     };
     let mut watcher = RecommendedWatcher::new(handler, Config::default().with_follow_symlinks(false))?;
-    let roots: Vec<&HostPath> = roots.iter().filter(|root| root.is_dir()).collect();
+    let roots: Vec<&HostPath> = roots.iter().filter(|root| io.filesystem().is_folder(root)).collect();
     // A root inside another is watched with it.
     for root in roots.iter().filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o))) {
         watcher.watch(root, RecursiveMode::Recursive)?;
     }
     let mut shallow: Vec<&HostPath> =
-        shallow.iter().filter(|d| d.is_dir() && !roots.iter().any(|r| d.starts_with(r))).collect();
+        shallow.iter().filter(|d| io.filesystem().is_folder(d) && !roots.iter().any(|r| d.starts_with(r))).collect();
     shallow.sort();
     shallow.dedup();
     for dir in shallow {
@@ -144,7 +144,7 @@ fn debounce(
                     // tells it so for every file made or removed in it - by the holder's own edits too, which would
                     // take the folder for another program's change. Renamed, it is told so (`Name`), and kept.
                     let listing = matches!(event.kind, EventKind::Modify(kind) if !matches!(kind, ModifyKind::Name(_)));
-                    let listed = |path: &HostPath| listing && path.is_dir();
+                    let listed = |path: &HostPath| listing && io.filesystem().is_folder(path);
                     // What the system says changed is in the form of the folder watched, which is a HostPath's.
                     let changed = event.paths.into_iter().filter_map(HostPath::from_plain);
                     for path in changed.filter(|p| !atomic(p) && !listed(p) && wanted(p)) {
@@ -173,6 +173,10 @@ fn debounce(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Change, watch};
     use sfs::HostPath;

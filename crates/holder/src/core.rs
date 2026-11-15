@@ -406,7 +406,7 @@ impl Core {
         }
         // Each file is as its own writing leaves it when what watches the layers tells of it.
         for path in &changed {
-            self.written.insert(path.clone(), project::storage::stamp(path));
+            self.written.insert(path.clone(), project::storage::stamp(self.project.io.filesystem(), path));
         }
         self.feed(&changed, &refreshed, answers, then);
         project::give_back_memory();
@@ -436,9 +436,9 @@ impl Core {
     /// the holder's own edits wrote, as they wrote it, is taken in already. One written over since is another's,
     /// and forgotten as its own.
     pub fn others(&mut self, changed: Vec<HostPath>) -> Vec<HostPath> {
-        let written = &mut self.written;
+        let (written, fs) = (&mut self.written, self.project.io.filesystem());
         let others = changed.into_iter().filter(|path| {
-            let own = written.get(path).is_some_and(|was| *was == project::storage::stamp(path));
+            let own = written.get(path).is_some_and(|was| *was == project::storage::stamp(fs, path));
             if !own {
                 written.remove(path);
             }

@@ -811,6 +811,10 @@ pub fn graph_ui(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Node, arrangement, short};
     use eframe::egui::Pos2;

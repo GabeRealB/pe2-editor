@@ -86,6 +86,10 @@ pub(crate) fn hash(text: &str, state: &mut impl Hasher) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{folded, hash, order, same};
     use std::cmp::Ordering;

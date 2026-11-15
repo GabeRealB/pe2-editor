@@ -108,7 +108,10 @@ fn about_ui(ui: &mut egui::Ui, ws: &Workspace, all: &[Present], p: &Present) {
                     row("Tree", held.tree.to_string());
                 }
                 Origin::Project(path) | Origin::User(path) | Origin::Install(path) => {
-                    row(if path.is_dir() { "Folder" } else { "Archive" }, path.display().to_string());
+                    row(
+                        if ws.project.io.filesystem().is_folder(path) { "Folder" } else { "Archive" },
+                        path.display().to_string(),
+                    );
                 }
                 Origin::Component(path) => row("File", path.display().to_string()),
                 Origin::Builtin | Origin::Linked => {}
@@ -596,7 +599,7 @@ fn adding_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
             let folder = folder.clone();
             let work = move |w: &mut crate::takein::Worker| {
                 // An archive is unpacked first, and copied in as its folder.
-                let unpacked = extensions::archive::is_archive(&folder)
+                let unpacked = extensions::archive::is_archive(w.core.project.io.filesystem(), &folder)
                     .then(|| extensions::archive::unpack(&folder, &w.core.project.io));
                 let unpacked = unpacked.transpose()?;
                 let from = unpacked.as_ref().map_or(&folder, |unpacked| &unpacked.folder);

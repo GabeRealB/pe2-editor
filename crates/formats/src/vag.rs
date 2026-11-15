@@ -1437,6 +1437,10 @@ pub fn decode(body: &[u8]) -> Result<Decoded, String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn what_is_encoded_decodes_to_input_encoding_alike() {

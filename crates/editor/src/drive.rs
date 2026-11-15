@@ -714,6 +714,10 @@ fn screenshot(image: &egui::ColorImage, rect: Option<(String, egui::Rect)>, scal
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::clipped;
     use eframe::egui;

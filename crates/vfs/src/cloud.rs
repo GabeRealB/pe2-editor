@@ -10,6 +10,12 @@
 //! one whose file changed is emptied, to be read again; one gone is removed; one changed here and not applied yet is
 //! left alone.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the sync root, its placeholders and the tree kept apart: what the Cloud Files API serves, which only the \
+              system's own calls see as it does (attributes, reparse points, what is fetched as it is read)"
+)]
+
 use pe2_path::{Name, PathError, RelPath, Why};
 use project::TreePath;
 use sfs::{HostPath, NotWithin};
@@ -775,7 +781,8 @@ const TREE: &Name = Name::constant("tree");
 /// The folder of what is kept apart of a folder served: its own, by the place of the one served.
 fn apart(at: &HostPath) -> Option<HostPath> {
     let place = project::extract::sha1_hex(at.to_string().to_lowercase().as_bytes());
-    Some(crate::backend::apart_for(at)?.join(&Name::new(&place[..16]).ok()?))
+    // What the system keeps apart is the system's: its settings read as it has them.
+    Some(crate::backend::apart_for(at, &pe2_io::SystemFilesystem)?.join(&Name::new(&place[..16]).ok()?))
 }
 
 /// Whether two paths name one folder, as Windows compares them.

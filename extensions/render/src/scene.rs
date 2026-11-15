@@ -554,6 +554,10 @@ fn hit(origin: V3, direction: V3, [a, b, c]: [V3; 3]) -> Option<f32> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
     use crate::model::{Corner, Material, Part};

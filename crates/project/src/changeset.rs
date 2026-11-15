@@ -81,8 +81,8 @@ impl Changeset {
     ///
     /// # Errors
     /// It cannot be read, or is not a changeset.
-    pub fn load(path: &HostPath) -> Result<Changeset> {
-        let text = match std::fs::read_to_string(path) {
+    pub fn load(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Result<Changeset> {
+        let text = match fs.read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Changeset::default()),
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
@@ -243,6 +243,10 @@ fn glob(pattern: &str, name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Base, Changeset, Op};
     use crate::testing::{rel, tree, uid};

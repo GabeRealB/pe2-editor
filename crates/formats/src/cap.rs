@@ -125,17 +125,21 @@ pub fn parse(data: &[u8]) -> Result<Cap, String> {
     let records: usize = commands.iter().map(|(_, c)| c.records.len()).sum();
     // An empty stream after the records' is the one thing the layout cannot imply.
     let streams_end = sequences;
-    let after_records = refs
-        .iter()
-        .max()
-        .map_or(text_start, |&last| usize_of(last) + 2 * codes_at(data, usize_of(last)).len() + 2);
-    let trailing_empty_text = records > 0 && after_records + 2 == streams_end && u16_at(data, after_records) == Some(END);
+    let after_records =
+        refs.iter().max().map_or(text_start, |&last| usize_of(last) + 2 * codes_at(data, usize_of(last)).len() + 2);
+    let trailing_empty_text =
+        records > 0 && after_records + 2 == streams_end && u16_at(data, after_records) == Some(END);
     let cap = Cap { cells, commands: numbered, trailing_empty_text };
     let rebuilt = write(&cap);
     if rebuilt != data {
         let at = rebuilt.iter().zip(data).position(|(a, b)| a != b).unwrap_or(rebuilt.len().min(data.len()));
         let mut why = String::new();
-        let _ = write!(why, "not laid out as written: they differ from byte {at:#x} ({} written, {} read)", rebuilt.len(), data.len());
+        let _ = write!(
+            why,
+            "not laid out as written: they differ from byte {at:#x} ({} written, {} read)",
+            rebuilt.len(),
+            data.len()
+        );
         return Err(why);
     }
     Ok(cap)
@@ -200,6 +204,10 @@ pub fn write(cap: &Cap) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Cap, Command, Record, parse, write};
 
@@ -213,11 +221,18 @@ mod tests {
             cells: vec![[0, 0, 24, 11], [24, 0, 7, 12], [31, 0, 6, 12]],
             commands: vec![
                 None,
-                Some(Command { bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], records: vec![line(0, &[25, 26, 0xFFFE])] }),
+                Some(Command {
+                    bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    records: vec![line(0, &[25, 26, 0xFFFE])],
+                }),
                 None,
                 Some(Command {
                     bytes: [2, 0, 1, 0x56, 0, 0, 1, 0, 0, 0, 0, 0],
-                    records: vec![line(0, &[26]), line(1, &[25]), Record { bytes: [5, 0x80, 0, 0, 1, 1, 0, 0], text: vec![] }],
+                    records: vec![
+                        line(0, &[26]),
+                        line(1, &[25]),
+                        Record { bytes: [5, 0x80, 0, 0, 1, 1, 0, 0], text: vec![] },
+                    ],
                 }),
             ],
             trailing_empty_text: true,

@@ -63,31 +63,47 @@ pub fn print(codes: &[u16], token_of: &dyn Fn(u16) -> Option<String>) -> String 
             if code & VIEW_MASK == VIEW {
                 let logical = if code & VIEW_LOGICAL != 0 { " logical" } else { "" };
                 let hide = if code & VIEW_HIDE_ACTORS != 0 { " hide" } else { "" };
-                { let _ = write!(out, "{{view {low}{logical}{hide}}}"); };
+                {
+                    let _ = write!(out, "{{view {low}{logical}{hide}}}");
+                };
             } else if let Some((_, name)) = CHOICES.iter().find(|(family, _)| code & 0xFF00 == *family) {
-                { let _ = write!(out, "{{choice {name} {low}}}"); };
+                {
+                    let _ = write!(out, "{{choice {name} {low}}}");
+                };
             } else if code & 0xFF00 == ICON {
-                { let _ = write!(out, "{{icon {low}}}"); };
+                {
+                    let _ = write!(out, "{{icon {low}}}");
+                };
             } else {
-                { let _ = write!(out, "{{code {code:04X}}}"); };
+                {
+                    let _ = write!(out, "{{code {code:04X}}}");
+                };
             }
         } else {
             let (cell, p, d) = (code & CELL_MASK, (code >> PALETTE_SHIFT) & 3, (code >> DELAY_SHIFT) & 7);
             if p != palette {
-                { let _ = write!(out, "{{palette {p}}}"); };
+                {
+                    let _ = write!(out, "{{palette {p}}}");
+                };
                 palette = p;
             }
             if d != delay {
-                { let _ = write!(out, "{{delay {d}}}"); };
+                {
+                    let _ = write!(out, "{{delay {d}}}");
+                };
                 delay = d;
             }
             match token_of(cell) {
-                None => { let _ = write!(out, "{{cell {cell}}}"); },
+                None => {
+                    let _ = write!(out, "{{cell {cell}}}");
+                }
                 Some(token) => {
                     let mut chars = token.chars();
                     match (chars.next(), chars.next()) {
                         (Some(ch), None) if ch != '{' && ch != '}' => out.push(ch),
-                        _ => { let _ = write!(out, "{{glyph {token}}}"); },
+                        _ => {
+                            let _ = write!(out, "{{glyph {token}}}");
+                        }
                     }
                 }
             }
@@ -151,12 +167,17 @@ pub fn parse(text: &str) -> Result<Vec<Item>, String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Item, parse, print};
 
     #[test]
     fn markup_reads_back_as_written() {
-        let codes = [0x19, 0x1A, 0xFFFE, 0x1B | 1 << 10, 0x8005 | 0x2000, 0xFFFD, 0x8203, 0x8401, 0x8800, 0x1E, 0x19 | 2 << 12];
+        let codes =
+            [0x19, 0x1A, 0xFFFE, 0x1B | 1 << 10, 0x8005 | 0x2000, 0xFFFD, 0x8203, 0x8401, 0x8800, 0x1E, 0x19 | 2 << 12];
         let token_of = |cell: u16| match cell {
             25 => Some("A".to_string()),
             26 => Some("{".to_string()),

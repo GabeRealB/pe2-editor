@@ -223,8 +223,8 @@ impl Server {
     /// last did: its packs' listings. What its records hold it reads by what is said to be served, not by them.
     fn reread(&self, changed: &[HostPath]) {
         let stamp = |path: &HostPath| {
-            let meta = std::fs::metadata(path).ok()?;
-            Some((meta.modified().ok()?, meta.len()))
+            let stat = self.project.io.filesystem().stat(path).ok()?;
+            Some((stat.modified?, stat.size))
         };
         let changed: Vec<HostPath> = {
             let mut read = lock(&self.reread);
@@ -356,7 +356,8 @@ impl Server {
     /// What is read of the folder served, remembered from one serving to the next: what a backend that keeps what is
     /// read lets go of last.
     fn remembered(&self) -> Arc<vfs::access::Access> {
-        let record = Arc::new(vfs::access::Access::of(&self.project.root, "the project's folder"));
+        let record =
+            Arc::new(vfs::access::Access::of(&self.project.root, "the project's folder", self.project.io.clone()));
         if !self.serving.keeps() {
             // Whatever kept what was read before has handed the folder over, and with it let go of what it kept.
             record.nothing_kept();
@@ -600,8 +601,8 @@ impl vfs::write::Owner for Server {
         let aside = self.project.root.join(&project::SET_ASIDE).join(when).join(path.rel());
         let kept = aside
             .parent()
-            .map_or(Ok(()), |folder| std::fs::create_dir_all(&folder))
-            .and_then(|()| std::fs::copy(staged, &aside));
+            .map_or(Ok(()), |folder| self.project.io.filesystem().create_folder_all(&folder))
+            .and_then(|()| self.project.io.filesystem().copy(staged, &aside));
         match kept {
             Ok(_) => println!("{path}: not taken into the project, and set aside in {aside}"),
             Err(e) => eprintln!("{path}: not taken into the project, and lost: {e}"),
@@ -618,7 +619,7 @@ fn clear_strays(
     staging: &HostPath,
 ) -> Result<()> {
     let at = &p.filesystem.at;
-    let vfs::strays::Found { strays: found, unnamed } = vfs::strays::strays(at, serving);
+    let vfs::strays::Found { strays: found, unnamed } = vfs::strays::strays(p.io.filesystem(), at, serving);
     // Named so no path takes it: nothing here moves it by its path, nor serves over it.
     if !unnamed.is_empty() {
         let listed: Vec<&str> = unnamed.iter().take(8).map(String::as_str).collect();
@@ -659,11 +660,11 @@ fn clear_strays(
             );
         }
         Strays::SetAside => {
-            vfs::strays::set_aside(at, &found, &aside)?;
+            vfs::strays::set_aside(p.io.filesystem(), at, &found, &aside)?;
             println!("{} {shown} held set aside in {}", files(found.len()), aside);
         }
         Strays::TakeIn => {
-            let kept = vfs::strays::take_in(at, &found, owner, staging, &aside)?;
+            let kept = vfs::strays::take_in(p.io.filesystem(), at, &found, owner, staging, &aside)?;
             println!("{} {shown} held written into the project", files(found.len() - kept.len()));
             if !kept.is_empty() {
                 println!(

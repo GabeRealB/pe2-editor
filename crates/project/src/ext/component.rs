@@ -1922,6 +1922,7 @@ impl Shared {
             wasi.inherit_network().allow_blocking_current_thread(true);
             if cfg!(windows) {
                 // Each drive a root of its own (`/D:`): what the host's paths are told as (`guest_path`).
+                #[allow(clippy::disallowed_methods, reason = "the drives the system has, each a root of what it sees")]
                 for letter in 'A'..='Z' {
                     let root = format!("{letter}:\\");
                     if Path::new(&root).is_dir() {
@@ -3083,18 +3084,19 @@ fn compiled_dir(environment: &dyn pe2_io::Environment) -> Option<HostPath> {
 
 /// Remove compiled components not written for 30 days: those of extensions since rebuilt, mostly; one still used is
 /// compiled again.
-fn sweep(dir: &HostPath, clock: &dyn pe2_io::Clock) {
+fn sweep(dir: &HostPath, io: &dyn pe2_io::Io) {
     const KEPT: Duration = Duration::from_hours(30 * 24);
-    let now = clock.wall();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
+    let (fs, now) = (io.filesystem(), io.clock().wall());
+    for entry in fs.read_directory(dir).unwrap_or_default() {
+        let path = dir.entry(&entry.name);
+        let old = fs
+            .stat_link(&path)
             .ok()
+            .and_then(|stat| stat.modified)
             .and_then(|t| now.duration_since(t).ok())
             .is_some_and(|age| age > KEPT);
-        if old && std::path::Path::new(&entry.file_name()).extension().is_some_and(|e| e == "cwasm") {
-            let _ = std::fs::remove_file(dir.entry(&entry.file_name()));
+        if old && std::path::Path::new(&entry.name).extension().is_some_and(|e| e == "cwasm") {
+            let _ = fs.remove_file(&path);
         }
     }
 }
@@ -3110,7 +3112,7 @@ fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Compone
     let file = compiled_dir(io.environment())
         .zip(pe2_path::Name::new(&format!("{key}.cwasm")).ok())
         .map(|(dir, name)| dir.join(&name));
-    if let Some(kept) = file.as_ref().and_then(|f| std::fs::read(f).ok())
+    if let Some(kept) = file.as_ref().and_then(|f| io.filesystem().read(f).ok())
         && let Some((digest, code)) = kept.split_at_checked(20)
         && Sha1::digest(code).as_slice() == digest
     {
@@ -3129,8 +3131,8 @@ fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Compone
         let mut kept = Sha1::digest(&code).to_vec();
         kept.extend_from_slice(&code);
         if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(&dir);
-            sweep(&dir, io.clock());
+            let _ = io.filesystem().create_folder_all(&dir);
+            sweep(&dir, io);
         }
         let _ = crate::cache::write_atomic(io.filesystem(), &file, &kept);
     }

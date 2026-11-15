@@ -406,6 +406,10 @@ pub fn sample(track: &Track, frame: f64) -> ([f64; 3], Option<[f64; 3]>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

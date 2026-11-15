@@ -627,7 +627,7 @@ impl Worker {
     fn look(&mut self) {
         let stamps: Vec<Option<std::time::SystemTime>> = crate::plans::watched(&self.core.project)
             .iter()
-            .map(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+            .map(|path| self.core.project.io.filesystem().stat(path).ok().and_then(|stat| stat.modified))
             .collect();
         *self.plans.lock().unwrap_or_else(PoisonError::into_inner) = Some(stamps);
         let found = extensions::found(&self.core.project);

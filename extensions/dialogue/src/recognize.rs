@@ -53,7 +53,11 @@ struct Payload<'a> {
 impl Payload<'_> {
     fn uses(&self, cell: u16) -> impl Iterator<Item = (&[u16], usize)> {
         self.streams.iter().flat_map(move |codes| {
-            codes.iter().enumerate().filter(move |(_, c)| draws(**c) && **c & CELL_MASK == cell).map(move |(n, _)| (codes.as_slice(), n))
+            codes
+                .iter()
+                .enumerate()
+                .filter(move |(_, c)| draws(**c) && **c & CELL_MASK == cell)
+                .map(move |(n, _)| (codes.as_slice(), n))
         })
     }
 
@@ -151,7 +155,8 @@ pub fn recognize(
     let mut notes = Vec::new();
     let mut ambiguous: Vec<(u16, Vec<String>)> = Vec::new();
     for (&cell, h) in &payload.hashes {
-        let names: Vec<String> = if h == "space" { vec![" ".into()] } else { table.get(h).cloned().unwrap_or_default() };
+        let names: Vec<String> =
+            if h == "space" { vec![" ".into()] } else { table.get(h).cloned().unwrap_or_default() };
         let char = match (names.len(), chosen.get(&cell)) {
             (0, _) => {
                 notes.push(Note::Unseen { cell, hash: h.clone() });
@@ -225,6 +230,10 @@ pub fn recognize(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -251,7 +260,8 @@ mod tests {
             c
         };
         let a = Picture { width: 1, height: 12, values: vec![5; 12] };
-        let shared = Picture { width: 3, height: 12, values: (0..36).map(|i| if i % 3 == 1 { 7 } else { 0 }).collect() };
+        let shared =
+            Picture { width: 3, height: 12, values: (0..36).map(|i| if i % 3 == 1 { 7 } else { 0 }).collect() };
         let table: BTreeMap<String, Vec<String>> =
             [(hash(&shared), vec!["I".into(), "l".into()]), (hash(&a), vec!["a".into()])].into();
         // "I" then "al": cell 25 stands alone, cell 26 follows a lowercase letter.

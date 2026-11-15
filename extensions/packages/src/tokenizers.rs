@@ -601,6 +601,10 @@ pub fn register(r: &mut Registry) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
     use pe2_model::model::{Model, Part, arrays};

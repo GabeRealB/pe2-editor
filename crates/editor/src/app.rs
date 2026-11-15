@@ -1317,15 +1317,15 @@ impl Editor {
         let (done, result) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         let what = format!("{} as {}", path.name().unwrap_or_default(), exporter.label);
-        let reveal = exporting.reveal;
+        let (reveal, io) = (exporting.reveal, self.io.clone());
         let made = std::thread::Builder::new().name("export".into()).spawn(move || {
             let made = (|| -> anyhow::Result<String> {
                 let asset = anyhow::Context::context(index.assets.get(&path), "the asset is gone")?;
                 let bytes = extensions.export(&index, asset, &exporter.output, member.as_deref())?;
                 if let Some(folder) = to.parent() {
-                    std::fs::create_dir_all(&folder)?;
+                    io.filesystem().create_folder_all(&folder)?;
                 }
-                anyhow::Context::with_context(std::fs::write(&to, bytes), || to.to_string())?;
+                anyhow::Context::with_context(io.filesystem().write(&to, &bytes), || to.to_string())?;
                 if reveal && let Some(folder) = to.parent() {
                     let _ = crate::external::open_default(&folder);
                 }
@@ -2757,6 +2757,9 @@ impl Editor {
         let Some(ws) = &self.workspace else { return };
         let asset = ws.selected.as_ref().and_then(|path| ws.index.assets.get(path)).cloned();
         let files: Vec<std::path::PathBuf> = text.lines().filter_map(local_path).collect();
+        // The user's files, not the project's: looked at as they are named.
+        let fs = self.io.filesystem();
+        let is_file = |file: &std::path::Path| HostPath::new(file).is_ok_and(|place| fs.is_file(&place));
         let (mut replace, mut add, mut cancel) = (false, false, false);
         let mut made: Option<(String, std::path::PathBuf)> = None;
         egui::Window::new("Import")
@@ -2770,8 +2773,7 @@ impl Editor {
                 // A node of its own, as the templates taking it make one.
                 if let [file] = files.as_slice() {
                     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                    for template in
-                        ws.extensions.templates_for(name).into_iter().filter(|t| t.offered && file.is_file())
+                    for template in ws.extensions.templates_for(name).into_iter().filter(|t| t.offered && is_file(file))
                     {
                         if ui.button(format!("New node: {}", template.label)).clicked() {
                             made = Some((template.name.clone(), file.clone()));
@@ -2785,7 +2787,7 @@ impl Editor {
                 };
                 let name = asset.path.name().unwrap_or_default();
                 let missing =
-                    files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
+                    files.iter().find(|file| !is_file(file)).map(|file| format!("{} is not a file", file.display()));
                 let name_of =
                     |file: &std::path::Path| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
                 let stack = match files.as_slice() {
@@ -2825,7 +2827,7 @@ impl Editor {
         let requests: Result<Vec<EditRequest>, String> = if replace {
             ws.replacing(&asset, &files[0])
         } else {
-            files.iter().map(|file| crate::workspace::adding(&asset, file)).collect()
+            files.iter().map(|file| crate::workspace::adding(self.io.filesystem(), &asset, file)).collect()
         };
         self.import = None;
         match requests {
@@ -2862,7 +2864,7 @@ impl Editor {
         if make {
             let dir = std::path::Path::new(text.trim()).to_path_buf();
             self.new_dialog = None;
-            match project::create(&dir) {
+            match project::create(&dir, self.io.filesystem()) {
                 Ok(()) => self.open(&dir),
                 Err(why) => self.message = Some(format!("No project was made: {why:#}")),
             }
@@ -2920,8 +2922,9 @@ impl Editor {
             capture.requested = true;
             capture.pending.store(1, Ordering::Release);
             let (path, pending, repaint) = (capture.path.clone(), capture.pending.clone(), ctx.clone());
+            let io = self.io.clone();
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |image| {
-                if let Err(e) = save_png(&path, &image) {
+                if let Err(e) = save_png(io.filesystem(), &path, &image) {
                     eprintln!("{}: {e}", path.display());
                 }
                 pending.store(0, Ordering::Release);
@@ -3335,21 +3338,27 @@ fn local_path(line: &str) -> Option<std::path::PathBuf> {
     Some(line.into())
 }
 
-fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
+fn save_png(
+    fs: &dyn pe2_io::Filesystem,
+    path: &std::path::Path,
+    image: &egui::ColorImage,
+) -> Result<(), Box<dyn std::error::Error>> {
     let [width, height] = image.size;
-    let mut encoder = png::Encoder::new(
-        std::io::BufWriter::new(std::fs::File::create(path)?),
-        u32::try_from(width)?,
-        u32::try_from(height)?,
-    );
+    let mut written = Vec::new();
+    let mut encoder = png::Encoder::new(&mut written, u32::try_from(width)?, u32::try_from(height)?);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let pixels: Vec<u8> = image.pixels.iter().flat_map(egui::Color32::to_array).collect();
     encoder.write_header()?.write_image_data(&pixels)?;
+    fs.write(&HostPath::new(path)?, &written)?;
     Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::local_path;
 

@@ -13,10 +13,13 @@ What code reads of the outside world - the time, a wait for it, randomness, the 
 I/O its owner was given (`pe2_io::Io`: a project's, the writes', a holder's), never from the system; the build refuses
 the system's own calls (`clippy.toml`). Where one is right - a measurement, the window's pace, what every process
 shares, a test's fixtures - it is allowed where it is made, saying why. `pe2-io` alone reads the system, and the
-setup crate, whose folder is the machine's. Files go the same way: the shared filesystem and the project's storage
-(content, the store, packs, records, the index, history, plans) open, read, write, lock and map them through the
-`Io`'s `Filesystem` - a folder and names within it, as `wasi:filesystem` has them, and places whole, as `std::fs`
-does - the rest of the host following.
+setup crate, whose folder is the machine's. Files go the same way: everything that opens, reads, writes, lists, locks
+or maps one - the shared filesystem, the project's storage, the served folder, the holder, the programs, a file the
+user names - does it through the `Io`'s `Filesystem` (a folder and names within it, as `wasi:filesystem` has them,
+and places whole, as `std::fs` does), and the build refuses `std::fs` and `Path`'s own. What is allowed says why:
+what the processes on a machine find each other by (the project lock, roles, presence, the scopes' markers, trust),
+the program's own files (its settings, what it keeps beside it), and what only the system's own calls reach (a
+backend's mount points, what is touched through a mount for the kernel to hear).
 
 What a build needs that is no crate is pinned in `prepare.toml`, as an extension's `[[setup]]` entries are, and fetched
 by `cargo xtask prepare` into `prepared/<platform>/`; the editor crate's build script fails by name until it is there

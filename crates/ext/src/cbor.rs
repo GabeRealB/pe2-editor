@@ -26,6 +26,10 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn a_table_reads_back_as_it_was() {

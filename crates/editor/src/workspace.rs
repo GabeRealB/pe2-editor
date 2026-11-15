@@ -512,10 +512,14 @@ pub enum GraphAsk {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn adding(asset: &Asset, file: &std::path::Path) -> std::result::Result<EditRequest, String> {
+pub fn adding(
+    fs: &dyn pe2_io::Filesystem,
+    asset: &Asset,
+    file: &std::path::Path,
+) -> std::result::Result<EditRequest, String> {
     let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
     let file_name = RelPath::new(name).map_err(|e| format!("{name}: {e}"))?;
-    let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let bytes = read_named(fs, file)?;
     let short = asset.path.name().unwrap_or_default();
     Ok(EditRequest::Write {
         uid: asset.uid.ok_or("It has no uid")?,
@@ -745,12 +749,21 @@ impl Drop for Leaving {
     }
 }
 
+/// A file the user names, read whole; why not, said as the window says it.
+///
+/// # Errors
+/// It is no place the system names, or cannot be read.
+pub fn read_named(fs: &dyn pe2_io::Filesystem, file: &std::path::Path) -> std::result::Result<Vec<u8>, String> {
+    let place = HostPath::new(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    fs.read(&place).map_err(|e| format!("{}: {e}", file.display()))
+}
+
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
 /// one running, or `pe2-cli` beside the editor started as one. Where that is not there, none does.
 fn stand_by(root: &HostPath, io: Arc<dyn pe2_io::Io>) {
     let Ok(program) = io.environment().current_exe() else { return };
     let program = project::host::cli_beside(&program.into_path_buf());
-    if !program.is_file() {
+    if !HostPath::new(&program).is_ok_and(|place| io.filesystem().is_file(&place)) {
         return;
     }
     let root = root.clone();
@@ -787,7 +800,10 @@ impl Loaded {
         let extensions = extensions::for_project(&project);
         // What they are asked in passing reads and keeps what the project's store holds.
         extensions.keep_in(store.clone());
-        let layer_view: LayerView = std::fs::read_to_string(cache.dir.join(&LAYER_VIEW))
+        let layer_view: LayerView = project
+            .io
+            .filesystem()
+            .read_to_string(&cache.dir.join(&LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
@@ -858,8 +874,8 @@ impl Workspace {
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
         let old = cache.path(pe2_path::Name::constant("artifacts"));
-        if old.exists() {
-            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
+        if io.filesystem().exists(&old) {
+            io.filesystem().remove_all(&old).with_context(|| old.display().to_string())?;
         }
         let Loaded { project, index, extensions, found: extensions_found, layer_view } =
             Loaded::of(project, index, &cache, &store, report);
@@ -1335,7 +1351,7 @@ impl Workspace {
         };
         let made_at = path.clone();
         let work: Made = Box::new(move |w| {
-            let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
+            let bytes = file.map(|file| read_named(w.core.project.io.filesystem(), &file)).transpose()?;
             let files: Vec<(&RelPath, &[u8])> = named.as_deref().zip(bytes.as_deref()).into_iter().collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, uid, &made_at, node, &mut w.history)
@@ -2614,7 +2630,7 @@ impl Workspace {
         let uid = asset.uid.ok_or("It has no uid")?;
         let named = RelPath::new(name).map_err(|e| format!("{name}: {e}"))?;
         let declaration = project::graph::layers::with_new_stack(asset.text(), &stack).map_err(|e| format!("{e:#}"))?;
-        let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let bytes = read_named(self.project.io.filesystem(), file)?;
         let short = asset.path.name().unwrap_or_default();
         let (label, merge) = (format!("Import {name} over {short}"), Some(format!("import {}", asset.path)));
         let write = |file: Arc<RelPath>, bytes: Vec<u8>| EditRequest::Write {

@@ -101,6 +101,10 @@ pub fn matrix(rotation: [f64; 3]) -> [[i16; 3]; 3] {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

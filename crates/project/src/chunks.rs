@@ -94,7 +94,7 @@ fn put_in_place(fs: &dyn Filesystem, path: &HostPath, bytes: &[u8]) -> io::Resul
 /// Have on disk what this process wrote into the stores of the project in `root` since it last did: before a
 /// record that names any of it is said in the log, so that what the log brings back names nothing a loss of power
 /// took (`storage::Storage::say`). What it wrote for another project is that one's to have on disk.
-pub fn sync_written(root: &HostPath) {
+pub fn sync_written(fs: &dyn Filesystem, root: &HostPath) {
     let written: Vec<HostPath> = {
         let mut all = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ours, others) = std::mem::take(&mut *all).into_iter().partition(|path| path.starts_with(root));
@@ -102,7 +102,7 @@ pub fn sync_written(root: &HostPath) {
         ours
     };
     for path in written {
-        crate::storage::sync_file(&path);
+        pe2_io::sync_file(fs, &path);
     }
 }
 /// The name a manifest adds to its file's.
@@ -845,7 +845,7 @@ mod tests {
     fn a_tree_keeps_its_objects_from_a_sweep_while_something_names_it() {
         let root = crate::testing::scratch("chunks-tree");
         let _ = std::fs::remove_dir_all(&root);
-        crate::create(&root).unwrap();
+        crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
         let project = crate::Project::load(&root).unwrap();
         let store = Store::at(&root, crate::testing::io());
         let folder = root.at("x.extension");
@@ -873,7 +873,7 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let root = crate::testing::scratch("chunks-sweep");
         let _ = std::fs::remove_dir_all(&root);
-        crate::create(&root).unwrap();
+        crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
         let project = crate::Project::load(&root).unwrap();
         let store = Store { dir: root.join(&crate::LAYERS).join(&super::STORE), io: crate::testing::io() };
         let (old, fresh, again) = (content(200_000, 1), content(200_000, 2), content(200_000, 3));

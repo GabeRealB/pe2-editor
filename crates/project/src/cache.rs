@@ -45,19 +45,19 @@ impl Cache {
     pub fn open(project: &Project, _lock: &Lock) -> Result<Cache> {
         let dir = project.root.join(&DIR);
         let version = format!("schema {SCHEMA}\nproject {}\n", env!("CARGO_PKG_VERSION"));
-        let current = std::fs::read_to_string(dir.join(&VERSION)).ok();
-        if current.as_deref() != Some(version.as_str()) && dir.exists() {
+        let current = project.io.filesystem().read_to_string(&dir.join(&VERSION)).ok();
+        if current.as_deref() != Some(version.as_str()) && project.io.filesystem().exists(&dir) {
             // Everything but what the process opening the cache holds - the project lock, and its agents' socket - and
             // what a host and the server serving its folder have there.
-            for entry in std::fs::read_dir(&dir).with_context(|| format!("{}", dir.display()))? {
-                let entry = entry?;
+            let fs = project.io.filesystem();
+            for entry in fs.read_directory(&dir).with_context(|| format!("{}", dir.display()))? {
                 let running = |n: &str| n.starts_with("host.") || n.starts_with("server.");
                 let kept = |n: &str| n.starts_with("lock") || running(n) || n == SOCKET || n == STAGING;
-                if entry.file_name().to_str().is_some_and(kept) {
+                if entry.name.to_str().is_some_and(kept) {
                     continue;
                 }
-                let path = entry.path();
-                if entry.file_type()?.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) }
+                let path = dir.entry(&entry.name);
+                if entry.kind == pe2_io::Kind::Folder { fs.remove_all(&path) } else { fs.remove_file(&path) }
                     .with_context(|| format!("wiping {}", path.display()))?;
             }
         }
@@ -87,7 +87,7 @@ pub fn make(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<HostPath> {
     let dir = root.join(&DIR);
     fs.create_folder_all(&dir).with_context(|| format!("{}", dir.display()))?;
     let ignore = dir.join(&GITIGNORE);
-    if !ignore.exists() {
+    if !fs.exists(&ignore) {
         write_atomic(fs, &ignore, b"*\n")?;
     }
     Ok(dir)
@@ -128,6 +128,10 @@ pub(crate) fn remove_all(root: &HostPath) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use crate::testing::At as _;
     #[test]

@@ -217,6 +217,10 @@ pub use ui::{
 };
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod references {
     use super::{Value, address_of, asked_of, fragment_of, query_of, target_of};
 

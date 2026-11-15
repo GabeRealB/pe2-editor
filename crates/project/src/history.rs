@@ -247,6 +247,8 @@ pub struct View {
     documents: BTreeMap<Uid, Document>,
     /// What a session a crash ended left, until it is taken up or let go.
     left: Option<Session>,
+    /// The project's I/O, which what it keeps is read through.
+    io: pe2_io::Held,
 }
 
 pub struct History {
@@ -276,8 +278,8 @@ pub struct History {
 
 impl View {
     /// What a history in `dir` shows before it holds anything.
-    fn new(dir: HostPath) -> View {
-        View { dir, done: Vec::new(), undone: Vec::new(), documents: BTreeMap::new(), left: None }
+    fn new(dir: HostPath, io: Arc<dyn pe2_io::Io>) -> View {
+        View { dir, done: Vec::new(), undone: Vec::new(), documents: BTreeMap::new(), left: None, io: pe2_io::Held(io) }
     }
 
     /// The session a crash ended, where one was left and is not taken up or let go yet.
@@ -380,7 +382,10 @@ impl View {
 
     fn blob(&self, hash: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let path = self.blob_path(hash)?;
-        std::fs::read(&path).with_context(|| format!("{}: a content the history kept is gone", path.display()))
+        self.io
+            .filesystem()
+            .read(&path)
+            .with_context(|| format!("{}: a content the history kept is gone", path.display()))
     }
 }
 
@@ -407,8 +412,9 @@ impl History {
     /// The history's folder cannot be read, cleared or made.
     pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
         let dir = cache.path(DIR);
+        let fs = cache.io.filesystem();
         let mut history = History {
-            view: View::new(dir.clone()),
+            view: View::new(dir.clone(), cache.io.clone()),
             merge_within: MERGE_WITHIN,
             io: cache.io.clone(),
             revision: std::cell::Cell::new(0),
@@ -420,21 +426,23 @@ impl History {
             storage: cache.dir.parent().and_then(|root| crate::storage::Storage::open(&root, cache.io.clone())),
         };
         let recovered = cache.recovered.clone();
-        let left = std::fs::read_to_string(dir.join(&SESSION))
+        let left = fs
+            .read_to_string(&dir.join(&SESSION))
             .ok()
             .and_then(|text| Session::read(&text))
             .filter(|left| !left.done.is_empty() || !left.undone.is_empty() || !left.documents.is_empty());
         if left.is_some() {
             // What it kept stays, for what it left to be taken up; the trash goes on numbering after it.
-            history.trashed = std::fs::read_dir(dir.join(&TRASH))
-                .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<usize>().ok()).max())
+            history.trashed = fs
+                .read_directory(&dir.join(&TRASH))
+                .map(|entries| entries.iter().filter_map(|e| e.name.to_str()?.parse::<usize>().ok()).max())
                 .ok()
                 .flatten()
                 .unwrap_or(0);
-        } else if dir.exists() {
-            std::fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+        } else if fs.exists(&dir) {
+            fs.remove_all(&dir).with_context(|| format!("{}", dir.display()))?;
         }
-        std::fs::create_dir_all(dir.join(&BLOBS)).with_context(|| format!("{}", dir.display()))?;
+        fs.create_folder_all(&dir.join(&BLOBS)).with_context(|| format!("{}", dir.display()))?;
         history.view.left = left;
         Ok((history, recovered))
     }
@@ -473,7 +481,7 @@ impl History {
 
     /// What the session kept, wiped: it is closing cleanly, and goes with this.
     pub fn wipe(&self) {
-        let _ = std::fs::remove_dir_all(&self.view.dir);
+        let _ = self.io.filesystem().remove_all(&self.view.dir);
     }
 
     /// The time now, as a step says when it was made: milliseconds since the epoch.
@@ -855,7 +863,8 @@ impl History {
             if forwards { step.changes.clone() } else { step.changes.iter().rev().map(Change::inverse).collect() };
         let edits: Vec<Edit> =
             if forwards { step.edits.clone() } else { step.edits.iter().rev().map(Edit::inverse).collect() };
-        let mut differing: Vec<String> = Self::changed(&list).iter().map(ToString::to_string).collect();
+        let mut differing: Vec<String> =
+            Self::changed(self.io.filesystem(), &list).iter().map(ToString::to_string).collect();
         differing.extend(self.edited(index, &edits));
         if !differing.is_empty() {
             if !force {
@@ -891,7 +900,7 @@ impl History {
     /// The files not as a list of changes expects them, followed in order: a file written twice is expected as the
     /// first write left it. Folders are not checked: one made is there or not, and one to remove that holds something
     /// now is left alone.
-    fn changed(list: &[Change]) -> Vec<HostPath> {
+    fn changed(fs: &dyn pe2_io::Filesystem, list: &[Change]) -> Vec<HostPath> {
         let mut state: HashMap<&HostPath, Option<pe2_ext::Sha1>> = HashMap::new();
         // Whether what an earlier move took away or put there is there, as the list leaves it.
         let mut moved: HashMap<&HostPath, bool> = HashMap::new();
@@ -899,7 +908,7 @@ impl History {
         for change in list {
             match change {
                 Change::Write { path, before, after } => {
-                    let now = state.get(path).copied().unwrap_or_else(|| current_hash(path));
+                    let now = state.get(path).copied().unwrap_or_else(|| current_hash(fs, path));
                     if now != *before {
                         differing.push(path.clone());
                     }
@@ -907,7 +916,7 @@ impl History {
                 }
                 Change::Rename { from, to } => {
                     let untouched = !state.contains_key(from) && !state.contains_key(to);
-                    let there = |path: &HostPath| moved.get(path).copied().unwrap_or_else(|| path.exists());
+                    let there = |path: &HostPath| moved.get(path).copied().unwrap_or_else(|| fs.exists(path));
                     if untouched && (!there(from) || there(to)) {
                         differing.push(from.clone());
                     }
@@ -915,7 +924,7 @@ impl History {
                     moved.insert(to, true);
                 }
                 Change::MakeDir { path } => {
-                    if path.exists() && !path.is_dir() {
+                    if fs.exists(path) && !fs.is_folder(path) {
                         differing.push(path.clone());
                     }
                 }
@@ -1079,10 +1088,9 @@ impl History {
             documents: documents.iter().map(|uid| (*uid, self.view.documents.get(uid))).collect(),
         };
         let appended = serde_json::to_string(&since).ok().and_then(|mut text| {
-            use std::io::Write as _;
             text.push('\n');
-            let mut file = std::fs::OpenOptions::new().append(true).open(self.view.dir.join(&SESSION)).ok()?;
-            file.write_all(text.as_bytes()).ok()?;
+            let file = self.io.filesystem().open(&self.view.dir.join(&SESSION), pe2_io::Open::APPEND).ok()?;
+            file.append(text.as_bytes()).ok()?;
             Some(text.len() as u64)
         });
         match appended {
@@ -1096,23 +1104,23 @@ impl History {
             Change::Write { path, after: Some(hash), .. } => {
                 write_atomic(self.io.filesystem(), path, &self.blob(hash)?)
             }
-            Change::Write { path, after: None, .. } => match std::fs::remove_file(path) {
+            Change::Write { path, after: None, .. } => match self.io.filesystem().remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context(path.display().to_string()),
                 _ => Ok(()),
             },
             Change::Rename { from, to } => {
-                std::fs::rename(from, to).with_context(|| format!("{} -> {}", from.display(), to.display()))
+                self.io.filesystem().rename(from, to).with_context(|| format!("{} -> {}", from.display(), to.display()))
             }
             Change::MakeDir { path } => {
-                if path.is_dir() {
+                if self.io.filesystem().is_folder(path) {
                     return Ok(());
                 }
-                std::fs::create_dir(path).with_context(|| path.display().to_string())
+                self.io.filesystem().create_folder(path).with_context(|| path.display().to_string())
             }
             // A folder that holds something now (put there since, outside the editor) is left as it is.
             Change::RemoveDir { path } => {
-                if is_empty_dir(path) {
-                    std::fs::remove_dir(path).with_context(|| path.display().to_string())?;
+                if pe2_io::is_empty_folder(self.io.filesystem(), path) {
+                    self.io.filesystem().remove_folder(path).with_context(|| path.display().to_string())?;
                 }
                 Ok(())
             }
@@ -1126,7 +1134,7 @@ impl History {
 
     /// Keep a file's current content; its hash, none where it is absent.
     fn keep_current(&self, path: &HostPath) -> Result<Option<pe2_ext::Sha1>> {
-        match crate::storage::read(path) {
+        match crate::storage::read(self.io.filesystem(), path) {
             Ok(Some(bytes)) => self.keep(&bytes).map(Some),
             Ok(None) => Ok(None),
             Err(e) => Err(e).with_context(|| path.display().to_string()),
@@ -1328,7 +1336,9 @@ impl Transaction<'_> {
             Seen::File(Some(hash)) => self.history.blob(&hash).map(Some),
             Seen::File(None) | Seen::Folder | Seen::Gone => Ok(None),
             // As what waits to be written leaves it, then as the disk has it.
-            Seen::Disk(at) => crate::storage::read(&at).with_context(|| at.display().to_string()),
+            Seen::Disk(at) => {
+                crate::storage::read(self.history.io.filesystem(), &at).with_context(|| at.display().to_string())
+            }
         }
     }
 
@@ -1336,15 +1346,17 @@ impl Transaction<'_> {
         self.pending(path).unwrap_or_else(|| {
             let at = self.on_disk(path);
             // A file as what waits to be written leaves it; a folder there for what waits in it.
-            crate::storage::waiting(&at)
-                .map_or_else(|| at.exists() || crate::storage::folder_waits(&at), |waits| waits.is_some())
+            crate::storage::waiting(&at).map_or_else(
+                || self.history.io.filesystem().exists(&at) || crate::storage::folder_waits(&at),
+                |waits| waits.is_some(),
+            )
         })
     }
 
     fn is_file(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::File(after) => after.is_some(),
-            Seen::Disk(at) => crate::storage::is_file(&at),
+            Seen::Disk(at) => crate::storage::is_file(self.history.io.filesystem(), &at),
             Seen::Folder | Seen::Gone => false,
         }
     }
@@ -1352,7 +1364,7 @@ impl Transaction<'_> {
     fn is_dir(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::Folder => true,
-            Seen::Disk(at) => at.is_dir(),
+            Seen::Disk(at) => self.history.io.filesystem().is_folder(&at),
             Seen::File(_) | Seen::Gone => false,
         }
     }
@@ -1436,7 +1448,7 @@ impl Transaction<'_> {
         if self.is_dir(path) {
             self.history.trashed += 1;
             let trash = self.history.view.dir.join(&TRASH);
-            std::fs::create_dir_all(&trash)?;
+            self.history.io.filesystem().create_folder_all(&trash)?;
             let to = trash.join(&Name::new(&self.history.trashed.to_string())?);
             self.change(Change::Rename { from: path.clone(), to });
             return Ok(());
@@ -1461,11 +1473,12 @@ impl Transaction<'_> {
         }
         self.history.trashed += 1;
         let trash = self.history.view.dir.join(&TRASH);
-        std::fs::create_dir_all(&trash)?;
+        self.history.io.filesystem().create_folder_all(&trash)?;
         let staged = trash.join(&Name::new(&self.history.trashed.to_string())?);
-        copy_all(from, &staged).with_context(|| format!("{} to {}", from.display(), staged.display()))?;
+        pe2_io::copy_all(self.history.io.filesystem(), from, &staged)
+            .with_context(|| format!("{} to {}", from.display(), staged.display()))?;
         // On disk before the log says it is moved into place: the log holds the move, not what is moved.
-        sync_all(&staged);
+        pe2_io::sync_all(self.history.io.filesystem(), &staged);
         self.make_parents(to);
         self.change(Change::Rename { from: staged, to: to.clone() });
         Ok(())
@@ -1522,53 +1535,26 @@ enum Seen {
     Disk(HostPath),
 }
 
-/// Have a file, or a folder and all in it, on disk: best effort.
-fn sync_all(path: &HostPath) {
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-            sync_all(&path.entry(&entry.file_name()));
-        }
-        if cfg!(unix) {
-            let _ = std::fs::File::open(path).and_then(|folder| folder.sync_all());
-        }
-    } else {
-        crate::storage::sync_file(path);
-    }
-}
-
-/// A file or a folder copied, with everything in it; a file keeps its permissions.
-fn copy_all(from: &HostPath, to: &HostPath) -> std::io::Result<()> {
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for entry in std::fs::read_dir(from)? {
-            let entry = entry?;
-            copy_all(&from.entry(&entry.file_name()), &to.entry(&entry.file_name()))?;
-        }
-        return Ok(());
-    }
-    std::fs::copy(from, to).map(drop)
-}
-
 /// Keep bytes in a history's folder, once: their hash.
 fn keep_in(fs: &dyn pe2_io::Filesystem, dir: &HostPath, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
     let hash = crate::extract::sha1_of(bytes);
     let path = dir.join(&BLOBS).join(&Name::new(&hash.to_string())?);
-    if !path.exists() {
+    if !fs.exists(&path) {
         write_atomic(fs, &path, bytes)?;
     }
     Ok(hash)
 }
 
 /// The hash of what a file holds - as what waits to be written leaves it; none where it is absent.
-fn current_hash(path: &HostPath) -> Option<pe2_ext::Sha1> {
-    crate::storage::read(path).ok().flatten().map(|bytes| crate::extract::sha1_of(&bytes))
-}
-
-fn is_empty_dir(path: &HostPath) -> bool {
-    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+fn current_hash(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Option<pe2_ext::Sha1> {
+    crate::storage::read(fs, path).ok().flatten().map(|bytes| crate::extract::sha1_of(&bytes))
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{History, Kind, StepError};
     use crate::Project;
@@ -1781,19 +1767,21 @@ mod tests {
         tx.commit().unwrap();
         // Said, and no file touched - nor their folders made: read as the set leaves them by whoever asks.
         assert!(!a.exists() && !a.parent().unwrap().exists());
-        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(read_through(&pe2_io::SystemFilesystem, &a).unwrap().as_deref(), Some(&b"one"[..]));
         assert_eq!(waiting_under(&a.parent().unwrap().parent().unwrap()).len(), 2);
         // Changed again and removed while they wait: each as the last set leaves it.
         let mut tx = history.begin("again");
         tx.write_stored(&a, b"ONE!").unwrap();
         tx.remove(&b).unwrap();
         tx.commit().unwrap();
-        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"ONE!"[..]));
-        assert!(!is_file(&b) && read_through(&b).unwrap().is_none());
+        assert_eq!(read_through(&pe2_io::SystemFilesystem, &a).unwrap().as_deref(), Some(&b"ONE!"[..]));
+        assert!(
+            !is_file(&pe2_io::SystemFilesystem, &b) && read_through(&pe2_io::SystemFilesystem, &b).unwrap().is_none()
+        );
         // Undone and redone while they wait, as when they are files.
         history.undo(&index, None, false).unwrap();
-        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"one"[..]));
-        assert_eq!(read_through(&b).unwrap().as_deref(), Some(&b"two"[..]));
+        assert_eq!(read_through(&pe2_io::SystemFilesystem, &a).unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(read_through(&pe2_io::SystemFilesystem, &b).unwrap().as_deref(), Some(&b"two"[..]));
         history.redo(&index, None, false).unwrap();
         let (said, _) = waiting_since(&a).unwrap();
         // Written: the files as the last set left them, each stamped with when its change was said - what read

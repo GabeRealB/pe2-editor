@@ -53,7 +53,7 @@ impl Written {
     /// Its file, or the log, cannot be read.
     pub fn read(&self, filesystem: &dyn pe2_io::Filesystem) -> std::io::Result<Vec<u8>> {
         match self {
-            Written::File(file) => std::fs::read(file),
+            Written::File(file) => filesystem.read(file),
             Written::Logged { log, len, ranges } => {
                 let log = sfs::Log::shared(log, sfs::log::Config::default(), filesystem)?;
                 let mut bytes = Vec::with_capacity(usize::try_from(*len).unwrap_or(0));
@@ -420,6 +420,10 @@ fn new_uid(index: &Index) -> Uid {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::is_junk;
 

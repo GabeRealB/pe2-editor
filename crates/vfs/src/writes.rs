@@ -216,7 +216,8 @@ impl State {
 struct Given {
     pins: Arc<Mutex<Vec<u64>>>,
     pin: Option<u64>,
-    file: Option<HostPath>,
+    /// The file it was written out to, and the I/O that removes it.
+    file: Option<(HostPath, Arc<dyn pe2_io::Io>)>,
     /// The file's number in the log, and where the log ended when it was read.
     taken: Option<(u64, u64)>,
     /// How many times the file had been changed when it was read.
@@ -231,8 +232,8 @@ impl Drop for Given {
                 pins.swap_remove(at);
             }
         }
-        if let Some(file) = &self.file {
-            let _ = std::fs::remove_file(file);
+        if let Some((file, io)) = &self.file {
+            let _ = io.filesystem().remove_file(file);
         }
     }
 }
@@ -350,13 +351,14 @@ impl Writes {
         let Some(space) = served.space() else {
             return Err(io::Error::other("what is written through is a view of the shared filesystem"));
         };
-        std::fs::create_dir_all(dir)?;
+        let fs = io.filesystem();
+        fs.create_folder_all(dir)?;
         // Emptied of what a serving before this one staged - but the log and the space the project's processes
         // share, which whoever holds the project may have open.
         let shared = |name: &std::ffi::OsStr| name == LOG || name == project::shared::SPACE;
-        for entry in std::fs::read_dir(dir)?.flatten().filter(|entry| !shared(&entry.file_name())) {
-            let path = dir.entry(&entry.file_name());
-            let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        for entry in fs.read_directory(dir)?.iter().filter(|entry| !shared(&entry.name)) {
+            let path = dir.entry(&entry.name);
+            let _ = if entry.kind == pe2_io::Kind::Folder { fs.remove_all(&path) } else { fs.remove_file(&path) };
         }
         let log = sfs::Log::shared(&dir.join(&LOG), log, io.filesystem())?;
         let waiter = io.clock().waiter();
@@ -654,7 +656,7 @@ impl Writes {
         let pins = self.0.pins.clone();
         let Some(ranges) = ranges else {
             let file = self.written_out(content)?;
-            let given = Given { pins, pin: None, file: Some(file.clone()), taken: None, changes };
+            let given = Given { pins, pin: None, file: Some((file.clone(), self.0.io.clone())), taken: None, changes };
             return Ok((Written::File(file), given));
         };
         // Pinned before the log could be let go of past it: the content is still held by who asked.
@@ -676,7 +678,8 @@ impl Writes {
             state.next
         };
         let path = self.0.dir.join(&pe2_path::Name::new(&number.to_string()).map_err(io::Error::other)?);
-        let mut out = io::BufWriter::new(std::fs::File::create(&path)?);
+        let file = self.0.io.filesystem().open(&path, pe2_io::Open::APPEND)?;
+        let mut out = io::BufWriter::new(pe2_io::Appending(file));
         reading(content).write_to(&self.0.log, &mut out)?;
         io::Write::flush(&mut out)?;
         Ok(path)
@@ -1711,13 +1714,15 @@ impl Writes {
     /// takes now stays due, and is asked for again in a moment.
     fn ask(&self) {
         loop {
+            // Asked again a moment after it was asked, however long it took to answer.
+            let asked = self.now();
             {
                 let mut state = self.lock();
                 if state.asked.is_empty() {
                     (state.again, state.waiting) = (None, false);
                     return;
                 }
-                if state.again.is_some_and(|again| again > self.now()) {
+                if state.again.is_some_and(|again| again > asked) {
                     return;
                 }
             }
@@ -1729,7 +1734,7 @@ impl Writes {
                     let mut state = self.lock();
                     if answered == 0 {
                         // It looked, and took nothing of ours: asked again in a moment.
-                        state.again = Some(self.now() + AGAIN);
+                        state.again = Some(asked + AGAIN);
                         return;
                     }
                     (state.again, state.waiting) = (None, false);
@@ -1739,7 +1744,7 @@ impl Writes {
                     if !std::mem::replace(&mut state.waiting, true) {
                         eprintln!("what was done through the folder is kept until the project can be told: {why}");
                     }
-                    state.again = Some(self.now() + AGAIN);
+                    state.again = Some(asked + AGAIN);
                     return;
                 }
             }
@@ -1795,7 +1800,7 @@ impl Writes {
         for (path, content) in left {
             if let Ok(file) = self.written_out(&content) {
                 self.0.owner.left(TreePath::within(&path), &file);
-                let _ = std::fs::remove_file(file);
+                let _ = self.0.io.filesystem().remove_file(&file);
             }
         }
         // Ended with nothing in transit that is not its owner's now: what the log holds is nobody's to take up,

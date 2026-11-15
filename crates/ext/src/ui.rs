@@ -584,6 +584,10 @@ fn plain(why: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     #[test]
     fn what_went_wrong_is_said_without_its_place() {

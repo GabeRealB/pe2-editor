@@ -113,6 +113,12 @@ pub trait Filesystem: Send + Sync {
     /// The system cannot, there.
     fn hard_link(&self, from: &HostPath, to: &HostPath) -> io::Result<()>;
 
+    /// Make `at` a link to `target`, where the system makes links (on Unix; elsewhere `Unsupported`).
+    ///
+    /// # Errors
+    /// The system makes no links, or not there.
+    fn symlink(&self, target: &HostPath, at: &HostPath) -> io::Result<()>;
+
     /// Where a link leads, as it says.
     ///
     /// # Errors
@@ -563,6 +569,18 @@ impl Filesystem for SystemFilesystem {
         std::fs::read_link(at)
     }
 
+    fn symlink(&self, target: &HostPath, at: &HostPath) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, at)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, at);
+            Err(io::Error::new(io::ErrorKind::Unsupported, "links are made on Unix"))
+        }
+    }
+
     fn set_readonly(&self, at: &HostPath, readonly: bool) -> io::Result<()> {
         let mut permissions = std::fs::metadata(at)?.permissions();
         if permissions.readonly() != readonly {
@@ -872,6 +890,20 @@ fn allocate(file: &std::fs::File, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// A file open to append (`Open::APPEND`) as a stream is written: what writes one, written through.
+pub struct Appending(pub Box<dyn Descriptor>);
+
+impl io::Write for Appending {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.append(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A file's whole content, read by position.
 ///
 /// # Errors
@@ -966,4 +998,48 @@ pub fn remove_all_at(folder: &dyn Descriptor, path: &RelPath) -> io::Result<()> 
     }
     drop(inside);
     folder.remove_directory_at(path)
+}
+
+/// Whether a folder holds nothing: not where it is not one, or cannot be read.
+#[must_use]
+pub fn is_empty_folder(fs: &dyn Filesystem, at: &HostPath) -> bool {
+    fs.read_directory(at).is_ok_and(|entries| entries.is_empty())
+}
+
+/// A file, or a folder with all it holds, copied: a file keeps its permissions.
+///
+/// # Errors
+/// Something of it cannot be read or written.
+pub fn copy_all(fs: &dyn Filesystem, from: &HostPath, to: &HostPath) -> io::Result<()> {
+    if fs.is_folder(from) {
+        fs.create_folder_all(to)?;
+        for entry in fs.read_directory(from)? {
+            copy_all(fs, &from.entry(&entry.name), &to.entry(&entry.name))?;
+        }
+        return Ok(());
+    }
+    fs.copy(from, to).map(drop)
+}
+
+/// Have a file on disk - or a folder, with all it holds, and what it holds: best effort, what is gone since is
+/// nothing to have. A file is opened to read where that lets it be flushed (a read-only one too), to write elsewhere.
+pub fn sync_all(fs: &dyn Filesystem, at: &HostPath) {
+    if fs.is_folder(at) {
+        for entry in fs.read_directory(at).unwrap_or_default() {
+            sync_all(fs, &at.entry(&entry.name));
+        }
+        if let Ok(folder) = fs.open(at, Open::FOLDER) {
+            let _ = folder.sync();
+        }
+    } else {
+        sync_file(fs, at);
+    }
+}
+
+/// Have a file on disk: best effort, as `sync_all`.
+pub fn sync_file(fs: &dyn Filesystem, at: &HostPath) {
+    let how = if cfg!(unix) { Open::READ } else { Open { write: true, ..Open::default() } };
+    if let Ok(file) = fs.open(at, how) {
+        let _ = file.sync();
+    }
 }

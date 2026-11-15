@@ -242,6 +242,7 @@ pub fn path() -> Option<std::path::PathBuf> {
 
 impl EditorSettings {
     /// The saved settings, or the defaults; a file that cannot be read is reported, not overwritten silently.
+    #[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
     pub fn load() -> (EditorSettings, Option<String>) {
         let Some(path) = path() else { return (EditorSettings::default(), None) };
         match std::fs::read_to_string(&path) {
@@ -255,6 +256,7 @@ impl EditorSettings {
 
     /// # Errors
     /// The directory or the file cannot be written.
+    #[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
     pub fn save(&self) -> Result<(), String> {
         let path = path().ok_or("no settings directory on this system")?;
         if let Some(dir) = path.parent() {

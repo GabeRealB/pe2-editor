@@ -1577,8 +1577,8 @@ impl Extensions {
         match &file.content {
             // Made here, it is in the store; only what is stored with its node is found there.
             pe2_ext::Content::Stored { sha1, .. } => match engine.store() {
-                Some(store) if store.blob_path(sha1).is_ok_and(|path| path.exists()) => {
-                    Ok(std::fs::read(store.blob_path(sha1)?)?)
+                Some(store) if store.blob_path(sha1).is_ok_and(|path| self.io().filesystem().exists(&path)) => {
+                    Ok(self.io().filesystem().read(&store.blob_path(sha1)?)?)
                 }
                 _ => graph::exec::Node::read_content(asset, &asset.io, sha1),
             },
@@ -2720,7 +2720,7 @@ impl pe2_ext::CallHost for StreamHost {
             }
             held => {
                 let folder = self.io.environment().temp_dir().context("the system's folder of temporary files")?;
-                graph::exec::written_for_program(&folder, held.held().unwrap_or_default())?
+                graph::exec::written_for_program(&self.io, &folder, held.held().unwrap_or_default())?
             }
         };
         Ok(pe2_ext::PlacedContent::new(given(path), written))
@@ -2942,6 +2942,10 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
     use super::{Extensions, Loadable, Origin, Status, satisfies};
@@ -3331,6 +3335,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod calling {
     use super::{Extensions, Lens, Loadable};

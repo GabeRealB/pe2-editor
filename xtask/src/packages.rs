@@ -1033,6 +1033,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Component, c_tokens, check, declared, mirror, names_version, shuffle, signed_file};
 

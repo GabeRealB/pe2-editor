@@ -30,7 +30,7 @@ pub fn add_generated(project: &Project, name: &Name, fills: &Name, history: &mut
         project.layers.iter().any(|l| *l.name == *fills && l.kind == crate::LayerKind::Assets),
         "the project has no asset layer {fills} to fill"
     );
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let item = document.entry("layer").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let layers = item.as_array_of_tables_mut().with_context(|| format!("`layer` in {FILE} is no list of tables"))?;
     let path = format!("{}/{name}", crate::LAYERS);
@@ -83,9 +83,9 @@ pub fn locate(project: &Project, at: &crate::TreePath, path: &Path) -> Result<()
     anyhow::ensure!(project.unmanaged.iter().any(|m| *m.at == *at), "the project has no unmanaged mount {at}");
     let path = written(path)?;
     let file = project.root.join(&crate::LOCAL);
-    let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
+    let mut document: DocumentMut = project.io.filesystem().read_to_string(&file).unwrap_or_default().parse()?;
     table(&mut document, "mounts")?.insert(at.as_str(), value(path));
-    std::fs::write(&file, document.to_string()).with_context(|| file.display().to_string())
+    project.io.filesystem().write(&file, document.to_string().as_ref()).with_context(|| file.display().to_string())
 }
 
 /// Mount a tree into the project at `at` (`path`, relative to the project or absolute): a files layer at the bottom
@@ -110,7 +110,7 @@ pub fn add_mount(
         !(unmanaged && path.is_none() && at == crate::SERVED),
         "{at} is where the project is served: an unmanaged mount there says where its tree is"
     );
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let item = document.entry("mount").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let mounts = item.as_array_of_tables_mut().with_context(|| format!("`mount` in {FILE} is no list of tables"))?;
     let mut mount = Table::new();
@@ -145,13 +145,13 @@ pub fn add_link(project: &Project, at: &Path, deployed: &Path) -> Result<()> {
     let (at, deployed) = (written(at)?, written(deployed)?);
     anyhow::ensure!(!project.links.contains_key(at), "the project links {at} already");
     let file = project.root.join(&crate::LOCAL);
-    let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
+    let mut document: DocumentMut = project.io.filesystem().read_to_string(&file).unwrap_or_default().parse()?;
     let build = table(&mut document, "build")?;
     build.set_implicit(true);
     let links = build.entry("links").or_insert(Item::Table(Table::new()));
     let links = links.as_table_mut().with_context(|| format!("`build.links` in {} is not a table", crate::LOCAL))?;
     links.insert(at, value(deployed));
-    std::fs::write(&file, document.to_string()).with_context(|| file.display().to_string())
+    project.io.filesystem().write(&file, document.to_string().as_ref()).with_context(|| file.display().to_string())
 }
 
 /// Add a build the project can be: `[config.<name>]`, a release and the target building it.
@@ -166,7 +166,7 @@ pub fn add_config(
     history: &mut History,
 ) -> Result<()> {
     anyhow::ensure!(project.configs.iter().all(|c| *c.name != *name), "the project has a config {name} already");
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let configs = table(&mut document, "config")?;
     configs.set_implicit(true);
     let mut config = Table::new();
@@ -204,7 +204,7 @@ pub fn set_property(
     if let Some(why) = to.and_then(|v| declared.kind.refuses(v)) {
         bail!("{property}: {why}");
     }
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let configs = table(&mut document, "config")?;
     let at = configs.get_mut(config.as_str()).and_then(Item::as_table_mut);
     let at = at.with_context(|| format!("`config.{config}` in {FILE} is not a table"))?;
@@ -233,7 +233,7 @@ pub fn declare_property(project: &Project, name: &str, declaration: &toml::Table
     if let Some(why) = property.default.as_ref().and_then(|d| property.kind.refuses(d)) {
         bail!("its default: {why}");
     }
-    let mut document = read(&project.root)?;
+    let mut document = read(project.io.filesystem(), &project.root)?;
     let properties = table(&mut document, "property")?;
     properties.set_implicit(true);
     let mut table = Table::new();
@@ -245,6 +245,10 @@ pub fn declare_property(project: &Project, name: &str, declaration: &toml::Table
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
 mod tests {
     use crate::Project;
     use crate::cache::Cache;
@@ -255,7 +259,7 @@ mod tests {
     fn a_project_is_set_up_by_its_edits_and_reads_back() {
         let dir = crate::testing::scratch("setup");
         let _ = std::fs::remove_dir_all(&dir);
-        crate::create(&dir).unwrap();
+        crate::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let project = || Project::load(&dir).unwrap();
         let lock = crate::lock::Lock::try_acquire(&dir, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project(), &lock).unwrap()).unwrap();
