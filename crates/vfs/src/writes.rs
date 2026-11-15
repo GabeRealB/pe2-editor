@@ -64,6 +64,41 @@ impl Default for Pace {
     }
 }
 
+/// What the writes read the time from, to say when something is due: the system's, or one that stands until it is
+/// moved (`Clock::standing`), which a test moves to say how much time has passed rather than waiting for it.
+#[derive(Clone, Debug, Default)]
+pub struct Clock(Option<Arc<Mutex<Instant>>>);
+
+impl Clock {
+    /// The system's.
+    #[must_use]
+    pub fn system() -> Clock {
+        Clock(None)
+    }
+
+    /// One that stands at this moment until it is moved.
+    #[must_use]
+    pub fn standing() -> Clock {
+        Clock(Some(Arc::new(Mutex::new(Instant::now()))))
+    }
+
+    /// The time now.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        match &self.0 {
+            None => Instant::now(),
+            Some(at) => *at.lock().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// Moved on by this much: one that stands, that is; the system's goes by itself.
+    pub fn advance(&self, by: Duration) {
+        if let Some(at) = &self.0 {
+            *at.lock().unwrap_or_else(PoisonError::into_inner) += by;
+        }
+    }
+}
+
 /// How many times the time between a file's changes the pause after its last is, for its burst to have ended.
 const RHYTHMS: u32 = 8;
 
@@ -268,6 +303,7 @@ struct Inner {
     /// appended for it. `NOT` otherwise.
     replaying: std::sync::atomic::AtomicU64,
     pace: Pace,
+    clock: Clock,
 }
 
 /// No record is being done again: what is done is appended to the log.
@@ -320,10 +356,10 @@ impl Writes {
     /// # Errors
     /// The folder or its log cannot be made, or the tree served is no view of a shared filesystem.
     pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &HostPath) -> io::Result<Writes> {
-        Writes::with(served, owner, dir, sfs::log::Config::default(), Pace::default())
+        Writes::with(served, owner, dir, sfs::log::Config::default(), Pace::default(), Clock::system())
     }
 
-    /// As `new`, the log laid out and new files paced as said.
+    /// As `new`, the log laid out, new files paced as said, and when what is due is read from this clock.
     ///
     /// # Errors
     /// The folder or its log cannot be made, or the tree served is no view of a shared filesystem.
@@ -333,6 +369,7 @@ impl Writes {
         dir: &HostPath,
         log: sfs::log::Config,
         pace: Pace,
+        clock: Clock,
     ) -> io::Result<Writes> {
         let Some(space) = served.space() else {
             return Err(io::Error::other("what is written through is a view of the shared filesystem"));
@@ -361,6 +398,7 @@ impl Writes {
             ordering: Mutex::default(),
             replaying: std::sync::atomic::AtomicU64::new(NOT),
             pace,
+            clock,
         }));
         // What a serving before this one left in what is served - made there and never the project's, removed
         // there, moved there - goes: what it left in transit is taken up from the log, which does it again.
@@ -384,7 +422,7 @@ impl Writes {
                     let Some(inner) = weak.upgrade() else { return };
                     let writes = Writes(inner);
                     let mut state = writes.lock();
-                    let now = Instant::now();
+                    let now = writes.now();
                     let next = Writes::next_due(&state);
                     let sleep = next.map_or(IDLE, |due| due.saturating_duration_since(now)).min(IDLE);
                     state.wakes = Some(now + sleep);
@@ -422,6 +460,11 @@ impl Writes {
         }
     }
 
+    /// The time now, by the writes' clock.
+    fn now(&self) -> Instant {
+        self.0.clock.now()
+    }
+
     fn wake_now(&self) {
         *self.0.wake.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.0.wake.1.notify_all();
@@ -430,7 +473,7 @@ impl Writes {
     /// A new file changed: it is the project's once its burst of changes has ended - the pause since this change
     /// several times the time between its changes.
     fn touch(&self, state: &mut State, number: u64) {
-        let now = Instant::now();
+        let now = self.now();
         let rhythm = match state.touched.get(&number) {
             Some((last, rhythm)) => {
                 let since = now.saturating_duration_since(*last);
@@ -999,7 +1042,7 @@ impl Writes {
             let mut state = self.lock();
             let number = if release { state.handles.remove(&handle) } else { state.handles.get(&handle).copied() };
             let Some(number) = number else { return Ok(()) };
-            let now = Instant::now();
+            let now = self.now();
             let written = state.staged.get(&number).map(|staged| (staged.dirty, reading(&staged.content).is_logged()));
             if let Some(due) = state.new.get(&number).copied() {
                 // A new file: its burst is told from when it was last changed, not from when it was let go of.
@@ -1068,7 +1111,7 @@ impl Writes {
         state.refused.remove(&number);
         if node.flags & NEW == 0 || state.promised(number) {
             // A moment for a file to be made there again: removed and written anew is one save.
-            let due = Instant::now() + self.0.pace.most;
+            let due = self.now() + self.0.pace.most;
             state.removed.insert(number, Some(due));
             if let Some(said) = said {
                 state.removals.insert(number, said);
@@ -1249,7 +1292,7 @@ impl Writes {
         state.ask(due, Asked::Rename { number, from: from.to_owned(), to: to.to_owned(), said, moved });
         // What was written to it and is not the project's yet goes on to its new name.
         if state.staged.get(&number).is_some_and(|staged| staged.dirty) && !state.open(number) {
-            state.new.insert(number, Instant::now());
+            state.new.insert(number, self.now());
         }
         drop(state);
         self.wake_now();
@@ -1282,7 +1325,7 @@ impl Writes {
         for open in state.handles.values_mut().filter(|open| **open == number) {
             *open = there;
         }
-        let now = Instant::now();
+        let now = self.now();
         if old.flags & NEW != 0 && !state.promised(there) {
             // One written there that the project is yet to have: its burst goes on.
             self.touch(&mut state, there);
@@ -1359,7 +1402,7 @@ impl Writes {
         }
         self.0.served.rename(from, to);
         let mut state = self.lock();
-        let due = Instant::now() + BACKUP;
+        let due = self.now() + BACKUP;
         state.removed.insert(number, Some(due));
         self.due(&state, due);
         drop(state);
@@ -1567,7 +1610,7 @@ impl Writes {
                     // The project has it as it was read: what was written to it meanwhile it has not.
                     staged.dirty |= reading(&content).changes() != given.changes;
                     if staged.dirty && !open && !state.new.contains_key(&number) {
-                        state.new.insert(number, Instant::now());
+                        state.new.insert(number, self.now());
                     }
                 }
                 drop(state);
@@ -1686,7 +1729,7 @@ impl Writes {
         // Where the log ends before anything is looked at: what is staged from now on is past it.
         let written = self.0.log.header().tail();
         self.answered();
-        self.say_due(Instant::now());
+        self.say_due(self.now());
         self.ask();
         self.let_go_of_log(written);
     }
@@ -1701,7 +1744,7 @@ impl Writes {
                     (state.again, state.waiting) = (None, false);
                     return;
                 }
-                if state.again.is_some_and(|again| again > Instant::now()) {
+                if state.again.is_some_and(|again| again > self.now()) {
                     return;
                 }
             }
@@ -1709,11 +1752,11 @@ impl Writes {
                 Ok(()) => {
                     let answered = self.answered();
                     // What its answers made due: a file written again while it was read.
-                    self.say_due(Instant::now());
+                    self.say_due(self.now());
                     let mut state = self.lock();
                     if answered == 0 {
                         // It looked, and took nothing of ours: asked again in a moment.
-                        state.again = Some(Instant::now() + AGAIN);
+                        state.again = Some(self.now() + AGAIN);
                         return;
                     }
                     (state.again, state.waiting) = (None, false);
@@ -1723,7 +1766,7 @@ impl Writes {
                     if !std::mem::replace(&mut state.waiting, true) {
                         eprintln!("what was done through the folder is kept until the project can be told: {why}");
                     }
-                    state.again = Some(Instant::now() + AGAIN);
+                    state.again = Some(self.now() + AGAIN);
                     return;
                 }
             }
@@ -1737,7 +1780,7 @@ impl Writes {
         let _settling = self.0.settling.lock().unwrap_or_else(PoisonError::into_inner);
         {
             let mut state = self.lock();
-            let now = Instant::now();
+            let now = self.now();
             state.again = None;
             for due in state.new.values_mut() {
                 *due = now;
@@ -1747,7 +1790,7 @@ impl Writes {
             }
         }
         self.answered();
-        self.say_due(Instant::now());
+        self.say_due(self.now());
         self.ask();
         // What nobody took is due no more: taken back, but what was answered this moment.
         let numbers: Vec<u64> = self.lock().asked.keys().copied().collect();
@@ -1996,7 +2039,7 @@ impl Writes {
                 }
             }
             // All that is still to be said due is due: nothing of it is waited for any longer.
-            let now = Instant::now();
+            let now = self.now();
             state.touched.clear();
             state.again = None;
             let dirty = |staged: &Staged| staged.dirty && reading(&staged.content).is_logged();
@@ -2037,6 +2080,25 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// Wait while it holds, for as long as that takes: nothing here promises when, and what never comes is a test that
+    /// does not end.
+    fn wait_while(holds: impl Fn() -> bool) {
+        while holds() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Writes whose clock stands until the test moves it (`passes`), new files paced so: nothing is due by itself.
+    fn standing(served: &Served, owner: Arc<Holder>, dir: &HostPath, pace: super::Pace) -> Writes {
+        Writes::with(served, owner, dir, sfs::log::Config::default(), pace, super::Clock::standing()).unwrap()
+    }
+
+    /// Time passes: what it brings due is said, and taken as the owner takes things, before this returns.
+    fn passes(writes: &Writes, by: Duration) {
+        writes.0.clock.advance(by);
+        writes.settle();
+    }
 
     /// How the stand-in for whoever holds a project takes what it is given.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2271,22 +2333,18 @@ mod tests {
         let dir = sfs::testing::scratch("writes-later");
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         let handle = writes.create(p("kept.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
-        // Tried, and not taken: it is shown as written, and nothing was given.
-        std::thread::sleep(Duration::from_millis(2500));
+        // Due, tried, and not taken: it is shown as written, and nothing was given.
+        passes(&writes, super::Pace::default().most);
         assert!(writes.shown(p("kept.txt")).is_some(), "shown as written while it waits");
         assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
-        // Someone takes changes again: it is given without being written again.
+        // Someone takes changes again: asked again, it is given without being written again.
         owner.take(Takes::All);
-        let given = || !owner.given().is_empty();
-        let asked = Instant::now();
-        while !given() && asked.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(given(), "given once someone takes it");
+        passes(&writes, super::AGAIN);
+        assert!(!owner.given().is_empty(), "given once someone takes it");
         assert!(owner.left.lock().unwrap().is_empty());
         drop(writes);
         done(&dir);
@@ -2299,7 +2357,7 @@ mod tests {
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let log = sfs::log::Config { segment: 64 << 10, budget: 1 << 20 };
-        let writes = Writes::with(&served, owner, &dir, log, super::Pace::default()).unwrap();
+        let writes = Writes::with(&served, owner, &dir, log, super::Pace::default(), super::Clock::system()).unwrap();
         let waits = writes.create(p("waits.txt")).unwrap();
         writes.write(waits, 0, b"written first, and kept").unwrap();
         writes.close(waits, true).unwrap();
@@ -2378,9 +2436,6 @@ mod tests {
         done(&dir);
     }
 
-    /// New files given only long after they were last changed: for what is to happen before they are.
-    const UNHURRIED: super::Pace = super::Pace { least: Duration::from_secs(20), most: Duration::from_secs(20) };
-
     #[test]
     fn a_save_returns_at_once_and_is_the_projects_a_moment_later() {
         let dir = sfs::testing::scratch("writes-save");
@@ -2391,15 +2446,12 @@ mod tests {
         writes.write(handle, 0, b"after").unwrap();
         // Let go of: it returns while the project has not taken it - which here waits to be told to go on.
         writes.close(handle, true).unwrap();
-        starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file, off this thread");
+        starts.recv().expect("the project is being given the file, off this thread");
         assert!(owner.given().is_empty(), "not the project's yet");
         assert_eq!(writes.read(p("saved.txt"), 0, 16).unwrap(), b"after", "read as written meanwhile");
         goes_on.send(()).unwrap();
-        let asked = Instant::now();
         let saved = || owner.given().iter().any(|c| c == "Write saved.txt from outside");
-        while !saved() && asked.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_while(|| !saved());
         assert!(saved(), "the project's a moment later");
         drop(writes);
         done(&dir);
@@ -2411,7 +2463,7 @@ mod tests {
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let pace = super::Pace { least: Duration::from_millis(400), most: Duration::from_secs(2) };
-        let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), pace).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, pace);
         let given = || owner.given().len();
         // Written again and again, let go of in between: one burst, for as long as it goes on.
         for round in 0..25u64 {
@@ -2419,14 +2471,11 @@ mod tests {
                 if round == 0 { writes.create(p("log.txt")) } else { writes.open(p("log.txt"), false) }.unwrap();
             writes.write(handle, round, b"x").unwrap();
             writes.close(handle, true).unwrap();
-            std::thread::sleep(Duration::from_millis(20));
+            passes(&writes, Duration::from_millis(20));
             assert_eq!(given(), 0, "not given while it is still being changed");
         }
-        // Ended: given once the pause is several times its rhythm, with no second gone by.
-        let ended = Instant::now();
-        while given() == 0 && ended.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Ended: given once the pause is several times its rhythm - here, the least a pause is.
+        passes(&writes, pace.least);
         assert_eq!(given(), 1, "given once its burst has ended");
         drop(writes);
         done(&dir);
@@ -2438,22 +2487,16 @@ mod tests {
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        let asked = Instant::now();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
+        // Made without waiting for the project, which takes nothing: had it waited, this would not go on.
         writes.make_folder(p("made")).expect("made, whatever the project is doing");
         writes.make_folder(p("made/inside")).expect("and one in it");
-        assert!(asked.elapsed() < Duration::from_secs(1), "without waiting for the project");
         assert!(writes.shown(p("made/inside")).is_some_and(|shown| shown.folder), "shown at once");
-        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
-        // Someone takes changes again: given in the order they were made.
+        // Someone takes changes again: asked again, given in the order they were made.
         owner.take(Takes::All);
-        let given = || owner.given();
-        let waited = Instant::now();
-        while given().len() < 2 && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(given(), ["New made from outside", "New inside from outside"]);
+        passes(&writes, super::AGAIN);
+        assert_eq!(owner.given(), ["New made from outside", "New inside from outside"]);
         drop(writes);
         done(&dir);
     }
@@ -2463,7 +2506,7 @@ mod tests {
         let dir = sfs::testing::scratch("writes-moved");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
-        let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         writes.make_folder(p("a")).unwrap();
         let handle = writes.create(p("a/x.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
@@ -2494,7 +2537,6 @@ mod tests {
         // The project refuses it a moment later - once nothing has it open. The file stays as written; whoever
         // opens it next is told as it closes or syncs.
         let told_at = |sync: bool| {
-            let waited = Instant::now();
             loop {
                 let handle = writes.open(p("a.txt"), false).unwrap();
                 let told = if sync { writes.close(handle, false) } else { writes.flush(handle) };
@@ -2502,7 +2544,6 @@ mod tests {
                     break (handle, told);
                 }
                 writes.close(handle, true).unwrap();
-                assert!(waited.elapsed() < Duration::from_secs(10), "never told");
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
@@ -2526,7 +2567,7 @@ mod tests {
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[("old/in/a.txt", "a")], Takes::Nothing);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         let number = served.ino(p("old/in/a.txt"));
         writes.rename(p("old"), p("new")).expect("renamed, whatever the project is doing");
         assert!(writes.shown(p("old")).is_none(), "no longer where it was");
@@ -2537,16 +2578,11 @@ mod tests {
         let handle = writes.open(p("new/in/a.txt"), true).unwrap();
         writes.write(handle, 0, b"after").unwrap();
         writes.close(handle, true).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
-        // Someone takes changes again: the rename first, then what was written where it led.
+        // Someone takes changes again: asked again, the rename first, then what was written where it led.
         owner.take(Takes::All);
-        let given = || owner.given();
-        let waited = Instant::now();
-        while given().len() < 2 && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(given(), ["Rename old to new from outside", "Write a.txt from outside"]);
+        passes(&writes, super::AGAIN);
+        assert_eq!(owner.given(), ["Rename old to new from outside", "Write a.txt from outside"]);
         drop(writes);
         done(&dir);
     }
@@ -2565,10 +2601,7 @@ mod tests {
         writes.rename(p("notes"), p("Notes")).expect("renamed");
         assert_eq!(names(writes.list(p("")).into_keys()), ["Notes"]);
         assert_eq!(served.ino(p("Notes/a.txt")), number, "each file keeps its number");
-        let waited = Instant::now();
-        while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_while(|| owner.given().is_empty());
         assert_eq!(owner.given(), ["Rename notes to Notes from outside"]);
         let listing = owner.listing.lock().unwrap();
         let written: Vec<&str> = listing.keys().map(|path| path.as_str()).collect();
@@ -2585,10 +2618,7 @@ mod tests {
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let given = |many: usize| {
-            let waited = Instant::now();
-            while owner.given().len() < many && waited.elapsed() < Duration::from_secs(10) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            wait_while(|| owner.given().len() < many);
             let mut given: Vec<String> = owner.batches.lock().unwrap().drain(..).flatten().collect();
             given.sort();
             given
@@ -2620,10 +2650,7 @@ mod tests {
         let writes = Writes::new(&served, owner, &dir).unwrap();
         writes.rename(p("old"), p("new")).expect("shown renamed, until the project says otherwise");
         let back = || writes.shown(p("old/a.txt")).is_some() && writes.shown(p("new")).is_none();
-        let waited = Instant::now();
-        while !back() && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_while(|| !back());
         assert!(back(), "where it was, as the project has it");
         drop(writes);
         done(&dir);
@@ -2673,10 +2700,7 @@ mod tests {
         // And given once someone takes it: what was asked in an order first, in that order.
         owner.take(Takes::All);
         let given = || owner.given();
-        let waited = Instant::now();
-        while given().len() < 6 && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_while(|| given().len() < 6);
         let mut given = given();
         assert_eq!(given[..2], ["New made from outside", "Rename old to new from outside"]);
         given.sort();
@@ -2708,10 +2732,7 @@ mod tests {
             writes.close(handle, true).unwrap();
             writes.rename(p("old"), p("new")).unwrap();
             // The project has the rename, and not what was written: there it ends.
-            let waited = Instant::now();
-            while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            wait_while(|| owner.given().is_empty());
             assert_eq!(owner.given(), ["Rename old to new from outside"]);
         }
         // The tree as the project has it: renamed.
@@ -2721,10 +2742,7 @@ mod tests {
         assert_eq!(writes.read(p("new/written.txt"), 0, 4).unwrap(), b"w", "where its folder is now");
         assert!(writes.shown(p("old")).is_none() && writes.shown(p("old/written.txt")).is_none());
         let given = || owner.given();
-        let waited = Instant::now();
-        while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_while(|| given().is_empty());
         assert_eq!(given(), ["Write written.txt from outside"], "the rename is not asked again");
         drop(writes);
         done(&dir);
@@ -2746,10 +2764,7 @@ mod tests {
             writes.write(handle, 0, b"first").unwrap();
             writes.close(handle, true).unwrap();
             let given = || owner.given().len();
-            let waited = Instant::now();
-            while given() < 3 && waited.elapsed() < Duration::from_secs(10) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            wait_while(|| given() < 3);
             assert_eq!(given(), 3, "the folder and the two files");
             // Written again after the project took it, and ended before it took that.
             let handle = writes.open(p("late.txt"), false).unwrap();
@@ -2758,15 +2773,10 @@ mod tests {
         // The tree as whoever holds the project has it by now.
         let owner = Holder::new(&dir, &[("made/a.txt", "one"), ("late.txt", "first")], Takes::All);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         assert_eq!(writes.read(p("late.txt"), 0, 32).unwrap(), b"first and more");
-        let given = || owner.given();
-        let waited = Instant::now();
-        while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(given(), ["Write late.txt from outside"], "only what the project had not taken");
+        passes(&writes, super::Pace::default().most);
+        assert_eq!(owner.given(), ["Write late.txt from outside"], "only what the project had not taken");
         assert!(writes.settled(p("made/a.txt")), "what it had is the tree's alone");
         drop(writes);
         done(&dir);
@@ -2787,9 +2797,9 @@ mod tests {
             assert_eq!(*owner.left.lock().unwrap(), ["left.txt"], "its owner's to keep, as serving ends");
         }
         owner.take(Takes::All);
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         assert!(writes.shown(p("left.txt")).is_none(), "not taken up again: it was set aside");
-        std::thread::sleep(Duration::from_millis(300));
+        passes(&writes, super::Pace::default().most);
         assert_eq!(owner.given().len(), 0, "and nothing is given");
         drop(writes);
         done(&dir);
@@ -2816,7 +2826,7 @@ mod tests {
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         // Paced so that nothing is given before it is asked for here.
-        let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         for name in ["a.txt", "b.txt", "c.txt"] {
             let handle = writes.create(p(name)).unwrap();
             writes.write(handle, 0, b"x").unwrap();
@@ -2845,7 +2855,7 @@ mod tests {
         let dir = sfs::testing::scratch("writes-finish");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
-        let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         let handle = writes.create(p("late.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
@@ -2888,7 +2898,7 @@ mod tests {
         let dir = sfs::testing::scratch("writes-folder");
         let owner = Holder::new(&dir, &[("kept/a.txt", "a")], Takes::All);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let writes = standing(&served, owner.clone(), &dir, super::Pace::default());
         // Emptied and removed, then made again before the removal has settled: as a program replacing a folder does.
         writes.remove(p("kept/a.txt")).unwrap();
         writes.remove(p("kept")).unwrap();
@@ -2896,13 +2906,9 @@ mod tests {
         writes.make_folder(p("kept")).expect("made again");
         assert!(writes.shown(p("kept")).is_some_and(|shown| shown.folder), "shown again");
         assert!(writes.list(p("kept")).is_empty(), "without what was removed from it");
-        // Once the removal has settled - however long that takes a machine doing other things - and then for as long
-        // as the folder's own would have taken to follow it.
-        let waited = std::time::Instant::now();
-        while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(20) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        std::thread::sleep(super::Pace::default().most + Duration::from_millis(600));
+        // Once the removal has settled, and then for as long again as the folder's own would have taken to follow it.
+        passes(&writes, super::Pace::default().most);
+        passes(&writes, super::Pace::default().most);
         let changes = owner.given();
         assert_eq!(changes, ["Remove a.txt from outside"], "only its file is removed from the project");
         drop(writes);
@@ -2919,20 +2925,16 @@ mod tests {
         let handle = writes.create(p("a.txt")).unwrap();
         writes.write(handle, 0, b"written").unwrap();
         writes.close(handle, true).unwrap();
-        starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file");
+        starts.recv().expect("the project is being given the file");
         // Removed at that moment: at once, without waiting for the project - which is to have the file, so its
         // removal is said due after it, rather than the file taken for one only written here, which would leave
         // it in the project.
-        let asked = Instant::now();
+        // The project is held at its gate until told to go on below: had the removal waited for it, this would not go on.
         writes.remove(p("a.txt")).expect("removed");
-        assert!(asked.elapsed() < Duration::from_millis(500), "without waiting for the project");
         assert!(writes.shown(p("a.txt")).is_none(), "hidden at once");
         goes_on.send(()).unwrap();
-        let asked = Instant::now();
         let removed = || owner.given().iter().any(|c| c == "Remove a.txt from outside");
-        while !removed() && asked.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_while(|| !removed());
         assert!(removed(), "removed from the project: {:?}", owner.given());
         assert!(served.tree().at(p("a.txt")).is_none() && writes.shown(p("a.txt")).is_none(), "and gone");
         drop(writes);

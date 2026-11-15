@@ -46,7 +46,7 @@ pub use extract::{Declared, Discs, Given, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use pe2_ext_macros::{extension, steps};
-pub use pe2_path::{Address, Asked, Query, Reference, RelPath, ResourcePath, Uid};
+pub use pe2_path::{Address, Asked, PathError, Query, Reference, RelPath, ResourcePath, Uid};
 /// A path in the project's tree: what an asset is found by, beside its uid.
 pub type TreePath = pe2_path::VfsPath<pe2_path::Tree>;
 /// The assets of a type, each by its path with its declaration's text (`CallHost::assets_of`).

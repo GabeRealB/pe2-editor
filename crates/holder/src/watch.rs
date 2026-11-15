@@ -141,16 +141,11 @@ mod tests {
     use sfs::HostPath;
     use sfs::testing::At as _;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    /// The paths of the batches that arrive within a few seconds.
+    /// The paths of the batches that arrive, until what has arrived holds.
     fn collect(batches: &mpsc::Receiver<Vec<HostPath>>, until: impl Fn(&[HostPath]) -> bool) -> Vec<HostPath> {
-        let start = Instant::now();
         let mut seen = Vec::new();
-        while start.elapsed() < Duration::from_secs(5) && !until(&seen) {
-            if let Ok(paths) = batches.recv_timeout(Duration::from_millis(20)) {
-                seen.extend(paths);
-            }
+        while !until(&seen) {
+            seen.extend(batches.recv().expect("the watcher goes on"));
         }
         seen
     }
@@ -187,8 +182,11 @@ mod tests {
         // (The file, or the folder made for it a moment before, whose watch it may come before: taken in whole.)
         let seen = collect(&batches, |seen| seen.contains(&file) || seen.contains(&shard));
         assert!(seen.contains(&file) || seen.contains(&shard), "{seen:?}");
-        // Wait out a batch more, for what a folder told modified would bring.
-        let seen = [seen, collect(&batches, |_| false)].concat();
+        // What a folder told modified would bring comes before what is changed after it: a file written once all of
+        // it has arrived.
+        let after = root.at("after.txt");
+        std::fs::write(&after, "x").unwrap();
+        let seen = [seen, collect(&batches, |seen| seen.contains(&after))].concat();
         assert!(!seen.contains(&root.at("b.node")), "the folder they were made in: {seen:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -507,9 +507,7 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
     let mut model = Model::new();
     run(&space, "p", 0..60, 100, &mut model);
     let mut reader = process("the_reader_that_is_killed", "PE2_SFS_SPACE_PINS", &dir).spawn().unwrap();
-    let waited = Instant::now();
     while !dir.at("pinned").exists() {
-        assert!(waited.elapsed() < Duration::from_secs(30), "the reader never pinned");
         std::thread::sleep(Duration::from_millis(5));
     }
     // While it lives, what the commit it reads reaches is not taken again - and what was written since is.

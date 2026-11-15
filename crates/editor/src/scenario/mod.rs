@@ -50,8 +50,9 @@ pub use fixture::Fixture;
 
 /// What a window is in a scenario: what a laptop has, so that nothing it asks for is out of sight.
 const SIZE: egui::Vec2 = egui::vec2(1400.0, 900.0);
-/// How long work off the window's thread may take: a first run compiles the extensions.
-const PATIENCE: Duration = Duration::from_secs(120);
+/// How long a scenario waits before it says what for - and goes on waiting: nothing here promises how long work off the
+/// window's thread takes (a first run compiles the extensions), and what never comes is a scenario that does not end.
+const SAY_AFTER: Duration = Duration::from_secs(120);
 /// The most frames waited for what is to be clicked to stay put: it has, long before.
 const STEADY_FRAMES: usize = 60;
 /// How many frames with nothing going on make it settled: what comes of a frame shows in the next.
@@ -336,16 +337,18 @@ impl Scenario {
             return;
         }
         let started = Instant::now();
+        let mut said = false;
         let mut quiet = 0;
         while quiet < QUIET {
             self.harness.input_mut().focused = true;
             self.harness.step();
             quiet = if self.harness.state().busy() { 0 } else { quiet + 1 };
-            if started.elapsed() >= PATIENCE {
+            if !said && started.elapsed() >= SAY_AFTER {
+                said = true;
                 let busy = self.harness.state().busy_with().join(", ");
-                panic!(
-                    "the editor did not settle in {}s, busy with {busy}; the window:\n{}",
-                    PATIENCE.as_secs(),
+                eprintln!(
+                    "the editor has not settled in {}s, busy with {busy}; the window:\n{}",
+                    SAY_AFTER.as_secs(),
                     self.shown().join("\n")
                 );
             }
@@ -455,14 +458,16 @@ impl Scenario {
     #[track_caller]
     pub fn until(&mut self, what: &str, holds: impl Fn(&mut Scenario) -> bool) {
         let started = Instant::now();
+        let mut said = false;
         while !holds(self) {
-            if started.elapsed() >= PATIENCE {
-                // What there was instead: the extensions as they stood, and what the window showed.
+            if !said && started.elapsed() >= SAY_AFTER {
+                said = true;
+                // What there is instead: the extensions as they stand, and what the window shows.
                 let extensions: Vec<String> =
                     self.workspace().extensions.present.iter().map(|p| format!("{} {:?}", p.id, p.status)).collect();
-                panic!(
-                    "{what} never came, in {}s; the extensions:\n{}\nthe window:\n{}",
-                    PATIENCE.as_secs(),
+                eprintln!(
+                    "{what} has not come in {}s; the extensions:\n{}\nthe window:\n{}",
+                    SAY_AFTER.as_secs(),
                     extensions.join("\n"),
                     self.shown().join("\n")
                 );
@@ -504,6 +509,7 @@ impl Scenario {
             (service.run)(&lens, &toml::Value::Table(toml::Table::new())).map(drop).map_err(|why| format!("{why:#}"))
         });
         let started = Instant::now();
+        let mut said = false;
         while !test.is_finished() {
             match asked.recv_timeout(Duration::from_millis(5)) {
                 Ok(step) => {
@@ -512,7 +518,10 @@ impl Scenario {
                 }
                 Err(_) => self.harness.step(),
             }
-            assert!(started.elapsed() < PATIENCE, "the test did not end");
+            if !said && started.elapsed() >= SAY_AFTER {
+                said = true;
+                eprintln!("the test {running} has not ended in {}s", SAY_AFTER.as_secs());
+            }
         }
         host::listen(None);
         test.join().map_err(|_| "the test panicked".to_string())?

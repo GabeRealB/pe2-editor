@@ -30,7 +30,7 @@ use crate::cache::Cache;
 use crate::changeset::{self, Base, Changeset, Op};
 use crate::extract::sha1_hex;
 pub use crate::model::Stamp;
-use crate::model::{Declaration, Record};
+use crate::model::{Declaration, Declared, Record};
 use crate::{FILE, Layer, LayerKind, Project, TreePath, uid};
 
 pub const BUNDLE_SUFFIX: &str = ".node";
@@ -357,14 +357,44 @@ fn plural_y(n: usize) -> &'static str {
 }
 
 /// A reference from one asset to another: where it is (the slot's name, or the field holding it) and its target.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reference {
     pub from: Arc<TreePath>,
-    pub slot: String,
-    pub uid: String,
-    pub target: String,
-    /// The output of the asset it names (`palettes/default`, from `uid://...#palettes/default`); none for the asset itself.
-    pub output: Option<String>,
+    pub slot: Box<str>,
+    /// The asset's uid; where what is written there is no uid, that text: the reference leads nowhere.
+    pub uid: Result<Uid, Box<str>>,
+    /// The bundle's path written beside the uid, where one is: what it resolves to where the uid names no asset.
+    pub target: Option<Arc<TreePath>>,
+    /// What of the asset it names (`palettes/default`, from `uid://.../palettes/default`); none for the asset itself.
+    pub output: Option<Arc<pe2_path::Asked>>,
+}
+
+impl Reference {
+    /// A reference a declaration at `from` makes.
+    fn of(from: &TreePath, declared: &Declared) -> Reference {
+        Reference {
+            from: from.to_owned(),
+            slot: declared.slot.clone(),
+            uid: declared.uid.clone(),
+            target: declared.target.clone(),
+            output: declared.output.clone(),
+        }
+    }
+
+    /// Its uid as written: the uid, or the text that is none.
+    #[must_use]
+    pub fn uid_text(&self) -> String {
+        self.uid.as_ref().map_or_else(ToString::to_string, ToString::to_string)
+    }
+
+    /// What it names, as it is written: the path beside its uid and the uid (`a/b (uid://x)`), or its uid alone.
+    #[must_use]
+    pub fn said(&self) -> String {
+        match &self.target {
+            Some(target) => format!("{target} ({})", self.uid_text()),
+            None => self.uid_text(),
+        }
+    }
 }
 
 /// Something wrong with the project, found by the index.
@@ -700,9 +730,11 @@ fn declaration(bytes: &[u8]) -> Declaration {
                 .collect();
             let name = table.get("name").and_then(toml::Value::as_str);
             // An asset's own `uid` (as declarations named it before changesets) is not a reference.
+            let mut made = Vec::new();
             for (key, value) in table.iter().filter(|(key, _)| *key != "uid") {
-                references(value, name.unwrap_or(key), &mut out.references);
+                references(value, name.unwrap_or(key), &mut made);
             }
+            out.references = made.into();
         }
         Err(e) => out.error = Some(e),
     }
@@ -1595,40 +1627,44 @@ fn bundle_at(rel: &TreePath) -> Option<Arc<TreePath>> {
     found.map(ToOwned::to_owned)
 }
 
+/// A uid as a reference writes it: the uid, or - where what is written is none - that text, the reference leading
+/// nowhere.
+pub type WrittenUid = Result<Uid, Box<str>>;
+
 /// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
 /// reference is the asset's uid, `"uid://..."` - with what of it it names after a `/` (`/palettes/default`), which
-/// this leaves out (`part_of` gives it) -, or, as written before uids sufficed, a table of the uid and the bundle's
+/// this leaves out (`asked_of` gives it) -, or, as written before uids sufficed, a table of the uid and the bundle's
 /// `res://` path.
 #[must_use]
-pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
+pub fn reference(value: &toml::Value) -> Option<(WrittenUid, Option<Arc<TreePath>>)> {
     match value {
         // One naming no node as a uid keeps its text: it resolves to nothing, and is said as a reference leading nowhere.
         toml::Value::String(s) if s.starts_with("uid://") => match pe2_ext::target_of(value) {
-            Ok(Some(target)) => Some((target.to_string(), None)),
-            _ => Some((s.clone(), None)),
+            Ok(Some(pe2_path::Reference::Uid(uid))) => Some((Ok(uid), None)),
+            _ => Some((Err(s.as_str().into()), None)),
         },
         toml::Value::Table(t) => {
             let uid = t.get("uid")?.as_str()?;
             let written = t.get("path")?.as_str()?;
-            let rel = TreePath::from_res(written.strip_suffix(BUNDLE_SUFFIX).unwrap_or(written)).ok()?;
-            Some((uid.to_string(), Some(rel.to_string())))
+            let path = TreePath::from_res(written.strip_suffix(BUNDLE_SUFFIX).unwrap_or(written)).ok()?;
+            Some((Uid::new(uid).map_err(|_| uid.into()), Some(path.to_owned())))
         }
         _ => None,
     }
 }
 
-/// What a reference names of its asset, and how it asks for it, as text to show (`cells/body?palette=default`): empty
-/// where it names the asset itself, or what it names is no address - which whoever reads it refuses, saying why.
-fn asked_text(value: &toml::Value) -> String {
-    pe2_ext::asked_of(value).ok().flatten().map_or_default(|asked| asked.to_string())
+/// What a reference names of its asset, and how it asks for it (`cells/body?palette=default`): none where it names the
+/// asset itself, or what it names is no address - which whoever reads it refuses, saying why.
+fn asked(value: &toml::Value) -> Option<Arc<pe2_path::Asked>> {
+    pe2_ext::asked_of(value).ok().flatten()
 }
 
 /// Every reference in a value (`reference`), named by the enclosing slot's `name` or else the field it sits in.
-fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String, String)>) {
+fn references(value: &toml::Value, field: &str, out: &mut Vec<Declared>) {
     match value {
         toml::Value::Table(t) => {
-            if let Some((uid, path)) = reference(value) {
-                out.push((field.to_string(), uid, path.unwrap_or_default(), asked_text(value)));
+            if let Some((uid, target)) = reference(value) {
+                out.push(Declared { slot: field.into(), uid, target, output: asked(value) });
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
@@ -1639,7 +1675,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
         toml::Value::String(_) => {
             if let Some((uid, _)) = reference(value) {
-                out.push((field.to_string(), uid, String::new(), asked_text(value)));
+                out.push(Declared { slot: field.into(), uid, target: None, output: asked(value) });
             }
         }
         _ => {}
@@ -1650,7 +1686,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
 /// The uids references name, as they are written: one whose text is no uid names no entry, and is none of these - the
 /// link says it dangles.
 fn named_uids<'a>(references: impl IntoIterator<Item = &'a Reference>) -> Vec<Uid> {
-    references.into_iter().filter_map(|r| Uid::new(&r.uid).ok()).collect()
+    references.into_iter().filter_map(|r| r.uid.as_ref().ok().copied()).collect()
 }
 
 /// A path without what it ends in, where it ends in it and something is before it: `a/b/c` without `b/c` is `a`.
@@ -2846,7 +2882,7 @@ impl Index {
             |asset: &TreePath| self.referenced_by.get(asset).is_some_and(|refs| refs.iter().any(|r| r.from != *asset));
         let whole = uids.iter().any(|uid| self.named.contains_key(uid))
             || self.layers.iter().any(|l| uids.iter().any(|uid| l.changeset.ops.contains_key(uid)))
-            || come.iter().any(|(_, asset)| self.dangling.iter().any(|r| r.target == asset.as_str()))
+            || come.iter().any(|(_, asset)| self.dangling.iter().any(|r| r.target.as_deref() == Some(&**asset)))
             || went.iter().any(|(_, asset)| others_refer(asset));
         {
             let by_uid = Shared::make_mut(&mut self.by_uid);
@@ -3443,8 +3479,8 @@ impl Index {
                     .and_then(|f| self.records.get(f))
                     .and_then(|r| r.declaration.as_ref());
                 // What a declaration names as it writes it: a text that is no uid names no layer's entry.
-                for (_, uid, _, _) in declaration.map_or(&[][..], |d| d.references.as_slice()) {
-                    let creating = Uid::new(uid).ok().and_then(|uid| creator.get(&uid));
+                for declared in declaration.map_or(&[][..], |d| &d.references) {
+                    let creating = declared.uid.as_ref().ok().and_then(|uid| creator.get(uid));
                     if let Some(&j) = creating.filter(|&&j| j != i) {
                         out[i].entry(j).or_insert((0, 0)).1 += 1;
                     }
@@ -4199,11 +4235,9 @@ impl Index {
                 .iter()
                 .find(|f| f.name == NODE_FILE)
                 .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
-            for (slot, uid, target, output) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned()
-            {
-                let output = (!output.is_empty()).then_some(output);
-                let reference = Reference { from: asset.path.clone(), slot, uid, target, output };
-                if let Ok(uid) = Uid::new(&reference.uid) {
+            for declared in declaration.map_or(&[][..], |d| &d.references) {
+                let reference = Reference::of(&asset.path, declared);
+                if let Ok(uid) = reference.uid {
                     *named.entry(uid).or_default() += 1;
                 }
                 match self.target_of(&reference) {
@@ -4231,11 +4265,11 @@ impl Index {
         }
         for (from, references) in before.iter().filter(|(a, _)| changed.contains(&***a)) {
             let named = Shared::make_mut(&mut self.named);
-            for uid in references.iter().filter_map(|r| Uid::new(&r.uid).ok()) {
-                if let Some(count) = named.get_mut(&uid) {
+            for uid in references.iter().filter_map(|r| r.uid.as_ref().ok()) {
+                if let Some(count) = named.get_mut(uid) {
                     *count -= 1;
                     if *count == 0 {
-                        named.remove(&uid);
+                        named.remove(uid);
                     }
                 }
             }
@@ -4257,7 +4291,7 @@ impl Index {
             let mut placed: HashMap<Arc<TreePath>, usize> = HashMap::new();
             let mut dangling_at = self.dangling.partition_point(|r| *r.from < *from);
             for reference in self.references_from(from) {
-                if let Ok(uid) = Uid::new(&reference.uid) {
+                if let Ok(uid) = reference.uid {
                     *Shared::make_mut(&mut self.named).entry(uid).or_default() += 1;
                 }
                 if let Some(target) = self.target_of(&reference) {
@@ -4283,37 +4317,21 @@ impl Index {
             .iter()
             .find(|f| f.name == NODE_FILE)
             .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
-        declaration
-            .map_or(&[][..], |d| d.references.as_slice())
-            .iter()
-            .map(|(slot, uid, target, output)| Reference {
-                from: path.to_owned(),
-                slot: slot.clone(),
-                uid: uid.clone(),
-                target: target.clone(),
-                output: (!output.is_empty()).then(|| output.clone()),
-            })
-            .collect()
+        declaration.map_or(&[][..], |d| &d.references).iter().map(|declared| Reference::of(path, declared)).collect()
     }
 
-    /// The asset a reference names, as a declaration writes it: by uid, else by path - each checked as it is read; one
-    /// that is none names nothing.
+    /// The asset a reference names, as a declaration writes it: by its uid, else by the path beside it; none where
+    /// neither names an asset.
     #[must_use]
-    pub fn resolve(&self, uid: &str, target: &str) -> Option<&Asset> {
-        let by_uid = Uid::new(uid).ok().and_then(|uid| self.by_uid.get(&uid)).and_then(|p| self.assets.get(p));
-        by_uid.or_else(|| TreePath::new(target).ok().and_then(|target| self.assets.get(target))).map(|a| &**a)
+    pub fn resolve(&self, uid: &WrittenUid, target: Option<&TreePath>) -> Option<&Asset> {
+        let by_uid = uid.as_ref().ok().and_then(|uid| self.by_uid.get(uid)).and_then(|p| self.assets.get(p));
+        by_uid.or_else(|| self.assets.get(target?)).map(|a| &**a)
     }
 
-    /// The asset path a reference resolves to: the uid decides, the path is the fallback - each as the declaration
-    /// writes it, checked as it is read; none where neither names an asset.
+    /// The asset path a reference resolves to: the uid decides, the path is the fallback; none where neither names
+    /// an asset.
     fn target_of(&self, reference: &Reference) -> Option<Arc<TreePath>> {
-        let by_uid = Uid::new(&reference.uid).ok().and_then(|uid| self.by_uid.get(&uid)).cloned();
-        by_uid.or_else(|| {
-            TreePath::new(&reference.target)
-                .ok()
-                .filter(|target| self.assets.contains_key(*target))
-                .map(ToOwned::to_owned)
-        })
+        self.resolve(&reference.uid, reference.target.as_deref()).map(|asset| asset.path.clone())
     }
 }
 

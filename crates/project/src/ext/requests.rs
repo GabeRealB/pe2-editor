@@ -107,12 +107,19 @@ pub trait Asking: Send + Sync {
 pub struct Requests {
     shared: Arc<Shared>,
     jobs: Mutex<Sender<(Key, u64)>>,
+    /// How long the first to ask waits (`BUDGET`).
+    budget: Duration,
 }
 
 impl Requests {
     /// Start the threads, on this project as it is taken in.
     #[must_use]
     pub fn start(index: Arc<Index>) -> Arc<Requests> {
+        Requests::waiting(index, BUDGET)
+    }
+
+    /// Start the threads, the first to ask waiting this long.
+    fn waiting(index: Arc<Index>, budget: Duration) -> Arc<Requests> {
         let shared = Arc::new(Shared {
             state: Mutex::default(),
             answered: Condvar::new(),
@@ -138,7 +145,7 @@ impl Requests {
                 }
             });
         }
-        Arc::new(Requests { shared, jobs: Mutex::new(jobs) })
+        Arc::new(Requests { shared, jobs: Mutex::new(jobs), budget })
     }
 
     /// Go on with these extensions.
@@ -206,7 +213,7 @@ impl Asking for Requests {
             state = self
                 .shared
                 .answered
-                .wait_timeout_while(state, BUDGET, making)
+                .wait_timeout_while(state, self.budget, making)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -250,8 +257,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     static MADE: AtomicUsize = AtomicUsize::new(0);
-    /// How long the operation below takes, in milliseconds.
-    static TAKES: AtomicU64 = AtomicU64::new(0);
+    /// Whether the operation below may finish: shut, it waits until the test opens it - what it is to take long,
+    /// said by the test rather than by a clock.
+    static GATE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
+
+    fn gate(open: bool) {
+        *GATE.0.lock().unwrap() = open;
+        GATE.1.notify_all();
+    }
 
     struct Blob;
 
@@ -267,7 +280,7 @@ mod tests {
         let _ = r.value_type::<Blob>();
         let _ = r.op("slow").output::<Blob>().run(|_| {
             MADE.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(TAKES.load(Ordering::SeqCst)));
+            drop(GATE.1.wait_while(GATE.0.lock().unwrap(), |open| !*open).unwrap());
             Ok(Typed::new(Blob::NAME, vec![File::new(pe2_ext::RelPath::constant("made.bin"), b"made".to_vec())]))
         });
         Ok(())
@@ -310,59 +323,48 @@ mod tests {
 
     fn ready(requests: &Requests, address: &str) -> Requested {
         let address = pe2_path::Asked::new(address).unwrap();
-        let started = Instant::now();
         loop {
             match requests.request(crate::TreePath::constant("n"), address) {
-                Requested::Pending { .. } => assert!(started.elapsed() < Duration::from_secs(10), "it never came"),
+                Requested::Pending { .. } => {}
                 answer => return answer,
             }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
 
-    // One test, as the operation's counts are one process's.
+    // One test, as the operation's counts are one process's. Nothing in it is timed: what takes long waits on the gate
+    // until the test opens it.
     #[test]
     fn what_is_asked_is_made_once_off_the_asking_thread_and_kept_until_forgotten() {
-        let (root, _lock, requests, _extensions) = opened("once");
-        TAKES.store(150, Ordering::SeqCst);
-        let started = Instant::now();
-        assert!(
-            matches!(
-                requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
-                Requested::Pending { .. }
-            ),
-            "too long to wait for"
-        );
-        assert!(started.elapsed() < Duration::from_millis(120), "whoever asked went on");
+        let (root, _lock, requests, extensions) = opened("once");
+        let native = pe2_path::Asked::constant("native");
+        let ask = |requests: &Requests| requests.request(crate::TreePath::constant("n"), native);
+        // Whoever asks goes on while it is made: answered with the gate shut, as it could not be had it waited.
+        gate(false);
+        assert!(matches!(ask(&requests), Requested::Pending { .. }), "whoever asked went on");
         // Others asking share it.
-        assert!(matches!(
-            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
-            Requested::Pending { .. }
-        ));
+        assert!(matches!(ask(&requests), Requested::Pending { .. }));
+        gate(true);
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));
         assert_eq!(MADE.load(Ordering::SeqCst), 1);
         drop(ready(&requests, "native"));
         assert_eq!(MADE.load(Ordering::SeqCst), 1, "kept");
         assert_eq!(requests.finished(), 1);
-        // Made quickly, it is there for the one asking.
-        TAKES.store(0, Ordering::SeqCst);
-        requests.clear();
-        assert_eq!(
-            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
-            Requested::Ready(b"made".to_vec()),
-            "within what a frame can spare"
-        );
+        // What is made within the wait is there for the one asking: waiting longer than anything here takes, it is
+        // answered at once.
+        let index = requests.shared.index.lock().unwrap().clone();
+        let waiting = Requests::waiting(index, Duration::from_secs(60));
+        waiting.set_extensions(&extensions);
+        assert_eq!(ask(&waiting), Requested::Ready(b"made".to_vec()), "made within the wait");
         assert_eq!(MADE.load(Ordering::SeqCst), 2);
-        // What was forgotten while on its way arrives to nobody.
-        TAKES.store(60, Ordering::SeqCst);
+        // What was forgotten while on its way arrives to nobody: it is made again for who asks after.
+        gate(false);
         requests.clear();
-        assert!(matches!(
-            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
-            Requested::Pending { .. }
-        ));
+        assert!(matches!(ask(&requests), Requested::Pending { .. }));
         requests.clear();
-        TAKES.store(0, Ordering::SeqCst);
+        gate(true);
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));
+        assert_eq!(MADE.load(Ordering::SeqCst), 4, "the forgotten one, then the one asked after");
         // Why it could not be is said, and kept with the rest.
         assert!(matches!(ready(&requests, "absent"), Requested::Failed(_)));
         assert!(!requests.busy());

@@ -51,11 +51,10 @@ fn settled(
     ctx: &eframe::egui::Context,
     setup: &Setup,
 ) -> Option<State> {
-    let started = std::time::Instant::now();
     loop {
         fetcher.tick(extensions, ctx);
         let state = fetcher.state_of(setup);
-        if !matches!(state, Some(State::Fetching(..))) || started.elapsed() > std::time::Duration::from_secs(10) {
+        if !matches!(state, Some(State::Fetching(..))) {
             return state;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

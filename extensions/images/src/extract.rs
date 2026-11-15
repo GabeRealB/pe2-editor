@@ -26,24 +26,35 @@
 //! no image owns: an image palette no slot names takes its colors from the run uploaded at its place (the system's
 //! text palettes, which every dialogue atlas is drawn with).
 
-use pe2_ext::{Discs, Made, Result, Table, anyhow, bail};
+use pe2_ext::{Discs, Made, Result, Table, TreePath, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use crate::texels_per_halfword;
 
-/// A reference as declarations write it: a uid and a bundle's `res://` path.
+/// A reference as declarations write it - a uid and a bundle's `res://` path - read as the declaration's path it
+/// names (`group/name`).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "Written")]
 struct Reference {
+    target: Arc<TreePath>,
+}
+
+/// A reference as it is written.
+#[derive(Deserialize)]
+struct Written {
     path: String,
 }
 
-impl Reference {
-    /// The declaration path (`group/name`) it names.
-    fn target(&self) -> &str {
-        self.path.trim_start_matches("res://").trim_end_matches(".node")
+impl TryFrom<Written> for Reference {
+    type Error = pe2_ext::PathError;
+
+    fn try_from(written: Written) -> std::result::Result<Reference, Self::Error> {
+        let path = written.path.strip_suffix(".node").unwrap_or(&written.path);
+        Ok(Reference { target: TreePath::from_res(path)?.to_owned() })
     }
 }
 
@@ -166,7 +177,7 @@ fn entries_at(bpp: u8) -> usize {
 
 /// Where a palette's colors are stored: a file asset's slot, a resource of it, or its image pages.
 struct PaletteSource {
-    file: String,
+    file: Arc<TreePath>,
     slot: String,
     resource: Option<usize>,
     in_pages: bool,
@@ -175,16 +186,16 @@ struct PaletteSource {
 /// What a texture's extraction reads of the other declarations, as a plan gives them (`extract_texture`).
 struct Textures {
     /// The images, by path.
-    images: BTreeMap<String, (Declaration, Table)>,
+    images: BTreeMap<Arc<TreePath>, (Declaration, Table)>,
     /// The file assets, by path.
-    files: BTreeMap<String, Declaration>,
-    vram: HashMap<String, VramSlot>,
+    files: BTreeMap<Arc<TreePath>, Declaration>,
+    vram: HashMap<Arc<TreePath>, VramSlot>,
     /// Where every image palette's colors are, by image and palette name.
-    palettes: HashMap<(String, String), PaletteSource>,
+    palettes: HashMap<(Arc<TreePath>, String), PaletteSource>,
     /// The named runs a slot uploads (colors no image owns: the system's text palettes), by VRAM slot and place.
-    runs: HashMap<(String, [u32; 2]), PaletteSource>,
+    runs: HashMap<(Arc<TreePath>, [u32; 2]), PaletteSource>,
     /// The file assets by release and place.
-    places: HashMap<(String, u32, Option<u32>, u32), String>,
+    places: HashMap<(String, u32, Option<u32>, u32), Arc<TreePath>>,
 }
 
 fn read(discs: &mut dyn Discs, at: &At) -> Result<Vec<u8>> {
@@ -193,7 +204,7 @@ fn read(discs: &mut dyn Discs, at: &At) -> Result<Vec<u8>> {
 
 impl Textures {
     /// A texture's native files in one release: its texels, and each placed palette's colors.
-    fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
+    fn extract(&mut self, path: &TreePath, release: &str, discs: &mut dyn Discs) -> Result<Made> {
         let (asset, table) = self.images.get(path).ok_or_else(|| anyhow!("{path}: no such image"))?;
         let loc = asset.from.get(release).ok_or_else(|| anyhow!("not in this release"))?;
         let at = loc.at.first().ok_or_else(|| anyhow!("read from nowhere"))?;
@@ -231,10 +242,10 @@ impl Textures {
             // uploads for every image drawn with it).
             let source = self
                 .palettes
-                .get(&(path.to_string(), name.clone()))
-                .or_else(|| self.runs.get(&(slot.target().to_string(), place)))
+                .get(&(path.to_owned(), name.clone()))
+                .or_else(|| self.runs.get(&(slot.target.clone(), place)))
                 .ok_or_else(|| anyhow!("{name}: no file uploads it"))?;
-            let vram = self.place_of(slot.target(), place)?;
+            let vram = self.place_of(&slot.target, place)?;
             let colors = self
                 .colors(source, release, discs, vram, tex.entries(&name))
                 .map_err(|e| anyhow!("{name} ({} {}): {e:#}", source.file, source.slot))?;
@@ -249,7 +260,7 @@ impl Textures {
 
 impl Textures {
     /// A placement's VRAM halfword.
-    fn place_of(&self, slot: &str, at: [u32; 2]) -> Result<(usize, usize)> {
+    fn place_of(&self, slot: &TreePath, at: [u32; 2]) -> Result<(usize, usize)> {
         let vram = self.vram.get(slot).ok_or_else(|| anyhow!("no VRAM slot {slot}"))?;
         Ok(((vram.rect[0] + at[0]) as usize, (vram.rect[1] + at[1]) as usize))
     }
@@ -260,7 +271,7 @@ impl Textures {
     fn image_pages(
         &self,
         discs: &mut dyn Discs,
-        path: &str,
+        path: &TreePath,
         release: &str,
         at: &At,
         pages: Vec<codecs::texture::Page>,
@@ -270,7 +281,7 @@ impl Textures {
         let key = (release.to_string(), at.stage.unwrap_or(0), at.folder, at.file.unwrap_or(0));
         let file = self.places.get(&key).and_then(|f| self.files.get(f));
         let holding = |slot: &ChunkSlot| -> Option<(usize, usize)> {
-            let entry = slot.pages.iter().find(|e| e.image.as_ref().is_some_and(|r| r.target() == path))?;
+            let entry = slot.pages.iter().find(|e| e.image.as_ref().is_some_and(|r| *r.target == *path))?;
             let from = entry.first.unwrap_or(0);
             Some((from, entry.count.unwrap_or(count - from)))
         };
@@ -293,7 +304,7 @@ impl Textures {
                 let offset: usize = slot
                     .pages
                     .iter()
-                    .take_while(|e| e.image.as_ref().is_none_or(|r| r.target() != path))
+                    .take_while(|e| e.image.as_ref().is_none_or(|r| *r.target != *path))
                     .map(|e| self.entry_pages(e))
                     .sum();
                 out.extend(stored.into_iter().skip(offset).take(n));
@@ -310,7 +321,7 @@ impl Textures {
 
     /// How many stored pages an image slot's entry fills.
     fn entry_pages(&self, entry: &PageEntry) -> usize {
-        let Some((_, table)) = entry.image.as_ref().and_then(|r| self.images.get(r.target())) else { return 1 };
+        let Some((_, table)) = entry.image.as_ref().and_then(|r| self.images.get(&r.target)) else { return 1 };
         let total = table
             .clone()
             .try_into::<Texture>()
@@ -398,16 +409,23 @@ impl Discs for Given {
     }
 }
 
-fn table_of(args: &Table, key: &str) -> impl Iterator<Item = (String, Table)> {
+/// A table of the plan's arguments, by the declarations' paths: each checked as a path, and as a table.
+fn table_of(args: &Table, key: &str) -> Result<Vec<(Arc<TreePath>, Table)>> {
     let given = args.get(key).and_then(pe2_ext::Value::as_table).cloned().unwrap_or_default();
-    given.into_iter().filter_map(|(path, table)| Some((path, table.as_table()?.clone())))
+    given
+        .into_iter()
+        .map(|(path, table)| {
+            let table = table.as_table().cloned().ok_or_else(|| anyhow!("{key}: {path} is no table"))?;
+            Ok((TreePath::new(&path)?.to_owned(), table))
+        })
+        .collect()
 }
 
 fn source_of(value: &pe2_ext::Value) -> Result<PaletteSource> {
     let text = |key: &str| value.get(key).and_then(pe2_ext::Value::as_str).map(str::to_string);
     let resource = value.get("resource").and_then(pe2_ext::Value::as_integer).map(usize::try_from).transpose()?;
     Ok(PaletteSource {
-        file: text("file").ok_or_else(|| anyhow!("a palette's source names no file"))?,
+        file: TreePath::new(&text("file").ok_or_else(|| anyhow!("a palette's source names no file"))?)?.to_owned(),
         slot: text("slot").ok_or_else(|| anyhow!("a palette's source names no slot"))?,
         resource,
         in_pages: value.get("in_pages").and_then(pe2_ext::Value::as_bool).unwrap_or(false),
@@ -424,27 +442,27 @@ fn source_of(value: &pe2_ext::Value) -> Result<PaletteSource> {
 /// the declarations say.
 pub fn extract_texture(chunks: Vec<Vec<u8>>, args: &Table) -> Result<Made> {
     let text = |key: &str| args.get(key).and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("no {key}"));
-    let (path, release) = (text("path")?, text("release")?);
-    let parse = |path: &str, table: Table| -> Result<Declaration> {
+    let (path, release) = (TreePath::new(text("path")?)?, text("release")?);
+    let parse = |path: &TreePath, table: Table| -> Result<Declaration> {
         Table::try_into(table).map_err(|e| anyhow!("{path}: {e}"))
     };
     let mut images = BTreeMap::new();
-    for (name, table) in table_of(args, "images") {
+    for (name, table) in table_of(args, "images")? {
         images.insert(name.clone(), (parse(&name, table.clone())?, table));
     }
     let mut files = BTreeMap::new();
-    for (name, table) in table_of(args, "files") {
+    for (name, table) in table_of(args, "files")? {
         files.insert(name.clone(), parse(&name, table)?);
     }
     let mut vram = HashMap::new();
-    for (name, table) in table_of(args, "vram") {
+    for (name, table) in table_of(args, "vram")? {
         vram.insert(name.clone(), table.try_into::<VramSlot>().map_err(|e| anyhow!("{name}: {e}"))?);
     }
     let list = |key: &str| args.get(key).and_then(pe2_ext::Value::as_array).cloned().unwrap_or_default();
     let mut palettes = HashMap::new();
     for entry in list("palettes") {
         let name = entry.get("palette").and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("a palette unnamed"))?;
-        palettes.insert((path.to_string(), name.to_string()), source_of(&entry)?);
+        palettes.insert((path.to_owned(), name.to_string()), source_of(&entry)?);
     }
     let mut runs = HashMap::new();
     for entry in list("runs") {
@@ -452,14 +470,14 @@ pub fn extract_texture(chunks: Vec<Vec<u8>>, args: &Table) -> Result<Made> {
         let at = entry.get("at").and_then(pe2_ext::Value::as_array).ok_or_else(|| anyhow!("a run at no place"))?;
         let place = |i: usize| at.get(i).and_then(pe2_ext::Value::as_integer).map(u32::try_from).transpose();
         let at = [place(0)?.unwrap_or(0), place(1)?.unwrap_or(0)];
-        runs.insert((slot.to_string(), at), source_of(&entry)?);
+        runs.insert((TreePath::new(slot)?.to_owned(), at), source_of(&entry)?);
     }
     let mut places = HashMap::new();
     for entry in list("places") {
         let number = |key: &str| entry.get(key).and_then(pe2_ext::Value::as_integer).map(u32::try_from).transpose();
         let file = entry.get("path").and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("a place of no file"))?;
         let key = (release.to_string(), number("stage")?.unwrap_or(0), number("folder")?, number("file")?.unwrap_or(0));
-        places.insert(key, file.to_string());
+        places.insert(key, TreePath::new(file)?.to_owned());
     }
     let reads = list("reads");
     if reads.len() != chunks.len() {

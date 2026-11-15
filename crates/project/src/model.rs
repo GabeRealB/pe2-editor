@@ -37,11 +37,23 @@ pub struct Declaration {
     pub uid: Option<String>,
     /// Its `variants`' names, in order.
     pub variants: Vec<String>,
-    /// Its references: (slot or field, uid, target path, the output of the asset it names - empty for the asset).
-    pub references: Vec<(String, String, String, String)>,
+    /// Its references, in the order it writes them.
+    pub references: Box<[Declared]>,
     /// Why it cannot be parsed.
     pub error: Option<String>,
     pub text: Arc<str>,
+}
+
+/// A reference a declaration makes: the slot or field it is in, the asset it names, and what of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declared {
+    pub slot: Box<str>,
+    /// The asset's uid; where what is written there is no uid, that text, kept to say the reference leads nowhere.
+    pub uid: std::result::Result<Uid, Box<str>>,
+    /// The bundle's path written beside the uid (`{ uid, path = "res://<path>.node" }`), where one is.
+    pub target: Option<Arc<crate::TreePath>>,
+    /// What of the asset it names, and how that is asked for (`palettes/default`); none for the asset itself.
+    pub output: Option<Arc<pe2_path::Asked>>,
 }
 
 /// What the index knows of a file.
@@ -243,11 +255,12 @@ fn record(name: &str, record: &Record) -> Vec<u8> {
             out.text(variant);
         }
         out.u32(u32::try_from(declaration.references.len()).unwrap_or(u32::MAX));
-        for (slot, uid, target, output) in &declaration.references {
-            out.text(slot);
-            out.text(uid);
-            out.text(target);
-            out.text(output);
+        // Each as text, as declarations write it: a uid that is none as written, none of the rest as nothing.
+        for declared in &declaration.references {
+            out.text(&declared.slot);
+            out.text(&declared.uid.as_ref().map_or_else(ToString::to_string, ToString::to_string));
+            out.text(declared.target.as_deref().map_or("", |target| target.as_str()));
+            out.text(&declared.output.as_deref().map_or_default(ToString::to_string));
         }
         out.maybe(declaration.error.as_deref());
     }
@@ -260,6 +273,17 @@ fn record(name: &str, record: &Record) -> Vec<u8> {
 /// A hash as the model keeps it: its twenty bytes.
 fn sha1_in(read: &mut In<'_>) -> Option<pe2_ext::Sha1> {
     Some(pe2_ext::Sha1::from_bytes(read.take(20)?.try_into().ok()?))
+}
+
+/// A reference a declaration makes, read back as `record` writes it: one that is not so is no record this reads.
+fn declared_in(read: &mut In<'_>) -> Option<Declared> {
+    let (slot, uid, target, output) = (read.text()?, read.text()?, read.text()?, read.text()?);
+    Some(Declared {
+        slot: slot.into(),
+        uid: Uid::new(&uid).map_err(|_| uid.into()),
+        target: if target.is_empty() { None } else { Some(crate::TreePath::new(&target).ok()?.to_owned()) },
+        output: if output.is_empty() { None } else { Some(Arc::from(pe2_path::Asked::new(&output).ok()?)) },
+    })
 }
 
 /// A file's record read back, with the name it says where its key could not: its declaration's text is to be
@@ -282,9 +306,7 @@ fn recorded(value: &[u8]) -> Option<(Record, Option<String>)> {
         let (mut uid, mut error) = (None, None);
         read.maybe(&mut uid)?;
         let variants = (0..read.u32()?).map(|_| read.text()).collect::<Option<Vec<_>>>()?;
-        let references = (0..read.u32()?)
-            .map(|_| Some((read.text()?, read.text()?, read.text()?, read.text()?)))
-            .collect::<Option<Vec<_>>>()?;
+        let references = (0..read.u32()?).map(|_| declared_in(&mut read)).collect::<Option<Box<[_]>>>()?;
         read.maybe(&mut error)?;
         Some(Declaration { shape, uid, variants, references, error, text: Arc::from("") })
     };
@@ -960,7 +982,12 @@ mod tests {
             uid: (n % 2 == 0).then(|| format!("uid://{n:012}")),
             variants: (0..n % 3).map(|v| format!("variant {v}")).collect(),
             references: (0..n % 4)
-                .map(|r| (format!("slot{r}"), format!("uid://{r:012}"), format!("a/b{r}"), String::new()))
+                .map(|r| Declared {
+                    slot: format!("slot{r}").into(),
+                    uid: if r == 3 { Err("uid://no uid".into()) } else { Ok(uid(&format!("uid://{r:012}"))) },
+                    target: (r % 2 == 0).then(|| crate::testing::tree(&format!("a/b{r}"))),
+                    output: (r == 1).then(|| Arc::from(pe2_path::Asked::new("palettes/night").unwrap())),
+                })
                 .collect(),
             error: (n % 5 == 0).then(|| "it cannot be parsed".to_string()),
             text: Arc::from(format!(

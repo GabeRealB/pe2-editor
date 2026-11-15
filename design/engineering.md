@@ -17,6 +17,13 @@ prepared, which only a test build reads. On Windows that is the DirectX Shader C
 one found on the PATH - the Vulkan SDK's, for one, makes shaders Direct3D refuses, which wgpu says as a lost device -
 and where there is none, Direct3D 12 is left out and another backend serves.
 
+Cargo keeps every unit it ever built, each in a folder of its own (`target/debug/build/<package>/<hash>`): a crate built
+with other features, for another profile, or before what it depends on changed stays beside the one built now, and the
+workspace's crates pile up dozens. `cargo xtask sweep` asks cargo what the checks build now - `cargo clippy --workspace
+--all-targets` and `cargo test --workspace --no-run`, whose messages name each unit made or found fresh, a program by the
+copy it is put beside the units as - and removes every other unit's folder, and the incremental caches rustc has not
+touched in a week, which no unit names. A build that fails names too little, so nothing is removed then.
+
 ## The packages the extensions download
 
 What the game's extensions download - compilers, assemblers, Python, FFmpeg - is built from its sources, not taken

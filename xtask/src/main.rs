@@ -25,6 +25,8 @@
 //! - `packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]`: the packages the
 //!   extensions download, built from their sources by the zig projects in `packages/` and laid out as their releases,
 //!   one a package version - published with `--publish` (`packages.rs`).
+//! - `sweep`: what `target/debug` keeps of builds no longer made removed, the units the checks build now kept - as
+//!   cargo says them - and the incremental caches touched in the last week (`sweep.rs`).
 #![allow(
     clippy::disallowed_methods,
     reason = "the workspace's build driver, as a build script is: it lays out and packs files of the folders it is run in"
@@ -37,13 +39,15 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
 mod packages;
+mod sweep;
 
 const USAGE: &str = "cargo xtask prepare [--target <triple>]\n\
                      cargo xtask dist [--tests] [--out <folder>]\n\
                      cargo xtask package [--out <folder>]\n\
                      cargo xtask hash <manifest> [--write]\n\
                      cargo xtask pins [<manifest>...]\n\
-                     cargo xtask packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]";
+                     cargo xtask packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]\n\
+                     cargo xtask sweep";
 
 /// What a task is asked to do.
 #[derive(Default)]
@@ -76,6 +80,10 @@ fn main() -> Result<()> {
     if task == "packages" {
         let (workspace, target) = places()?;
         return packages::run(args, &workspace, &target);
+    }
+    if task == "sweep" {
+        let (workspace, target) = places()?;
+        return sweep::run(&workspace, &target);
     }
     if task == "pins" {
         let named: Vec<PathBuf> = args.map(PathBuf::from).collect();

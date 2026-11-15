@@ -2492,7 +2492,7 @@ impl Project for Lens<'_> {
 
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>> {
         let (uid, path) = index::reference(reference)?;
-        self.index.resolve(&uid, path.as_deref().unwrap_or_default()).map(|a| self.extensions.lend(a))
+        self.index.resolve(&uid, path.as_deref()).map(|a| self.extensions.lend(a))
     }
 
     fn find(&self, node_type: &str) -> Vec<Asset<'_>> {
@@ -2585,7 +2585,7 @@ impl graph::exec::World for Graph<'_> {
             self.index.asset_at(path)?
         } else {
             let (uid, path) = index::reference(reference)?;
-            self.index.resolve(&uid, path.as_deref().unwrap_or_default())?
+            self.index.resolve(&uid, path.as_deref())?
         };
         let (plan, _) = self.extensions.plan(asset);
         Some((asset as &dyn graph::exec::Node, plan))

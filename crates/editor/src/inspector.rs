@@ -868,7 +868,7 @@ fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &project::Tre
         return Err("It would name itself".to_string());
     }
     let held = reference_in(value).and_then(project::index::reference);
-    let held = held.and_then(|(uid, path)| sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()));
+    let held = held.and_then(|(uid, path)| sheet.index.resolve(&uid, path.as_deref()));
     let dropped = sheet.index.assets.get(path).ok_or("It is gone")?;
     match held.and_then(|held| sheet.extensions.type_name(held)) {
         Some(node_type) if sheet.extensions.type_name(dropped) != Some(node_type) => {
@@ -1239,9 +1239,12 @@ fn is_reference(value: &toml::Value) -> bool {
 
 /// A reference as a chip: its asset's icon and short name, opening it on a click; red where it names nothing.
 pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav: &mut Option<crate::workspace::Nav>) {
-    let (uid, path) = project::index::reference(value).unwrap_or_default();
-    let target = path.clone().unwrap_or_else(|| uid.clone());
-    match sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) {
+    let (uid, path) = project::index::reference(value).unwrap_or((Err("".into()), None));
+    // What it names, as it is written, where that is no asset.
+    let target = path
+        .as_ref()
+        .map_or_else(|| uid.as_ref().map_or_else(ToString::to_string, ToString::to_string), ToString::to_string);
+    match sheet.index.resolve(&uid, path.as_deref()) {
         Some(asset) => {
             let (icon, tint) = icons::for_type(sheet.extensions, sheet.extensions.type_name(asset));
             let mut parts = asset.path.parts().rev();
@@ -1404,7 +1407,7 @@ fn part_picture(ui: &mut egui::Ui, sheet: &Sheet, parts: &mut crate::workspace::
         return;
     };
     let part = part.to_string();
-    let Some(asset) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) else { return };
+    let Some(asset) = sheet.index.resolve(&uid, path.as_deref()) else { return };
     let ctx = ui.ctx().clone();
     let Some(Ok(picture)) = parts.get(&ctx, sheet.extensions, asset, &part) else { return };
     let size = if picture.size.y <= 1.0 {

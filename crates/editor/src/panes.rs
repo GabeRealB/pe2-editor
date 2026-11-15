@@ -388,8 +388,8 @@ fn move_into(ws: &Workspace, path: &project::TreePath, folder: &project::TreePat
     if path.parent() == Some(folder) {
         return Err("It is in this folder already".to_string());
     }
-    let name = path.name().unwrap_or_default();
-    let to = project::index::bundle_named(&crate::workspace::child_path(folder, name));
+    let name = path.last().ok_or("The project's top cannot be moved")?;
+    let to = project::index::bundle_named(&folder.join(name));
     if ws.index.entries.contains_key(&to) {
         return Err(format!("{name} is there already"));
     }
@@ -1048,11 +1048,10 @@ fn assets_grid_ui(
     let Some(node) = ws.tree.at(folder) else { return };
     ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
     ui.horizontal_wrapped(|ui| {
-        for (name, child) in node.sorted_children() {
-            if child.entry.is_some() {
-                continue;
-            }
-            let path = crate::workspace::child_path(folder, name);
+        for (key, child) in node.sorted_children() {
+            // An asset's looks are the tree's: the grid shows what is in the folder.
+            let Some(path) = key.path_in(folder) else { continue };
+            let name = key.as_str();
             let is_folder = !child.children.is_empty();
             let marked = ws.marked_folder.as_ref() == Some(&path);
             let response = grid_cell(ui, ws, name, child, marked);
@@ -1091,7 +1090,7 @@ fn assets_grid_ui(
             for file in asset.on_disk().files.iter().filter(|f| f.made_by.is_none()) {
                 let mut parts = file.name.parts();
                 let (top, deeper) = (parts.next().map_or("", |part| part.as_str()), parts.next().is_some());
-                if !tops.iter().any(|(t, _)| *t == top) && !node.children.contains_key(top) {
+                if !tops.iter().any(|(t, _)| *t == top) && !node.children.keys().any(|child| child.as_str() == top) {
                     tops.push((top, deeper));
                 }
             }
@@ -1099,7 +1098,7 @@ fn assets_grid_ui(
                 // A folder of files draws as a folder: something inside it.
                 let mut shown = Node { file: !folder, ..Node::default() };
                 if folder {
-                    shown.children.insert(String::new(), Node::default());
+                    shown.children.insert(crate::workspace::Child::Look(Box::default()), Node::default());
                 }
                 let response = grid_cell(ui, ws, top, &shown, false);
                 if response.clicked() {
@@ -1196,7 +1195,8 @@ impl TreeView<'_> {
         pick: &mut Option<Pick>,
         chosen: &mut Option<Entry>,
     ) {
-        for (name, child) in node.sorted_children() {
+        for (key, child) in node.sorted_children() {
+            let name = key.as_str();
             let has_files = self.folders.is_none() && !self.files_of(child).is_empty();
             if child.children.is_empty() && !has_files {
                 if self.folders.is_some() {
@@ -1212,12 +1212,12 @@ impl TreeView<'_> {
                 continue;
             }
             // Beside a grid, what is in a folder is the grid's: one with no folder in it has nothing to unfold.
+            // What has something in it is a folder or an asset of the tree, an entry: a look has nothing in it.
+            let Some(path) = key.path_in(prefix) else { continue };
             if self.folders.is_some() && !child.children.values().any(|inner| !inner.children.is_empty()) {
-                self.folder_leaf(ui, name, child, &crate::workspace::child_path(prefix, name));
+                self.folder_leaf(ui, name, child, &path);
                 continue;
             }
-            // What has something in it is a folder or an asset of the tree: named as a path is.
-            let path = crate::workspace::child_path(prefix, name);
             let id = ui.make_persistent_id(&path);
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
             if self.reveal.is_some_and(|r| *r != *path && r.starts_with(&path)) {
@@ -2086,7 +2086,7 @@ pub(crate) fn references_ui(
         .index
         .references_from(&asset.path)
         .into_iter()
-        .filter_map(|r| Some((r.slot, ws.index.resolve(&r.uid, &r.target)?)))
+        .filter_map(|r| Some((r.slot.to_string(), ws.index.resolve(&r.uid, r.target.as_deref())?)))
         .collect();
     theme::section(ui, &format!("References ({})", outgoing.len()), |ui| {
         if outgoing.is_empty() {
@@ -2287,7 +2287,7 @@ fn problems_ui(
             }
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
-                theme::short(ui, RichText::new(format!("→ {} ({})", r.target, r.uid)).small().color(theme::weak()));
+                theme::short(ui, RichText::new(format!("→ {}", r.said())).small().color(theme::weak()));
             });
         }
     });
@@ -2403,7 +2403,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<crate::workspa
     if !ws.index.dangling.is_empty() {
         theme::section(ui, &format!("Dangling references ({})", ws.index.dangling.len()), |ui| {
             for r in &ws.index.dangling {
-                let detail = RichText::new(format!("{} → {}", r.slot, r.target)).color(ui.visuals().error_fg_color);
+                let detail = RichText::new(format!("{} → {}", r.slot, r.said())).color(ui.visuals().error_fg_color);
                 if theme::link_row(ui, r.from.as_str(), detail).clicked() {
                     *nav = Some(crate::workspace::Nav::to(r.from.clone()));
                 }

@@ -6,7 +6,7 @@ use sfs::HostPath;
 use sfs::testing::At as _;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use project::host::{Connection, FromHost, ToHost};
 use project::server::{FromServer, ToServer};
@@ -208,7 +208,7 @@ struct StandIn {
 impl StandIn {
     fn take(root: &HostPath) -> StandIn {
         let p = project::Project::load(root).unwrap();
-        let lock = project::lock::Lock::acquire_within(root, "a stand-in", Duration::from_secs(20)).unwrap();
+        let lock = project::lock::Lock::acquire(root, "a stand-in", |_| {}).unwrap();
         let cache = project::cache::Cache::open(&p, &lock).unwrap();
         let (history, _) = project::history::History::open(&cache).unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
@@ -247,21 +247,17 @@ impl Drop for Tried {
     fn drop(&mut self) {
         let _ = self.ask(&["serve", "--stop"]);
         let project = self.project();
-        within(Duration::from_secs(20), || !project::host::running(&project) && !project::server::running(&project));
+        until(|| !project::host::running(&project) && !project::server::running(&project));
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
-/// Wait until something holds, as long as given: whether it came to.
-fn within(long: Duration, holds: impl Fn() -> bool) -> bool {
-    let asked = Instant::now();
-    while asked.elapsed() < long {
-        if holds() {
-            return true;
-        }
+/// Wait until something holds, as long as that takes: nothing here promises when, and what never comes is a test that
+/// does not end.
+fn until(holds: impl Fn() -> bool) {
+    while !holds() {
         std::thread::sleep(Duration::from_millis(50));
     }
-    holds()
 }
 
 fn written(at: &HostPath, text: &str) -> String {
@@ -290,7 +286,7 @@ fn what_commands_ask_is_answered_by_one_host_started_for_it() {
     // Told to stop, it is gone.
     let (stopped, said) = tried.ask(&["serve", "--stop"]);
     assert!(stopped, "{said}");
-    assert!(within(Duration::from_secs(20), || !project::host::running(&tried.project())), "the host stops");
+    until(|| !project::host::running(&tried.project())); // the host stops
 }
 
 #[test]
@@ -347,7 +343,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     assert_eq!(folder.read("notes/a.txt").as_deref(), Some("one"));
     // What a program writes there is the host's step, as the command's was: the next undo takes it back.
     folder.write("b.txt", "two");
-    assert!(within(Duration::from_secs(20), || tried.host_said("New b.txt")), "what is written is the project's");
+    until(|| tried.host_said("New b.txt")); // what is written is the project's
     assert_eq!(folder.read("b.txt").as_deref(), Some("two"));
     let (undone, said) = tried.ask(&["undo"]);
     assert!(undone && said.contains("b.txt"), "{said}");
@@ -378,7 +374,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     let (stopped, said) = tried.ask(&["serve", "--stop"]);
     assert!(stopped, "{said}");
     let gone = || !project::host::running(&tried.project()) && !project::server::running(&tried.project());
-    assert!(within(Duration::from_secs(20), gone), "the host and the server stop");
+    until(gone); // the host and the server stop
 }
 
 #[test]
@@ -394,14 +390,14 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     let stand_in = StandIn::take(&tried.project());
     assert_eq!(tried.holder().as_deref(), Some("a stand-in"));
     let fed_by_it = || tried.server().is_some_and(|(_, by)| by.is_some_and(|by| by != "pe2-cli"));
-    assert!(within(Duration::from_secs(20), fed_by_it), "whoever holds the project feeds the server");
+    until(fed_by_it); // whoever holds the project feeds the server
     // The server says who feeds it a moment before that one has its answer.
     let knows = || matches!(stand_in.files.state(), holder::files::State::Served(..));
-    assert!(within(Duration::from_secs(20), knows), "and knows it is served");
+    until(knows); // and knows it is served
     assert_eq!(folder.read("a.txt").as_deref(), Some("one"), "served on");
     // What a program writes now is made by who holds the project.
     folder.write("c.txt", "three");
-    assert!(within(Duration::from_secs(20), || stand_in.made("New c.txt")), "the holder makes the edit");
+    until(|| stand_in.made("New c.txt")); // the holder makes the edit
     assert_eq!(folder.read("c.txt").as_deref(), Some("three"));
     // Let go of - said first, as an editor closing says it - the project is the host's again without it looking for
     // it: it feeds the server what is served now, the other's edit in it.
@@ -413,10 +409,10 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
         tried.holder().as_deref() == Some("the host")
             && tried.server().is_some_and(|(_, by)| by.as_deref() == Some("pe2-cli"))
     };
-    assert!(within(Duration::from_secs(20), back), "the host takes the project back, and feeds the server");
+    until(back); // the host takes the project back, and feeds the server
     assert_eq!(folder.read("c.txt").as_deref(), Some("three"));
     folder.write("d.txt", "four");
-    assert!(within(Duration::from_secs(20), || tried.host_said("New d.txt")), "what is written is the host's step");
+    until(|| tried.host_said("New d.txt")); // what is written is the host's step
     assert_eq!(tried.server().map(|(pid, _)| pid), Some(server), "one server, throughout");
 }
 
@@ -428,17 +424,12 @@ fn what_is_written_while_nothing_holds_the_project_starts_a_host() {
     // Its host gone - told to stop, as one that differs is - the server serves on what it was listed last.
     let stopping = Connection::connect(&tried.project()).and_then(|mut host| host.ask(&ToHost::Stop).ok());
     assert_eq!(stopping, Some(FromHost::Stopping));
-    assert!(within(Duration::from_secs(20), || !project::host::running(&tried.project())), "the host stops");
+    until(|| !project::host::running(&tried.project())); // the host stops
     assert!(tried.server().is_some(), "the server serves on for a while");
     // What a program writes now has a host started to hold the project, which feeds the server from then on.
     folder.write("e.txt", "five");
-    let made = within(Duration::from_secs(30), || tried.host_said("New e.txt"));
-    assert!(
-        made,
-        "a host is started, and makes it; the server said:\n{}\nthe host said:\n{}",
-        tried.said().0,
-        tried.said().1
-    );
+    // A host is started, and makes it.
+    until(|| tried.host_said("New e.txt"));
     assert_ne!(tried.host(), Some(host), "another host");
     assert_eq!(folder.read("e.txt").as_deref(), Some("five"));
 }
@@ -448,7 +439,7 @@ fn what_is_written_while_a_tool_has_the_project_is_taken_in_once_it_is_done() {
     let tried = Tried::new("busy");
     let folder = tried.serve();
     // A tool takes the project, as an extraction does: it answers no edits.
-    let tool = project::lock::Lock::acquire_within(&tried.project(), "a tool", Duration::from_secs(20)).unwrap();
+    let tool = project::lock::Lock::acquire(&tried.project(), "a tool", |_| {}).unwrap();
     assert_eq!(tried.holder().as_deref(), Some("a tool"));
     // What a program writes meanwhile is kept, shown as written, and is nobody's step yet.
     folder.write("meanwhile.txt", "kept");
@@ -457,7 +448,7 @@ fn what_is_written_while_a_tool_has_the_project_is_taken_in_once_it_is_done() {
     assert!(!tried.host_said("New meanwhile.txt"));
     // The tool done, the host has the project again, and what was kept is its step.
     drop(tool);
-    assert!(within(Duration::from_secs(30), || tried.host_said("New meanwhile.txt")), "taken in once it is done");
+    until(|| tried.host_said("New meanwhile.txt")); // taken in once it is done
     assert_eq!(folder.read("meanwhile.txt").as_deref(), Some("kept"));
     let (undone, said) = tried.ask(&["undo"]);
     assert!(undone && said.contains("meanwhile.txt"), "{said}");

@@ -24,7 +24,7 @@ use crate::settings::{Preview, Upscale};
 /// its other looks - is a virtual folder of them: choosing one shows the image so.
 #[derive(Default)]
 pub struct Node {
-    pub children: BTreeMap<String, Node>,
+    pub children: BTreeMap<Child, Node>,
     pub asset: Option<Arc<TreePath>>,
     pub entry: Option<Entry>,
     /// The resolved entry here, by its real path.
@@ -82,10 +82,31 @@ fn look_of(path: &TreePath) -> (Arc<TreePath>, String) {
     (path.to_owned(), project::ext::PICTURE.to_string())
 }
 
-/// A path of the tree and the name of one of its children there: what the tree's nodes are named is their paths'.
-#[must_use]
-pub fn child_path(prefix: &TreePath, name: &str) -> Arc<TreePath> {
-    prefix.join(pe2_path::Name::new(name).expect("the tree names its folders and assets by their paths' names"))
+/// What a node of the tree is to the node holding it: an entry, by its name, or one of an asset's looks.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Child {
+    Entry(Arc<Name>),
+    Look(Box<str>),
+}
+
+impl Child {
+    /// Its name, as the tree shows it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Child::Entry(name) => name.as_str(),
+            Child::Look(look) => look,
+        }
+    }
+
+    /// Its path, in a folder of this path: none for a look, which is no entry of the tree.
+    #[must_use]
+    pub fn path_in(&self, folder: &TreePath) -> Option<Arc<TreePath>> {
+        match self {
+            Child::Entry(name) => Some(folder.join(name)),
+            Child::Look(_) => None,
+        }
+    }
 }
 
 impl Node {
@@ -97,7 +118,7 @@ impl Node {
             let path = if entry.kind == Kind::Asset { project::index::asset_of(real) } else { real.clone() };
             let mut node = &mut root;
             for part in path.parts() {
-                node = node.children.entry(part.to_string()).or_default();
+                node = node.children.entry(Child::Entry(part.to_owned())).or_default();
             }
             node.path = Some(real.clone());
             match entry.kind {
@@ -110,7 +131,7 @@ impl Node {
                     if names.len() > 1 {
                         for name in names {
                             let entry = Some(Entry { image: path.clone(), look: name.clone() });
-                            node.children.insert(name, Node { entry, ..Node::default() });
+                            node.children.insert(Child::Look(name.into()), Node { entry, ..Node::default() });
                         }
                     }
                 }
@@ -123,12 +144,12 @@ impl Node {
     /// The node at a path below it.
     #[must_use]
     pub fn at(&self, path: &TreePath) -> Option<&Node> {
-        path.parts().try_fold(self, |node, step| node.children.get(step.as_str()))
+        path.parts().try_fold(self, |node, step| node.children.get(&Child::Entry(step.to_owned())))
     }
 
-    pub fn sorted_children(&self) -> Vec<(&String, &Node)> {
-        let mut children: Vec<(&String, &Node)> = self.children.iter().collect();
-        children.sort_by_cached_key(|(name, _)| natural(name));
+    pub fn sorted_children(&self) -> Vec<(&Child, &Node)> {
+        let mut children: Vec<(&Child, &Node)> = self.children.iter().collect();
+        children.sort_by_cached_key(|(child, _)| natural(child.as_str()));
         children
     }
 }
@@ -2705,7 +2726,7 @@ impl Workspace {
     /// The asset a reference value (`{ uid, path }`) names.
     pub fn target(&self, value: &toml::Value) -> Option<&Asset> {
         let (uid, path) = project::index::reference(value)?;
-        self.index.resolve(&uid, path.as_deref().unwrap_or_default())
+        self.index.resolve(&uid, path.as_deref())
     }
 
     /// An asset's looks by name.

@@ -586,8 +586,9 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .references_from(&asset.path)
         .iter()
         .map(|r| {
-            let resolved = index.resolve(&r.uid, &r.target).map(|a| a.path.clone());
-            json!({ "slot": r.slot, "uid": r.uid, "output": r.output, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
+            let resolved = index.resolve(&r.uid, r.target.as_deref()).map(|a| a.path.clone());
+            let output = r.output.as_ref().map(ToString::to_string);
+            json!({ "slot": r.slot, "uid": r.uid_text(), "output": output, "target": r.target, "resolves_to": resolved })
         })
         .collect();
     let by: Vec<Value> = index
@@ -595,13 +596,13 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .get(&asset.path)
         .map_or(&[][..], Vec::as_slice)
         .iter()
-        .map(|r| json!({ "from": r.from, "slot": r.slot, "output": r.output }))
+        .map(|r| json!({ "from": r.from, "slot": r.slot, "output": r.output.as_ref().map(ToString::to_string) }))
         .collect();
     Ok(json!({ "path": asset.path, "references": made, "referenced_by": by }))
 }
 
 fn reference(r: &Reference) -> Value {
-    json!({ "from": r.from, "slot": r.slot, "uid": r.uid, "target": (!r.target.is_empty()).then_some(&r.target) })
+    json!({ "from": r.from, "slot": r.slot, "uid": r.uid_text(), "target": r.target })
 }
 
 fn problems(index: &Index, limit: usize) -> Value {

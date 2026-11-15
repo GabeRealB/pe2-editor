@@ -360,7 +360,7 @@ impl crate::graph::exec::World for Layer<'_> {
     fn node(&self, reference: &toml::Value) -> Option<(&dyn crate::graph::exec::Node, crate::graph::Plan)> {
         let path = match reference.as_str().filter(|r| !r.starts_with("uid://")) {
             Some(path) => path,
-            None => self.uids.get(crate::index::reference(reference)?.0.as_str())?.as_str(),
+            None => self.uids.get(&crate::index::reference(reference)?.0.ok()?.to_string())?.as_str(),
         };
         let (path, (uid, slot)) = self.nodes.get_key_value(path)?;
         let node = slot.get_or_init(|| Written::open(self.roots, path, uid).ok()).as_ref()?;

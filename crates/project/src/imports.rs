@@ -454,9 +454,9 @@ impl Imports {
                 for reference in only.iter().flat_map(|path| index.references_from(path)) {
                     // Named by its uid, or by its path where that names nothing - each as the declaration writes it:
                     // what is neither names no asset, and the link says it dangles.
-                    let by_uid = pe2_path::Uid::new(&reference.uid).ok().and_then(|uid| index.by_uid.get(&uid));
+                    let by_uid = reference.uid.as_ref().ok().and_then(|uid| index.by_uid.get(uid));
                     around.extend(by_uid.cloned());
-                    around.extend(TreePath::new(&reference.target).ok().map(ToOwned::to_owned));
+                    around.extend(reference.target.clone());
                 }
                 around.iter().filter_map(|target| index.referenced_by.get_key_value(target)).collect()
             }
@@ -470,7 +470,8 @@ impl Imports {
             let asset =
                 index.assets.get(*target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())?;
             // Of what it makes, what is named: listing the members of the rest would be asking its extension for nothing.
-            let mut families: Vec<&str> = named.iter().filter_map(|r| r.output.as_deref()?.split('/').next()).collect();
+            let mut families: Vec<&str> =
+                named.iter().filter_map(|r| Some(r.output.as_deref()?.address().output())).collect();
             families.sort_unstable();
             families.dedup();
             let digest = sha1_hex(format!("{}\n{}", families.join(" "), asset.settings_text()).as_bytes());
@@ -490,15 +491,13 @@ impl Imports {
                 .into_iter()
                 .filter_map(|reference| {
                     // Named by its address, however it is asked for; what is no address names no output it has.
-                    let has = |o: &&String| {
-                        pe2_path::Asked::new(o).is_ok_and(|asked| addresses.contains(asked.address().as_str()))
-                    };
+                    let has = |o: &&Arc<pe2_path::Asked>| addresses.contains(o.address().as_str());
                     let output = reference.output.as_ref().filter(|o| !has(o))?;
                     Some(Problem::MissingOutput {
                         asset: reference.from.to_string(),
-                        slot: reference.slot.clone(),
+                        slot: reference.slot.to_string(),
                         target: target.to_string(),
-                        output: output.clone(),
+                        output: output.to_string(),
                     })
                 })
                 .collect();
@@ -642,7 +641,7 @@ fn in_order(index: &Index, paths: &[&TreePath]) -> Vec<Vec<usize>> {
         index
             .references_from(paths[at])
             .into_iter()
-            .filter_map(|r| places.get(&*index.resolve(&r.uid, &r.target)?.path).copied())
+            .filter_map(|r| places.get(&*index.resolve(&r.uid, r.target.as_deref())?.path).copied())
     };
     let mut waiting: Vec<(usize, HashSet<usize>)> =
         (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();

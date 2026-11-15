@@ -10,8 +10,9 @@
 //!   the materials filling its slots (`model.materials`, `materials`) and their images (`images`, `vram_slots`), held to
 //!   the bytes; makes nothing.
 
-use pe2_ext::{Call, Data, File, Registry, Result, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Call, Data, File, Registry, Result, Table, TreePath, Typed, Value, anyhow, bail};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::material::{self, Definition};
 use crate::model::{Binding, Placement, decode, encode};
@@ -124,9 +125,15 @@ pub(crate) fn extract_clip(stored: &[u8], settings: &Table) -> Result<String> {
     Ok(text)
 }
 
-fn tables_of(settings: &Table, key: &str) -> HashMap<String, Table> {
+/// A table of the plan's settings, by the declarations' paths: each checked as a path, and as a table.
+fn tables_of(settings: &Table, key: &str) -> Result<HashMap<Arc<TreePath>, Table>> {
     let given = settings.get(key).and_then(Value::as_table).into_iter().flatten();
-    given.filter_map(|(path, table)| Some((path.clone(), table.as_table()?.clone()))).collect()
+    given
+        .map(|(path, table)| {
+            let table = table.as_table().cloned().ok_or_else(|| anyhow!("{key}: {path} is no table"))?;
+            Ok((TreePath::new(path)?.to_owned(), table))
+        })
+        .collect()
 }
 
 pub(crate) fn check_model(stored: &[u8], mesh_text: &str, settings: &Table) -> Result<()> {
@@ -136,9 +143,9 @@ pub(crate) fn check_model(stored: &[u8], mesh_text: &str, settings: &Table) -> R
         mesh::pose(&mut model, &joints)?;
     }
     let tables = Tables {
-        materials: tables_of(settings, "materials"),
-        images: tables_of(settings, "images"),
-        slots: tables_of(settings, "vram_slots"),
+        materials: tables_of(settings, "materials")?,
+        images: tables_of(settings, "images")?,
+        slots: tables_of(settings, "vram_slots")?,
     };
     let declared = settings.get("model").and_then(Value::as_table).cloned().unwrap_or_default();
     let bindings: Vec<Binding> = slots.iter().map(|slot| binding(&tables, &declared, slot)).collect::<Result<_>>()?;
@@ -157,15 +164,18 @@ pub(crate) fn check_model(stored: &[u8], mesh_text: &str, settings: &Table) -> R
 /// The declarations a model's bytes are rebuilt from, by path: its materials, their images and the slots of VRAM those
 /// are placed in.
 pub(crate) struct Tables {
-    pub materials: HashMap<String, Table>,
-    pub images: HashMap<String, Table>,
-    pub slots: HashMap<String, Table>,
+    pub materials: HashMap<Arc<TreePath>, Table>,
+    pub images: HashMap<Arc<TreePath>, Table>,
+    pub slots: HashMap<Arc<TreePath>, Table>,
 }
 
-/// The path a reference names, a `slot` beside what it places or the reference alone.
-fn target(reference: &Value) -> Option<&str> {
+/// The path a reference names, a `slot` beside what it places or the reference alone: none where it says no path.
+///
+/// # Errors
+/// What it says is no bundle's path.
+fn target(reference: &Value) -> Result<Option<Arc<TreePath>>> {
     let reference = reference.get("slot").unwrap_or(reference);
-    reference.get("slot").unwrap_or(reference).get("path")?.as_str()?.strip_prefix("res://")?.strip_suffix(".node")
+    pe2_ext::declared_path(reference.get("slot").unwrap_or(reference))
 }
 
 fn pair(value: Option<&Value>) -> Option<[i64; 2]> {
@@ -175,7 +185,8 @@ fn pair(value: Option<&Value>) -> Option<[i64; 2]> {
 
 /// Where a slot of VRAM puts what it holds, in halfwords: its corner, plus what the placement adds.
 fn placed(tables: &Tables, placement: &Value) -> Option<[i64; 2]> {
-    let rect = tables.slots.get(target(placement)?)?.get("rect")?.as_array()?;
+    // A placement naming no slot of VRAM - or what is none - is placed nowhere, which what places it says.
+    let rect = tables.slots.get(&target(placement).ok().flatten()?)?.get("rect")?.as_array()?;
     let (x, y) = (rect.first()?.as_integer()?, rect.get(1)?.as_integer()?);
     let [ax, ay] = pair(placement.get("at")).unwrap_or_default();
     Some([x + ax, y + ay])
@@ -184,8 +195,8 @@ fn placed(tables: &Tables, placement: &Value) -> Option<[i64; 2]> {
 /// Where a material's texture is on the console: all of it follows from the image's declaration, and the depth the
 /// material reads it at where it says.
 fn placement(tables: &Tables, texture: &Value, bits: Option<i64>) -> Result<Placement> {
-    let path = target(texture).ok_or_else(|| anyhow!("a texture names no image"))?;
-    let image = tables.images.get(path).ok_or_else(|| anyhow!("no image {path}"))?;
+    let path = target(texture)?.ok_or_else(|| anyhow!("a texture names no image"))?;
+    let image = tables.images.get(&path).ok_or_else(|| anyhow!("no image {path}"))?;
     material::placement_at(&material::image_placement(image, |placement| placed(tables, placement)), texture, bits)
         .map_err(|why| anyhow!("{path}: {why:#}"))
 }
@@ -195,8 +206,8 @@ fn binding(tables: &Tables, model: &Table, slot: &str) -> Result<Binding> {
         .get("materials")
         .and_then(|materials| materials.get(slot))
         .ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
-    let path = target(reference).ok_or_else(|| anyhow!("its slot {slot} names nothing"))?;
-    let table = tables.materials.get(path).ok_or_else(|| anyhow!("no material {path}"))?;
+    let path = target(reference)?.ok_or_else(|| anyhow!("its slot {slot} names nothing"))?;
+    let table = tables.materials.get(&path).ok_or_else(|| anyhow!("no material {path}"))?;
     let read = Definition::read(|key| table.get(key));
     let texture = if read.shader.textures.is_empty() {
         None
@@ -219,6 +230,7 @@ mod tests {
 
     fn tables() -> Tables {
         let text = |toml: &str| toml.parse::<Table>().unwrap();
+        let path = |name: &str| TreePath::new(name).unwrap().to_owned();
         let slot = |name: &str| format!("{{ uid = 'uid://x', path = 'res://{name}.node' }}");
         let image = format!(
             "mode = 'indexed_8bpp'\npage = {{ slot = {}, at = [0, 0] }}\ncells.left = {{ rect = [0, 0, 128, 256], palette = 'one' }}\ncells.right = {{ rect = [128, 0, 128, 256], palette = 'two' }}\npalettes.one = {{ slot = {}, at = [0, 0] }}\npalettes.two = {{ slot = {}, at = [0, 1] }}",
@@ -228,10 +240,10 @@ mod tests {
         );
         Tables {
             materials: HashMap::new(),
-            images: HashMap::from([("image".to_string(), text(&image))]),
+            images: HashMap::from([(path("image"), text(&image))]),
             slots: HashMap::from([
-                ("sheet".to_string(), text("rect = [384, 256, 128, 256]")),
-                ("colors".to_string(), text("rect = [0, 245, 256, 2]")),
+                (path("sheet"), text("rect = [384, 256, 128, 256]")),
+                (path("colors"), text("rect = [0, 245, 256, 2]")),
             ]),
         }
     }
