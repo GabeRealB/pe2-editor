@@ -390,7 +390,8 @@ pub(crate) use schedule::parallel;
 
 #[derive(Clone, PartialEq)]
 pub struct Layer {
-    pub name: String,
+    /// Its name, which names its folder in `.layers/` and its changeset.
+    pub name: Arc<Name>,
     pub kind: LayerKind,
     /// Its content's directory: in `.layers/`, or a mounted tree.
     pub path: HostPath,
@@ -405,7 +406,7 @@ pub struct Layer {
     /// A mount, which `project.toml` declares apart (`[[mount]]`) until mounts move into the stack.
     pub mounted: bool,
     /// The layer a generated layer gives its nodes' files.
-    pub fills: Option<String>,
+    pub fills: Option<Arc<Name>>,
     /// How its content is stored.
     pub storage: Storage,
 }
@@ -603,7 +604,7 @@ pub enum Storage {
 }
 
 /// How a layer says it is stored, its pack opened where it is packed.
-fn storage_of(root: &HostPath, layer: &str, said: Option<&str>, generated: bool, path: &HostPath) -> Result<Storage> {
+fn storage_of(root: &HostPath, layer: &Name, said: Option<&str>, generated: bool, path: &HostPath) -> Result<Storage> {
     let file = root.join(&FILE);
     let storage = match said {
         None | Some("text") => Storage::Text,
@@ -651,7 +652,7 @@ impl Project {
             .iter()
             .map(|m| -> Result<Layer> {
                 Ok(Layer {
-                    name: m.at.to_string(),
+                    name: layer_name(m.at.as_str())?,
                     kind: LayerKind::Files,
                     path: m.path.clone(),
                     at: m.at.clone(),
@@ -665,12 +666,13 @@ impl Project {
             })
             .collect::<Result<_>>()?;
         for l in file.layer {
+            let name = layer_name(&l.name)?;
             let path = match l.path.as_deref() {
                 Some(path) => resolve_path(&root, path)?,
-                None => root.join(&LAYERS).join(&layer_name(&l.name)?),
+                None => root.join(&LAYERS).join(&name),
             };
             let changeset = path.with_suffix(CHANGESET_SUFFIX);
-            if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at.as_str() == l.name) {
+            if layers.iter().any(|m| m.name == name) || unmanaged.iter().any(|m| m.at.parts().eq([&*name])) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
             }
             let kind = match l.kind.as_deref() {
@@ -686,9 +688,10 @@ impl Project {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
             let read_only = l.read_only || generated;
-            let storage = storage_of(&root, &l.name, l.storage.as_deref(), generated, &path)?;
+            let storage = storage_of(&root, &name, l.storage.as_deref(), generated, &path)?;
+            let fills = l.fills.as_deref().map(layer_name).transpose()?;
             layers.push(Layer {
-                name: l.name,
+                name,
                 kind,
                 path,
                 at: TreePath::root().to_owned(),
@@ -696,7 +699,7 @@ impl Project {
                 read_only,
                 changeset_writable: !read_only,
                 mounted: false,
-                fills: l.fills,
+                fills,
                 storage,
             });
         }
@@ -800,8 +803,7 @@ impl Project {
     /// # Errors
     /// `uri` is not a `res://` path.
     pub fn resolve(&self, uri: &str) -> Result<HostPath> {
-        let Some(rel) = uri.strip_prefix("res://") else { bail!("{uri}: not a res:// path") };
-        let rel = TreePath::new(rel.trim_matches('/')).with_context(|| uri.to_string())?;
+        let rel = TreePath::from_res(uri)?;
         let mut mounts: Vec<&Mount> = self.mounts.iter().chain(&self.unmanaged).collect();
         mounts.sort_by_key(|m| std::cmp::Reverse(m.at.as_str().len()));
         for m in mounts {
@@ -821,8 +823,8 @@ impl Project {
     ///
     /// # Errors
     /// The project has no such layer.
-    pub fn layer(&self, name: &str) -> Result<&Layer> {
-        self.layers.iter().find(|l| l.name == name).with_context(|| format!("the project has no layer {name}"))
+    pub fn layer(&self, name: &Name) -> Result<&Layer> {
+        self.layers.iter().find(|l| *l.name == *name).with_context(|| format!("the project has no layer {name}"))
     }
 }
 

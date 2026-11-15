@@ -219,7 +219,8 @@ enum ConvertCommand {
 enum LayerCommand {
     /// Add an empty layer at the top of the stack (`.layers/<name>`)
     Add {
-        name: String,
+        #[arg(value_parser = name)]
+        name: Arc<pe2_path::Name>,
         /// A layer of plain files only (code), not assets
         #[arg(long)]
         files: bool,
@@ -231,8 +232,8 @@ enum LayerCommand {
         #[arg(long, requires = "fills", conflicts_with_all = ["files", "bottom"])]
         generated: bool,
         /// The layer a generated layer fills
-        #[arg(long, requires = "generated")]
-        fills: Option<String>,
+        #[arg(long, requires = "generated", value_parser = name)]
+        fills: Option<Arc<pe2_path::Name>>,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -240,7 +241,8 @@ enum LayerCommand {
     /// Make a layer's records those of a tree of files and its changeset (`<folder>.toml` beside it), in place of all it
     /// had: what a tool writes as files
     Import {
-        name: String,
+        #[arg(value_parser = name)]
+        name: Arc<pe2_path::Name>,
         /// The tree
         #[arg(long)]
         from: PathBuf,
@@ -250,7 +252,8 @@ enum LayerCommand {
     },
     /// Write a records layer's entries out as a tree of files, its changeset beside it (`<folder>.toml`)
     Export {
-        name: String,
+        #[arg(value_parser = name)]
+        name: Arc<pe2_path::Name>,
         /// Where
         #[arg(long)]
         to: PathBuf,
@@ -264,10 +267,11 @@ enum LayerCommand {
 enum MountCommand {
     /// Mount a tree at a name: a files layer at the bottom of the stack, or, unmanaged, a place read by path alone
     Add {
-        at: String,
+        #[arg(value_parser = name)]
+        at: Arc<pe2_path::Name>,
         /// The tree, relative to the project or absolute; an unmanaged mount's is each machine's (`locate`)
         #[arg(required_unless_present = "unmanaged")]
-        path: Option<String>,
+        path: Option<PathBuf>,
         /// Nothing is written into it
         #[arg(long)]
         read_only: bool,
@@ -280,9 +284,10 @@ enum MountCommand {
     },
     /// Say where an unmanaged mount is on this machine (`project.local.toml`)
     Locate {
-        at: String,
+        #[arg(value_parser = tree)]
+        at: Arc<project::TreePath>,
         /// Where it is, relative to the project or absolute
-        path: String,
+        path: PathBuf,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -295,9 +300,9 @@ enum LinkCommand {
     /// language server looks for it, the project not being the root of what it is edited in
     Add {
         /// The link, relative to the project (`../compile_commands.json`)
-        at: String,
+        at: PathBuf,
         /// The deployed file, relative to the project (`build/compile_commands.json`)
-        deployed: String,
+        deployed: PathBuf,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -308,7 +313,8 @@ enum LinkCommand {
 enum ConfigCommand {
     /// Add a build the project can be: a release, and the target building it
     Add {
-        name: String,
+        #[arg(value_parser = name)]
+        name: Arc<pe2_path::Name>,
         #[arg(long)]
         release: Option<String>,
         #[arg(long)]
@@ -319,7 +325,8 @@ enum ConfigCommand {
     },
     /// Set a config's property: a TOML value (`fr`, `2`, `["-O2"]`), text where it is none
     Set {
-        config: String,
+        #[arg(value_parser = name)]
+        config: Arc<pe2_path::Name>,
         property: String,
         value: String,
         /// The project's directory
@@ -328,7 +335,8 @@ enum ConfigCommand {
     },
     /// Leave a config's property to its default
     Unset {
-        config: String,
+        #[arg(value_parser = name)]
+        config: Arc<pe2_path::Name>,
         property: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
@@ -370,8 +378,8 @@ struct EditAt {
     #[arg(long, default_value = ".")]
     project: PathBuf,
     /// The layer it goes to: by default, the highest the project lets be written
-    #[arg(long)]
-    layer: Option<String>,
+    #[arg(long, value_parser = name)]
+    layer: Option<Arc<pe2_path::Name>>,
 }
 
 #[derive(Subcommand)]
@@ -396,8 +404,8 @@ enum StoreCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The layer
-        #[arg(long)]
-        layer: String,
+        #[arg(long, value_parser = name)]
+        layer: Arc<pe2_path::Name>,
     },
     /// Unpack a packed layer: its files written back as files
     Unpack {
@@ -405,8 +413,8 @@ enum StoreCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The layer
-        #[arg(long)]
-        layer: String,
+        #[arg(long, value_parser = name)]
+        layer: Arc<pe2_path::Name>,
     },
     /// Store a layer stored as a tree of files as records (one a entry, by uid): kept only where the project shows the
     /// same after, else the tree is put back
@@ -415,8 +423,8 @@ enum StoreCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The layer
-        #[arg(long)]
-        layer: String,
+        #[arg(long, value_parser = name)]
+        layer: Arc<pe2_path::Name>,
     },
 }
 
@@ -429,8 +437,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// This generated layer alone
-        #[arg(long)]
-        layer: Option<String>,
+        #[arg(long, value_parser = name)]
+        layer: Option<Arc<pe2_path::Name>>,
         /// The releases to read: `available` - those whose discs are all found - `all`, failing by name on a disc not
         /// found, or a list (`USA,EUR`)
         #[arg(long, default_value = "available")]
@@ -442,8 +450,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The config (the project's first by default)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, value_parser = name)]
+        config: Option<Arc<pe2_path::Name>>,
         /// Clean first
         #[arg(long)]
         clean: bool,
@@ -477,7 +485,8 @@ enum ProjectCommand {
     /// plain one, or a `node.toml` that makes its folder a node
     Write {
         /// The path in the project, as the served folder shows it
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         /// The file whose content to write; standard input where none
         #[arg(long)]
         from: Option<PathBuf>,
@@ -486,71 +495,82 @@ enum ProjectCommand {
     },
     /// Make a folder
     Mkdir {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Delete an entry (a node with what is inside it), or a file of a node
     Rm {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Rename or move an entry, or a file within its node
     Mv {
-        from: String,
-        to: String,
+        #[arg(value_parser = tree)]
+        from: Arc<project::TreePath>,
+        #[arg(value_parser = tree)]
+        to: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Make the layer's own version of an entry from below
     Override {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Drop the layer's operation on an entry - an override, a move, a delete - and what it holds of it
     Drop {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Keep the layer's version of a stale override: its base becomes what is below now
     KeepMine {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Give up the layer's version of an entry for the one below
     TakeBase {
-        path: String,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Take an entry a layer lists and no longer holds out of its list (a problem's layer and path)
     Forget {
         /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER")]
-        of: String,
-        path: String,
+        #[arg(value_name = "LAYER", value_parser = name)]
+        of: Arc<pe2_path::Name>,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// List what a layer holds unlisted at and under a path of it (a problem's layer and path)
     Adopt {
         /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER")]
-        of: String,
-        path: String,
+        #[arg(value_name = "LAYER", value_parser = name)]
+        of: Arc<pe2_path::Name>,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
     /// Remove what a layer holds unlisted at a path of it from its folder (a problem's layer and path)
     RemoveUnlisted {
         /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER")]
-        of: String,
-        path: String,
+        #[arg(value_name = "LAYER", value_parser = name)]
+        of: Arc<pe2_path::Name>,
+        #[arg(value_parser = tree)]
+        path: Arc<project::TreePath>,
         #[command(flatten)]
         at: EditAt,
     },
@@ -642,8 +662,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// This generated layer alone
-        #[arg(long)]
-        layer: Option<String>,
+        #[arg(long, value_parser = name)]
+        layer: Option<Arc<pe2_path::Name>>,
     },
     /// Check a project's generated layers against their plans, without the discs: every file there, made by what the
     /// plan says now, unchanged since it was written
@@ -652,22 +672,22 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// This generated layer alone
-        #[arg(long)]
-        layer: Option<String>,
+        #[arg(long, value_parser = name)]
+        layer: Option<Arc<pe2_path::Name>>,
     },
     /// Make an output of assets for a config, saying what each made: a file's name, size and SHA-1, a table as TOML
     Output {
         /// The assets, by path or uid
-        assets: Vec<String>,
+        assets: Vec<pe2_path::Reference>,
         /// Every asset of this type besides (`pe2.dialogue@dialogue`)
         #[arg(long)]
         r#type: Option<String>,
         /// The output, by its address
-        #[arg(long, default_value = "native")]
-        output: String,
+        #[arg(long, default_value = "native", value_parser = asked)]
+        output: Arc<pe2_path::Asked>,
         /// The config built (the project's first by default)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, value_parser = name)]
+        config: Option<Arc<pe2_path::Name>>,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -686,8 +706,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The config (the project's first by default)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, value_parser = name)]
+        config: Option<Arc<pe2_path::Name>>,
     },
     /// Say which places of a project you trust: what is in them runs unsandboxed. Kept with you, never in the project.
     /// With nothing to trust named, it says what is trusted
@@ -699,8 +719,8 @@ enum ProjectCommand {
         #[arg(long)]
         all: bool,
         /// A layer or a mount, by name
-        #[arg(long)]
-        layer: Vec<String>,
+        #[arg(long, value_parser = name)]
+        layer: Vec<Arc<pe2_path::Name>>,
         /// A folder
         #[arg(long)]
         path: Vec<PathBuf>,
@@ -721,8 +741,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The config (the project's first by default)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, value_parser = name)]
+        config: Option<Arc<pe2_path::Name>>,
     },
 }
 
@@ -740,8 +760,8 @@ enum ExtensionCommand {
         /// Its folder or archive, or its id
         what: String,
         /// The layer to hold it (the one holding it already, else the highest the project writes)
-        #[arg(long)]
-        layer: Option<String>,
+        #[arg(long, value_parser = name)]
+        layer: Option<Arc<pe2_path::Name>>,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -786,6 +806,22 @@ enum ExtensionCommand {
 }
 
 const TOOLS: &[&str] = &["project", "convert", "uid"];
+
+/// A name an argument gives - a layer's, a mount point's, a config's - checked as it comes in.
+fn name(text: &str) -> Result<Arc<pe2_path::Name>, pe2_path::PathError> {
+    pe2_path::Name::new(text).map(ToOwned::to_owned)
+}
+
+/// A path of the project's tree an argument gives, as the served folder shows it (`packages/aya`, `/` around it
+/// allowed).
+fn tree(text: &str) -> Result<Arc<project::TreePath>, pe2_path::PathError> {
+    project::TreePath::new(text.trim_matches('/')).map(ToOwned::to_owned)
+}
+
+/// An output an argument asks for: its address, and after `?` its query.
+fn asked(text: &str) -> Result<Arc<pe2_path::Asked>, pe2_path::PathError> {
+    pe2_path::Asked::new(text).map(Arc::from)
+}
 
 fn write_png(output: &Path, width: usize, height: usize, color: png::ColorType, pixels: &[u8]) -> Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(output)?);
@@ -916,12 +952,12 @@ fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()>
     }
 }
 
-fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
+fn signal(project: &Path, config: Option<&pe2_path::Name>, events: &[&str]) -> anyhow::Result<()> {
     let p = project::Project::load(project)?;
     // Whoever holds the project runs them, and says what came of them: an editor, or a host - started for it where
     // nothing does.
     let events_named: Vec<String> = events.iter().map(ToString::to_string).collect();
-    let request = mcp::Request::Signal { events: events_named, config: config.map(str::to_string) };
+    let request = mcp::Request::Signal { events: events_named, config: config.map(ToOwned::to_owned) };
     if let Some(reply) = mcp::server::ask_holder(&p.root, &request) {
         let said = reply.told().map_err(anyhow::Error::msg)?;
         if !said.is_empty() {
@@ -1153,7 +1189,7 @@ fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
 fn add_from(
     p: &project::Project,
     from: &Path,
-    into: Option<&str>,
+    into: Option<&pe2_path::Name>,
     history: &mut project::history::History,
     label: String,
 ) -> Result<project::ext::component::About> {
@@ -1351,7 +1387,7 @@ fn untrusted(extensions: &project::ext::Extensions) {
 }
 
 /// `pe2-cli project trust`.
-fn trust(project: &Path, all: bool, layers: &[String], paths: Vec<PathBuf>, revoke: bool) -> Result<()> {
+fn trust(project: &Path, all: bool, layers: &[Arc<pe2_path::Name>], paths: Vec<PathBuf>, revoke: bool) -> Result<()> {
     use extensions::trust as places;
     let p = project::Project::load(project)?;
     let mut named = paths;
@@ -1542,8 +1578,8 @@ fn edit_project(
 }
 
 /// A project's generated layers, or the one named: none is an error.
-fn generated_layers<'p>(p: &'p project::Project, only: Option<&str>) -> Result<Vec<&'p project::Layer>> {
-    let layers: Vec<_> = p.generated().filter(|l| only.is_none_or(|name| l.name == name)).collect();
+fn generated_layers<'p>(p: &'p project::Project, only: Option<&pe2_path::Name>) -> Result<Vec<&'p project::Layer>> {
+    let layers: Vec<_> = p.generated().filter(|l| only.is_none_or(|name| *l.name == *name)).collect();
     if layers.is_empty() {
         match only {
             Some(name) => anyhow::bail!("the project has no generated layer {name}"),
@@ -1632,33 +1668,28 @@ fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> 
     made_of(command).transpose()
 }
 
-/// As `edit_of`: the paths it is given checked where they become an edit, one that is none refused.
+/// As `edit_of`: the edit a command is, its paths checked as its arguments were read; standard input kept for a write.
 fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> {
     use vfs::ops::Op;
-    let path = |p: &String| -> Result<Arc<project::TreePath>> {
-        let path =
-            project::TreePath::new(p.trim_matches('/')).with_context(|| format!("{p}: no path of the project"))?;
-        Ok(path.to_owned())
-    };
     Ok(Some(match command {
         ProjectCommand::Write { path: at_path, from, at } => {
             let from = match from {
                 Some(from) => from.clone(),
                 None => read_stdin_to_file()?,
             };
-            (Op::Write { path: path(at_path)?, from: vfs::write::Written::file(&from)? }, at)
+            (Op::Write { path: at_path.clone(), from: vfs::write::Written::file(&from)? }, at)
         }
-        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: path(p)? }, at),
-        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: path(p)? }, at),
-        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: path(from)?, to: path(to)? }, at),
-        ProjectCommand::Override { path: p, at } => (Op::Override { path: path(p)? }, at),
-        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: path(p)? }, at),
-        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: path(p)? }, at),
-        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: path(p)? }, at),
-        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: path(p)? }, at),
-        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: path(p)? }, at),
+        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: p.clone() }, at),
+        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: p.clone() }, at),
+        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: from.clone(), to: to.clone() }, at),
+        ProjectCommand::Override { path: p, at } => (Op::Override { path: p.clone() }, at),
+        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: p.clone() }, at),
+        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: p.clone() }, at),
+        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: p.clone() }, at),
+        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: p.clone() }, at),
+        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: p.clone() }, at),
         ProjectCommand::RemoveUnlisted { of, path: p, at } => {
-            (Op::RemoveUnlisted { layer: of.clone(), path: path(p)? }, at)
+            (Op::RemoveUnlisted { layer: of.clone(), path: p.clone() }, at)
         }
         ProjectCommand::Undo { at } => (Op::Undo, at),
         ProjectCommand::Redo { at } => (Op::Redo, at),
@@ -1707,7 +1738,13 @@ fn problems(project: &Path) -> Result<()> {
 
 /// `pe2-cli project output`: an output of assets made for a config, under the project's lock - a line an asset, its file
 /// by name, size and SHA-1, a table as TOML, or why nothing was made. Fails where any was not.
-fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &str, config: Option<&str>) -> Result<()> {
+fn outputs(
+    project: &Path,
+    assets: &[pe2_path::Reference],
+    of_type: Option<&str>,
+    output: &pe2_path::Asked,
+    config: Option<&pe2_path::Name>,
+) -> Result<()> {
     use project::graph::{Content, Value};
     let p = project::Project::load(project)?;
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", |owner| {
@@ -1729,13 +1766,9 @@ fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &st
     let mut paths: Vec<Arc<project::TreePath>> = Vec::new();
     for name in assets {
         // An asset named by its uid or its path, as given on the command line.
-        let path = if name.starts_with("uid://") {
-            let uid = pe2_path::Uid::new(name).with_context(|| format!("{name}: no uid"))?;
-            index.by_uid.get(&uid).cloned()
-        } else {
-            Some(ToOwned::to_owned(
-                project::TreePath::new(name).with_context(|| format!("{name}: no path of the project"))?,
-            ))
+        let path = match name {
+            pe2_path::Reference::Uid(uid) => index.by_uid.get(uid).cloned(),
+            pe2_path::Reference::Path(path) => Some(path.clone()),
         };
         let path = path.filter(|path| index.assets.contains_key(path));
         paths.push(path.with_context(|| format!("the project has no asset {name}"))?);
@@ -1743,7 +1776,6 @@ fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &st
     if let Some(of_type) = of_type {
         paths.extend(extensions.find(&index, of_type).map(|a| a.path.clone()));
     }
-    let output = pe2_path::Asked::new(output)?;
     let mut failed = 0;
     for path in &paths {
         let asset = &index.assets[path];
@@ -1987,7 +2019,7 @@ fn backends(project: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
+fn verify_layer(project: &Path, only: Option<&pe2_path::Name>) -> Result<()> {
     let p = project::Project::load(project)?;
     let extensions = project_extensions(&p);
     let mut whole = true;

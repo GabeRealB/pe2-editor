@@ -98,11 +98,8 @@ pub fn target_of(reference: &Value) -> Result<Option<Reference>> {
 pub fn declared_path(reference: &Value) -> Result<Option<std::sync::Arc<TreePath>>> {
     let Some(written) = reference.get("path") else { return Ok(None) };
     let text = written.as_str().ok_or_else(|| anyhow!("its `path` is {}, no text", written.type_str()))?;
-    let path = text
-        .strip_prefix("res://")
-        .and_then(|path| path.strip_suffix(".node"))
-        .ok_or_else(|| anyhow!("{text}: no bundle's path (`res://<path>.node`)"))?;
-    Ok(Some(std::sync::Arc::from(TreePath::new(path)?)))
+    let path = text.strip_suffix(".node").ok_or_else(|| anyhow!("{text}: no bundle's path (`res://<path>.node`)"))?;
+    Ok(Some(std::sync::Arc::from(TreePath::from_res(path)?)))
 }
 
 /// The node a field names, where the field is there: as `target_of` reads it.

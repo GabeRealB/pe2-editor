@@ -954,7 +954,7 @@ mod tests {
         history.undo(&index, None, false).unwrap();
         assert!(!record.exists(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
-        add_extension(&project, &source, Some("game"), &mut history, "add".into()).unwrap();
+        add_extension(&project, &source, Some(pe2_path::Name::constant("game")), &mut history, "add".into()).unwrap();
         let in_game = root.at(".layers/game/.records/extensions/pe2.events.toml");
         assert!(in_game.is_file());
         let project = project::Project::load(&root).unwrap();
@@ -962,7 +962,10 @@ mod tests {
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
         assert!(!record.exists());
         assert_eq!(tool(&project), "#!/bin/sh\necho newer\n");
-        assert!(add_extension(&project, &source, Some("nowhere"), &mut history, "add".into()).is_err());
+        assert!(
+            add_extension(&project, &source, Some(pe2_path::Name::constant("nowhere")), &mut history, "add".into())
+                .is_err()
+        );
         // Held by a layer the project does not write: removed, the layer written above leaves it off.
         let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
         std::fs::write(
@@ -1095,7 +1098,7 @@ mod tests {
         project::edit::create(
             &p,
             &index,
-            "project",
+            pe2_path::Name::constant("project"),
             uid("uid://group"),
             tree("graph/passed"),
             (group, &[]),
@@ -1105,7 +1108,7 @@ mod tests {
         project::edit::create(
             &p,
             &index,
-            "project",
+            pe2_path::Name::constant("project"),
             uid("uid://template"),
             tree("graph/template"),
             (template, &[]),
@@ -1123,8 +1126,16 @@ mod tests {
         let made = format!("uid = \"uid://made\"\n\n{stack}");
         let notes = pe2_path::RelPath::new("notes.txt").unwrap();
         let files: [(&pe2_path::RelPath, &[u8]); 1] = [(notes, b"hello")];
-        project::edit::create(&p, &index, "project", uid("uid://made"), tree("notes"), (&made, &files), &mut history)
-            .unwrap();
+        project::edit::create(
+            &p,
+            &index,
+            pe2_path::Name::constant("project"),
+            uid("uid://made"),
+            tree("notes"),
+            (&made, &files),
+            &mut history,
+        )
+        .unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
         let _ = extensions.take_definitions(&index);
         let engine = extensions.engine();

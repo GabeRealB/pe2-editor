@@ -376,13 +376,15 @@ pub fn is_file(path: &HostPath) -> bool {
 }
 
 /// Set how a layer is stored in `project.toml` (`storage`): none for the default, its files as files.
-fn set_storage(project: &crate::Project, layer: &str, storage: Option<&str>) -> io::Result<()> {
+fn set_storage(project: &crate::Project, layer: &Name, storage: Option<&str>) -> io::Result<()> {
     let at = project.root.join(&crate::FILE);
     let text = std::fs::read_to_string(&at)?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(io::Error::other)?;
     let layers = doc.get_mut("layer").and_then(toml_edit::Item::as_array_of_tables_mut);
     let table = layers
-        .and_then(|layers| layers.iter_mut().find(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(layer)))
+        .and_then(|layers| {
+            layers.iter_mut().find(|t| t.get("name").and_then(toml_edit::Item::as_str).is_some_and(|of| *layer == of))
+        })
         .ok_or_else(|| io::Error::other(format!("{layer}: no such layer in project.toml")))?;
     match storage {
         Some(storage) => {
@@ -396,11 +398,11 @@ fn set_storage(project: &crate::Project, layer: &str, storage: Option<&str>) -> 
 }
 
 /// The layer of a project to pack or unpack: a generated one, as only those are packed so far.
-fn generated<'a>(project: &'a crate::Project, name: &str) -> io::Result<&'a crate::Layer> {
+fn generated<'a>(project: &'a crate::Project, name: &Name) -> io::Result<&'a crate::Layer> {
     let layer = project
         .layers
         .iter()
-        .find(|l| l.name == name)
+        .find(|l| *l.name == *name)
         .ok_or_else(|| io::Error::other(format!("{name}: no such layer")))?;
     if layer.kind != crate::LayerKind::Generated {
         return Err(io::Error::other(format!("{name}: only a generated layer is packed, so far")));
@@ -430,7 +432,7 @@ fn files_in(dir: &HostPath, rel: &str, out: &mut Vec<(String, HostPath)>) {
 ///
 /// # Errors
 /// It is no generated layer, or a file cannot be read, stored or removed.
-pub fn pack_layer(project: &crate::Project, name: &str) -> io::Result<usize> {
+pub fn pack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
     let layer = generated(project, name)?;
     let pack = Pack::open(&layer.path)?;
     let mut found = Vec::new();
@@ -457,7 +459,7 @@ pub fn pack_layer(project: &crate::Project, name: &str) -> io::Result<usize> {
 ///
 /// # Errors
 /// It is no generated layer, or a file cannot be read or written.
-pub fn unpack_layer(project: &crate::Project, name: &str) -> io::Result<usize> {
+pub fn unpack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
     let layer = generated(project, name)?;
     let pack = Pack::open(&layer.path)?;
     let entries = pack.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();

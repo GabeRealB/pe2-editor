@@ -137,7 +137,7 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
 fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
     let kept = editor.workspace().cache_path(pe2_path::RelPath::constant("editor/layers.toml"));
-    editor.workspace().toggle_lock("top").expect("locked");
+    editor.workspace().toggle_lock(pe2_path::Name::constant("top")).expect("locked");
     // Written by the worker's thread, aside: there a moment after, with no frame waited for.
     editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
 }

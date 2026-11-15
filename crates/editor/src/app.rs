@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 use egui_tiles::{Behavior as _, TileId};
-use pe2_path::Uid;
+use pe2_path::{Name, Uid};
 use project::TreePath;
 use serde::Deserialize;
 use sfs::HostPath;
@@ -74,7 +74,7 @@ enum Deferred {
     /// A files layer made of this name, and the entry of this uid overridden in it.
     OverrideInNew {
         uid: Uid,
-        name: String,
+        name: Arc<Name>,
     },
 }
 
@@ -671,7 +671,7 @@ impl Editor {
     fn choose_dialog(&mut self, ctx: &egui::Context) {
         let Some(choosing) = &mut self.choosing else { return };
         let (mut chosen, mut create, mut cancel) = (None, false, false);
-        let valid = self.workspace.as_ref().map(|ws| project::stack::check_name(&ws.project, choosing.name.trim()));
+        let valid = self.workspace.as_ref().map(|ws| crate::layers::new_name(&ws.project, &choosing.name));
         egui::Window::new("Override in a files layer")
             .collapsible(false)
             .resizable(false)
@@ -715,8 +715,8 @@ impl Editor {
             let uid = choosing.uid;
             self.choosing = None;
             self.edit(&EditRequest::OverrideIn(uid, layer));
-        } else if create {
-            let (uid, name) = (choosing.uid, choosing.name.trim().to_string());
+        } else if create && let Some(Ok(name)) = valid {
+            let uid = choosing.uid;
             self.choosing = None;
             self.override_in_new(uid, name);
         }
@@ -724,7 +724,7 @@ impl Editor {
 
     /// Make a files layer of this name and override the entry of this uid in it: once the project has been read,
     /// where it is being read - the window goes on meanwhile.
-    fn override_in_new(&mut self, uid: Uid, name: String) {
+    fn override_in_new(&mut self, uid: Uid, name: Arc<Name>) {
         let Some(ws) = &mut self.workspace else { return };
         if let Some(ticket) = ws.reading_until() {
             self.deferred.push((ticket, Deferred::OverrideInNew { uid, name }));
@@ -3254,8 +3254,8 @@ fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, Arc<TreePa
 struct Choosing {
     uid: Uid,
     path: Arc<TreePath>,
-    home: String,
-    layers: Vec<String>,
+    home: Arc<Name>,
+    layers: Vec<Arc<Name>>,
     name: String,
 }
 

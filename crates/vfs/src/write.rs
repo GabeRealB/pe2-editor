@@ -16,7 +16,7 @@ use sfs::HostPath;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{RelPath, Uid};
+use pe2_path::{Name, RelPath, Uid};
 use project::history::History;
 use project::index::{BUNDLE_SUFFIX, Index, Kind, NODE_FILE, asset_of, bundle_named};
 use project::{Project, TreePath, edit};
@@ -296,7 +296,7 @@ pub fn refused(path: &RelPath) -> bool {
 
 /// The layer a filesystem's writes go to where nothing chooses one: the highest the project lets be written.
 #[must_use]
-pub fn writable_layer(index: &Index) -> Option<String> {
+pub fn writable_layer(index: &Index) -> Option<Arc<Name>> {
     index.layers().into_iter().rev().find(|l| l.writable && !l.mounted).map(|l| l.name)
 }
 
@@ -308,7 +308,7 @@ pub fn apply(
     change: &Change,
     project: &Project,
     index: &Index,
-    layer: &str,
+    layer: &Name,
     history: &mut History,
 ) -> Result<Vec<HostPath>> {
     let label = change.label();
@@ -344,7 +344,7 @@ pub fn apply(
 fn write(
     project: &Project,
     index: &Index,
-    layer: &str,
+    layer: &Name,
     path: &TreePath,
     bytes: &[u8],
     label: String,
@@ -376,7 +376,7 @@ fn write(
 fn rename(
     project: &Project,
     index: &Index,
-    layer: &str,
+    layer: &Name,
     from: &TreePath,
     to: &TreePath,
     label: String,

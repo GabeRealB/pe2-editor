@@ -392,7 +392,9 @@ impl Imports {
         let mut problems = Vec::new();
         let resolved = crate::parallel(&found, |(path, _, import)| {
             let asset = index.assets.get(path)?;
-            Some((source_file(asset).map_or_default(|f| f.layer.clone()), import.resolved(asset)))
+            // What it makes is the layer's holding its source; with none, the one whose version of it wins.
+            let layer = source_file(asset).map(|f| f.layer.clone()).or_else(|| asset.layers.last().cloned())?;
+            Some((layer, import.resolved(asset)))
         });
         for ((path, _, import), resolved) in found.into_iter().zip(resolved) {
             let Some((layer, resolved)) = resolved else { continue };

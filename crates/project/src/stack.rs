@@ -13,6 +13,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use crate::history::History;
 use crate::index::LayerInfo;
 use crate::{FILE, LAYERS, LayerKind, Project};
+use pe2_path::Name;
 
 pub(crate) fn read(root: &HostPath) -> Result<DocumentMut> {
     let path = root.join(&FILE);
@@ -37,8 +38,8 @@ fn name_of(table: &Table) -> Option<&str> {
 
 /// Why `order` (the stack's own layers, bottom to top) breaks what a layer needs; none when it keeps it.
 #[must_use]
-pub fn order_breaks(layers: &[LayerInfo], order: &[String]) -> Option<String> {
-    let position = |name: &str| order.iter().position(|n| n == name);
+pub fn order_breaks(layers: &[LayerInfo], order: &[std::sync::Arc<Name>]) -> Option<String> {
+    let position = |name: &Name| order.iter().position(|n| **n == *name);
     for layer in layers {
         let Some(at) = position(&layer.name) else { continue };
         for dependency in &layer.depends_on {
@@ -54,7 +55,12 @@ pub fn order_breaks(layers: &[LayerInfo], order: &[String]) -> Option<String> {
 ///
 /// # Errors
 /// The order breaks what a layer needs, does not name each layer once, or `project.toml` cannot be rewritten.
-pub fn reorder(project: &Project, layers: &[LayerInfo], order: &[String], history: &mut History) -> Result<()> {
+pub fn reorder(
+    project: &Project,
+    layers: &[LayerInfo],
+    order: &[std::sync::Arc<Name>],
+    history: &mut History,
+) -> Result<()> {
     if let Some(why) = order_breaks(layers, order) {
         bail!("{why}");
     }
@@ -88,11 +94,11 @@ pub fn reorder(project: &Project, layers: &[LayerInfo], order: &[String], histor
 ///
 /// # Errors
 /// It may not.
-pub fn check_name(project: &Project, name: &str) -> Result<()> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+pub fn check_name(project: &Project, name: &Name) -> Result<()> {
+    if !name.as_str().chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         bail!("a layer's name is letters, digits, `_` and `-`");
     }
-    if project.layers.iter().any(|l| l.name == name) {
+    if project.layers.iter().any(|l| *l.name == *name) {
         bail!("the project has a layer {name} already");
     }
     Ok(())
@@ -102,7 +108,7 @@ pub fn check_name(project: &Project, name: &str) -> Result<()> {
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
-pub fn add(project: &Project, name: &str, kind: LayerKind, history: &mut History) -> Result<()> {
+pub fn add(project: &Project, name: &Name, kind: LayerKind, history: &mut History) -> Result<()> {
     add_at(project, name, kind, false, history)
 }
 
@@ -111,11 +117,11 @@ pub fn add(project: &Project, name: &str, kind: LayerKind, history: &mut History
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
-pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, history: &mut History) -> Result<()> {
+pub fn add_at(project: &Project, name: &Name, kind: LayerKind, bottom: bool, history: &mut History) -> Result<()> {
     check_name(project, name)?;
     let mut document = read(&project.root)?;
     let mut table = Table::new();
-    table.insert("name", value(name));
+    table.insert("name", value(name.as_str()));
     table.insert("path", value(format!("{LAYERS}/{name}")));
     if kind == LayerKind::Files {
         table.insert("kind", value("files"));
@@ -139,8 +145,7 @@ pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, hist
         tables.push(table);
     }
     let mut tx = history.begin(format!("Add the layer {name}"));
-    let folder =
-        project.root.join(&LAYERS).join(&pe2_path::Name::new(name).with_context(|| format!("the layer {name}"))?);
+    let folder = project.root.join(&LAYERS).join(name);
     tx.make_dir(&folder)?;
     // An assets layer is records (`records`); code is a tree, worked on with its own tools.
     if kind == LayerKind::Assets {
@@ -155,15 +160,15 @@ pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, hist
 ///
 /// # Errors
 /// It is a mount, a generated layer fills it, another layer needs it, or `project.toml` cannot be rewritten.
-pub fn remove(project: &Project, layers: &[LayerInfo], name: &str, history: &mut History) -> Result<()> {
+pub fn remove(project: &Project, layers: &[LayerInfo], name: &Name, history: &mut History) -> Result<()> {
     if let Some(generated) = project.layers.iter().find(|l| l.fills.as_deref() == Some(name)) {
         bail!("{} fills {name}'s nodes with their files", generated.name);
     }
-    if layers.iter().any(|l| l.name == name && l.mounted) {
+    if layers.iter().any(|l| *l.name == *name && l.mounted) {
         bail!("{name} is a mount, declared apart in project.toml ([[mount]])");
     }
     if let Some((layer, dependency)) =
-        layers.iter().find_map(|l| Some((l, l.depends_on.iter().find(|d| d.layer == name)?)))
+        layers.iter().find_map(|l| Some((l, l.depends_on.iter().find(|d| *d.layer == *name)?)))
     {
         bail!("{}, so it cannot be taken out", dependency.describe(&layer.name));
     }
@@ -171,7 +176,7 @@ pub fn remove(project: &Project, layers: &[LayerInfo], name: &str, history: &mut
     let tables = layer_tables(&mut document)?;
     let at = tables
         .iter()
-        .position(|t| name_of(t) == Some(name))
+        .position(|t| name_of(t).is_some_and(|of| *name == of))
         .with_context(|| format!("the stack has no layer {name}"))?;
     tables.remove(at);
     write(&project.root, &document, history, format!("Take the layer {name} out of the stack"))
@@ -189,7 +194,7 @@ mod tests {
 
     fn info(name: &str, below: &[&str]) -> LayerInfo {
         LayerInfo {
-            name: name.into(),
+            name: crate::testing::name(name),
             kind: LayerKind::Assets,
             at: crate::TreePath::root().to_owned(),
             read_only: false,
@@ -201,7 +206,10 @@ mod tests {
             moves: 0,
             deletes: 0,
             problems: 0,
-            depends_on: below.iter().map(|l| Dependency { layer: (*l).into(), operations: 2, references: 0 }).collect(),
+            depends_on: below
+                .iter()
+                .map(|l| Dependency { layer: crate::testing::name(l), operations: 2, references: 0 })
+                .collect(),
         }
     }
 
@@ -219,20 +227,20 @@ mod tests {
         let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let history = &mut history;
         let layers = [info("game", &[]), info("mod", &["game"])];
-        let order = ["mod".to_string(), "game".to_string()];
+        let order = [crate::testing::name("mod"), crate::testing::name("game")];
         let why = stack::order_breaks(&layers, &order).unwrap();
         assert_eq!(why, "mod acts on 2 entries of game, so it stays above it");
         assert!(stack::reorder(&project, &layers, &order, history).is_err());
-        stack::add(&project, "fixes", LayerKind::Assets, history).unwrap();
+        stack::add(&project, pe2_path::Name::constant("fixes"), LayerKind::Assets, history).unwrap();
         let project = Project::load(&root).unwrap();
-        assert!(stack::add(&project, "fixes", LayerKind::Assets, history).is_err());
-        stack::add(&project, "patch", LayerKind::Files, history).unwrap();
+        assert!(stack::add(&project, pe2_path::Name::constant("fixes"), LayerKind::Assets, history).is_err());
+        stack::add(&project, pe2_path::Name::constant("patch"), LayerKind::Files, history).unwrap();
         let read = Project::load(&root).unwrap();
-        assert_eq!(read.layer("patch").unwrap().kind, LayerKind::Files);
+        assert_eq!(read.layer(pe2_path::Name::constant("patch")).unwrap().kind, LayerKind::Files);
         history.undo(&index, None, false).unwrap();
         let project = Project::load(&root).unwrap();
         let layers = [info("game", &[]), info("mod", &["game"]), info("fixes", &[])];
-        let order: Vec<String> = ["game", "fixes", "mod"].map(String::from).into();
+        let order = ["game", "fixes", "mod"].map(crate::testing::name);
         stack::reorder(&project, &layers, &order, history).unwrap();
         let project = Project::load(&root).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["game", "fixes", "mod"]);
@@ -240,8 +248,8 @@ mod tests {
         // Comments travel with their tables.
         let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
         assert!(text.starts_with("# the stack\n") && text.contains("# mine\n[[layer]]\nname = \"mod\""), "{text}");
-        assert!(stack::remove(&project, &layers, "game", history).is_err());
-        stack::remove(&project, &layers, "fixes", history).unwrap();
+        assert!(stack::remove(&project, &layers, pe2_path::Name::constant("game"), history).is_err());
+        stack::remove(&project, &layers, pe2_path::Name::constant("fixes"), history).unwrap();
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
         assert!(root.at(".layers/fixes").is_dir());
         // Undone: taken out, reordered, added - back to the two layers, and the new layer's folder gone.

@@ -3,9 +3,11 @@
 //! Layer pane, the active layer's changeset: its operations with their status, its creates, its problems.
 
 use eframe::egui::{self, RichText};
+use pe2_path::Name;
 use project::LayerKind;
 use project::changeset::Op;
 use project::index::{Kind, LayerInfo, OpStatus};
+use std::sync::Arc;
 
 use crate::icons;
 use crate::theme;
@@ -21,7 +23,17 @@ pub struct LayersState {
 
 /// A layer's row being dragged: its name.
 #[derive(Clone)]
-struct Dragged(String);
+struct Dragged(Arc<Name>);
+
+/// A name typed for a new layer, as a layer may take it: checked as a name, then as the stack takes one.
+///
+/// # Errors
+/// It is no name, or one a layer may not take.
+pub fn new_name(project: &project::Project, typed: &str) -> anyhow::Result<Arc<Name>> {
+    let name = Name::new(typed.trim())?;
+    project::stack::check_name(project, name)?;
+    Ok(name.to_owned())
+}
 
 /// The Layers pane.
 pub fn layers_ui(ui: &mut egui::Ui, ws: &mut Workspace, state: &mut LayersState, message: &mut Option<String>) {
@@ -31,7 +43,7 @@ pub fn layers_ui(ui: &mut egui::Ui, ws: &mut Workspace, state: &mut LayersState,
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         for layer in &rows {
-            row_ui(ui, ws, layer, active.as_deref() == Some(layer.name.as_str()), &mut action);
+            row_ui(ui, ws, layer, active.as_ref() == Some(&layer.name), &mut action);
         }
     });
     ui.add_space(6.0);
@@ -44,19 +56,19 @@ pub fn layers_ui(ui: &mut egui::Ui, ws: &mut Workspace, state: &mut LayersState,
 
 /// What a click in the pane asks for.
 enum Action {
-    Eye(String),
-    Solo(String),
-    Lock(String),
-    Activate(String),
+    Eye(Arc<Name>),
+    Solo(Arc<Name>),
+    Lock(Arc<Name>),
+    Activate(Arc<Name>),
     /// A layer put above (true) or below another.
     Move {
-        layer: String,
-        target: String,
+        layer: Arc<Name>,
+        target: Arc<Name>,
         above: bool,
     },
     /// A new layer, of plain files (true) or of assets.
-    Add(String, bool),
-    Remove(String),
+    Add(Arc<Name>, bool),
+    Remove(Arc<Name>),
 }
 
 impl Action {
@@ -111,7 +123,7 @@ fn row_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &LayerInfo, active: bool, ac
         card.dnd_set_drag_payload(Dragged(layer.name.clone()));
     }
     let dragged = card.dragged();
-    let soloed = ws.layer_view.solo.as_deref() == Some(layer.name.as_str());
+    let soloed = ws.layer_view.solo.as_ref() == Some(&layer.name);
     let (mut fill, mut stroke) = (theme::raised(), egui::Stroke::new(1.0, theme::border()));
     if soloed {
         fill = fill.lerp_to_gamma(theme::solo(), 0.2);
@@ -138,7 +150,7 @@ fn row_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &LayerInfo, active: bool, ac
     content.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let tint = if hidden { theme::weak() } else { theme::text() };
-        ui.add(egui::Label::new(RichText::new(&layer.name).strong().color(tint)).selectable(false).truncate());
+        ui.add(egui::Label::new(RichText::new(layer.name.as_str()).strong().color(tint)).selectable(false).truncate());
         let summary = RichText::new(summary(layer)).small().color(theme::weak());
         ui.add(egui::Label::new(summary).selectable(false).truncate());
     });
@@ -256,7 +268,7 @@ fn summary(layer: &LayerInfo) -> String {
         LayerKind::Files if layer.mounted => format!("files, mounted at {}/", layer.at),
         LayerKind::Files => "files".to_string(),
         LayerKind::Generated => {
-            format!("the files of {}'s nodes, made by its plan", layer.fills.as_deref().unwrap_or("?"))
+            format!("the files of {}'s nodes, made by its plan", layer.fills.as_deref().map_or("?", Name::as_str))
         }
     };
     let mut parts = vec![kind];
@@ -275,7 +287,7 @@ fn summary(layer: &LayerInfo) -> String {
 }
 
 fn hover_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &LayerInfo) {
-    ui.label(RichText::new(&layer.name).strong());
+    ui.label(RichText::new(layer.name.as_str()).strong());
     ui.label(format!("{} overrides, {} moves, {} deletes", layer.overrides, layer.moves, layer.deletes));
     for d in &layer.depends_on {
         ui.label(RichText::new(d.describe(&layer.name)).color(theme::weak()));
@@ -289,7 +301,7 @@ fn menu_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &LayerInfo, action: &mut Op
     if ui.add_enabled(ws.layer_view.solo.is_none(), egui::Button::new("Make active")).clicked() {
         *action = Some(Action::Activate(layer.name.clone()));
     }
-    let soloed = ws.layer_view.solo.as_deref() == Some(layer.name.as_str());
+    let soloed = ws.layer_view.solo.as_ref() == Some(&layer.name);
     let label = if soloed { "End the solo" } else { "Solo" };
     if ui.button(label).on_hover_text("Show it alone: the layers above it hidden, every other layer locked").clicked() {
         *action = Some(Action::Solo(layer.name.clone()));
@@ -335,12 +347,11 @@ fn footer_ui(ui: &mut egui::Ui, ws: &Workspace, state: &mut LayersState, action:
                 edit.request_focus();
                 ui.selectable_value(&mut state.files, false, "Assets").on_hover_text("Assets and plain files");
                 ui.selectable_value(&mut state.files, true, "Files").on_hover_text("Plain files only: code, a patch");
-                let valid = project::stack::check_name(&ws.project, name.trim());
+                let valid = new_name(&ws.project, name);
                 let add = ui.add_enabled(valid.is_ok(), egui::Button::new("Add"));
-                if add.clicked()
-                    || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && valid.is_ok())
-                {
-                    *action = Some(Action::Add(name.trim().to_string(), state.files));
+                let confirmed = add.clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if confirmed && let Ok(name) = &valid {
+                    *action = Some(Action::Add(name.clone(), state.files));
                 }
                 cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
                 if let Err(e) = valid
@@ -371,7 +382,7 @@ pub fn layer_ui(
     };
     let definition = ws.project.layers.iter().find(|l| l.name == layer.name);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&layer.name).heading());
+        ui.label(RichText::new(layer.name.as_str()).heading());
         if ws.is_locked(&layer) {
             ui.label(RichText::new(format!("{}  read-only", icons::LOCK_SIMPLE)).small().color(theme::weak()));
         }
@@ -399,7 +410,7 @@ pub fn layer_ui(
         .index
         .problems
         .iter()
-        .filter(|p| p.layers().contains(&layer.name.as_str()))
+        .filter(|p| p.layers().contains(&&*layer.name))
         .map(project::index::Problem::describe)
         .collect();
     if !problems.is_empty() {
@@ -418,7 +429,7 @@ pub fn layer_ui(
 fn operations_ui(
     ui: &mut egui::Ui,
     ws: &Workspace,
-    layer: &str,
+    layer: &Name,
     nav: &mut Option<crate::workspace::Nav>,
     mut edit: Option<&mut Option<EditRequest>>,
 ) {
@@ -529,7 +540,7 @@ fn resolutions_ui(ui: &mut egui::Ui, op: &project::index::OpView, edit: &mut Opt
 }
 
 /// The entries a layer creates, a row each (a game's nodes run to thousands, so only the rows in view are drawn).
-fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<crate::workspace::Nav>) {
+fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &Name, nav: &mut Option<crate::workspace::Nav>) {
     let creates = ws.index.creates(layer);
     theme::section(ui, &format!("Creates ({})", creates.len()), |ui| {
         if creates.is_empty() {

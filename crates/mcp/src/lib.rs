@@ -39,11 +39,11 @@ pub enum Request {
     /// A resource read by its URI (`uid://...`).
     Read { uri: String },
     /// Events signaled, one epoch each: answered once they have ended, only by an editor.
-    Signal { events: Vec<String>, config: Option<String> },
+    Signal { events: Vec<String>, config: Option<std::sync::Arc<pe2_path::Name>> },
     /// An edit of the project (the command line's, a program's through the served folder), made in a layer - by default
     /// the one edits go to - by whoever holds the project, as a step of its history: answered with the step's label.
     /// Never an agent's: no tool makes one.
-    Edit { op: vfs::ops::Op, layer: Option<String> },
+    Edit { op: vfs::ops::Op, layer: Option<std::sync::Arc<pe2_path::Name>> },
     /// Something was done through the served folder and is due to be the project's: said where the project's
     /// processes share it (`vfs::due`), for whoever holds the project to take from there and make edits of, each
     /// a step of its own. Answered once what became of each is said there, with what is served after them.

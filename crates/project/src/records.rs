@@ -647,7 +647,7 @@ static SETS: std::sync::RwLock<Vec<std::sync::Arc<Set>>> = std::sync::RwLock::ne
 fn placed_alike(
     records: &Read,
     located: &std::collections::HashMap<Uid, Arc<TreePath>>,
-    layer: &str,
+    layer: &Name,
     problems: &mut Vec<String>,
 ) -> std::collections::HashSet<Uid> {
     let mut placing: std::collections::HashMap<&TreePath, Vec<Uid>> = std::collections::HashMap::new();
@@ -1285,7 +1285,7 @@ pub fn of_tree(
 fn records_of_tree(
     project: &crate::Project,
     index: &crate::index::Index,
-    layer: &str,
+    layer: &Name,
     disk: &dyn Fn(&TreePath) -> HostPath,
     changeset: &crate::changeset::Changeset,
 ) -> Result<BTreeMap<Uid, Record>> {
@@ -1397,7 +1397,7 @@ fn records_of_tree(
 pub fn import(
     project: &crate::Project,
     cache: &crate::cache::Cache,
-    name: &str,
+    name: &Name,
     from: &std::path::Path,
 ) -> Result<usize> {
     let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
@@ -1452,7 +1452,7 @@ pub fn import(
 ///
 /// # Errors
 /// The layer is no records layer read, or a file cannot be read or written.
-pub fn export(project: &crate::Project, name: &str, to: &std::path::Path) -> Result<usize> {
+pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Result<usize> {
     let to = &HostPath::new(to).with_context(|| to.display().to_string())?;
     let layer = project.layer(name)?;
     Set::open(project)?;
@@ -1676,7 +1676,7 @@ fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
 /// # Errors
 /// The layer is a records layer holding no extensions as folders, mounted or generated; what it holds cannot be read;
 /// or the project shows otherwise once converted.
-pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &str) -> Result<Converted> {
+pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &Name) -> Result<Converted> {
     let layer = project.layer(name)?;
     if is_records(&layer.path) {
         // What it still holds as folders, of what it held before records: its extensions.

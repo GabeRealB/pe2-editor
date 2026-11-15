@@ -175,7 +175,7 @@ fn greet(root: &HostPath) {
 }
 
 /// Make an edit while holding the project for it alone: a step of a history of its own, which ends with it.
-fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -> Reply {
+fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&pe2_path::Name>) -> Reply {
     if matches!(op, vfs::ops::Op::Undo | vfs::ops::Op::Redo) {
         return Reply::failed(
             "nothing holds the project: what is taken back is an editor's or a host's history".into(),
@@ -186,7 +186,7 @@ fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str
         let cache = Cache::open(&project, lock)?;
         let index = Index::open(&project, &cache)?;
         let layer = match layer {
-            Some(layer) => layer.to_string(),
+            Some(layer) => layer.to_owned(),
             None => vfs::write::writable_layer(&index).context("no layer of the project can be written")?,
         };
         let (mut history, _) = project::history::History::open(&cache)?;

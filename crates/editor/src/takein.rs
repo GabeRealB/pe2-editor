@@ -16,7 +16,7 @@
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use holder::core::{Core, Queue};
-use pe2_path::Uid;
+use pe2_path::{Name, Uid};
 use project::Project;
 use project::cache::Cache;
 use project::ext::Extensions;
@@ -36,7 +36,7 @@ pub enum Job {
     /// Paths changed on disk, by another program.
     Paths(Vec<HostPath>),
     /// The layers hidden from view (the editor's eyes): every asset assembled again.
-    Hidden(BTreeSet<String>),
+    Hidden(BTreeSet<Arc<Name>>),
     /// The point of the history shown, read-only - after its first steps, of one document or all - or none: now.
     /// The index shows the documents' working copies as they were then.
     Viewing(Option<(usize, Option<Uid>)>),
@@ -448,7 +448,7 @@ impl TakeIn {
     }
 
     /// Hide these layers from view; returns the job's ticket.
-    pub fn hidden(&mut self, names: BTreeSet<String>) -> u64 {
+    pub fn hidden(&mut self, names: BTreeSet<Arc<Name>>) -> u64 {
         self.send(Job::Hidden(names))
     }
 
@@ -522,6 +522,9 @@ impl Drop for TakeIn {
     }
 }
 
+/// Events asked to be signaled, and the config named, given back where the window holds them back.
+type Signaled = (Vec<String>, Option<Arc<Name>>);
+
 impl Worker {
     /// Take in all that was asked and is not yet, as one, and hand over what it came to: what the thread does
     /// each time something was asked - nothing, where an asking before this one took it along.
@@ -585,7 +588,7 @@ impl Worker {
 
     /// Make edits asked from outside the window - a command's, a program's through the served folder - as
     /// steps of the history (`Core::edits`): how each went.
-    pub fn edits(&mut self, ops: &[vfs::ops::Op], layer: &str) -> Vec<mcp::Reply> {
+    pub fn edits(&mut self, ops: &[vfs::ops::Op], layer: &Name) -> Vec<mcp::Reply> {
         let (replies, taken) = self.core.edits(&mut self.history, ops, Some(layer));
         self.taken.and(taken);
         replies
@@ -594,7 +597,7 @@ impl Worker {
     /// Take what is due of what programs did through the served folder (`Core::take_due`), in this layer - or
     /// none of it, where no layer can be edited now, and why: `then` given what was answered once that is said
     /// and served.
-    pub fn take_due(&mut self, layer: Result<&str, &str>, then: holder::core::Then) {
+    pub fn take_due(&mut self, layer: Result<&Name, &str>, then: holder::core::Then) {
         let (_, taken) = self.core.take_due(&mut self.history, layer.map(Some), Some(then));
         self.taken.and(taken);
     }
@@ -677,7 +680,7 @@ impl Worker {
     /// Make an edit asked from outside the window - a command's, an agent's - as the window shows the project
     /// now: in the layer named, or the one edits go to, as a step of the session's log; or the last step taken
     /// back or made again, as the History pane's undo and redo do.
-    pub fn asked_edit(&mut self, op: &vfs::ops::Op, layer: Option<&str>) -> mcp::Reply {
+    pub fn asked_edit(&mut self, op: &vfs::ops::Op, layer: Option<&Name>) -> mcp::Reply {
         let showing = self.showing();
         self.history.set_author(showing.author);
         let read_only = showing.viewing.then_some(VIEWING);
@@ -704,11 +707,11 @@ impl Worker {
         }
         let layers = self.core.index.layers();
         let layer = match layer {
-            Some(name) => match layers.iter().find(|l| l.name == name) {
+            Some(name) => match layers.iter().find(|l| *l.name == *name) {
                 None => Err(format!("no layer {name}")),
                 Some(_) if read_only.is_some() => Err(VIEWING.to_string()),
                 Some(info) if showing.layers.is_locked(info) => Err(format!("{name} cannot be edited: it is locked")),
-                Some(_) => Ok(name.to_string()),
+                Some(_) => Ok(name.to_owned()),
             },
             None => showing.layers.editable(&layers, read_only).map(|layer| layer.name.clone()),
         };
@@ -731,8 +734,8 @@ impl Worker {
     pub fn asked_signal(
         &mut self,
         events: Vec<String>,
-        config: Option<String>,
-    ) -> Result<mpsc::Receiver<mcp::Reply>, (Vec<String>, Option<String>)> {
+        config: Option<Arc<Name>>,
+    ) -> Result<mpsc::Receiver<mcp::Reply>, Signaled> {
         let showing = self.showing();
         if !self.attached || showing.holding {
             return Err((events, config));

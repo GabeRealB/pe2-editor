@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged, ProjectOpened};
-use pe2_path::{RelPath, Uid};
+use pe2_path::{Name, RelPath, Uid};
 use project::cache::Cache;
 use project::ext::{Extensions, Lens};
 use project::history::{History, StepError};
@@ -162,14 +162,14 @@ pub struct Shown {
 #[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LayerView {
     #[serde(default)]
-    pub hidden: BTreeSet<String>,
+    pub hidden: BTreeSet<Arc<Name>>,
     #[serde(default)]
-    pub locked: BTreeSet<String>,
+    pub locked: BTreeSet<Arc<Name>>,
     #[serde(default)]
-    pub active: Option<String>,
+    pub active: Option<Arc<Name>>,
     /// Shown alone: the layers above it hidden, those below shown, every other layer locked, and it the active one.
     #[serde(default)]
-    pub solo: Option<String>,
+    pub solo: Option<Arc<Name>>,
 }
 
 impl LayerView {
@@ -212,12 +212,17 @@ impl LayerView {
     }
 
     /// The layers hidden from the view: the eyes', or, while a layer is shown alone, the layers above it.
-    fn hidden(&self, layers: &[LayerInfo]) -> BTreeSet<String> {
+    fn hidden(&self, layers: &[LayerInfo]) -> BTreeSet<Arc<Name>> {
         match &self.solo {
             Some(solo) => layers.iter().skip_while(|l| l.name != *solo).skip(1).map(|l| l.name.clone()).collect(),
             None => self.hidden.clone(),
         }
     }
+}
+
+/// Layers' names as a list says them.
+fn names(layers: &[Arc<Name>]) -> String {
+    layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 const LAYER_VIEW: &pe2_path::RelPath = pe2_path::RelPath::constant("editor/layers.toml");
@@ -423,7 +428,7 @@ type Steps = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(String, Optio
 pub enum EditRequest {
     Override(Uid),
     /// Override in this layer, not the active one: code, overridden in a files layer chosen for it.
-    OverrideIn(Uid, String),
+    OverrideIn(Uid, Arc<Name>),
     /// Ask for a new name, then rename: the uid and the entry's real path.
     Rename(Uid, Arc<TreePath>),
     /// Rename to this real path.
@@ -431,11 +436,11 @@ pub enum EditRequest {
     Delete(Uid),
     /// Take an entry gone from this layer out of its list: the layer and the uid. Any layer whose list can be written,
     /// its content read-only or not.
-    Forget(String, Uid),
+    Forget(Arc<Name>, Uid),
     /// List what a layer holds unlisted at a path, and under it: the layer and the path.
-    Adopt(String, Arc<TreePath>),
+    Adopt(Arc<Name>, Arc<TreePath>),
     /// Remove what a layer holds unlisted at a path from its folder: the layer and the path.
-    RemoveUnlisted(String, Arc<TreePath>),
+    RemoveUnlisted(Arc<Name>, Arc<TreePath>),
     Resolve(Uid, project::edit::Resolution),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
@@ -1377,8 +1382,8 @@ impl Workspace {
 
     /// Set a config's property, or leave it to its default (`None`): written in `project.toml`, as a step. Why it
     /// could not be - the value is not as the project declares it, or it cannot be written - is said.
-    pub fn set_property(&mut self, config: &str, property: &str, to: Option<&toml::Value>) {
-        let (config, property, to) = (config.to_string(), property.to_string(), to.cloned());
+    pub fn set_property(&mut self, config: &Name, property: &str, to: Option<&toml::Value>) {
+        let (config, property, to) = (config.to_owned(), property.to_string(), to.cloned());
         let work = move |w: &mut crate::takein::Worker| {
             project::setup::set_property(&w.core.project, &config, &property, to.as_ref(), &mut w.history)
                 .map_err(|e| format!("{e:#}"))
@@ -1912,7 +1917,7 @@ impl Workspace {
             return Some(format!("moved by {layer}"));
         }
         let home = self.layers.iter().find(|l| l.name == entry.home)?;
-        (!home.mounted && !Self::locked_by_nature(home)).then(|| entry.home.clone())
+        (!home.mounted && !Self::locked_by_nature(home)).then(|| entry.home.to_string())
     }
 
     /// The user's view of the layers kept, in the project's cache: written by the worker's thread, aside.
@@ -1973,12 +1978,12 @@ impl Workspace {
     /// # Errors
     /// The user's view cannot be saved.
     /// While a layer is soloed, the solo decides what is shown: the eyes wait until it ends.
-    pub fn toggle_eye(&mut self, name: &str) -> Result<()> {
+    pub fn toggle_eye(&mut self, name: &Name) -> Result<()> {
         if self.layer_view.solo.is_some() {
             return Ok(());
         }
         if !self.layer_view.hidden.remove(name) {
-            self.layer_view.hidden.insert(name.to_string());
+            self.layer_view.hidden.insert(name.to_owned());
         }
         self.apply_eyes()
     }
@@ -1989,9 +1994,8 @@ impl Workspace {
     ///
     /// # Errors
     /// The user's view cannot be saved.
-    pub fn solo(&mut self, name: &str) -> Result<()> {
-        self.layer_view.solo =
-            if self.layer_view.solo.as_deref() == Some(name) { None } else { Some(name.to_string()) };
+    pub fn solo(&mut self, name: &Name) -> Result<()> {
+        self.layer_view.solo = if self.layer_view.solo.as_deref() == Some(name) { None } else { Some(name.to_owned()) };
         self.apply_eyes()
     }
 
@@ -1999,12 +2003,12 @@ impl Workspace {
     ///
     /// # Errors
     /// The user's view cannot be saved.
-    pub fn toggle_lock(&mut self, name: &str) -> Result<()> {
+    pub fn toggle_lock(&mut self, name: &Name) -> Result<()> {
         if self.layer_view.solo.is_some() {
             return Ok(());
         }
         if !self.layer_view.locked.remove(name) {
-            self.layer_view.locked.insert(name.to_string());
+            self.layer_view.locked.insert(name.to_owned());
         }
         self.refresh_editable();
         self.save_layer_view()
@@ -2014,11 +2018,11 @@ impl Workspace {
     ///
     /// # Errors
     /// The user's view cannot be saved.
-    pub fn activate(&mut self, name: &str) -> Result<()> {
+    pub fn activate(&mut self, name: &Name) -> Result<()> {
         if self.layer_view.solo.is_some() {
             return Ok(());
         }
-        self.layer_view.active = Some(name.to_string());
+        self.layer_view.active = Some(name.to_owned());
         self.save_layer_view()
     }
 
@@ -2144,9 +2148,9 @@ impl Workspace {
     ///
     /// # Errors
     /// The layer cannot be edited, or the edit cannot be made.
-    pub fn apply_edit(&mut self, op: &vfs::ops::Op, layer: Option<&str>) -> Result<(String, Vec<HostPath>), String> {
+    pub fn apply_edit(&mut self, op: &vfs::ops::Op, layer: Option<&Name>) -> Result<(String, Vec<HostPath>), String> {
         self.tell_showing();
-        let (op, layer) = (op.clone(), layer.map(str::to_string));
+        let (op, layer) = (op.clone(), layer.map(ToOwned::to_owned));
         match self.held(move |w| w.asked_edit(&op, layer.as_deref()))? {
             mcp::Reply::Edited { label, touched } => Ok((label, touched)),
             other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
@@ -2185,7 +2189,7 @@ impl Workspace {
             if let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)? {
                 anyhow::bail!(
                     "code is overridden in a files layer ({})",
-                    if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
+                    if choices.is_empty() { "none yet".into() } else { names(&choices) }
                 );
             }
             saving.push((uid, layer, format!("Save {}", path.name().unwrap_or_default())));
@@ -2351,7 +2355,7 @@ impl Workspace {
         {
             anyhow::bail!(
                 "code is overridden in a files layer ({})",
-                if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
+                if choices.is_empty() { "none yet".into() } else { names(&choices) }
             );
         }
         let (request, selected) = (request.clone(), self.selected.clone());
@@ -2389,14 +2393,14 @@ impl Workspace {
     }
 
     /// The stack's own layers (not the mounts), bottom to top.
-    pub fn stack_order(&self) -> Vec<String> {
+    pub fn stack_order(&self) -> Vec<Arc<Name>> {
         self.layers.iter().filter(|l| !l.mounted).map(|l| l.name.clone()).collect()
     }
 
     /// Put the stack's own layers in this order (bottom to top), if it keeps what each needs: written to
     /// `project.toml`, and the project read again. `then` is given why it could not be, where it could not: a
     /// layer it would put below one it needs, or `project.toml` not written.
-    pub fn reorder(&mut self, order: &[String], then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
+    pub fn reorder(&mut self, order: &[Arc<Name>], then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
         let (layers, order) = (self.layers.clone(), order.to_vec());
         self.ask(move |w| project::stack::reorder(&w.core.project, &layers, &order, &mut w.history), then);
     }
@@ -2405,11 +2409,11 @@ impl Workspace {
     /// with it - or given why it could not be: the name is not one a layer may take, or it cannot be written.
     pub fn add_layer(
         &mut self,
-        name: &str,
+        name: &Name,
         kind: project::LayerKind,
         then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static,
     ) {
-        let name = name.to_string();
+        let name = name.to_owned();
         self.ask(move |w| project::stack::add(&w.core.project, &name, kind, &mut w.history), then);
     }
 
@@ -2419,7 +2423,7 @@ impl Workspace {
     ///
     /// # Errors
     /// The active layer cannot be written, or holds plain files only and the entry is an asset.
-    pub fn override_choice(&self, uid: Uid) -> Result<Option<Vec<String>>, String> {
+    pub fn override_choice(&self, uid: Uid) -> Result<Option<Vec<Arc<Name>>>, String> {
         use project::LayerKind;
         let active = self.editable_layer()?;
         let Some(entry) = self.index.entries.values().find(|e| e.uid == uid) else { return Ok(None) };
@@ -2443,8 +2447,8 @@ impl Workspace {
     /// Take a layer out of the stack; its files stay on disk. `then` is given why it could not be, where it could
     /// not: another layer needs it, a generated layer fills it, it is a mount, or `project.toml` cannot be
     /// rewritten.
-    pub fn remove_layer(&mut self, name: &str, then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
-        let (layers, name) = (self.layers.clone(), name.to_string());
+    pub fn remove_layer(&mut self, name: &Name, then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
+        let (layers, name) = (self.layers.clone(), name.to_owned());
         self.ask(move |w| project::stack::remove(&w.core.project, &layers, &name, &mut w.history), then);
     }
 

@@ -4,7 +4,7 @@
 //! (`forget`, `adopt`, `remove-unlisted`) is a layer's own path, as the problem gives it. A file's content goes by the
 //! path of a file holding it (`from`), never inline: what applies it reads it there.
 
-use pe2_path::Uid;
+use pe2_path::{Name, Uid};
 use sfs::HostPath;
 use std::sync::Arc;
 
@@ -57,17 +57,17 @@ pub enum Op {
     },
     /// Take an entry a layer lists and no longer holds out of its list, by the layer's own path.
     Forget {
-        layer: String,
+        layer: Arc<Name>,
         path: Arc<TreePath>,
     },
     /// List what a layer holds unlisted at and under its own path.
     Adopt {
-        layer: String,
+        layer: Arc<Name>,
         path: Arc<TreePath>,
     },
     /// Remove what a layer holds unlisted at its own path from its folder.
     RemoveUnlisted {
-        layer: String,
+        layer: Arc<Name>,
         path: Arc<TreePath>,
     },
     /// Take back the last step, or do again the last taken back.
@@ -151,7 +151,7 @@ pub fn apply(
     op: &Op,
     project: &Project,
     index: &Index,
-    layer: &str,
+    layer: &Name,
     history: &mut History,
 ) -> Result<(String, Vec<HostPath>)> {
     let touched = match op {

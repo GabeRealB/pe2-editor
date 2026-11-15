@@ -86,7 +86,7 @@ pub struct BundleFile {
     pub path: HostPath,
     pub size: u64,
     pub modified: Stamp,
-    pub layer: String,
+    pub layer: Arc<Name>,
     /// The hash of its content.
     pub sha1: pe2_ext::Sha1,
     /// The importer that made it of the asset's source, kept in the cache (`imports`); none for a file of the bundle.
@@ -108,7 +108,7 @@ pub struct Asset {
     pub variants: Vec<String>,
     pub files: Vec<BundleFile>,
     /// The layer creating it, then those overriding it, bottom to top.
-    pub layers: Vec<String>,
+    pub layers: Vec<Arc<Name>>,
     /// Why its `node.toml` could not be parsed; its fields are then empty.
     pub error: Option<String>,
     text: Arc<str>,
@@ -236,13 +236,13 @@ pub enum Kind {
 pub struct Entry {
     pub kind: Kind,
     pub uid: Uid,
-    pub home: String,
-    pub layer: String,
+    pub home: Arc<Name>,
+    pub layer: Arc<Name>,
     pub disk: HostPath,
     /// The layers overriding it, bottom to top.
-    pub overrides: Vec<String>,
+    pub overrides: Vec<Arc<Name>>,
     /// The layer that moved it here, where one did.
-    pub moved: Option<String>,
+    pub moved: Option<Arc<Name>>,
 }
 
 /// How an operation of a layer applies to the layers below it.
@@ -302,13 +302,13 @@ pub struct Below {
     /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
     pub files: Vec<(Arc<RelPath>, HostPath)>,
     /// The layer holding its content.
-    pub layer: String,
+    pub layer: Arc<Name>,
 }
 
 /// A layer in the stack as the layer panel shows it.
 #[derive(Clone, Debug)]
 pub struct LayerInfo {
-    pub name: String,
+    pub name: Arc<Name>,
     pub kind: LayerKind,
     /// A mount's mount point; empty for a layer at the top.
     pub at: Arc<TreePath>,
@@ -318,7 +318,7 @@ pub struct LayerInfo {
     pub writable: bool,
     pub mounted: bool,
     /// The layer a generated layer gives its nodes' files.
-    pub fills: Option<String>,
+    pub fills: Option<Arc<Name>>,
     pub entries: usize,
     pub overrides: usize,
     pub moves: usize,
@@ -331,7 +331,7 @@ pub struct LayerInfo {
 /// What a layer needs of one below it: operations on its entries, references to its assets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dependency {
-    pub layer: String,
+    pub layer: Arc<Name>,
     pub operations: usize,
     pub references: usize,
 }
@@ -339,7 +339,7 @@ pub struct Dependency {
 impl Dependency {
     /// Why a layer must stay above another, as said to the user.
     #[must_use]
-    pub fn describe(&self, from: &str) -> String {
+    pub fn describe(&self, from: &Name) -> String {
         let mut parts = vec![];
         if self.operations > 0 {
             parts.push(format!("acts on {} entr{} of {}", self.operations, plural_y(self.operations), self.layer));
@@ -375,17 +375,17 @@ pub enum Problem {
     /// One uid created twice.
     DuplicateUid { uid: String, paths: Vec<String> },
     /// One path in several layers, which no changeset declares an override of.
-    Conflict { path: String, layers: Vec<String> },
+    Conflict { path: String, layers: Vec<Arc<Name>> },
     /// What a layer holds that its changeset does not list: put in a layer folder by other means than the editor, or in
     /// one that cannot be written. Adopted (listed) or removed by the user.
-    Unlisted { layer: String, path: String },
+    Unlisted { layer: Arc<Name>, path: String },
     /// An entry a changeset lists that its layer does not hold; or holds where the index leaves it out (`left_out`:
     /// an extension's folder, an ignored name), which no asset is.
-    Missing { layer: String, path: String, left_out: bool },
+    Missing { layer: Arc<Name>, path: String, left_out: bool },
     /// An operation whose entry no layer below creates.
-    Unbound { layer: String, uid: String },
+    Unbound { layer: Arc<Name>, uid: String },
     /// An override whose base changed since it was made.
-    Stale { layer: String, path: String },
+    Stale { layer: Arc<Name>, path: String },
     /// An asset whose import failed: it has no native files.
     Import { asset: String, error: String },
     /// An extension the project requires and does not have.
@@ -407,13 +407,13 @@ pub enum Problem {
     Property { config: Option<String>, property: String, why: String },
     /// What a layer holds by a name no path takes - one some system refuses, or that is not text - at its path as it
     /// shows: none of the project's, nor anything in it, until it is renamed.
-    Refused { layer: String, path: String, why: String },
+    Refused { layer: Arc<Name>, path: String, why: String },
 }
 
 impl Problem {
     /// Whether it is one the stack says as it is applied, of this layer or at one of these paths: what applying
     /// the stack for some entries alone would have to say again.
-    fn of_stack(&self, layer: &str, paths: &HashSet<&str>) -> bool {
+    fn of_stack(&self, layer: &Name, paths: &HashSet<&str>) -> bool {
         match self {
             Problem::DuplicateUid { paths: at, .. } => at.iter().any(|path| paths.contains(path.as_str())),
             Problem::Conflict { path, layers } => paths.contains(path.as_str()) || layers.iter().any(|l| l == layer),
@@ -455,7 +455,10 @@ impl Problem {
         match self {
             Problem::Unreadable { error, .. } => format!("node.toml cannot be read: {error}"),
             Problem::DuplicateUid { uid, paths } => format!("{uid} is created {} times", paths.len()),
-            Problem::Conflict { layers, .. } => format!("in layers {} without a declared override", layers.join(", ")),
+            Problem::Conflict { layers, .. } => {
+                let layers: Vec<&str> = layers.iter().map(|layer| layer.as_str()).collect();
+                format!("in layers {} without a declared override", layers.join(", "))
+            }
             Problem::Unlisted { layer, .. } => {
                 format!("held by {layer}, which does not list it: put there by other means than the editor")
             }
@@ -489,14 +492,14 @@ impl Problem {
 
     /// The layers it is about.
     #[must_use]
-    pub fn layers(&self) -> Vec<&str> {
+    pub fn layers(&self) -> Vec<&Name> {
         match self {
-            Problem::Conflict { layers, .. } => layers.iter().map(String::as_str).collect(),
+            Problem::Conflict { layers, .. } => layers.iter().map(|layer| &**layer).collect(),
             Problem::Unlisted { layer, .. }
             | Problem::Missing { layer, .. }
             | Problem::Unbound { layer, .. }
             | Problem::Stale { layer, .. }
-            | Problem::Refused { layer, .. } => vec![layer.as_str()],
+            | Problem::Refused { layer, .. } => vec![&**layer],
             Problem::Unreadable { .. }
             | Problem::DuplicateUid { .. }
             | Problem::Import { .. }
@@ -618,24 +621,21 @@ impl Refreshed {
 /// What differs between the records known of a layer stored as records and those read of it now, said of the
 /// project's model.
 fn records_differ(
-    was: &BTreeMap<String, crate::model::Recorded>,
+    was: &BTreeMap<Uid, crate::model::Recorded>,
     now: &BTreeMap<Uid, crate::records::Recorded>,
-    layer: &str,
+    layer: &Name,
     model: &mut crate::model::Delta,
 ) {
-    // The model keeps records by their uid's text.
-    let now: BTreeMap<String, &crate::records::Recorded> =
-        now.iter().map(|(uid, held)| (uid.to_string(), held)).collect();
     for uid in was.keys().filter(|uid| !now.contains_key(*uid)) {
-        model.record(layer, uid, None);
+        model.record(layer, *uid, None);
     }
-    for (uid, (record, modified, len)) in &now {
+    for (uid, (record, modified, len)) in now {
         let modified = crate::model::stamp_of(*modified);
         let same = was.get(uid).is_some_and(|(known, at, of)| {
             *at == modified && of == len && (Arc::ptr_eq(known, record) || known == record)
         });
         if !same {
-            model.record(layer, uid, Some(&(record.clone(), modified, *len)));
+            model.record(layer, *uid, Some(&(record.clone(), modified, *len)));
         }
     }
 }
@@ -980,7 +980,7 @@ impl Scan {
     }
 
     /// What differs between what a layer held and what it holds now, said of the project's model.
-    fn differs(before: &Scan, now: &Scan, root: &HostPath, layer: &str, model: &mut crate::model::Delta) {
+    fn differs(before: &Scan, now: &Scan, root: &HostPath, layer: &Name, model: &mut crate::model::Delta) {
         let (before, now) = (before.held(), now.held());
         for path in before.keys().filter(|path| !now.contains_key(*path)) {
             model.held(root, layer, path, None);
@@ -1075,9 +1075,9 @@ impl Scan {
     }
 
     /// What it holds by a name no path takes, each the problem it is of `layer`.
-    fn refused_problems<'a>(&'a self, layer: &'a str) -> impl Iterator<Item = Problem> + 'a {
+    fn refused_problems<'a>(&'a self, layer: &'a Name) -> impl Iterator<Item = Problem> + 'a {
         self.refused.iter().map(move |(path, why)| Problem::Refused {
-            layer: layer.to_string(),
+            layer: layer.to_owned(),
             path: path.clone(),
             why: why.to_string(),
         })
@@ -1297,7 +1297,7 @@ enum Listing {
 /// A layer as the index holds it.
 #[derive(Clone)]
 struct LayerState {
-    name: String,
+    name: Arc<Name>,
     kind: LayerKind,
     place: Place,
     changeset_path: HostPath,
@@ -1313,7 +1313,7 @@ struct LayerState {
     listing: Listing,
     /// The layer whose nodes a generated layer gives their files: taking no part in the stack, what it holds at a path
     /// is that layer's bundle's too.
-    fills: Option<String>,
+    fills: Option<Arc<Name>>,
     /// What it holds, shared with the snapshots made of the index until it is scanned again.
     scan: Arc<Scan>,
 }
@@ -1609,8 +1609,9 @@ pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
         },
         toml::Value::Table(t) => {
             let uid = t.get("uid")?.as_str()?;
-            let rel = t.get("path")?.as_str()?.strip_prefix("res://")?;
-            Some((uid.to_string(), Some(rel.trim_end_matches(BUNDLE_SUFFIX).to_string())))
+            let written = t.get("path")?.as_str()?;
+            let rel = TreePath::from_res(written.strip_suffix(BUNDLE_SUFFIX).unwrap_or(written)).ok()?;
+            Some((uid.to_string(), Some(rel.to_string())))
         }
         _ => None,
     }
@@ -1818,7 +1819,7 @@ impl Index {
 
     /// Whether a layer leaves a path out (an extension's folder, a name it ignores): no asset, whatever is on disk.
     #[must_use]
-    pub fn leaves_out(&self, layer: &str, path: &TreePath) -> bool {
+    pub fn leaves_out(&self, layer: &Name, path: &TreePath) -> bool {
         self.layers.iter().find(|l| l.name == layer).is_some_and(|l| l.place.ignores(path))
     }
 
@@ -1889,9 +1890,9 @@ impl Index {
         let Some(set) = crate::records::Set::current(&self.root) else { return crate::model::Records::new() };
         let of_layers = self.layers.iter().filter_map(|layer| {
             let read = set.records_read(&layer.place.root)?;
-            let read = read.into_iter().map(|(uid, (record, modified, len))| {
-                (uid.to_string(), (record, crate::model::stamp_of(modified), len))
-            });
+            let read = read
+                .into_iter()
+                .map(|(uid, (record, modified, len))| (uid, (record, crate::model::stamp_of(modified), len)));
             // A layer with no record is none the model knows of.
             Some((layer.name.clone(), read.collect::<BTreeMap<_, _>>())).filter(|(_, read)| !read.is_empty())
         });
@@ -1905,7 +1906,7 @@ impl Index {
         let mut model = crate::model::Delta::default();
         for (layer, records) in self.records_known() {
             for (uid, recorded) in &records {
-                model.record(&layer, uid, Some(recorded));
+                model.record(&layer, *uid, Some(recorded));
             }
         }
         model
@@ -2030,10 +2031,9 @@ impl Index {
         // is known of their records - held to their files, or taken as it is.
         let of_layers = project.layers.iter().filter_map(|layer| {
             let known = known_records.get(&layer.name)?;
-            // Each uid the model keeps checked as it is read back; a record of one that is none is read from its file.
-            let read = known.iter().filter_map(|(uid, (record, modified, len))| {
-                Some((Uid::new(uid).ok()?, (record.clone(), crate::model::time_of(*modified), *len)))
-            });
+            let read = known
+                .iter()
+                .map(|(uid, (record, modified, len))| (*uid, (record.clone(), crate::model::time_of(*modified), *len)));
             Some((layer.path.clone(), read.collect()))
         });
         let set = crate::records::Set::open_over(project, of_layers.collect(), !held)?;
@@ -2045,7 +2045,7 @@ impl Index {
         }
         for (layer, gone) in known_records {
             for uid in gone.keys() {
-                opened.record(&layer, uid, None);
+                opened.record(&layer, *uid, None);
             }
         }
         let mut layers = Vec::new();
@@ -2526,7 +2526,7 @@ impl Index {
                 let recorded = now
                     .recorded(dir, *uid)
                     .map(|(record, modified, len)| (record, crate::model::stamp_of(modified), len));
-                model.record(&layer.name, &uid.to_string(), recorded.as_ref());
+                model.record(&layer.name, *uid, recorded.as_ref());
             }
         }
         let _span = tracing::info_span!("refresh: the changesets made again").entered();
@@ -3509,12 +3509,12 @@ impl Index {
 
     /// A layer's changeset as the index read it.
     #[must_use]
-    pub fn changeset(&self, layer: &str) -> Option<&Changeset> {
+    pub fn changeset(&self, layer: &Name) -> Option<&Changeset> {
         self.layers.iter().find(|l| l.name == layer).map(|l| &l.changeset)
     }
 
     /// The stack resolved without a layer and those above it: what that layer stands on.
-    fn below_layer(&self, layer: &str) -> Option<Arc<Beneath>> {
+    fn below_layer(&self, layer: &Name) -> Option<Arc<Beneath>> {
         let at = self.layers.iter().position(|l| l.name == layer)?;
         let mut beneath = self.beneath.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(found) = beneath.get(&at) {
@@ -3529,20 +3529,20 @@ impl Index {
 
     /// What the layers below `layer` resolve, to be asked by path and by uid: nothing is copied of it.
     #[must_use]
-    pub fn under(&self, layer: &str) -> Under {
+    pub fn under(&self, layer: &Name) -> Under {
         Under(self.below_layer(layer))
     }
 
     /// What the layers below `layer` resolve, by path: each entry's uid and kind.
     #[must_use]
-    pub fn entries_below(&self, layer: &str) -> HashMap<Arc<TreePath>, (Uid, Kind)> {
+    pub fn entries_below(&self, layer: &Name) -> HashMap<Arc<TreePath>, (Uid, Kind)> {
         let Some(beneath) = self.below_layer(layer) else { return HashMap::new() };
         beneath.resolution.resolved.iter().map(|(path, node)| (path.clone(), (node.uid, node.kind))).collect()
     }
 
     /// An entry as the layers below `layer` resolve it, by its uid.
     #[must_use]
-    pub fn below(&self, layer: &str, uid: Uid) -> Option<Below> {
+    pub fn below(&self, layer: &Name, uid: Uid) -> Option<Below> {
         let beneath = self.below_layer(layer)?;
         let (path, node) = beneath.resolution.resolved.get_key_value(beneath.by_uid.get(&uid)?)?;
         let source = &self.layers[node.content.0];
@@ -3561,7 +3561,7 @@ impl Index {
 
     /// The entries the layers below `layer` resolve inside a folder (its path), by uid.
     #[must_use]
-    pub fn below_inside(&self, layer: &str, folder: &TreePath) -> Vec<(Uid, Arc<TreePath>)> {
+    pub fn below_inside(&self, layer: &Name, folder: &TreePath) -> Vec<(Uid, Arc<TreePath>)> {
         let Some(beneath) = self.below_layer(layer) else { return vec![] };
         let resolved = &beneath.resolution.resolved;
         let inside = subtree(resolved, folder).into_iter().filter(|path| path != folder);
@@ -3594,7 +3594,7 @@ impl Index {
                     overrides: count(|o| matches!(o, Op::Override { .. })),
                     moves: count(|o| matches!(o, Op::Move { .. })),
                     deletes: count(|o| matches!(o, Op::Delete)),
-                    problems: self.problems.iter().filter(|p| p.layers().contains(&l.name.as_str())).count(),
+                    problems: self.problems.iter().filter(|p| p.layers().contains(&&*l.name)).count(),
                     depends_on: depends_on.collect(),
                 }
             })
@@ -3603,7 +3603,7 @@ impl Index {
 
     /// A layer's creates, in path order.
     #[must_use]
-    pub fn creates(&self, layer: &str) -> Vec<CreateView> {
+    pub fn creates(&self, layer: &Name) -> Vec<CreateView> {
         let Some(l) = self.layers.iter().find(|l| l.name == layer) else { return vec![] };
         let mut out: Vec<CreateView> = l
             .changeset
@@ -3618,7 +3618,7 @@ impl Index {
     /// What makes a layer's override of an entry (by uid) stale: what each file it changes conflicts with below - a
     /// field, lines, a whole file - and each it removes, or holds, that changed below since otherwise.
     #[must_use]
-    pub fn stale_parts(&self, layer: &str, uid: Uid) -> Vec<StalePart> {
+    pub fn stale_parts(&self, layer: &Name, uid: Uid) -> Vec<StalePart> {
         let Some(i) = self.layers.iter().position(|l| l.name == layer) else { return vec![] };
         let Some(Op::Override { files, to }) = self.layers[i].changeset.ops.get(&uid) else { return vec![] };
         let Some(below) = self.below(layer, uid) else { return vec![] };
@@ -3668,7 +3668,7 @@ impl Index {
 
     /// A layer's operations with their status, in the order of the paths they act on.
     #[must_use]
-    pub fn operations(&self, layer: &str) -> Vec<OpView> {
+    pub fn operations(&self, layer: &Name) -> Vec<OpView> {
         let Some(i) = self.layers.iter().position(|l| l.name == layer) else { return vec![] };
         let statuses = self.ops.get(i);
         let mut out: Vec<OpView> = self.layers[i]
@@ -3686,7 +3686,7 @@ impl Index {
 
     /// Leave layers out of the view (the editor's eyes), or bring them back: the resolved entries and assets follow;
     /// problems and statuses stay the whole stack's. Returns whether the view changed.
-    pub fn set_hidden(&mut self, names: &BTreeSet<String>) -> bool {
+    pub fn set_hidden(&mut self, names: &BTreeSet<Arc<Name>>) -> bool {
         let hidden: HashSet<usize> =
             self.layers.iter().enumerate().filter(|(_, l)| names.contains(&l.name)).map(|(i, _)| i).collect();
         if hidden == self.hidden {
@@ -3765,6 +3765,8 @@ impl Index {
             }
             let Some(file) = file else { continue };
             let Some(record) = self.records.get(&file.path) else { continue };
+            // An asset is a layer's, the one creating it at least: none is a layer's file.
+            let Some(layer) = layer.clone() else { continue };
             if name == NODE_FILE
                 && let Some(d) = &record.declaration
             {
@@ -3783,7 +3785,7 @@ impl Index {
                 path: file.path.clone(),
                 size: record.size,
                 modified: record.modified,
-                layer: layer.unwrap_or_default(),
+                layer,
                 sha1: record.sha1,
                 made_by: None,
             });
@@ -3822,7 +3824,7 @@ impl Index {
 
     /// The uid a layer lists an entry under, by its path in the layer.
     #[must_use]
-    pub fn listed(&self, layer: &str, path: &TreePath) -> Option<Uid> {
+    pub fn listed(&self, layer: &Name, path: &TreePath) -> Option<Uid> {
         let layer = self.layers.iter().find(|known| known.name == layer)?;
         layer.changeset.entries.iter().find(|(_, listed)| *listed == path).map(|(uid, _)| *uid)
     }
@@ -3950,7 +3952,7 @@ impl Index {
     ///
     /// # Errors
     /// There is no such layer, or a new uid cannot be made.
-    pub fn adoption(&self, layer: &str, path: &TreePath) -> Result<Vec<(Uid, Arc<TreePath>)>> {
+    pub fn adoption(&self, layer: &Name, path: &TreePath) -> Result<Vec<(Uid, Arc<TreePath>)>> {
         let i = anyhow::Context::with_context(self.layers.iter().position(|l| l.name == layer), || {
             format!("no layer {layer}")
         })?;
@@ -4327,7 +4329,7 @@ mod tests {
 
     /// The top layer's override of an entry, changing these files of it: each made from the version below now, kept.
     fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
-        let below = index.below("top", crate::testing::uid(uid)).expect("below top");
+        let below = index.below(pe2_path::Name::constant("top"), crate::testing::uid(uid)).expect("below top");
         let store =
             crate::chunks::Store::at(&index.merged.parent().and_then(|cache| cache.parent()).expect("a project"));
         let files = files.iter().map(|name| {
@@ -4446,22 +4448,25 @@ mod tests {
         write(&root, ".layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
         assert_eq!(index.assets.keys().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["c", "g/a"]);
-        assert_eq!(index.assets[&tree("g/a")].layers, ["base", "top"]);
-        assert!(index.assets[&tree("g/a")].files.iter().all(|f| f.layer == "top"));
+        assert_eq!(
+            index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
+            ["base", "top"]
+        );
+        assert!(index.assets[&tree("g/a")].files.iter().all(|f| *f.layer == "top"));
         assert_eq!(index.assets[&tree("c")].uid, Some(uid_of("b.node")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // What it overrides is there, a node of its own.
         let below = index.version("below:uid://a").unwrap();
         assert_eq!(
             (below.named.as_deref(), below.uid, below.layers.as_slice()),
-            (Some("below:uid://a"), None, ["base".to_string()].as_slice())
+            (Some("below:uid://a"), None, [crate::testing::name("base")].as_slice())
         );
-        assert!(below.files.iter().all(|f| f.layer == "base"));
+        assert!(below.files.iter().all(|f| *f.layer == "base"));
         assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
         write(&root, ".layers/base/g/a.node/native.texels", "retouched");
         let (_, index) = open(&root);
-        assert_eq!(index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.node".into() }]);
+        assert_eq!(index.problems, [Problem::Stale { layer: crate::testing::name("top"), path: "g/a.node".into() }]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4487,7 +4492,11 @@ mod tests {
     #[test]
     fn a_name_no_path_takes_is_a_problem_and_nothing_of_the_projects() {
         let root = project("refused");
-        let refused = |path: &str| Problem::Refused { layer: "base".into(), path: path.into(), why: index_why(path) };
+        let refused = |path: &str| Problem::Refused {
+            layer: crate::testing::name("base"),
+            path: path.into(),
+            why: index_why(path),
+        };
         // `:` is a name Windows takes for something else: made here, where the system lets it be.
         std::fs::write(root.at(".layers/base/g").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
         let (project, index) = open(&root);
@@ -4558,10 +4567,13 @@ mod tests {
         write(&root, ".layers/top/new.node/node.toml", "kind = [unclosed\n");
         let (_, index) = open(&root);
         let has = |p: &Problem| index.problems.contains(p);
-        assert!(has(&Problem::Conflict { path: "b.node".into(), layers: vec!["base".into(), "top".into()] }));
-        assert!(has(&Problem::Unlisted { layer: "top".into(), path: "new.node".into() }));
-        assert!(has(&Problem::Missing { layer: "top".into(), path: "nowhere".into(), left_out: false }));
-        assert!(has(&Problem::Unbound { layer: "top".into(), uid: "uid://unknown".into() }));
+        assert!(has(&Problem::Conflict {
+            path: "b.node".into(),
+            layers: vec![crate::testing::name("base"), crate::testing::name("top")]
+        }));
+        assert!(has(&Problem::Unlisted { layer: crate::testing::name("top"), path: "new.node".into() }));
+        assert!(has(&Problem::Missing { layer: crate::testing::name("top"), path: "nowhere".into(), left_out: false }));
+        assert!(has(&Problem::Unbound { layer: crate::testing::name("top"), uid: "uid://unknown".into() }));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4580,8 +4592,8 @@ mod tests {
         std::fs::rename(root.at(".layers/base/g"), root.at(".layers/base/h")).unwrap();
         index.refresh(&project, &[root.at(".layers/base/g"), root.at(".layers/base/h")]).unwrap();
         assert!(!index.assets.contains_key(&tree("h/a")));
-        assert!(index.problems.contains(&Problem::Unlisted { layer: "base".into(), path: "h".into() }));
-        let adopted = index.adoption("base", &tree("h")).unwrap();
+        assert!(index.problems.contains(&Problem::Unlisted { layer: crate::testing::name("base"), path: "h".into() }));
+        let adopted = index.adoption(pe2_path::Name::constant("base"), &tree("h")).unwrap();
         assert!(adopted.contains(&(uid("uid://a"), tree("h/a.node"))), "{adopted:?}");
         assert!(adopted.contains(&(folder, tree("h"))), "{adopted:?}");
         let mut base = changeset(&root, "base");
@@ -4595,7 +4607,7 @@ mod tests {
         index.refresh(&project, &[root.at(".layers/base/f.node")]).unwrap();
         assert!(!index.assets.contains_key(&tree("f")));
         assert!(index.problems.contains(&Problem::Missing {
-            layer: "base".into(),
+            layer: crate::testing::name("base"),
             path: "f.node".into(),
             left_out: false
         }));
@@ -4623,7 +4635,12 @@ mod tests {
         let held: Vec<(&str, &str)> = a.files.iter().map(|f| (f.name.as_str(), f.layer.as_str())).collect();
         assert_eq!(held, [("native.texels", "base-files"), ("node.toml", "base")]);
         assert!(index.problems.is_empty(), "{:?}", index.problems);
-        assert!(index.layers().iter().any(|l| l.name == "base-files" && l.fills.as_deref() == Some("base")));
+        assert!(
+            index
+                .layers()
+                .iter()
+                .any(|l| *l.name == "base-files" && l.fills.as_deref() == Some(pe2_path::Name::constant("base")))
+        );
         // What the plan writes again is taken in as the node's.
         let (_, fresh) = open(&root);
         let texels = write(&root, ".layers/base-files/g/a.node/native.texels", "repainted");
@@ -4636,7 +4653,7 @@ mod tests {
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
         top.save(&root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        let below = index.below("top", uid("uid://a")).unwrap();
+        let below = index.below(pe2_path::Name::constant("top"), uid("uid://a")).unwrap();
         assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
         write(&root, ".layers/base-files/g/a.node/native.texels", "extracted otherwise");
         let (_, after) = open(&root);
@@ -4742,17 +4759,26 @@ mod tests {
         let (_, mut index) = open(&root);
         let info = index.layers();
         assert_eq!((info[1].overrides, info[1].deletes, info[1].problems), (1, 1, 1));
-        assert_eq!(info[1].depends_on, [super::Dependency { layer: "base".into(), operations: 1, references: 0 }]);
-        let statuses: Vec<_> = index.operations("top").iter().map(|o| o.status).collect();
+        assert_eq!(
+            info[1].depends_on,
+            [super::Dependency { layer: crate::testing::name("base"), operations: 1, references: 0 }]
+        );
+        let statuses: Vec<_> = index.operations(pe2_path::Name::constant("top")).iter().map(|o| o.status).collect();
         assert!(statuses.contains(&super::OpStatus::Applied) && statuses.contains(&super::OpStatus::Unbound));
-        assert_eq!(index.assets[&tree("g/a")].layers, ["base", "top"]);
+        assert_eq!(
+            index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
+            ["base", "top"]
+        );
         // Hiding the top layer shows the base's version; the problems stay the whole stack's.
         let problems = index.problems.clone();
-        assert!(index.set_hidden(&["top".to_string()].into()));
-        assert_eq!(index.assets[&tree("g/a")].layers, ["base"]);
+        assert!(index.set_hidden(&[crate::testing::name("top")].into()));
+        assert_eq!(index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(), ["base"]);
         assert_eq!(index.problems, problems);
         assert!(index.set_hidden(&std::collections::BTreeSet::new()));
-        assert_eq!(index.assets[&tree("g/a")].layers, ["base", "top"]);
+        assert_eq!(
+            index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
+            ["base", "top"]
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

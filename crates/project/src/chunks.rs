@@ -38,7 +38,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::Path;
 
 /// Where a store keeps what it keeps by `key`, as `ab/abcdef`: an error where the key is no name a file can have.
@@ -64,6 +64,26 @@ fn written(path: &HostPath) {
     if written.len() < KEPT {
         written.push(path.clone());
     }
+}
+
+/// Put what the store keeps by its hash in its place: written aside, then moved there whole. Each write has its own
+/// file aside - two threads may be putting the same chunk at once, as two files sharing it do - and one finding it
+/// put there meanwhile lets its own go: what is there is the same, and may be read-only already.
+fn put_in_place(path: &HostPath, bytes: &[u8]) -> io::Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_extension(format!("{}.{write}.tmp", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => {}
+        Err(_) if path.exists() => std::fs::remove_file(&temporary)?,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(e);
+        }
+    }
+    written(path);
+    Ok(())
 }
 
 /// Have on disk what this process wrote into the stores of the project in `root` since it last did: before a
@@ -290,10 +310,7 @@ impl Store {
         }
         let manifest = self.put(bytes)?;
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&temporary, manifest.render())?;
-        std::fs::rename(&temporary, &path)?;
-        written(&path);
+        put_in_place(&path, manifest.render().as_bytes())?;
         Ok(sha1)
     }
 
@@ -337,11 +354,7 @@ impl Store {
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(&temporary, path)?;
-        written(path);
-        Ok(())
+        put_in_place(path, bytes)
     }
 
     /// Keep bytes as one whole object, by their SHA-1 (given).
@@ -494,10 +507,7 @@ impl Store {
                     std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(SystemTime::now()));
             } else {
                 std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
-                let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-                std::fs::File::create(&temporary)?.write_all(chunk)?;
-                std::fs::rename(&temporary, &path)?;
-                written(&path);
+                put_in_place(&path, chunk)?;
             }
             chunks.push((hash, cut.length as u64));
         }
@@ -772,6 +782,47 @@ mod tests {
         assert!(new <= 3, "{new} chunks stored for a ten-byte edit");
         assert_eq!(again.read_range(&store, 0, edited.len()).expect("read"), edited);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threads_putting_one_file_at_once_each_have_it_kept() {
+        let dir = crate::testing::scratch("chunks-at-once");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store { dir: dir.clone() };
+        let bytes = content(1 << 20, 11);
+        std::thread::scope(|scope| {
+            let putting: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| (store.put_file(&bytes).map(drop), store.put_object(&bytes).map(drop))))
+                .collect();
+            for put in putting {
+                let (file, object) = put.join().unwrap();
+                file.expect("kept as chunks");
+                object.expect("kept whole");
+            }
+        });
+        let sha1 = crate::extract::sha1_of(&bytes);
+        assert_eq!(store.get_file(&sha1).unwrap(), bytes);
+        assert_eq!(store.get_object(&sha1).unwrap(), bytes);
+        let left = walkdir(&dir)
+            .into_iter()
+            .filter(|path| std::path::Path::new(path).extension().is_some_and(|e| e == "tmp"))
+            .count();
+        assert_eq!(left, 0, "nothing written aside stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every file in a folder, as text.
+    fn walkdir(dir: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walkdir(&path));
+            } else {
+                found.push(path.display().to_string());
+            }
+        }
+        found
     }
 
     #[test]

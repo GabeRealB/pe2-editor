@@ -112,7 +112,7 @@ fn code_is_overridden_in_a_layer_made_for_it() {
     assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
     let copy = root.at(".layers/mine/src/thing.c");
     assert_eq!(std::fs::read_to_string(&copy).expect("the copy"), "int thing;\n");
-    assert!(editor.workspace().layers.iter().any(|layer| layer.name == "mine"), "the project has it");
+    assert!(editor.workspace().layers.iter().any(|layer| *layer.name == "mine"), "the project has it");
 }
 
 #[test]

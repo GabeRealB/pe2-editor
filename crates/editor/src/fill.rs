@@ -7,6 +7,7 @@
 //!
 //! A plan runs as the work graph's only work (`runner`): after the epoch running, which may be cancelled for it, and
 //! before any event signaled meanwhile, which waits until what it wrote is taken in.
+use pe2_path::Name;
 use sfs::HostPath;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
@@ -19,7 +20,7 @@ use crate::workspace::Workspace;
 
 /// A plan running.
 struct Running {
-    layer: String,
+    layer: Arc<Name>,
     path: HostPath,
     progress: Arc<Progress>,
     /// Set once it runs, the epoch before it ended.
@@ -33,7 +34,7 @@ pub struct Fill {
     /// Not now: asked again when the project is opened again.
     put_off: bool,
     /// The layers put off, each with its state then: not asked again while it stays so. Read from the cache once.
-    put_off_as: Option<std::collections::BTreeMap<String, String>>,
+    put_off_as: Option<std::collections::BTreeMap<Arc<Name>, String>>,
     /// Asked for (the command), whatever the layers' states.
     asked: bool,
     running: Option<Running>,
@@ -74,15 +75,15 @@ fn remembered(state: &State) -> String {
 
 /// The generated layer to ask about: the one running, else the first not as its plan says and not put off as it is,
 /// else - asked for - the first.
-fn wanted(ws: &Workspace) -> Option<String> {
+fn wanted(ws: &Workspace) -> Option<Arc<Name>> {
     let fill = &ws.fill;
     if let Some(running) = &fill.running {
         return Some(running.layer.clone());
     }
-    let put_off = |name: &str, state: &State| {
+    let put_off = |name: &Name, state: &State| {
         fill.put_off_as.as_ref().and_then(|put| put.get(name)).is_some_and(|then| *then == remembered(state))
     };
-    let to_fill = |name: &str, state: Option<&Result<State, String>>| match state {
+    let to_fill = |name: &Name, state: Option<&Result<State, String>>| match state {
         Some(Ok(state @ (State::Empty | State::Stale(_)))) => fill.asked || !put_off(name, state),
         _ => false,
     };
@@ -97,7 +98,7 @@ fn wanted(ws: &Workspace) -> Option<String> {
 
 /// Run a generated layer's plan, off the window's thread.
 /// Have a generated layer's plan run, as the work graph's only work.
-fn start(ws: &mut Workspace, layer: &str) {
+fn start(ws: &mut Workspace, layer: &Name) {
     let Ok(generated) = ws.project.layer(layer).cloned() else { return };
     let progress = Arc::new(Progress::default());
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -111,7 +112,7 @@ fn start(ws: &mut Workspace, layer: &str) {
     });
     ws.fill.failed = None;
     let began = Instant::now();
-    ws.fill.running = Some(Running { layer: layer.to_string(), path, progress, started, done, began });
+    ws.fill.running = Some(Running { layer: layer.to_owned(), path, progress, started, done, began });
 }
 
 /// Take what a run made, once it is done: the layer taken in again, its state worked out again. What it did, said.
@@ -205,7 +206,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
         }
     });
     if let Some((at, path)) = look_here {
-        match project::setup::locate(&ws.project, at.as_str(), &path) {
+        match project::setup::locate(&ws.project, &at, std::path::Path::new(&path)) {
             Ok(()) => {
                 ws.fill.look_in = None;
                 ws.reload_project("where the discs are changed");
@@ -319,7 +320,7 @@ fn look_in_ui(
     planned: &crate::plans::Planned,
 ) -> Option<(Arc<project::TreePath>, String)> {
     let header = planned.header.as_ref().ok()?;
-    let look_in = header.inputs.values().next()?.look_in.trim_start_matches("res://").trim_matches('/');
+    let look_in = project::TreePath::from_res(&header.inputs.values().next()?.look_in).ok()?;
     let mount = ws.project.unmanaged.iter().find(|m| *m.at == *look_in)?;
     let (at, now) = (mount.at.clone(), mount.path.display().to_string());
     let editing = ws.fill.look_in.get_or_insert_with(|| (at.clone(), now.clone()));

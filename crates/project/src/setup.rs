@@ -5,11 +5,13 @@
 
 use anyhow::{Context, Result, bail};
 use sfs::HostPath;
+use std::path::Path;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
 use crate::stack::{read, write};
 use crate::{FILE, Project};
+use pe2_path::Name;
 
 fn table<'a>(document: &'a mut DocumentMut, key: &str) -> Result<&'a mut Table> {
     let item = document.entry(key).or_insert(Item::Table(Table::new()));
@@ -22,32 +24,34 @@ fn table<'a>(document: &'a mut DocumentMut, key: &str) -> Result<&'a mut Table> 
 ///
 /// # Errors
 /// The name is taken, the layer it fills is not one of the project's, or the files cannot be written.
-pub fn add_generated(project: &Project, name: &str, fills: &str, history: &mut History) -> Result<()> {
+pub fn add_generated(project: &Project, name: &Name, fills: &Name, history: &mut History) -> Result<()> {
     crate::stack::check_name(project, name)?;
     anyhow::ensure!(
-        project.layers.iter().any(|l| l.name == fills && l.kind == crate::LayerKind::Assets),
+        project.layers.iter().any(|l| *l.name == *fills && l.kind == crate::LayerKind::Assets),
         "the project has no asset layer {fills} to fill"
     );
     let mut document = read(&project.root)?;
     let item = document.entry("layer").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let layers = item.as_array_of_tables_mut().with_context(|| format!("`layer` in {FILE} is no list of tables"))?;
-    let folder = pe2_path::Name::new(name).with_context(|| format!("the layer {name}"))?;
     let path = format!("{}/{name}", crate::LAYERS);
     let mut layer = Table::new();
-    layer.insert("name", value(name));
+    layer.insert("name", value(name.as_str()));
     layer.insert("path", value(&path));
     layer.insert("kind", value("generated"));
-    layer.insert("fills", value(fills));
+    layer.insert("fills", value(fills.as_str()));
     // An array of tables takes no insert: rebuilt with it after the layer it fills.
     let mut all: Vec<Table> = layers.iter().cloned().collect();
-    let at = all.iter().position(|t| t.get("name").and_then(Item::as_str) == Some(fills)).map_or(all.len(), |i| i + 1);
+    let at = all
+        .iter()
+        .position(|t| t.get("name").and_then(Item::as_str).is_some_and(|of| *fills == of))
+        .map_or(all.len(), |i| i + 1);
     all.insert(at, layer);
     layers.clear();
     for table in all {
         layers.push(table);
     }
     let mut tx = history.begin(format!("Add the layer {name}, filling {fills}"));
-    tx.make_dir(&project.root.join(&crate::LAYERS).join(&folder))?;
+    tx.make_dir(&project.root.join(&crate::LAYERS).join(name))?;
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     ignored(&mut tx, &project.root, &format!("/{path}/"))?;
     tx.commit().map(drop)
@@ -65,16 +69,22 @@ fn ignored(tx: &mut crate::history::Transaction<'_>, root: &HostPath, entry: &st
     tx.write(&file, format!("{text}{separator}{entry}\n").as_bytes())
 }
 
+/// A place as `project.toml` and `project.local.toml` write it: as it was given, relative to the project or absolute.
+fn written(path: &Path) -> Result<&str> {
+    path.to_str().with_context(|| format!("{}: a place written as no text is", path.display()))
+}
+
 /// Where an unmanaged mount is on this machine: written to `project.local.toml` (`[mounts] <at> = "<path>"`), which is
 /// this machine's alone and no step of the project's history.
 ///
 /// # Errors
 /// The project has no such unmanaged mount, or the file cannot be written.
-pub fn locate(project: &Project, at: &str, path: &str) -> Result<()> {
+pub fn locate(project: &Project, at: &crate::TreePath, path: &Path) -> Result<()> {
     anyhow::ensure!(project.unmanaged.iter().any(|m| *m.at == *at), "the project has no unmanaged mount {at}");
+    let path = written(path)?;
     let file = project.root.join(&crate::LOCAL);
     let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
-    table(&mut document, "mounts")?.insert(at, value(path));
+    table(&mut document, "mounts")?.insert(at.as_str(), value(path));
     std::fs::write(&file, document.to_string()).with_context(|| file.display().to_string())
 }
 
@@ -86,13 +96,13 @@ pub fn locate(project: &Project, at: &str, path: &str) -> Result<()> {
 /// Something of the project is called so already, a managed mount has no path, or `project.toml` cannot be rewritten.
 pub fn add_mount(
     project: &Project,
-    at: &str,
-    path: Option<&str>,
+    at: &Name,
+    path: Option<&Path>,
     read_only: bool,
     unmanaged: bool,
     history: &mut History,
 ) -> Result<()> {
-    if project.layers.iter().any(|l| l.name == at) || project.unmanaged.iter().any(|m| *m.at == *at) {
+    if project.layers.iter().any(|l| *l.name == *at) || project.unmanaged.iter().any(|m| m.at.parts().eq([at])) {
         bail!("the project has a layer or mount {at} already");
     }
     anyhow::ensure!(unmanaged || path.is_some(), "a mount says where its tree is, but for an unmanaged one");
@@ -104,9 +114,9 @@ pub fn add_mount(
     let item = document.entry("mount").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let mounts = item.as_array_of_tables_mut().with_context(|| format!("`mount` in {FILE} is no list of tables"))?;
     let mut mount = Table::new();
-    mount.insert("at", value(at));
+    mount.insert("at", value(at.as_str()));
     if let Some(path) = path {
-        mount.insert("path", value(path));
+        mount.insert("path", value(written(path)?));
     }
     if read_only {
         mount.insert("read_only", value(true));
@@ -131,7 +141,8 @@ pub fn add_mount(
 ///
 /// # Errors
 /// It links that file already, or the file cannot be written.
-pub fn add_link(project: &Project, at: &str, deployed: &str) -> Result<()> {
+pub fn add_link(project: &Project, at: &Path, deployed: &Path) -> Result<()> {
+    let (at, deployed) = (written(at)?, written(deployed)?);
     anyhow::ensure!(!project.links.contains_key(at), "the project links {at} already");
     let file = project.root.join(&crate::LOCAL);
     let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
@@ -149,7 +160,7 @@ pub fn add_link(project: &Project, at: &str, deployed: &str) -> Result<()> {
 /// It has the config already, or `project.toml` cannot be rewritten.
 pub fn add_config(
     project: &Project,
-    name: &str,
+    name: &Name,
     release: Option<&str>,
     target: Option<&str>,
     history: &mut History,
@@ -165,7 +176,7 @@ pub fn add_config(
     if let Some(target) = target {
         config.insert("target", value(target));
     }
-    configs.insert(name, Item::Table(config));
+    configs.insert(name.as_str(), Item::Table(config));
     write(&project.root, &document, history, format!("Add the config {name}"))
 }
 
@@ -182,7 +193,7 @@ fn item_of(v: &toml::Value) -> Result<Item> {
 /// The project has no such config or property, the value is not as declared, or `project.toml` cannot be rewritten.
 pub fn set_property(
     project: &Project,
-    config: &str,
+    config: &Name,
     property: &str,
     to: Option<&toml::Value>,
     history: &mut History,
@@ -195,7 +206,7 @@ pub fn set_property(
     }
     let mut document = read(&project.root)?;
     let configs = table(&mut document, "config")?;
-    let at = configs.get_mut(config).and_then(Item::as_table_mut);
+    let at = configs.get_mut(config.as_str()).and_then(Item::as_table_mut);
     let at = at.with_context(|| format!("`config.{config}` in {FILE} is not a table"))?;
     let label = if let Some(v) = to {
         let properties = at.entry("properties").or_insert(Item::Table(Table::new()));
@@ -248,16 +259,32 @@ mod tests {
         let project = || Project::load(&dir).unwrap();
         let lock = crate::lock::Lock::try_acquire(&dir, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project(), &lock).unwrap()).unwrap();
-        crate::stack::add_at(&project(), "game", crate::LayerKind::Assets, true, &mut history).unwrap();
-        super::add_generated(&project(), "game-files", "game", &mut history).unwrap();
-        super::add_mount(&project(), "roms", None, false, true, &mut history).unwrap();
-        super::add_mount(&project(), "packages", Some("../packages"), true, false, &mut history).unwrap();
-        super::add_config(&project(), "usa", Some("USA"), Some("psx"), &mut history).unwrap();
+        crate::stack::add_at(
+            &project(),
+            pe2_path::Name::constant("game"),
+            crate::LayerKind::Assets,
+            true,
+            &mut history,
+        )
+        .unwrap();
+        let (files, game) = (pe2_path::Name::constant("game-files"), pe2_path::Name::constant("game"));
+        super::add_generated(&project(), files, game, &mut history).unwrap();
+        super::add_mount(&project(), pe2_path::Name::constant("roms"), None, false, true, &mut history).unwrap();
+        super::add_mount(
+            &project(),
+            pe2_path::Name::constant("packages"),
+            Some(std::path::Path::new("../packages")),
+            true,
+            false,
+            &mut history,
+        )
+        .unwrap();
+        super::add_config(&project(), pe2_path::Name::constant("usa"), Some("USA"), Some("psx"), &mut history).unwrap();
         let made = project();
-        let files = made.layer("game-files").unwrap();
+        let files = made.layer(pe2_path::Name::constant("game-files")).unwrap();
         assert_eq!(
             (files.kind, files.fills.as_deref(), files.read_only),
-            (crate::LayerKind::Generated, Some("game"), true)
+            (crate::LayerKind::Generated, Some(game), true)
         );
         let at = |path: &str| dir.at(path);
         assert_eq!(files.plan(), at(".layers/game-files.plan.jsonl"));
@@ -267,17 +294,20 @@ mod tests {
         let declaration: toml::Table = toml::from_str("values = [\"en\", \"fr\"]\ndefault = \"en\"").unwrap();
         super::declare_property(&project(), "language", &declaration, &mut history).unwrap();
         let fr = toml::Value::String("fr".into());
-        super::set_property(&project(), "usa", "language", Some(&fr), &mut history).unwrap();
+        super::set_property(&project(), pe2_path::Name::constant("usa"), "language", Some(&fr), &mut history).unwrap();
         let de = toml::Value::String("de".into());
-        assert!(super::set_property(&project(), "usa", "language", Some(&de), &mut history).is_err());
+        assert!(
+            super::set_property(&project(), pe2_path::Name::constant("usa"), "language", Some(&de), &mut history)
+                .is_err()
+        );
         let set = project();
         assert_eq!(set.properties_of(&set.configs[0]).get("language"), Some(&fr));
         assert!(set.property_problems.is_empty(), "{:?}", set.property_problems);
-        super::set_property(&project(), "usa", "language", None, &mut history).unwrap();
+        super::set_property(&project(), pe2_path::Name::constant("usa"), "language", None, &mut history).unwrap();
         let set = project();
         assert_eq!(set.properties_of(&set.configs[0]).get("language").and_then(toml::Value::as_str), Some("en"));
-        assert!(made.layers.iter().any(|l| l.name == "packages" && l.read_only));
-        let at = |name: &str| made.layers.iter().position(|l| l.name == name).unwrap();
+        assert!(made.layers.iter().any(|l| *l.name == "packages" && l.read_only));
+        let at = |name: &str| made.layers.iter().position(|l| *l.name == name).unwrap();
         assert!(at("game") < at("project"), "the game's layer is below the project's own");
         assert_eq!(at("game-files"), at("game") + 1, "a generated layer is right above the layer it fills");
         let ignored = std::fs::read_to_string(dir.at(".gitignore")).unwrap();
@@ -285,13 +315,15 @@ mod tests {
         assert!(ignored.contains("/project.local.toml"), "{ignored}");
         // Where the discs are is this machine's.
         let elsewhere = dir.with_suffix(pe2_path::Name::constant(".elsewhere"));
-        super::locate(&made, "roms", &elsewhere.to_string()).unwrap();
+        super::locate(&made, crate::TreePath::constant("roms"), std::path::Path::new(&elsewhere.to_string())).unwrap();
         assert_eq!(project().unmanaged[0].path, elsewhere);
         // So are the links it wants.
-        super::add_link(&project(), "../compile_commands.json", "build/compile_commands.json").unwrap();
+        super::add_link(&project(), "../compile_commands.json".as_ref(), "build/compile_commands.json".as_ref())
+            .unwrap();
         assert_eq!(project().links["../compile_commands.json"], "build/compile_commands.json");
         assert!(!std::fs::read_to_string(dir.join(&crate::FILE)).unwrap().contains("links"));
-        assert!(super::add_generated(&project(), "more", "nothing", &mut history).is_err());
+        let (more, nothing) = (pe2_path::Name::constant("more"), pe2_path::Name::constant("nothing"));
+        assert!(super::add_generated(&project(), more, nothing, &mut history).is_err());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }

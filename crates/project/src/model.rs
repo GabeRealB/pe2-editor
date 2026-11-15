@@ -18,6 +18,7 @@
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
+use pe2_path::{Name, Uid};
 use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -311,12 +312,12 @@ pub enum Held {
 
 /// What the model holds of the layers: each by its name, with what its listing was made by (its place and the
 /// names it leaves out, as the index says them) and what it holds by path.
-pub type Layers = BTreeMap<String, (String, BTreeMap<String, Held>)>;
+pub type Layers = BTreeMap<Arc<Name>, (String, BTreeMap<String, Held>)>;
 
 /// A record of a layer stored as records, with its file's time and length as it was read.
 pub type Recorded = (Arc<crate::records::Record>, Stamp, u64);
 /// What the model holds of the layers stored as records: each layer's records, by its name and their uids.
-pub type Records = BTreeMap<String, BTreeMap<String, Recorded>>;
+pub type Records = BTreeMap<Arc<Name>, BTreeMap<Uid, Recorded>>;
 
 /// The stack applied, as the model keeps it: what it was made of besides the files, the layers' listings and
 /// their records (the layers as the project says them); each entry it resolves, by its path; and what else it
@@ -455,7 +456,7 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
 }
 
 /// The name of what a layer holds at a path.
-fn held_name(layer: &str, path: &str) -> String {
+fn held_name(layer: &Name, path: &str) -> String {
     format!("{layer}\u{0}{path}")
 }
 
@@ -539,15 +540,15 @@ impl Delta {
     }
 
     /// A layer holds this at a path now - or, with none, nothing there any more.
-    pub fn held(&mut self, root: &HostPath, layer: &str, path: &str, now: Option<&Held>) {
+    pub fn held(&mut self, root: &HostPath, layer: &Name, path: &str, now: Option<&Held>) {
         let name = held_name(layer, path);
         self.changes.push((INPUTS, key(HELD, &name), now.map(|now| held(root, &name, now))));
     }
 
     /// A record of a layer stored as records is this now, in a file of this time and length - or, with none, is
     /// no more.
-    pub fn record(&mut self, layer: &str, uid: &str, now: Option<&Recorded>) {
-        let name = held_name(layer, uid);
+    pub fn record(&mut self, layer: &Name, uid: Uid, now: Option<&Recorded>) {
+        let name = held_name(layer, &uid.to_string());
         let said = now.map(|(record, modified, len)| layer_record(&name, record, *modified, *len));
         self.changes.push((RECORDS, key(RECORD, &name), said));
     }
@@ -576,13 +577,13 @@ impl Delta {
 
     /// A layer's listing was made by this (its place and the names it leaves out) - or, with none, the layer is
     /// no more.
-    pub fn layer(&mut self, layer: &str, made_by: Option<&str>) {
+    pub fn layer(&mut self, layer: &Name, made_by: Option<&str>) {
         let said = made_by.map(|made_by| {
             let mut out = Out::new();
             out.text(made_by);
             out.0
         });
-        self.changes.push((INPUTS, key(LAYER, layer), said));
+        self.changes.push((INPUTS, key(LAYER, layer.as_str()), said));
     }
 
     /// This, and what a later refresh changed.
@@ -796,7 +797,7 @@ pub fn records(pages: &impl Pages) -> Result<Records> {
                 None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
             };
             let (layer, uid) = name.split_once('\u{0}')?;
-            Some((layer.to_owned(), uid.to_owned(), recorded))
+            Some((Name::new(layer).ok()?.to_owned(), Uid::new(uid).ok()?, recorded))
         });
         match read {
             Some((layer, uid, recorded)) => drop(records.entry(layer).or_default().insert(uid, recorded)),
@@ -820,7 +821,10 @@ pub fn layers(pages: &impl Pages, root: &HostPath) -> Result<Layers> {
     sfs::tree::scan_prefix(pages, INPUTS, &[LAYER], &mut |key, value| {
         let read = std::str::from_utf8(&key[1..]).ok().zip(In::after_stamp(value).and_then(|mut said| said.text()));
         match read {
-            Some((layer, made_by)) => drop(layers.insert(layer.to_owned(), (made_by, BTreeMap::new()))),
+            Some((layer, made_by)) => match Name::new(layer) {
+                Ok(layer) => drop(layers.insert(layer.to_owned(), (made_by, BTreeMap::new()))),
+                Err(_) => failed = Some(invalid("a layer named as none is")),
+            },
             None => failed = Some(invalid("a layer that is none")),
         }
         failed.is_none()
@@ -832,7 +836,7 @@ pub fn layers(pages: &impl Pages, root: &HostPath) -> Result<Layers> {
                 None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
             };
             let (layer, path) = name.split_once('\u{0}')?;
-            Some((layer.to_owned(), path.to_owned(), held))
+            Some((Name::new(layer).ok()?.to_owned(), path.to_owned(), held))
         });
         match read {
             // What is held by a layer the model does not name is nothing it holds.
@@ -1005,8 +1009,8 @@ mod tests {
         ]
         .into();
         [
-            ("game".to_string(), ("made by this".to_string(), holds)),
-            ("code".to_string(), ("and that".to_string(), code)),
+            (crate::testing::name("game"), ("made by this".to_string(), holds)),
+            (crate::testing::name("code"), ("and that".to_string(), code)),
         ]
         .into()
     }
@@ -1036,17 +1040,17 @@ mod tests {
         // A bundle's files change, a folder goes, a layer's listing is made by something else, and a layer is no more.
         let mut delta = Delta::default();
         let changed = Held::Bundle([(rel("only.bin"), root.at(".layers/game/rooms/r7.node/only.bin"))].into());
-        delta.held(root, "game", "rooms/r7.node", Some(&changed));
-        delta.held(root, "game", &format!("deep/{}", "long/".repeat(200)), None);
-        delta.layer("game", Some("made by another"));
-        delta.held(root, "code", "src", None);
-        delta.held(root, "code", "src/a.c", None);
-        delta.layer("code", None);
+        delta.held(root, pe2_path::Name::constant("game"), "rooms/r7.node", Some(&changed));
+        delta.held(root, pe2_path::Name::constant("game"), &format!("deep/{}", "long/".repeat(200)), None);
+        delta.layer(pe2_path::Name::constant("game"), Some("made by another"));
+        delta.held(root, pe2_path::Name::constant("code"), "src", None);
+        delta.held(root, pe2_path::Name::constant("code"), "src/a.c", None);
+        delta.layer(pe2_path::Name::constant("code"), None);
         let mut txn = space.write().unwrap();
         delta.apply(&mut txn).unwrap();
         txn.commit().unwrap();
-        now.remove("code");
-        let game = now.get_mut("game").unwrap();
+        now.remove(pe2_path::Name::constant("code"));
+        let game = now.get_mut(pe2_path::Name::constant("game")).unwrap();
         game.0 = "made by another".into();
         game.1.insert("rooms/r7.node".into(), changed);
         game.1.remove(&format!("deep/{}", "long/".repeat(200)));
@@ -1096,11 +1100,11 @@ mod tests {
                 name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap().to_owned()),
                 files,
             };
-            (format!("uid://{n:012}"), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
+            (uid(&format!("uid://{n:012}")), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
         };
         [
-            ("game".to_string(), (0..300).map(record).collect()),
-            ("project".to_string(), (300..320).map(record).collect()),
+            (crate::testing::name("game"), (0..300).map(record).collect()),
+            (crate::testing::name("project"), (300..320).map(record).collect()),
         ]
         .into()
     }
@@ -1112,7 +1116,7 @@ mod tests {
         let mut delta = Delta::default();
         for (layer, records) in &now {
             for (uid, recorded) in records {
-                delta.record(layer, uid, Some(recorded));
+                delta.record(layer, *uid, Some(recorded));
             }
         }
         let mut txn = space.write().unwrap();
@@ -1122,14 +1126,16 @@ mod tests {
         assert_eq!(records(&space.read().unwrap()).unwrap(), now);
         // One changed, one in a file of another time, one gone, and a layer's last.
         let mut delta = Delta::default();
-        let game = now.get_mut("game").unwrap();
-        let changed = (game["uid://000000000001"].0.clone(), (1_800_000_000, 0), 5);
-        delta.record("game", "uid://000000000001", Some(&changed));
-        game.insert("uid://000000000001".into(), changed);
-        delta.record("game", "uid://000000000002", None);
-        game.remove("uid://000000000002");
-        for uid in now.remove("project").unwrap().keys() {
-            delta.record("project", uid, None);
+        let (game_layer, project_layer) = (pe2_path::Name::constant("game"), pe2_path::Name::constant("project"));
+        let (first, second) = (uid("uid://000000000001"), uid("uid://000000000002"));
+        let game = now.get_mut(game_layer).unwrap();
+        let changed = (game[&first].0.clone(), (1_800_000_000, 0), 5);
+        delta.record(game_layer, first, Some(&changed));
+        game.insert(first, changed);
+        delta.record(game_layer, second, None);
+        game.remove(&second);
+        for uid in now.remove(project_layer).unwrap().keys() {
+            delta.record(project_layer, *uid, None);
         }
         let mut txn = space.write().unwrap();
         delta.apply(&mut txn).unwrap();

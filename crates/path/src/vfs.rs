@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::error::PathError;
+use crate::error::{PathError, Why};
 use crate::name::{Name, RelPath};
 
 /// A kind of scope of the filesystem: what a [`VfsPath`] is within. Whoever holds a scope knows where it is; a path
@@ -36,6 +36,22 @@ impl Scope for Run {
 
 impl Scope for Given {
     const KIND: &'static str = "a program's given files";
+}
+
+/// What starts a path of the project's tree written as a place (`res://packages/aya`), as the files a project
+/// writes name one.
+pub const RES_PREFIX: &str = "res://";
+
+impl VfsPath<Tree> {
+    /// `text` as a path of the project's tree written as a place: `res://` and the path (`res://packages/aya`), a
+    /// folder's `/` after it taken.
+    ///
+    /// # Errors
+    /// It does not start with `res://`, or what follows is no path.
+    pub fn from_res(text: &str) -> Result<&VfsPath<Tree>, PathError> {
+        let path = text.strip_prefix(RES_PREFIX).ok_or_else(|| PathError::new(text, Why::NoRes))?;
+        VfsPath::new(path.strip_suffix('/').unwrap_or(path))
+    }
 }
 
 /// A path within a scope of kind `S`: a [`RelPath`] the compiler will not take for a path of another kind of scope.
@@ -316,5 +332,15 @@ mod tests {
         let read: Arc<VfsPath<Tree>> = serde_json::from_str("\"a/b\"").unwrap();
         assert_eq!(VfsPath::into_scope::<Run>(read).as_str(), "a/b");
         assert!(serde_json::from_str::<Arc<VfsPath<Tree>>>("\"a/../b\"").is_err());
+    }
+
+    #[test]
+    fn a_place_of_the_tree_is_res_and_its_path() {
+        assert_eq!(VfsPath::from_res("res://roms/a.bin").unwrap().as_str(), "roms/a.bin");
+        assert_eq!(VfsPath::from_res("res://roms/").unwrap().as_str(), "roms");
+        assert!(VfsPath::from_res("res://").unwrap().is_root());
+        let refused = VfsPath::from_res("roms/a.bin").unwrap_err();
+        assert_eq!(refused.to_string(), "\"roms/a.bin\" is no place of the project (`res://` and a path)");
+        assert!(VfsPath::from_res("res://a/../b").is_err());
     }
 }

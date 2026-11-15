@@ -219,7 +219,7 @@ impl Core {
     pub fn take_due(
         &mut self,
         history: &mut History,
-        layer: Result<Option<&str>, &str>,
+        layer: Result<Option<&pe2_path::Name>, &str>,
         then: Option<Then>,
     ) -> (mcp::Reply, Taken) {
         let answered = |reply: mcp::Reply, then: Option<Then>| {
@@ -256,7 +256,7 @@ impl Core {
         &mut self,
         history: &mut History,
         ops: &[vfs::ops::Op],
-        layer: Option<&str>,
+        layer: Option<&pe2_path::Name>,
     ) -> (Vec<mcp::Reply>, Taken) {
         self.edits_then(history, ops, Ok(layer), None, None)
     }
@@ -269,7 +269,7 @@ impl Core {
         &mut self,
         history: &mut History,
         ops: &[vfs::ops::Op],
-        layer: Result<Option<&str>, &str>,
+        layer: Result<Option<&pe2_path::Name>, &str>,
         due: Option<&[u64]>,
         then: Option<crate::files::Then>,
     ) -> (Vec<mcp::Reply>, Taken) {
@@ -285,7 +285,7 @@ impl Core {
         // Over the files as they are: held first to what the index took of them as known.
         let mut taken = self.verified().unwrap_or_default();
         let layer = match layer {
-            Ok(Some(layer)) => Ok(layer.to_string()),
+            Ok(Some(layer)) => Ok(layer.to_owned()),
             Ok(None) => vfs::write::writable_layer(&self.index).ok_or("no layer of the project can be written"),
             Err(why) => Err(why),
         };

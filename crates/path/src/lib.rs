@@ -48,4 +48,4 @@ pub use error::{PathError, Why};
 pub use fold::{UNICODE_VERSION, folded};
 pub use name::{Name, Names, RelPath};
 pub use resource::{Address, Asked, Query, Reference, ResourcePath, Uid};
-pub use vfs::{Given, Run, Scope, Tree, VfsPath};
+pub use vfs::{Given, RES_PREFIX, Run, Scope, Tree, VfsPath};

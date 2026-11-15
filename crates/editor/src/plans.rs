@@ -4,6 +4,7 @@
 //! or that is asked (`want_discs`), its discs are looked for too, each image of a disc's size hashed.
 
 use eframe::egui;
+use pe2_path::Name;
 use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::sync::{Arc, mpsc};
@@ -17,7 +18,7 @@ use project::plan::{Disc, Header, State};
 #[derive(Clone)]
 pub struct Planned {
     /// The layer it fills.
-    pub fills: String,
+    pub fills: Arc<Name>,
     /// What the plan reads and needs; why not, where its plan cannot be read.
     pub header: Result<Header, String>,
     /// How the layer is; none until worked out.
@@ -29,10 +30,10 @@ pub struct Planned {
 #[derive(Default)]
 pub struct Plans {
     /// By generated layer, in the stack's order.
-    pub layers: BTreeMap<String, Planned>,
+    pub layers: BTreeMap<Arc<Name>, Planned>,
     /// The plans' and records' stamps they were worked out from.
     stamps: Vec<Option<SystemTime>>,
-    working: Option<mpsc::Receiver<BTreeMap<String, Planned>>>,
+    working: Option<mpsc::Receiver<BTreeMap<Arc<Name>, Planned>>>,
     /// Whether they were worked out at all.
     worked: bool,
     /// Worked out again at the next look, whatever the stamps: the project was read again.
@@ -93,7 +94,8 @@ impl Plans {
                 let plan = layer.plan();
                 let header = project::plan::header(&plan).map_err(|e| format!("{e:#}"));
                 let state = project::plan::state(&plan, &layer.path, &extensions).map_err(|e| format!("{e:#}"));
-                let fills = layer.fills.clone().unwrap_or_default();
+                // A generated layer fills one: the project refuses it otherwise.
+                let Some(fills) = layer.fills.clone() else { continue };
                 let filled = matches!(state, Ok(State::Filled | State::Partial(_) | State::NoPlan));
                 let discs = match &header {
                     Ok(header) if wanted || !filled => Some(project::plan::discs(&project, header)),
@@ -113,7 +115,7 @@ impl Plans {
 
     /// How a generated layer is, in a few words.
     #[must_use]
-    pub fn said(&self, layer: &str) -> String {
+    pub fn said(&self, layer: &Name) -> String {
         match self.layers.get(layer).and_then(|p| p.state.as_ref()) {
             None => "looking at its plan".into(),
             Some(Err(why)) => format!("its plan cannot be read: {why}"),

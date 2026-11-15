@@ -26,6 +26,8 @@ pub enum Why {
     Trailing(char),
     /// No `uid://` and a uid's digits.
     NoUid,
+    /// No `res://` before a path of the project's tree written as a place.
+    NoRes,
     /// A suffix after `#` with nothing in it.
     EmptySuffix,
     /// A character an address or a query does not take: an address's parts and a query's keys are ASCII letters,
@@ -67,6 +69,7 @@ impl fmt::Display for PathError {
             Why::Trailing(' ') => write!(f, "{text:?} has a name ending in a space, which Windows drops"),
             Why::Trailing(c) => write!(f, "{text:?} has a name ending in `{c}`, which Windows drops"),
             Why::NoUid => write!(f, "{text:?} is no uid (`uid://` and its digits)"),
+            Why::NoRes => write!(f, "{text:?} is no place of the project (`res://` and a path)"),
             Why::EmptySuffix => write!(f, "{text:?} has nothing after its `#`"),
             Why::Word(c) => write!(f, "{text:?} has a `{c}` where only ASCII letters, digits and `_` are taken"),
             Why::Underscore => {

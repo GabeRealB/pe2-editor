@@ -311,7 +311,7 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
     let result = match name {
         "editors" => Ok(crate::presence::report(&view.project.root)),
         "project" => Ok(project(view)),
-        "find_assets" => parse(arguments).map(|a| find_assets(view.index, view.extensions, &a)),
+        "find_assets" => parse(arguments).and_then(|a| find_assets(view.index, view.extensions, &a)),
         "list_folder" => {
             parse(arguments).and_then(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref()))
         }
@@ -363,21 +363,57 @@ pub fn read(view: &View, uri: &str) -> Result<ReadResourceResult, String> {
     Ok(ReadResourceResult::new(vec![contents]))
 }
 
-/// An asset by its path (`res://` and `.node` allowed) or its uid.
-fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
-    let name = name.trim();
-    if name.starts_with("uid://") {
-        let uid = pe2_path::Uid::new(name).map_err(|e| format!("{name}: {e}"))?;
-        let path = index.by_uid.get(&uid).ok_or_else(|| format!("{name}: no asset has this uid"))?;
-        return index.assets.get(path).map(|a| &**a).ok_or_else(|| format!("{name}: no asset"));
+/// What an agent names, read once as it comes in: an asset - by its uid, its path, or its path as a place (`res://`,
+/// `.node` allowed) - and the output of it named, where one is (`uid://.../cells/cursor`, `<path>#cells/cursor`).
+struct Named<'t> {
+    text: &'t str,
+    asset: pe2_path::Reference,
+    asked: Option<Arc<pe2_path::Asked>>,
+}
+
+fn named(text: &str) -> Result<Named<'_>, String> {
+    let text = text.trim();
+    let refused = |e: pe2_path::PathError| format!("{text}: {e}");
+    if text.starts_with("uid://") {
+        let named = pe2_path::ResourcePath::new(text).map_err(refused)?;
+        return Ok(Named { text, asset: pe2_path::Reference::Uid(named.uid), asked: named.asked });
     }
-    let path = tree(name.trim_start_matches("res://").trim_end_matches('/'))?;
-    let path = project::index::asset_named(&path).map_err(|e| format!("{name}: {e}"))?;
+    let (path, asked) = match text.split_once('#') {
+        Some((path, asked)) => (path, Some(Arc::from(pe2_path::Asked::new(asked).map_err(refused)?))),
+        None => (text, None),
+    };
+    let path = if path.starts_with(pe2_path::RES_PREFIX) {
+        project::TreePath::from_res(path)
+    } else {
+        project::TreePath::new(path.strip_suffix('/').unwrap_or(path))
+    };
+    let path = project::index::asset_named(path.map_err(refused)?).map_err(refused)?;
+    Ok(Named { text, asset: pe2_path::Reference::Path(path), asked })
+}
+
+/// The asset an agent names, where it names no output of it.
+fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
+    let named = named(name)?;
+    if named.asked.is_some() {
+        return Err(format!("{}: names an output of an asset, where the asset is asked for", named.text));
+    }
+    asset_of(index, &named)
+}
+
+/// The asset an agent's name leads to.
+fn asset_of<'a>(index: &'a Index, named: &Named<'_>) -> Result<&'a Asset, String> {
+    let text = named.text;
+    let path = match &named.asset {
+        pe2_path::Reference::Uid(uid) => {
+            index.by_uid.get(uid).ok_or_else(|| format!("{text}: no asset has this uid"))?
+        }
+        pe2_path::Reference::Path(path) => path,
+    };
     index
         .assets
-        .get(&path)
+        .get(path)
         .map(|a| &**a)
-        .ok_or_else(|| format!("{name}: no asset has this path (find_assets searches by text)"))
+        .ok_or_else(|| format!("{text}: no asset has this path (find_assets searches by text)"))
 }
 
 /// A path of the tree an agent names, checked as it comes in.
@@ -432,20 +468,20 @@ fn is_of(extensions: &Extensions, asset: &Asset, wanted: &str) -> bool {
     extensions.node_types_of(asset).iter().any(|known| known.name.to_string() == wanted || known.name.local() == wanted)
 }
 
-fn find_assets(index: &Index, extensions: &Extensions, args: &FindArgs) -> Value {
+fn find_assets(index: &Index, extensions: &Extensions, args: &FindArgs) -> Result<Value, String> {
     let text = args.text.as_deref().map(str::to_lowercase);
-    let under = args.under.as_deref().map(|u| format!("{}/", u.trim_end_matches('/')));
+    let under = args.under.as_deref().map(|under| tree(under.trim_matches('/'))).transpose()?;
     let matches: Vec<&Asset> = index
         .assets
         .values()
         .map(|a| &**a)
         .filter(|a| text.as_ref().is_none_or(|t| a.path.as_str().to_lowercase().contains(t.as_str())))
         .filter(|a| args.node_type.as_ref().is_none_or(|wanted| is_of(extensions, a, wanted)))
-        .filter(|a| under.as_ref().is_none_or(|u| format!("{}/", a.path).starts_with(u.as_str())))
+        .filter(|a| under.as_ref().is_none_or(|under| a.path.starts_with(under)))
         .collect();
     let (offset, limit) = (args.offset.unwrap_or(0), args.limit.unwrap_or(50).min(500));
     let page: Vec<Value> = matches.iter().skip(offset).take(limit).map(|a| summary(extensions, a)).collect();
-    json!({ "total": matches.len(), "offset": offset, "assets": page })
+    Ok(json!({ "total": matches.len(), "offset": offset, "assets": page }))
 }
 
 fn list_folder(index: &Index, extensions: &Extensions, path: Option<&str>) -> Result<Value, String> {
@@ -649,18 +685,8 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
 
 fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {
     // An output: a reference naming one (`uid://.../picture/night`), or one after a path's `#` (`path#cells/cursor`).
-    let (named, output) = match args.asset.trim() {
-        text if text.starts_with("uid://") => {
-            let named = pe2_path::ResourcePath::new(text).map_err(|e| format!("{e}"))?;
-            (asset(index, &named.uid.to_string())?, named.asked)
-        }
-        text => match text.split_once('#') {
-            Some((name, output)) => {
-                (asset(index, name)?, Some(Arc::from(pe2_path::Asked::new(output).map_err(|e| format!("{e}"))?)))
-            }
-            None => (asset(index, text)?, None),
-        },
-    };
+    let named = named(&args.asset)?;
+    let (named, output) = (asset_of(index, &named)?, named.asked);
     if let Some(output) = output {
         let asset = named;
         let ids: Vec<String> = extensions.addresses(asset).into_iter().map(|(address, _)| address).collect();

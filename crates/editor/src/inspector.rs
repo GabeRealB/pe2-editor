@@ -837,20 +837,22 @@ pub fn reference_in(value: &toml::Value) -> Option<&toml::Value> {
 
 /// A reference written as this one is, naming another asset: of an output it keeps naming that output.
 fn retargeted(value: &toml::Value, asset: &Asset) -> Option<toml::Value> {
-    retarget_to(value, &asset.uid?.to_string(), asset.path.as_str())
+    retarget_to(value, asset.uid?, &asset.path)
 }
 
-fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value> {
+fn retarget_to(value: &toml::Value, uid: pe2_path::Uid, path: &project::TreePath) -> Option<toml::Value> {
     let toml::Value::Table(table) = value else {
         // What it names of its asset, kept: all that follows its uid; one by its path names the asset alone.
         let text = value.as_str()?;
-        let part =
-            text.strip_prefix("uid://").map_or("", |rest| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]);
-        return Some(format!("{uid}{part}").into());
+        let named = match pe2_path::Reference::new(text) {
+            Ok(pe2_path::Reference::Path(_)) => pe2_path::ResourcePath::of(uid),
+            _ => pe2_path::ResourcePath { uid, ..pe2_path::ResourcePath::new(text).ok()? },
+        };
+        return Some(named.to_string().into());
     };
     let mut table = table.clone();
     if is_reference(value) {
-        table.insert("uid".to_string(), uid.into());
+        table.insert("uid".to_string(), uid.to_string().into());
         table.insert("path".to_string(), format!("res://{path}{}", project::index::BUNDLE_SUFFIX).into());
     } else {
         let (key, held) = table.iter().find(|(_, v)| is_reference(v))?;
@@ -2132,12 +2134,12 @@ fn entry_ui(
             };
             row("Kind", kind.to_string());
             row("Uid", entry.uid.to_string());
-            row("Made by", entry.home.clone());
+            row("Made by", entry.home.to_string());
             if !entry.overrides.is_empty() {
-                row("Overridden in", entry.overrides.join(", "));
+                row("Overridden in", entry.overrides.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", "));
             }
             if let Some(layer) = &entry.moved {
-                row("Moved by", layer.clone());
+                row("Moved by", layer.to_string());
             }
         });
         ui.horizontal(|ui| {
@@ -2179,7 +2181,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                         ));
                     }
                     None => {
-                        ui.label(RichText::new(&f.layer).small().color(theme::weak()));
+                        ui.label(RichText::new(f.layer.as_str()).small().color(theme::weak()));
                     }
                 }
                 let hint = match tool.command(tools).trim() {
@@ -2292,7 +2294,8 @@ mod tests {
             "a = \"uid://old/palettes/x\"\nb = { slot = \"uid://old\", at = [1, 2] }\n".parse().unwrap();
         let (a, b) = (&asset["a"], &asset["b"]);
         assert_eq!(super::reference_in(b).and_then(toml::Value::as_str), Some("uid://old"));
-        let retarget = |value| super::retarget_to(value, "uid://new", "g/new");
+        let (uid, path) = (pe2_path::Uid::new("uid://new").unwrap(), project::TreePath::new("g/new").unwrap());
+        let retarget = |value| super::retarget_to(value, uid, path);
         assert_eq!(retarget(a).unwrap().as_str(), Some("uid://new/palettes/x"));
         let moved = retarget(b).unwrap();
         assert_eq!(moved["slot"].as_str(), Some("uid://new"));

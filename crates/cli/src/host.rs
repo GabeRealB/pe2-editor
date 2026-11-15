@@ -322,7 +322,7 @@ impl Host {
     /// Run what events set off while holding the project, as an editor does - one epoch, on the project as it is now,
     /// off the thread holding it, so that it reads and edits on meanwhile - and say what came of it once it has
     /// ended.
-    fn signal(self: &Arc<Self>, events: Vec<String>, config: Option<String>) -> mcp::Reply {
+    fn signal(self: &Arc<Self>, events: Vec<String>, config: Option<Arc<pe2_path::Name>>) -> mcp::Reply {
         let host = self.clone();
         let started = self.ask(move |state| {
             host.ready(state)?;
@@ -366,7 +366,7 @@ impl Host {
     }
 
     /// Make an edit while holding the project: a step of its history, taken in at once.
-    fn edit(&self, op: vfs::ops::Op, layer: Option<String>) -> mcp::Reply {
+    fn edit(&self, op: vfs::ops::Op, layer: Option<Arc<pe2_path::Name>>) -> mcp::Reply {
         let made = self.ask(move |state| {
             let held = state.held.as_mut()?;
             // What reads were answered from changes: made again at the next.

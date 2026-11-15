@@ -7,6 +7,7 @@
 //! (`records::EXTENSIONS`): one is added from wherever it is kept - and updated the same way - and removed, each as one
 //! step with what the project requires of it (`[[extension]]`).
 
+use pe2_path::Name;
 use sfs::HostPath;
 
 use anyhow::{Context, Result, bail};
@@ -69,7 +70,7 @@ fn held_in(layer: &crate::Layer, id: &str) -> Option<Says> {
 pub fn add_extension(
     project: &Project,
     from: &std::path::Path,
-    into: Option<&str>,
+    into: Option<&Name>,
     history: &mut History,
     label: String,
 ) -> Result<About> {
