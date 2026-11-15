@@ -403,7 +403,7 @@ fn register(r: &mut Registry) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let files = extract_dialogues(&chunks, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::owning(bytes) })
                 .collect();
             Ok(Data::Typed(Typed::new("bytes", files)))
         });

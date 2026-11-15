@@ -25,6 +25,11 @@ code, `RelPath::new(text)?` for one made or read, so `objects/a.o` is a path, no
 extraction makes is `Made`, its files each by that name; a reference written with its bundle's path
 (`{ uid, path = "res://<path>.node" }`) is read with `declared_path`.
 
+A file's content (`File::content`) is a few bytes held in itself (`Content::Inline`, up to 30), bytes held in memory
+and shared (`Content::Memory`), or a blob the editor keeps by its SHA-1 (`Content::Stored`, a `Sha1`: twenty bytes,
+written as forty hex digits). `Content::of(bytes)` and `Content::owning(vec)` make one of bytes, holding in itself what
+fits; `held()` gives the bytes a content holds, none for a stored one, which `call.read(file)` reads on asking.
+
 An output is asked for by an `Asked`: its path and, after `?`, its query - `pe2_ext::NATIVE` and `pe2_ext::SETTINGS`,
 which every asset has, `Asked::constant("page")` for a name written in the code, or `Asked::new(text)?` for one read
 from somewhere. A reference held in a field is read with `target_of` (the asset it names: none where the field holds

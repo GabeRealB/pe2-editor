@@ -29,7 +29,7 @@ pub trait Node: Sync {
         crate::extract::sha1_hex(self.declaration().as_bytes())
     }
     /// A stored file's hash; none where its bundle has no such file.
-    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String>;
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1>;
     /// Its stored files' names, a file in a folder of the bundle as `<folder>/<file>`: what a folder of it holds.
     fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
         Box::default()
@@ -54,7 +54,7 @@ pub trait Node: Sync {
         )
     }
     /// Where a content of the node is, by its hash: a stored file's, or what its outputs made.
-    fn content_path(&self, sha1: &str) -> Option<HostPath> {
+    fn content_path(&self, sha1: &pe2_ext::Sha1) -> Option<HostPath> {
         let _ = sha1;
         None
     }
@@ -62,7 +62,7 @@ pub trait Node: Sync {
     ///
     /// # Errors
     /// It has no such content, or it cannot be read.
-    fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
+    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let path = self.content_path(sha1).with_context(|| format!("{}: no content {sha1}", self.path()))?;
         crate::content::read(&path).with_context(|| path.display().to_string())
     }
@@ -88,8 +88,8 @@ impl Node for crate::index::Asset {
         crate::index::Asset::fields_toml(self)
     }
 
-    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
-        self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.sha1.clone())
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
+        self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.sha1)
     }
 
     fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
@@ -106,8 +106,8 @@ impl Node for crate::index::Asset {
         self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.size)
     }
 
-    fn content_path(&self, sha1: &str) -> Option<HostPath> {
-        self.files.iter().find(|f| f.sha1 == sha1).map(|f| f.path.clone())
+    fn content_path(&self, sha1: &pe2_ext::Sha1) -> Option<HostPath> {
+        self.files.iter().find(|f| f.sha1 == *sha1).map(|f| f.path.clone())
     }
 
     fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
@@ -116,12 +116,36 @@ impl Node for crate::index::Asset {
     }
 }
 
+/// A stored file as an operation read it: its content's hash, or none where the node had no file of its name - written
+/// in a trace as the hash's text, or empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileRead(pub Option<pe2_ext::Sha1>);
+
+impl Serialize for FileRead {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(sha1) => serializer.collect_str(&sha1),
+            None => serializer.serialize_str(""),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileRead {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<FileRead, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as Deserialize>::deserialize(deserializer)?;
+        if text.is_empty() {
+            return Ok(FileRead(None));
+        }
+        pe2_ext::Sha1::from_hex(&text).map(|sha1| FileRead(Some(sha1))).map_err(serde::de::Error::custom)
+    }
+}
+
 /// What operations read of their node: its stored files by their hashes (empty where it had none of the name), its
 /// declaration's hash where they read its settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reads {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub files: BTreeMap<String, String>,
+    pub files: BTreeMap<String, FileRead>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<String>,
     /// Other nodes' outputs read, each by `<node>#<address>` (its node as traces name it), with its hash.
@@ -185,7 +209,7 @@ const FOR_EACH_MADE: &str = "for_each@1";
 impl Reads {
     /// Add what another read: an output made from a kept one read what that one did.
     pub fn merge(&mut self, other: &Reads) {
-        self.files.extend(other.files.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.files.extend(other.files.iter().map(|(k, v)| (k.clone(), *v)));
         self.outputs.extend(other.outputs.iter().map(|(k, v)| (k.clone(), v.clone())));
         self.entries.extend(other.entries.iter().map(|(k, v)| (k.clone(), v.clone())));
         if other.declaration.is_some() {
@@ -205,9 +229,10 @@ impl Reads {
     #[must_use]
     pub fn hold(&self, node: &dyn Node, reach: Option<Reach<'_>>) -> bool {
         // A file recorded by a name no path takes is read no more: what read it is made again.
-        self.files.iter().all(|(name, sha1)| {
-            pe2_path::RelPath::new(name).is_ok_and(|name| node.file_sha1(name).unwrap_or_default() == *sha1)
-        }) && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
+        self.files
+            .iter()
+            .all(|(name, sha1)| pe2_path::RelPath::new(name).is_ok_and(|name| FileRead(node.file_sha1(name)) == *sha1))
+            && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
             && (self.outputs.is_empty()
                 || reach.is_some_and(|reach| {
                     self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))
@@ -322,7 +347,9 @@ impl<'a> Reach<'a> {
                 let listed: Vec<&str> = files.iter().map(|file| file.as_str()).collect();
                 Some(list_hash(&listed))
             }
-            None => crate::content::sha1_known(&self.world.entry(crate::TreePath::new(read).ok()?)?).ok(),
+            None => crate::content::sha1_known(&self.world.entry(crate::TreePath::new(read).ok()?)?)
+                .ok()
+                .map(|sha1| sha1.to_string()),
         }
     }
 
@@ -363,7 +390,7 @@ pub struct Recorder<'a> {
 
 impl<'a> Recorder<'a> {
     pub fn file(&self, name: &pe2_ext::RelPath) {
-        let sha1 = self.node.file_sha1(name).unwrap_or_default();
+        let sha1 = FileRead(self.node.file_sha1(name));
         self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).files.insert(name.to_string(), sha1);
     }
 
@@ -465,7 +492,7 @@ struct Got {
 }
 
 /// Where stored contents of other nodes' outputs are, by hash.
-type Others = Mutex<HashMap<String, HostPath>>;
+type Others = Mutex<HashMap<pe2_ext::Sha1, HostPath>>;
 
 /// Another node's output, made or found kept, and its stored contents found: where its node has them, or - its node having
 /// them nowhere a path names - kept in the store.
@@ -800,7 +827,8 @@ impl<'a> Call<'a> {
         for file in files {
             // Where its content is; one with no place on disk (a node holding it otherwise), read and held.
             let content = match &file.content {
-                super::Content::Inline(bytes) => Given::Bytes(Arc::from(bytes.as_slice())),
+                super::Content::Memory(bytes) => Given::Bytes(bytes.clone()),
+                super::Content::Inline { .. } => Given::Bytes(Arc::from(file.content.held().unwrap_or_default())),
                 super::Content::Stored { sha1, .. } => match self.content_path(sha1) {
                     Some(disk) => Given::Disk(disk),
                     None => Given::Bytes(Arc::from(
@@ -841,9 +869,9 @@ impl<'a> Call<'a> {
     pub fn copy(&self, content: &Content, into: &mut Writer) -> Result<()> {
         use std::io::Write as _;
         const RANGE: usize = 4 << 20;
-        let size = match content {
-            Content::Inline(bytes) => return into.write_all(bytes).map_err(Into::into),
-            Content::Stored { size, .. } => *size,
+        let size = match (content, content.held()) {
+            (_, Some(bytes)) => return into.write_all(bytes).map_err(Into::into),
+            (_, None) => content.size(),
         };
         let mut at = 0;
         while at < size {
@@ -857,7 +885,7 @@ impl<'a> Call<'a> {
 
     /// Where a stored content is: in the store, or among its node's files.
     #[must_use]
-    pub fn content_path(&self, sha1: &str) -> Option<HostPath> {
+    pub fn content_path(&self, sha1: &pe2_ext::Sha1) -> Option<HostPath> {
         let other = || self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha1).cloned();
         self.store
             .and_then(|s| s.blob_path(sha1).ok())
@@ -872,11 +900,11 @@ impl<'a> Call<'a> {
     /// It is stored where it cannot be found or read.
     pub fn read(&self, content: &Content) -> Result<Vec<u8>> {
         match content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => match self.content_path(sha1) {
                 Some(path) => crate::content::read(&path).with_context(|| path.display().to_string()),
                 None => self.recorder.node.read_content(sha1),
             },
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
@@ -886,10 +914,6 @@ impl<'a> Call<'a> {
     /// As `read`.
     pub fn read_range(&self, content: &Content, offset: u64, len: usize) -> Result<Vec<u8>> {
         match content {
-            Content::Inline(bytes) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
-            }
             Content::Stored { sha1, .. } => {
                 let Some(path) = self.content_path(sha1) else {
                     let bytes = self.recorder.node.read_content(sha1)?;
@@ -898,6 +922,7 @@ impl<'a> Call<'a> {
                 };
                 crate::content::read_range(&path, offset, len).with_context(|| path.display().to_string())
             }
+            held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
     }
 
@@ -920,11 +945,11 @@ impl pe2_ext::FileWriter for Writer {
 }
 
 /// The hashes of a value's stored contents.
-pub(crate) fn stored_contents(value: &Value, out: &mut Vec<String>) {
+pub(crate) fn stored_contents(value: &Value, out: &mut Vec<pe2_ext::Sha1>) {
     match value {
         Value::Typed(typed) => out.extend(typed.files.iter().filter_map(|f| match &f.content {
-            Content::Stored { sha1, .. } => Some(sha1.clone()),
-            Content::Inline(_) => None,
+            Content::Stored { sha1, .. } => Some(*sha1),
+            _ => None,
         })),
         Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
         Value::Image(_)
@@ -984,13 +1009,13 @@ impl Writer {
     pub fn finish(mut self) -> Result<File> {
         let name = self.name.clone();
         let Some((mut file, path)) = self.spilled.take() else {
-            return Ok(File { name, content: Content::Inline(std::mem::take(&mut self.memory)) });
+            return Ok(File { name, content: Content::owning(std::mem::take(&mut self.memory)) });
         };
         // Its file is the store's from here, whatever comes of keeping it: removed where it cannot be kept.
         let kept = (|| {
             std::io::Write::flush(&mut file)?;
             drop(file);
-            let sha1 = crate::extract::hex(&std::mem::take(&mut self.hasher).finalize());
+            let sha1 = pe2_ext::Sha1::from_bytes(std::mem::take(&mut self.hasher).finalize().into());
             self.store.as_ref().context("spilled with no store")?.adopt(&path, &sha1)?;
             Ok(File { name, content: Content::Stored { sha1, size: self.size } })
         })();
@@ -1630,11 +1655,11 @@ impl Evaluation<'_> {
     /// A content's bytes: inline, or kept in the store.
     fn content(&self, content: &Content) -> pe2_ext::Result<Vec<u8>> {
         match content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => {
                 let path = self.store.context("no store")?.blob_path(sha1)?;
                 std::fs::read(&path).with_context(|| path.to_string())
             }
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
@@ -1814,8 +1839,8 @@ impl Evaluation<'_> {
     fn as_file(&self, input: &Input) -> std::result::Result<Input, String> {
         let Value::Typed(typed) = input.value() else { return Err(format!("given {}", input.value().ty())) };
         let file = typed.file().map_err(|e| e.to_string())?;
-        match (&file.content, self.store) {
-            (Content::Inline(bytes), Some(store)) => {
+        match (file.content.held(), self.store) {
+            (Some(bytes), Some(store)) => {
                 let blob = store.keep(bytes).map_err(|e| format!("{e:#}"))?;
                 let content = Content::Stored { sha1: blob.sha1, size: blob.size };
                 let mut typed = typed.clone();
@@ -2253,7 +2278,7 @@ impl Node for Nowhere {
         &self.fields
     }
 
-    fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<String> {
+    fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
         None
     }
 

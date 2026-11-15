@@ -606,8 +606,8 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
     let text = |v: Value| Ok(CallToolResult::success(vec![ContentBlock::text(v.to_string())]));
     let file = |f: &project::graph::File| {
         let (size, sha1) = match &f.content {
-            Content::Inline(bytes) => (bytes.len() as u64, project::extract::sha1_hex(bytes)),
-            Content::Stored { sha1, size } => (*size, sha1.clone()),
+            Content::Stored { sha1, size } => (*size, *sha1),
+            held => (held.size(), project::extract::sha1_of(held.held().unwrap_or_default())),
         };
         json!({ "name": f.name, "size": size, "sha1": sha1 })
     };

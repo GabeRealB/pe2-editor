@@ -104,7 +104,7 @@ fn about_ui(ui: &mut egui::Ui, ws: &Workspace, all: &[Present], p: &Present) {
                 // Held by a layer: kept whole as a tree, laid out where it runs from.
                 Origin::Project(path) if let Some(held) = project::records::held(path) => {
                     row("Held by", held.layer.file_name().map_or_default(|n| n.to_string_lossy().into_owned()));
-                    row("Tree", held.tree.clone());
+                    row("Tree", held.tree.to_string());
                 }
                 Origin::Project(path) | Origin::User(path) | Origin::Install(path) => {
                     row(if path.is_dir() { "Folder" } else { "Archive" }, path.display().to_string());

@@ -1292,22 +1292,19 @@ impl CallHost for NodeHost<'_> {
 
     fn read(&self, content: &Content) -> crate::Result<Vec<u8>> {
         match content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
             // A stored content is read by its hash, which the contract sends where it sends a file's name.
-            Content::Stored { sha1, .. } => self.0.resource().read(sha1).map_err(crate::Error::msg),
+            Content::Stored { sha1, .. } => self.0.resource().read(&sha1.to_string()).map_err(crate::Error::msg),
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
     fn read_range(&self, content: &Content, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
         match content {
-            Content::Inline(bytes) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
-            }
             Content::Stored { sha1, .. } => {
                 let len = u32::try_from(len).unwrap_or(u32::MAX);
-                self.0.resource().read_range(sha1, offset, len).map_err(crate::Error::msg)
+                self.0.resource().read_range(&sha1.to_string(), offset, len).map_err(crate::Error::msg)
             }
+            held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
     }
 
@@ -1353,8 +1350,8 @@ impl CallHost for NodeHost<'_> {
 
     fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
         match content {
-            Content::Inline(_) => None,
-            Content::Stored { sha1, .. } => self.0.resource().path_of(sha1).map(given),
+            Content::Stored { sha1, .. } => self.0.resource().path_of(&sha1.to_string()).map(given),
+            _ => None,
         }
     }
 
@@ -1454,11 +1451,16 @@ fn item_to_wit(value: Data) -> Option<types::Item> {
 }
 
 fn file_to_wit(f: crate::File) -> types::File {
-    let content = match f.content {
-        Content::Inline(bytes) => types::Content::Inline(bytes),
-        Content::Stored { sha1, size } => types::Content::Stored((sha1, size)),
-    };
-    types::File { name: f.name.to_string(), content }
+    types::File { name: f.name.to_string(), content: content_to_wit(f.content) }
+}
+
+/// A content as the contract carries it.
+fn content_to_wit(content: Content) -> types::Content {
+    match content {
+        Content::Inline { bytes, len } => types::Content::Inline((bytes, len)),
+        Content::Memory(bytes) => types::Content::Memory(bytes.to_vec()),
+        Content::Stored { sha1, size } => types::Content::Stored((*sha1.bytes(), size)),
+    }
 }
 
 fn typed_to_wit(t: crate::Typed) -> types::Typed {
@@ -1531,11 +1533,20 @@ fn item_from_wit(item: types::Item) -> Data {
 }
 
 fn file_from_wit(f: types::File) -> crate::File {
-    let content = match f.content {
-        types::Content::Inline(bytes) => Content::Inline(bytes),
-        types::Content::Stored((sha1, size)) => Content::Stored { sha1, size },
-    };
-    crate::File { name: told_name(&f.name), content }
+    crate::File { name: told_name(&f.name), content: content_from_wit(f.content) }
+}
+
+/// What a content holds in itself at most, as its length is written.
+#[expect(clippy::cast_possible_truncation, reason = "thirty")]
+const INLINE_LEN: u8 = crate::INLINE as u8;
+
+/// A content as the contract carries it: what the host holds in itself held so here too.
+fn content_from_wit(content: types::Content) -> Content {
+    match content {
+        types::Content::Inline((bytes, len)) => Content::Inline { bytes, len: len.min(INLINE_LEN) },
+        types::Content::Memory(bytes) => Content::owning(bytes),
+        types::Content::Stored((sha1, size)) => Content::Stored { sha1: crate::Sha1::from_bytes(sha1), size },
+    }
 }
 
 /// A view, kept between frames.

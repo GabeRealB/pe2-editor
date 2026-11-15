@@ -43,7 +43,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::TreePath;
 use crate::cache::{Cache, write_atomic};
-use crate::extract::sha1_hex;
 use crate::index::{Index, Working, WorkingFile};
 
 pub(crate) const DIR: &Name = Name::constant("history");
@@ -63,7 +62,7 @@ const MERGE_WITHIN: Duration = Duration::from_millis(1500);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     /// A file's content before and after, by hash; none: absent.
-    Write { path: HostPath, before: Option<String>, after: Option<String> },
+    Write { path: HostPath, before: Option<pe2_ext::Sha1>, after: Option<pe2_ext::Sha1> },
     /// A file or a folder moved.
     Rename { from: HostPath, to: HostPath },
     /// A folder made (for a file written into it).
@@ -76,7 +75,7 @@ impl Change {
     fn inverse(&self) -> Change {
         match self {
             Change::Write { path, before, after } => {
-                Change::Write { path: path.clone(), before: after.clone(), after: before.clone() }
+                Change::Write { path: path.clone(), before: *after, after: *before }
             }
             Change::Rename { from, to } => Change::Rename { from: to.clone(), to: from.clone() },
             Change::MakeDir { path } => Change::RemoveDir { path: path.clone() },
@@ -100,13 +99,13 @@ pub struct Edit {
     /// Where the asset was when it was edited.
     pub path: Arc<TreePath>,
     pub file: Arc<RelPath>,
-    pub before: Option<String>,
-    pub after: Option<String>,
+    pub before: Option<pe2_ext::Sha1>,
+    pub after: Option<pe2_ext::Sha1>,
 }
 
 impl Edit {
     fn inverse(&self) -> Edit {
-        Edit { before: self.after.clone(), after: self.before.clone(), ..self.clone() }
+        Edit { before: self.after, after: self.before, ..self.clone() }
     }
 }
 
@@ -190,9 +189,9 @@ impl Step {
 pub struct Document {
     /// Where the asset is.
     pub path: Arc<TreePath>,
-    pub base: BTreeMap<Arc<RelPath>, Option<String>>,
-    pub working: BTreeMap<Arc<RelPath>, Option<String>>,
-    pub stale: Option<BTreeMap<Arc<RelPath>, Option<String>>>,
+    pub base: BTreeMap<Arc<RelPath>, Option<pe2_ext::Sha1>>,
+    pub working: BTreeMap<Arc<RelPath>, Option<pe2_ext::Sha1>>,
+    pub stale: Option<BTreeMap<Arc<RelPath>, Option<pe2_ext::Sha1>>>,
 }
 
 /// What a session a crash ended left: its steps, and its documents with unsaved changes.
@@ -228,8 +227,8 @@ impl std::fmt::Display for StepError {
 impl std::error::Error for StepError {}
 
 /// A file of an asset as it is on disk, by hash: none where it has no such file, or the index no such asset.
-fn on_disk(index: &Index, uid: Uid, file: &RelPath) -> Option<String> {
-    disk_file(index, uid, file).map(|f| f.sha1.clone())
+fn on_disk(index: &Index, uid: Uid, file: &RelPath) -> Option<pe2_ext::Sha1> {
+    disk_file(index, uid, file).map(|f| f.sha1)
 }
 
 fn disk_file<'i>(index: &'i Index, uid: Uid, file: &RelPath) -> Option<&'i crate::index::BundleFile> {
@@ -331,7 +330,7 @@ impl View {
                     // A hash that names no file of its folder is no content it kept.
                     let file = sha1
                         .as_ref()
-                        .and_then(|sha1| Some(WorkingFile { path: self.blob_path(sha1).ok()?, sha1: sha1.clone() }));
+                        .and_then(|sha1| Some(WorkingFile { path: self.blob_path(sha1).ok()?, sha1: *sha1 }));
                     (name.clone(), file)
                 });
                 (*uid, Working { files: files.collect() })
@@ -343,7 +342,7 @@ impl View {
     ///
     /// # Errors
     /// It is not kept.
-    pub fn content(&self, sha1: &str) -> Result<Vec<u8>> {
+    pub fn content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         self.blob(sha1)
     }
 
@@ -351,11 +350,11 @@ impl View {
     /// since edited them: each by uid and name, by hash (none: absent). Of one document, or all. What steps did to
     /// files otherwise (a move, a new asset) is not taken back: a point is of the documents.
     #[must_use]
-    pub fn states_at(&self, point: usize, scope: Option<Uid>) -> BTreeMap<(Uid, Arc<RelPath>), Option<String>> {
+    pub fn states_at(&self, point: usize, scope: Option<Uid>) -> BTreeMap<(Uid, Arc<RelPath>), Option<pe2_ext::Sha1>> {
         let mut states = BTreeMap::new();
         for step in self.done[point.min(self.done.len())..].iter().rev() {
             for edit in step.edits.iter().rev().filter(|e| scope.is_none_or(|uid| e.uid == uid)) {
-                states.insert((edit.uid, edit.file.clone()), edit.before.clone());
+                states.insert((edit.uid, edit.file.clone()), edit.before);
             }
         }
         states
@@ -373,11 +372,11 @@ impl View {
         working
     }
 
-    fn blob_path(&self, hash: &str) -> Result<HostPath> {
-        Ok(self.dir.join(&BLOBS).join(&Name::new(hash)?))
+    fn blob_path(&self, hash: &pe2_ext::Sha1) -> Result<HostPath> {
+        Ok(self.dir.join(&BLOBS).join(&Name::new(&hash.to_string())?))
     }
 
-    fn blob(&self, hash: &str) -> Result<Vec<u8>> {
+    fn blob(&self, hash: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let path = self.blob_path(hash)?;
         std::fs::read(&path).with_context(|| format!("{}: a content the history kept is gone", path.display()))
     }
@@ -561,9 +560,9 @@ impl History {
     }
 
     /// A file of an asset as its working copy has it, else as on disk.
-    fn current(&self, index: &Index, uid: Uid, file: &RelPath) -> Option<String> {
+    fn current(&self, index: &Index, uid: Uid, file: &RelPath) -> Option<pe2_ext::Sha1> {
         match self.view.documents.get(&uid).and_then(|d| d.working.get(file)) {
-            Some(working) => working.clone(),
+            Some(working) => *working,
             None => on_disk(index, uid, file),
         }
     }
@@ -587,7 +586,7 @@ impl History {
                 let _ = keep_in(&self.view.dir, &bytes);
             }
         }
-        document.working.insert(edit.file.clone(), edit.after.clone());
+        document.working.insert(edit.file.clone(), edit.after);
         if document.working == document.base && document.stale.is_none() {
             self.view.documents.remove(&edit.uid);
         }
@@ -601,7 +600,7 @@ impl History {
         let Some(document) = self.view.documents.get(&uid) else { return Ok(vec![]) };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let changed = document.working.iter().filter(|(name, sha1)| disk.get(*name) != Some(*sha1));
-        changed.map(|(name, sha1)| Ok((name.clone(), sha1.as_deref().map(|s| self.blob(s)).transpose()?))).collect()
+        changed.map(|(name, sha1)| Ok((name.clone(), sha1.as_ref().map(|s| self.blob(s)).transpose()?))).collect()
     }
 
     /// A document was saved: its working copy is what is on disk.
@@ -616,10 +615,9 @@ impl History {
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let mut step = Step::new(label, self.author.clone());
         for (file, working) in &document.working {
-            let after = disk.get(file).cloned().flatten();
+            let after = disk.get(file).copied().flatten();
             if *working != after {
-                let edit =
-                    Edit { uid, path: document.path.clone(), file: file.clone(), before: working.clone(), after };
+                let edit = Edit { uid, path: document.path.clone(), file: file.clone(), before: *working, after };
                 step.edits.push(edit);
             }
         }
@@ -654,7 +652,7 @@ impl History {
                 document.path.clone_from(path);
                 changed = true;
             }
-            let now: BTreeMap<Arc<RelPath>, Option<String>> =
+            let now: BTreeMap<Arc<RelPath>, Option<pe2_ext::Sha1>> =
                 document.base.keys().map(|file| (file.clone(), on_disk(index, *uid, file))).collect();
             let stale = if now == document.base { None } else { Some(now.clone()) };
             // What the disk has now is kept: taken, it is the working copy.
@@ -871,16 +869,16 @@ impl History {
 
     /// The documents' files not as a list of edits expects them, followed in order, each named by its asset's path.
     fn edited(&self, index: &Index, edits: &[Edit]) -> Vec<String> {
-        let mut state: HashMap<(Uid, &RelPath), Option<String>> = HashMap::new();
+        let mut state: HashMap<(Uid, &RelPath), Option<pe2_ext::Sha1>> = HashMap::new();
         let mut differing = vec![];
         for edit in edits {
             let key = (edit.uid, &*edit.file);
-            let now = state.get(&key).cloned().unwrap_or_else(|| self.current(index, edit.uid, &edit.file));
+            let now = state.get(&key).copied().unwrap_or_else(|| self.current(index, edit.uid, &edit.file));
             if now != edit.before {
                 let path = index.by_uid.get(&edit.uid).unwrap_or(&edit.path);
                 differing.push(format!("{path}: {}", edit.file));
             }
-            state.insert(key, edit.after.clone());
+            state.insert(key, edit.after);
         }
         differing
     }
@@ -889,18 +887,18 @@ impl History {
     /// first write left it. Folders are not checked: one made is there or not, and one to remove that holds something
     /// now is left alone.
     fn changed(list: &[Change]) -> Vec<HostPath> {
-        let mut state: HashMap<&HostPath, Option<String>> = HashMap::new();
+        let mut state: HashMap<&HostPath, Option<pe2_ext::Sha1>> = HashMap::new();
         // Whether what an earlier move took away or put there is there, as the list leaves it.
         let mut moved: HashMap<&HostPath, bool> = HashMap::new();
         let mut differing = vec![];
         for change in list {
             match change {
                 Change::Write { path, before, after } => {
-                    let now = state.get(path).cloned().unwrap_or_else(|| current_hash(path));
+                    let now = state.get(path).copied().unwrap_or_else(|| current_hash(path));
                     if now != *before {
                         differing.push(path.clone());
                     }
-                    state.insert(path, after.clone());
+                    state.insert(path, *after);
                 }
                 Change::Rename { from, to } => {
                     let untouched = !state.contains_key(from) && !state.contains_key(to);
@@ -989,7 +987,7 @@ impl History {
             .map(|change| match change {
                 Change::Write { path, before, after } => {
                     let after = after.as_ref().map(|hash| self.blob(hash)).transpose().ok()?;
-                    Some(Behind { path: path.clone(), after, before: before.clone(), folder: false, at })
+                    Some(Behind { path: path.clone(), after, before: *before, folder: false, at })
                 }
                 Change::MakeDir { path } => {
                     Some(Behind { path: path.clone(), after: None, before: None, folder: true, at })
@@ -1115,12 +1113,12 @@ impl History {
     }
 
     /// Keep bytes in the history; their hash.
-    fn keep(&self, bytes: &[u8]) -> Result<String> {
+    fn keep(&self, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
         keep_in(&self.view.dir, bytes)
     }
 
     /// Keep a file's current content; its hash, none where it is absent.
-    fn keep_current(&self, path: &HostPath) -> Result<Option<String>> {
+    fn keep_current(&self, path: &HostPath) -> Result<Option<pe2_ext::Sha1>> {
         match crate::storage::read(path) {
             Ok(Some(bytes)) => self.keep(&bytes).map(Some),
             Ok(None) => Ok(None),
@@ -1274,7 +1272,7 @@ impl Transaction<'_> {
         let mut at = path.clone();
         for change in self.step.changes.iter().rev() {
             match change {
-                Change::Write { path, after, .. } if *path == at => return Seen::File(after.clone()),
+                Change::Write { path, after, .. } if *path == at => return Seen::File(*after),
                 Change::MakeDir { path } if *path == at => return Seen::Folder,
                 Change::RemoveDir { path } if *path == at => return Seen::Gone,
                 Change::Rename { from, to } => {
@@ -1351,7 +1349,7 @@ impl Transaction<'_> {
     }
 
     /// A file's content as the changes so far leave it, kept; its hash, none where it is absent.
-    fn current(&self, path: &HostPath) -> Result<Option<String>> {
+    fn current(&self, path: &HostPath) -> Result<Option<pe2_ext::Sha1>> {
         match self.seen(path) {
             Seen::File(after) => Ok(after),
             Seen::Disk(at) => self.history.keep_current(&at),
@@ -1506,7 +1504,7 @@ impl Transaction<'_> {
 /// What a path is, as a transaction's changes so far leave it.
 enum Seen {
     /// A file they wrote, by its content's hash, or (none) removed.
-    File(Option<String>),
+    File(Option<pe2_ext::Sha1>),
     /// A folder they made.
     Folder,
     /// Nothing: removed, or moved away.
@@ -1543,9 +1541,9 @@ fn copy_all(from: &HostPath, to: &HostPath) -> std::io::Result<()> {
 }
 
 /// Keep bytes in a history's folder, once: their hash.
-fn keep_in(dir: &HostPath, bytes: &[u8]) -> Result<String> {
-    let hash = sha1_hex(bytes);
-    let path = dir.join(&BLOBS).join(&Name::new(&hash)?);
+fn keep_in(dir: &HostPath, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
+    let hash = crate::extract::sha1_of(bytes);
+    let path = dir.join(&BLOBS).join(&Name::new(&hash.to_string())?);
     if !path.exists() {
         write_atomic(&path, bytes)?;
     }
@@ -1553,8 +1551,8 @@ fn keep_in(dir: &HostPath, bytes: &[u8]) -> Result<String> {
 }
 
 /// The hash of what a file holds - as what waits to be written leaves it; none where it is absent.
-fn current_hash(path: &HostPath) -> Option<String> {
-    crate::storage::read(path).ok().flatten().map(|bytes| sha1_hex(&bytes))
+fn current_hash(path: &HostPath) -> Option<pe2_ext::Sha1> {
+    crate::storage::read(path).ok().flatten().map(|bytes| crate::extract::sha1_of(&bytes))
 }
 
 fn is_empty_dir(path: &HostPath) -> bool {
@@ -1881,7 +1879,7 @@ mod tests {
     }
 
     fn working_text(history: &History, uid: &str) -> Option<String> {
-        let sha1 = history.document(crate::testing::uid(uid))?.working.get(&rel("node.toml"))?.clone()?;
+        let sha1 = (*history.document(crate::testing::uid(uid))?.working.get(&rel("node.toml"))?)?;
         Some(String::from_utf8(history.content(&sha1).unwrap()).unwrap())
     }
 

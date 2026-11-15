@@ -75,7 +75,7 @@ fn file_name(name: &RelPath, at: &TreePath) -> String {
 /// A merge remembered, by its inputs: what it made (its SHA-1) and its conflicts.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Memo {
-    sha1: String,
+    sha1: pe2_ext::Sha1,
     conflicts: Vec<crate::merge::Conflict>,
 }
 
@@ -88,7 +88,7 @@ pub struct BundleFile {
     pub modified: Stamp,
     pub layer: String,
     /// The hash of its content.
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
     /// The importer that made it of the asset's source, kept in the cache (`imports`); none for a file of the bundle.
     pub made_by: Option<String>,
 }
@@ -138,7 +138,7 @@ pub struct Working {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingFile {
     pub path: HostPath,
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
 }
 
 /// An asset's settings with what its import derived from its source in their places.
@@ -298,7 +298,7 @@ pub struct Below {
     pub hash: Option<String>,
     /// Its files' hashes, by name: what an override records of a file it changes, as what it was made from
     /// (`changeset::Base::was`).
-    pub sha1s: BTreeMap<Arc<RelPath>, String>,
+    pub sha1s: BTreeMap<Arc<RelPath>, pe2_ext::Sha1>,
     /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
     pub files: Vec<(Arc<RelPath>, HostPath)>,
     /// The layer holding its content.
@@ -672,7 +672,7 @@ fn read(file: &Pending) -> Option<Record> {
     // A declaration is read whole, to be parsed; any other file is only hashed, a piece at a time.
     let (sha1, declaration) = if file.declaration {
         let bytes = crate::content::read(&file.path).ok()?;
-        (sha1_hex(&bytes), Some(declaration(&bytes)))
+        (crate::extract::sha1_of(&bytes), Some(declaration(&bytes)))
     } else {
         (crate::content::sha1(&file.path).ok()?, None)
     };
@@ -3055,10 +3055,10 @@ impl Index {
                 let files = self.bundle_files(layer, path)?;
                 let mut listing = String::new();
                 for (name, f, _) in &files {
-                    let sha1 = self.records.get(f).map_or("", |r| r.sha1.as_str());
+                    let sha1 = self.records.get(f).map_or_default(|r| r.sha1.to_string());
                     listing.push_str(name.as_str());
                     listing.push(' ');
-                    listing.push_str(sha1);
+                    listing.push_str(&sha1);
                     listing.push('\n');
                 }
                 Some(format!("sha1:{}", sha1_hex(listing.as_bytes())))
@@ -3081,12 +3081,13 @@ impl Index {
     }
 
     /// A file's SHA-1: as recorded, or, for one merged in the cache, the name of its folder.
-    fn sha1_of(&self, path: &HostPath) -> Option<String> {
+    fn sha1_of(&self, path: &HostPath) -> Option<pe2_ext::Sha1> {
         if let Some(record) = self.records.get(path) {
-            return Some(record.sha1.clone());
+            return Some(record.sha1);
         }
+        // A folder named by no hash holds no merged file.
         let folder = path.parent().filter(|f| f.parent().is_some_and(|merged| merged == self.merged))?;
-        folder.file_name()?.to_str().map(str::to_string)
+        pe2_ext::Sha1::from_hex(folder.file_name()?.to_str()?).ok()
     }
 
     /// The hash of a resolved entry's content: a plain file's own, a bundle's over its files' names and hashes.
@@ -3095,7 +3096,7 @@ impl Index {
             Kind::Asset => {
                 let mut listing = String::new();
                 for (name, f, _) in &self.node_files(node) {
-                    let sha1 = self.sha1_of(f).unwrap_or_default();
+                    let sha1 = self.sha1_of(f).map_or_default(|sha1| sha1.to_string());
                     listing.push_str(name.as_str());
                     listing.push(' ');
                     listing.push_str(&sha1);
@@ -3202,18 +3203,18 @@ impl Index {
     fn merged(
         &self,
         name: &str,
-        was: &str,
+        was: &pe2_ext::Sha1,
         now: &HostPath,
         mine: &HostPath,
     ) -> Option<(HostPath, Vec<crate::merge::Conflict>)> {
         let (now_sha1, mine_sha1) = (self.sha1_of(now)?, self.sha1_of(mine)?);
         let key = sha1_hex(format!("{name}\n{was}\n{now_sha1}\n{mine_sha1}").as_bytes());
         let memo = self.merged.join(&Name::constant("memo")).join(&Name::new(&key).ok()?);
-        let at = |sha1: &str| {
-            if sha1 == mine_sha1 {
+        let at = |sha1: &pe2_ext::Sha1| {
+            if *sha1 == mine_sha1 {
                 mine.clone()
             } else {
-                match (Name::new(sha1), RelPath::new(name)) {
+                match (Name::new(&sha1.to_string()), RelPath::new(name)) {
                     (Ok(sha1), Ok(name)) => self.merged.join(&sha1).join(&name),
                     _ => self.merged.clone(),
                 }
@@ -3229,7 +3230,7 @@ impl Index {
         let theirs = crate::content::read(now).ok()?;
         let ours = crate::content::read(mine).ok()?;
         let merged = crate::merge::merge(name, &base, &theirs, &ours);
-        let sha1 = sha1_hex(&merged.bytes);
+        let sha1 = crate::extract::sha1_of(&merged.bytes);
         let path =
             if sha1 == mine_sha1 { mine.clone() } else { merged_file(&self.merged, name, &merged.bytes).ok()? };
         let remembered = Memo { sha1, conflicts: merged.conflicts };
@@ -3626,7 +3627,7 @@ impl Index {
             Kind::File => self.layers[i].scan.files.get(&at).cloned(),
             _ => self.layers[i].scan.bundles.get(&at).and_then(|b| b.get(name)).cloned(),
         };
-        let whole = |file: &RelPath, mine: &str, was: &Option<String>, now: Option<&String>| StalePart {
+        let whole = |file: &RelPath, mine: &str, was: &Option<pe2_ext::Sha1>, now: Option<&pe2_ext::Sha1>| StalePart {
             file: file.to_owned(),
             field: None,
             mine: Some(mine.to_string()),
@@ -3783,7 +3784,7 @@ impl Index {
                 size: record.size,
                 modified: record.modified,
                 layer: layer.unwrap_or_default(),
-                sha1: record.sha1.clone(),
+                sha1: record.sha1,
                 made_by: None,
             });
         }
@@ -4106,7 +4107,7 @@ impl Index {
                 size: record.size,
                 modified: record.modified,
                 layer: self.layers[*held].name.clone(),
-                sha1: record.sha1.clone(),
+                sha1: record.sha1,
                 made_by: None,
             });
         }
@@ -4161,7 +4162,7 @@ impl Index {
                         size: record.size,
                         modified: record.modified,
                         layer: below.layer.clone(),
-                        sha1: record.sha1.clone(),
+                        sha1: record.sha1,
                         made_by: None,
                     });
                 }
@@ -4333,7 +4334,7 @@ mod tests {
             let name = rel(name);
             let (_, file) = below.files.iter().find(|(n, _)| *n == name).expect("a file below");
             store.put_file(&crate::content::read(file).expect("read")).expect("kept");
-            let was = below.sha1s.get(&name).cloned();
+            let was = below.sha1s.get(&name).copied();
             (name, Base { was, removed: false })
         });
         Op::Override { files: files.collect(), to: None }

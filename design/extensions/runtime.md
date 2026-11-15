@@ -58,6 +58,10 @@ counting, as that is what it is.
   goes unused or grows, one for views. An instance that traps is dropped.
 - **Lending.** Host objects (an asset, the project, a UI frame) are put in the resource table for the length of one
   call and taken out before it returns, so a guest can never keep one.
+- **A content crosses as what it is:** a few bytes in itself (`inline`, a `list<u8, 30>` and how many), bytes
+  (`memory`), or a stored blob by its SHA-1 (`stored`, a `list<u8, 20>` and its size) - fixed-length lists, which the
+  engine is set to take (`Config::wasm_component_model_fixed_length_lists`). A hash is a `Sha1` on both sides and in
+  the project's records, the store and the model: text only where it is written out.
 - **Names are types on both sides, text between.** The contract carries an asset's path, a reference, an output's
   address and a file's name (`RelPath`, within an asset or a value) as strings; the SDK and the host check each into
   its `pe2-path` type where it arrives. An operation's lent asset reads a stored content by its hash where a name

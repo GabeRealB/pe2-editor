@@ -40,7 +40,7 @@ enum Form {
     /// written.
     Object {
         path: HostPath,
-        sha1: String,
+        sha1: pe2_ext::Sha1,
         size: u64,
         modified: std::time::SystemTime,
     },
@@ -70,7 +70,7 @@ fn manifest(key: String, read: impl FnOnce() -> io::Result<Manifest>) -> io::Res
 }
 
 /// A file kept in the store, by its SHA-1: its manifest.
-fn stored_manifest(store: &Store, sha1: &str) -> io::Result<Arc<Manifest>> {
+fn stored_manifest(store: &Store, sha1: &pe2_ext::Sha1) -> io::Result<Arc<Manifest>> {
     manifest(format!("{}:{sha1}", store.dir.display()), || store.file_manifest(sha1))
 }
 
@@ -87,7 +87,7 @@ fn held(path: &HostPath) -> Option<Form> {
     let file = held.file(&within)?;
     Some(Form::Object {
         path: held.store.object_path(&file.sha1).ok()?,
-        sha1: file.sha1.clone(),
+        sha1: file.sha1,
         size: file.size,
         modified: held.modified,
     })
@@ -383,11 +383,11 @@ pub fn stat(path: &HostPath) -> io::Result<(u64, std::time::SystemTime)> {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn sha1(path: &HostPath) -> io::Result<String> {
+pub fn sha1(path: &HostPath) -> io::Result<pe2_ext::Sha1> {
     match form(path)? {
         Form::Plain(path) => crate::extract::sha1_file(&path).map_err(io::Error::other),
-        Form::Inline { bytes, .. } => Ok(crate::extract::sha1_hex(&bytes)),
-        Form::Chunked { manifest, .. } | Form::Packed { manifest, .. } => Ok(manifest.sha1.clone()),
+        Form::Inline { bytes, .. } => Ok(crate::extract::sha1_of(&bytes)),
+        Form::Chunked { manifest, .. } | Form::Packed { manifest, .. } => Ok(manifest.sha1),
         Form::Object { sha1, .. } => Ok(sha1),
     }
 }
@@ -400,16 +400,16 @@ pub fn sha1(path: &HostPath) -> io::Result<String> {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn sha1_known(path: &HostPath) -> io::Result<String> {
+pub fn sha1_known(path: &HostPath) -> io::Result<pe2_ext::Sha1> {
     use std::time::{Duration, SystemTime};
     /// A file's time and length, when it was read, and what it hashed to.
-    type Known = std::collections::HashMap<HostPath, ((SystemTime, u64), SystemTime, String)>;
+    type Known = std::collections::HashMap<HostPath, ((SystemTime, u64), SystemTime, pe2_ext::Sha1)>;
     static KNOWN: std::sync::LazyLock<std::sync::Mutex<Known>> = std::sync::LazyLock::new(Default::default);
     // No file of that very path - a chunked or packed one, an object: its hash is read from what says it.
     let Some(stamp) = std::fs::metadata(path).ok().and_then(|meta| Some((meta.modified().ok()?, meta.len()))) else {
         return sha1(path);
     };
-    let known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned();
+    let known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).copied();
     let settled = |read: SystemTime| read.duration_since(stamp.0).is_ok_and(|since| since > Duration::from_secs(1));
     if let Some((_, _, hash)) = known.filter(|(at, read, _)| *at == stamp && settled(*read)) {
         return Ok(hash);
@@ -417,7 +417,7 @@ pub fn sha1_known(path: &HostPath) -> io::Result<String> {
     let read = SystemTime::now();
     let hash = sha1(path)?;
     let mut known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    known.insert(path.clone(), (stamp, read, hash.clone()));
+    known.insert(path.clone(), (stamp, read, hash));
     Ok(hash)
 }
 
@@ -672,9 +672,10 @@ pub fn for_program(path: &HostPath) -> io::Result<HostPath> {
 }
 
 /// Where a project's cache keeps a content assembled for programs: by its hash, under the name of the file it is.
-fn materialized(project: &HostPath, sha1: &str, path: &HostPath) -> io::Result<HostPath> {
+fn materialized(project: &HostPath, sha1: &pe2_ext::Sha1, path: &HostPath) -> io::Result<HostPath> {
     const MATERIALIZED: &Name = Name::constant("materialized");
-    let hash = Name::new(sha1).map_err(io::Error::other)?;
+    let hash = sha1.to_string();
+    let hash = Name::new(&hash).map_err(io::Error::other)?;
     let folder = project.join(&crate::cache::DIR).join(&MATERIALIZED).join(&hash);
     Ok(folder.entry(path.file_name().ok_or_else(|| not_in_a_project(path))?))
 }
@@ -695,7 +696,7 @@ pub fn materialize(path: &HostPath) -> io::Result<HostPath> {
         Form::Inline { bytes, .. } => {
             let layers = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == crate::LAYERS));
             let project = layers.and_then(|layers| layers.parent()).ok_or_else(|| not_in_a_project(path))?;
-            let out = materialized(&project, &crate::extract::sha1_hex(&bytes), path)?;
+            let out = materialized(&project, &crate::extract::sha1_of(&bytes), path)?;
             if !out.is_file() {
                 if let Some(parent) = out.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -731,7 +732,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.at("a.c");
-        let hash = |text: &str| crate::extract::sha1_hex(text.as_bytes());
+        let hash = |text: &str| crate::extract::sha1_of(text.as_bytes());
         std::fs::write(&file, "one").unwrap();
         assert_eq!(super::sha1_known(&file).unwrap(), hash("one"));
         assert_eq!(super::sha1_known(&file).unwrap(), hash("one"));
@@ -774,7 +775,7 @@ mod tests {
         assert_eq!(read(&path).expect("read"), bytes);
         assert_eq!(read_range(&path, 1_000_000, 16).expect("range"), bytes[1_000_000..1_000_016]);
         assert_eq!(len(&path).expect("len"), bytes.len() as u64);
-        assert_eq!(sha1(&path).expect("sha1"), crate::extract::sha1_hex(&bytes));
+        assert_eq!(sha1(&path).expect("sha1"), crate::extract::sha1_of(&bytes));
         // Written small again, it is a file once more.
         write(&path, b"small").expect("written");
         assert!(path.is_file() && stored(&path) == Some(path.clone()));

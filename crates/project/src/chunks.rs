@@ -45,6 +45,7 @@ use std::path::Path;
 fn sharded(dir: &HostPath, key: &str) -> io::Result<HostPath> {
     Ok(dir.join(&RelPath::sharded(key, "").map_err(io::Error::other)?))
 }
+use pe2_ext::Sha1;
 use pe2_path::{Name, RelPath};
 use sfs::HostPath;
 use std::time::{Duration, SystemTime};
@@ -99,13 +100,13 @@ const MAX: usize = 256 << 10;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub size: u64,
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
     pub chunks: Vec<(String, u64)>,
     starts: Vec<u64>,
 }
 
 impl Manifest {
-    pub(crate) fn new(size: u64, sha1: String, chunks: Vec<(String, u64)>) -> Manifest {
+    pub(crate) fn new(size: u64, sha1: pe2_ext::Sha1, chunks: Vec<(String, u64)>) -> Manifest {
         let mut starts = Vec::with_capacity(chunks.len());
         let mut at = 0;
         for (_, len) in &chunks {
@@ -129,7 +130,7 @@ impl Manifest {
             lines.next().and_then(|l| l.strip_prefix(name)).map(str::trim).map(str::to_string).ok_or_else(|| bad(name))
         };
         let size: u64 = field("size ")?.parse().map_err(|_| bad("size"))?;
-        let sha1 = field("sha1 ")?;
+        let sha1 = Sha1::from_hex(&field("sha1 ")?).map_err(|_| bad("sha1"))?;
         let chunks = lines
             .filter(|l| !l.is_empty())
             .map(|l| {
@@ -198,7 +199,7 @@ impl Manifest {
 /// A file of a tree: a whole object, by its SHA-1 and length, and whether it is run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeFile {
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
     pub size: u64,
     pub executable: bool,
 }
@@ -234,7 +235,8 @@ impl Tree {
                 _ => return Err(bad("a file's mode")),
             };
             let size = size.parse().map_err(|_| bad("a file's length"))?;
-            files.insert(name.to_string(), TreeFile { sha1: sha1.to_string(), size, executable });
+            let sha1 = Sha1::from_hex(sha1).map_err(|_| bad("a file's sha1"))?;
+            files.insert(name.to_string(), TreeFile { sha1, size, executable });
         }
         Ok(Tree { files })
     }
@@ -251,8 +253,8 @@ impl Tree {
 
     /// Its hash: its text's SHA-1.
     #[must_use]
-    pub fn sha1(&self) -> String {
-        crate::extract::sha1_hex(self.render().as_bytes())
+    pub fn sha1(&self) -> Sha1 {
+        crate::extract::sha1_of(self.render().as_bytes())
     }
 }
 
@@ -269,16 +271,16 @@ impl Store {
         Store { dir: root.join(&crate::LAYERS).join(&STORE) }
     }
 
-    fn file_path(&self, sha1: &str) -> io::Result<HostPath> {
-        sharded(&self.dir.join(&FILES), sha1)
+    fn file_path(&self, sha1: &Sha1) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&FILES), &sha1.to_string())
     }
 
     /// Keep a file whole, by its SHA-1 (given), its chunks shared with every other file holding them.
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_file(&self, bytes: &[u8]) -> io::Result<String> {
-        let sha1 = crate::extract::sha1_hex(bytes);
+    pub fn put_file(&self, bytes: &[u8]) -> io::Result<Sha1> {
+        let sha1 = crate::extract::sha1_of(bytes);
         let path = self.file_path(&sha1)?;
         if path.exists() {
             // Kept again: as new to a sweep as one written now, its chunks too.
@@ -299,7 +301,7 @@ impl Store {
     ///
     /// # Errors
     /// It is not kept, or its chunks are not all there.
-    pub fn get_file(&self, sha1: &str) -> io::Result<Vec<u8>> {
+    pub fn get_file(&self, sha1: &Sha1) -> io::Result<Vec<u8>> {
         let manifest = Manifest::parse(&std::fs::read_to_string(self.file_path(sha1)?)?)?;
         let len = usize::try_from(manifest.size).map_err(io::Error::other)?;
         manifest.read_range(self, 0, len)
@@ -309,7 +311,7 @@ impl Store {
     ///
     /// # Errors
     /// It is not kept.
-    pub fn file_manifest(&self, sha1: &str) -> io::Result<Manifest> {
+    pub fn file_manifest(&self, sha1: &Sha1) -> io::Result<Manifest> {
         Manifest::parse(&std::fs::read_to_string(self.file_path(sha1)?)?)
     }
 
@@ -317,12 +319,12 @@ impl Store {
     ///
     /// # Errors
     /// Its hash is no name a file can have.
-    pub fn object_path(&self, sha1: &str) -> io::Result<HostPath> {
-        sharded(&self.dir.join(&OBJECTS), sha1)
+    pub fn object_path(&self, sha1: &Sha1) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&OBJECTS), &sha1.to_string())
     }
 
-    fn tree_path(&self, sha1: &str) -> io::Result<HostPath> {
-        sharded(&self.dir.join(&TREES), sha1)
+    fn tree_path(&self, sha1: &Sha1) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&TREES), &sha1.to_string())
     }
 
     /// Write `bytes` at `path` once: where it is there already, it is touched instead (as new to a sweep as one written
@@ -346,8 +348,8 @@ impl Store {
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_object(&self, bytes: &[u8]) -> io::Result<String> {
-        let sha1 = crate::extract::sha1_hex(bytes);
+    pub fn put_object(&self, bytes: &[u8]) -> io::Result<Sha1> {
+        let sha1 = crate::extract::sha1_of(bytes);
         let path = self.object_path(&sha1)?;
         self.write_once(&path, bytes)?;
         // Read-only: an object is what its hash says, and what reads it in place must not change it.
@@ -363,7 +365,7 @@ impl Store {
     ///
     /// # Errors
     /// It is not kept.
-    pub fn get_object(&self, sha1: &str) -> io::Result<Vec<u8>> {
+    pub fn get_object(&self, sha1: &Sha1) -> io::Result<Vec<u8>> {
         std::fs::read(self.object_path(sha1)?)
     }
 
@@ -371,9 +373,9 @@ impl Store {
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_tree(&self, tree: &Tree) -> io::Result<String> {
+    pub fn put_tree(&self, tree: &Tree) -> io::Result<Sha1> {
         let text = tree.render();
-        let sha1 = crate::extract::sha1_hex(text.as_bytes());
+        let sha1 = crate::extract::sha1_of(text.as_bytes());
         self.write_once(&self.tree_path(&sha1)?, text.as_bytes())?;
         Ok(sha1)
     }
@@ -382,7 +384,7 @@ impl Store {
     ///
     /// # Errors
     /// It is not kept, or is no tree.
-    pub fn get_tree(&self, sha1: &str) -> io::Result<Tree> {
+    pub fn get_tree(&self, sha1: &Sha1) -> io::Result<Tree> {
         Tree::parse(&std::fs::read_to_string(self.tree_path(sha1)?)?)
     }
 
@@ -390,7 +392,7 @@ impl Store {
     ///
     /// # Errors
     /// A file cannot be read, or kept.
-    pub fn put_folder(&self, folder: &HostPath) -> io::Result<(String, Tree)> {
+    pub fn put_folder(&self, folder: &HostPath) -> io::Result<(pe2_ext::Sha1, Tree)> {
         fn walk(dir: &HostPath, at: &str, out: &mut Vec<(String, HostPath)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
@@ -429,7 +431,7 @@ impl Store {
     }
 
     /// Every whole object and tree kept, by SHA-1, with where.
-    fn kept_in(&self, kind: &Name) -> Vec<(String, HostPath)> {
+    fn kept_in(&self, kind: &Name) -> Vec<(Sha1, HostPath)> {
         let dir = self.dir.join(kind);
         let shards = std::fs::read_dir(&dir).into_iter().flatten().flatten();
         shards
@@ -439,20 +441,21 @@ impl Store {
                 files.map(move |file| (shard.clone(), file))
             })
             .filter_map(|(shard, file)| {
+                // What is named by no hash is none of the store's own, and left alone.
                 let name = file.file_name().to_str().filter(|n| Path::new(n).extension().is_none())?.to_string();
-                Some((name, shard.entry(&file.file_name())))
+                Some((Sha1::from_hex(&name).ok()?, shard.entry(&file.file_name())))
             })
             .collect()
     }
 
     /// Whether a file is kept, by its SHA-1.
     #[must_use]
-    pub fn has_file(&self, sha1: &str) -> bool {
+    pub fn has_file(&self, sha1: &Sha1) -> bool {
         self.file_path(sha1).is_ok_and(|path| path.is_file())
     }
 
     /// Every file kept whole, by SHA-1, with its manifest's text.
-    fn files(&self) -> Vec<(String, HostPath)> {
+    fn files(&self) -> Vec<(Sha1, HostPath)> {
         self.kept_in(FILES)
     }
 
@@ -498,7 +501,7 @@ impl Store {
             }
             chunks.push((hash, cut.length as u64));
         }
-        Ok(Manifest::new(bytes.len() as u64, crate::extract::sha1_hex(bytes), chunks))
+        Ok(Manifest::new(bytes.len() as u64, crate::extract::sha1_of(bytes), chunks))
     }
 
     /// Every chunk it holds, by hash.
@@ -727,14 +730,9 @@ fn remove_object(path: &HostPath) {
 }
 
 /// What may be a file's SHA-1 in a text: every run of forty hexadecimal digits.
-fn sha1s_in(text: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    for run in text.split(|b| !b.is_ascii_hexdigit()) {
-        if run.len() == 40 {
-            out.push(String::from_utf8_lossy(run).into_owned());
-        }
-    }
-    out
+fn sha1s_in(text: &[u8]) -> Vec<Sha1> {
+    let runs = text.split(|b| !b.is_ascii_hexdigit()).filter(|run| run.len() == 40);
+    runs.filter_map(|run| Sha1::from_hex(std::str::from_utf8(run).ok()?).ok()).collect()
 }
 
 #[cfg(test)]

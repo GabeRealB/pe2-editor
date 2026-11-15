@@ -59,7 +59,7 @@ pub enum Source {
     /// Text a record holds: the record's file, and the file's name in it.
     RecordText { record: HostPath, name: String },
     /// Kept in a store for a record, by its SHA-1.
-    Stored { sha1: String, store: HostPath },
+    Stored { sha1: pe2_ext::Sha1, store: HostPath },
 }
 
 /// What changed of a listing: the paths shown anew or otherwise - written otherwise among them - and the paths gone.

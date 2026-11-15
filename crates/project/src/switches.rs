@@ -47,7 +47,7 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
 #[derive(PartialEq, Eq)]
 enum Says {
     /// It holds it, as this tree.
-    Holds(String),
+    Holds(pe2_ext::Sha1),
     /// It leaves the one below off.
     LeavesOff,
 }
@@ -96,7 +96,7 @@ pub fn add_extension(
         layer.name
     );
     let (tree, _) = crate::chunks::Store::at(&project.root).put_folder(from)?;
-    let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree.clone()));
+    let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree));
     let mut document = read(&project.root)?;
     let before = document.to_string();
     let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);

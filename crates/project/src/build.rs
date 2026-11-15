@@ -165,11 +165,11 @@ impl Site<'_> {
 
     fn bytes(&self, file: &File) -> Result<Vec<u8>> {
         match &file.content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => {
                 let store = self.engine.store().context("no store holds it")?;
-                std::fs::read(store.blob_path(sha1)?).with_context(|| sha1.clone())
+                std::fs::read(store.blob_path(sha1)?).with_context(|| sha1.to_string())
             }
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 

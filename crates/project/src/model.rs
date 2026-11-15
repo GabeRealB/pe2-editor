@@ -50,7 +50,7 @@ pub struct Record {
     pub modified: Stamp,
     /// When it was read: a record is trusted only for a file last modified before (git's "racily clean" case).
     pub recorded: Stamp,
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
     pub declaration: Option<Declaration>,
 }
 
@@ -66,7 +66,7 @@ pub const LINKS: usize = 12;
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
 /// of the files changes, and one whose names were compared by another version of Unicode
 /// (`pe2_path::UNICODE_VERSION`), by which names are one name.
-const FORMAT: u32 = 6;
+const FORMAT: u32 = 7;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.
@@ -226,18 +226,14 @@ fn stamped(read: &mut In<'_>) -> Option<Stamp> {
 /// A file's record as the model keeps it, under its name: all of it but a declaration's text, which is by itself.
 fn record(name: &str, record: &Record) -> Vec<u8> {
     let mut out = Out::new();
-    let sha1 = (record.sha1.len() == 40).then(|| hex(&record.sha1)).flatten();
     let declaration = record.declaration.as_ref();
     let long = name.len() > NAMED;
     let says = |it: bool, said: u8| if it { said } else { 0 };
-    out.u8(says(declaration.is_some(), says::DECLARATION) | says(long, says::NAMED) | says(sha1.is_some(), says::SHA1));
+    out.u8(says(declaration.is_some(), says::DECLARATION) | says(long, says::NAMED) | says::SHA1);
     out.u64(record.size);
     stamp(&mut out, record.modified);
     stamp(&mut out, record.recorded);
-    match sha1 {
-        Some(sha1) => out.0.extend_from_slice(&sha1),
-        None => out.text(&record.sha1),
-    }
+    out.0.extend_from_slice(record.sha1.bytes());
     if let Some(declaration) = declaration {
         out.text(&declaration.shape);
         out.maybe(declaration.uid.as_deref());
@@ -260,28 +256,9 @@ fn record(name: &str, record: &Record) -> Vec<u8> {
     out.0
 }
 
-/// A hash written as forty hexadecimal digits, as its twenty bytes; none where it is written otherwise.
-fn hex(text: &str) -> Option<[u8; 20]> {
-    let mut bytes = [0u8; 20];
-    for (byte, digits) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
-        let digit = |digit: u8| match digit {
-            b'0'..=b'9' => Some(digit - b'0'),
-            b'a'..=b'f' => Some(digit - b'a' + 10),
-            _ => None,
-        };
-        *byte = digit(digits[0])? << 4 | digit(*digits.get(1)?)?;
-    }
-    Some(bytes)
-}
-
-fn hexed(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+/// A hash as the model keeps it: its twenty bytes.
+fn sha1_in(read: &mut In<'_>) -> Option<pe2_ext::Sha1> {
+    Some(pe2_ext::Sha1::from_bytes(read.take(20)?.try_into().ok()?))
 }
 
 /// A file's record read back, with the name it says where its key could not: its declaration's text is to be
@@ -292,7 +269,11 @@ fn recorded(value: &[u8]) -> Option<(Record, Option<String>)> {
     let size = read.u64()?;
     let modified = stamped(&mut read)?;
     let recorded = stamped(&mut read)?;
-    let sha1 = if said & says::SHA1 == 0 { read.text()? } else { hexed(read.take(20)?) };
+    // A record says its hash in its twenty bytes: one saying it otherwise is of no model this reads.
+    if said & says::SHA1 == 0 {
+        return None;
+    }
+    let sha1 = sha1_in(&mut read)?;
     let declaration = if said & says::DECLARATION == 0 {
         None
     } else {
@@ -417,11 +398,14 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
             }
             Some(Content::Stored { sha1, size }) => {
                 out.u8(2);
-                out.text(sha1);
+                out.0.extend_from_slice(sha1.bytes());
                 out.u64(*size);
             }
         }
-        out.maybe(held.was.as_deref());
+        out.u8(u8::from(held.was.is_some()));
+        if let Some(was) = &held.was {
+            out.0.extend_from_slice(was.bytes());
+        }
     }
     if long {
         out.text(name);
@@ -456,11 +440,13 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
         let content = match read.u8()? {
             0 => None,
             1 => Some(Content::Text(read.text()?)),
-            2 => Some(Content::Stored { sha1: read.text()?, size: read.u64()? }),
+            2 => Some(Content::Stored { sha1: sha1_in(&mut read)?, size: read.u64()? }),
             _ => return None,
         };
-        let mut was = None;
-        read.maybe(&mut was)?;
+        let was = match read.u8()? {
+            0 => None,
+            _ => Some(sha1_in(&mut read)?),
+        };
         files.insert(file, File { content, was });
     }
     let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
@@ -978,7 +964,7 @@ mod tests {
                 "x".repeat(usize::try_from(n * 97 % 3000).unwrap())
             )),
         });
-        let sha1 = if n % 11 == 0 { String::new() } else { crate::extract::sha1_hex(&n.to_le_bytes()) };
+        let sha1 = crate::extract::sha1_of(&n.to_le_bytes());
         Record { size: n * 7, modified: (1_700_000_000 + n, 5), recorded: (1_700_000_100, 9), sha1, declaration }
     }
 
@@ -1086,13 +1072,19 @@ mod tests {
                 let text = format!("type = \"data\"\n# {}\n", "y".repeat(usize::try_from(n * 131 % 4000).unwrap()));
                 files.insert(
                     rel("node.toml"),
-                    File { content: Some(Content::Text(text)), was: (op == Op::Override).then(|| "3f2a".repeat(10)) },
+                    File {
+                        content: Some(Content::Text(text)),
+                        was: (op == Op::Override).then(|| crate::extract::sha1_of(b"was")),
+                    },
                 );
                 files.insert(
                     rel("native.bin"),
-                    File { content: Some(Content::Stored { sha1: "9c1e".repeat(10), size: n * 1000 }), was: None },
+                    File {
+                        content: Some(Content::Stored { sha1: crate::extract::sha1_of(b"native"), size: n * 1000 }),
+                        was: None,
+                    },
                 );
-                files.insert(rel("gone.bin"), File { content: None, was: Some("77aa".repeat(10)) });
+                files.insert(rel("gone.bin"), File { content: None, was: Some(crate::extract::sha1_of(b"gone")) });
             } else if op == Op::Create {
                 files.insert(rel(""), File { content: Some(Content::Text(String::new())), was: None });
             }

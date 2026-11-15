@@ -36,9 +36,9 @@ mod ui;
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use data::{
-    BuildConfig, Call, CallHost, Content, Export, File, FileWriter, Generator, Lent, Members, Micro, MicroInput, Need,
-    NodeNamed, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp, StartStream, StreamInput,
-    StreamSource, Type, Typed, Use, Value as Data, Writer, merged, targeted,
+    BuildConfig, Call, CallHost, Content, Export, File, FileWriter, Generator, INLINE, Lent, Members, Micro,
+    MicroInput, Need, NodeNamed, NotSha1, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp,
+    Sha1, StartStream, StreamInput, StreamSource, Type, Typed, Use, Value as Data, Writer, merged, targeted,
 };
 pub use extract::{Declared, Discs, Given, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};

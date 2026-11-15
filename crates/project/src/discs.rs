@@ -14,7 +14,7 @@ use std::fs;
 use crate::extract::sha1_file;
 
 /// A disc image in `roms`, by size and sha1 (its name may differ).
-pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &str) -> Result<HostPath> {
+pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &pe2_ext::Sha1) -> Result<HostPath> {
     let named = roms.join(&Name::new(name)?);
     let mut candidates = vec![];
     if named.is_file() {
@@ -28,7 +28,7 @@ pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &str) -> R
     others.sort();
     candidates.extend(others);
     for p in candidates {
-        if fs::metadata(&p)?.len() == size && sha1_file(&p)? == sha1 {
+        if fs::metadata(&p)?.len() == size && sha1_file(&p)? == *sha1 {
             return Ok(p);
         }
     }
@@ -41,7 +41,7 @@ pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &str) -> R
 pub struct Layout {
     pub image: String,
     pub size: u64,
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
     pub slots: Vec<(String, String)>,
 }
 

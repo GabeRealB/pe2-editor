@@ -228,7 +228,7 @@ fn changes_ui(ui: &mut egui::Ui, ws: &Workspace, step: &Step) {
                 let name = edit.path.name().unwrap_or_default();
                 ui.label(RichText::new(format!("{name} · {}", edit.file)).small().strong());
                 // Each content read once, and kept: what a step changed is drawn every frame it shows.
-                let kept = |sha1: &Option<String>| sha1.as_deref().map(|s| ws.kept(s));
+                let kept = |sha1: &Option<pe2_ext::Sha1>| sha1.as_ref().map(|s| ws.kept(s));
                 match (kept(&edit.before), kept(&edit.after)) {
                     (Some(Kept::Text(before)), Some(Kept::Text(after)))
                         if edit

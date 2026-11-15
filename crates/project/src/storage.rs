@@ -198,7 +198,7 @@ pub fn is_file(path: &HostPath) -> bool {
 pub struct Behind {
     pub path: HostPath,
     pub after: Option<Vec<u8>>,
-    pub before: Option<String>,
+    pub before: Option<pe2_ext::Sha1>,
     /// A folder to make, in place of a file.
     pub folder: bool,
     /// When the set was said: the time the file is given once written, so that who read it while it waited finds
@@ -395,9 +395,9 @@ impl Shared {
             }
             return;
         }
-        let now = std::fs::read(&file.path).ok().map(|bytes| crate::extract::sha1_hex(&bytes));
+        let now = std::fs::read(&file.path).ok().map(|bytes| crate::extract::sha1_of(&bytes));
         // As the set leaves it already - written again from the log by whoever took the project meanwhile.
-        if now != file.before && now == file.after.as_ref().map(|bytes| crate::extract::sha1_hex(bytes)) {
+        if now != file.before && now == file.after.as_ref().map(|bytes| crate::extract::sha1_of(bytes)) {
             return;
         }
         if now != file.before {

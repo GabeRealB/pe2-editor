@@ -44,9 +44,10 @@ pub use pe2_ext::{Content, Data as Value, File, Image, Pcm, Port, Retain, Type, 
 #[must_use]
 pub fn hash(value: &Value) -> String {
     let sha1 = crate::extract::sha1_hex;
+    // A content by its hash, held or stored alike.
     let content = |c: &Content| match c {
-        Content::Inline(bytes) => sha1(bytes),
-        Content::Stored { sha1, .. } => sha1.clone(),
+        Content::Stored { sha1, .. } => *sha1,
+        held => crate::extract::sha1_of(held.held().unwrap_or_default()),
     };
     let text = match value {
         Value::Typed(typed) => {

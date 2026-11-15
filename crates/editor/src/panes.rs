@@ -2822,7 +2822,7 @@ fn project_settings_ui(
                             for (name, size, sha1) in &input.discs {
                                 ui.monospace(name);
                                 ui.label(RichText::new(size_text(*size)).color(theme::weak()));
-                                ui.label(RichText::new(sha1).monospace().small().color(theme::weak()));
+                                ui.label(RichText::new(sha1.to_string()).monospace().small().color(theme::weak()));
                                 ui.end_row();
                             }
                         },

@@ -89,7 +89,8 @@ fn replay(text: &str) -> io::Result<(BTreeMap<String, Entry>, usize)> {
                     .map(|c| c.split_once(':').and_then(|(h, l)| Some((h.to_string(), l.parse().ok()?))))
                     .collect();
                 let size: u64 = size.parse().map_err(|_| bad("a length"))?;
-                let manifest = Manifest::new(size, (*sha1).to_string(), chunks.ok_or_else(|| bad("a chunk"))?);
+                let sha1 = pe2_ext::Sha1::from_hex(sha1).map_err(|_| bad("a sha1"))?;
+                let manifest = Manifest::new(size, sha1, chunks.ok_or_else(|| bad("a chunk"))?);
                 let modified = time(modified).ok_or_else(|| bad("a time"))?;
                 entries.insert((*rel).to_string(), Entry { manifest: Arc::new(manifest), modified });
             }
@@ -511,7 +512,7 @@ mod tests {
         let text = std::fs::read_to_string(layer.join(&super::FILE)).unwrap();
         let (entries, lines) = super::replay(&text).unwrap();
         assert_eq!((entries.len(), lines), (2, 4));
-        assert_eq!(entries["a.node/native.bin"].manifest.sha1, crate::extract::sha1_hex(b"native"));
+        assert_eq!(entries["a.node/native.bin"].manifest.sha1, crate::extract::sha1_of(b"native"));
         pack.compact().unwrap();
         let (entries, lines) = super::replay(&std::fs::read_to_string(layer.join(&super::FILE)).unwrap()).unwrap();
         assert_eq!((entries.len(), lines), (2, 2));

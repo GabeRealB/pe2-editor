@@ -167,7 +167,8 @@ pub const TESTS: &str = "tests";
 /// What it holds cannot be read.
 pub fn trust(file: &HostPath, folder: Option<&HostPath>, about: &super::component::About) -> Result<String> {
     let Some(folder) = folder else {
-        return crate::content::sha1(file).with_context(|| file.display().to_string());
+        // What trust is kept as: the hash's text.
+        return crate::content::sha1(file).map(|sha1| sha1.to_string()).with_context(|| file.display().to_string());
     };
     let mut files = Vec::new();
     files_in(folder, RelPath::root(), &mut files)?;

@@ -90,6 +90,8 @@ const READING_FRAMES: u32 = 60;
 fn new_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model_async(true);
+    // A hash and a content's few bytes cross as fixed arrays (`list<u8, 20>`).
+    config.wasm_component_model_fixed_length_lists(true);
     config.epoch_interruption(true);
     config.cranelift_nan_canonicalization(true);
     config.relaxed_simd_deterministic(true);
@@ -2625,8 +2627,11 @@ impl<'a> Node<'a> {
     }
 
     /// What an operation's asset reads by name: a content, by its hash, which the contract sends where it sends a name.
-    fn content(name: &pe2_ext::RelPath) -> pe2_ext::Content {
-        pe2_ext::Content::Stored { sha1: name.to_string(), size: 0 }
+    ///
+    /// # Errors
+    /// It is no hash.
+    fn content(name: &pe2_ext::RelPath) -> Result<pe2_ext::Content> {
+        Ok(pe2_ext::Content::Stored { sha1: pe2_ext::Sha1::from_hex(name.as_str())?, size: 0 })
     }
 }
 
@@ -2653,7 +2658,7 @@ impl Source for Node<'_> {
     }
 
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
-        self.host.read(&Node::content(name))
+        self.host.read(&Node::content(name)?)
     }
 
     fn size(&self, _: &pe2_ext::RelPath) -> Option<u64> {
@@ -2661,7 +2666,7 @@ impl Source for Node<'_> {
     }
 
     fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.host.read_range(&Node::content(name), offset, len)
+        self.host.read_range(&Node::content(name)?, offset, len)
     }
 
     fn writer(&self, name: &pe2_ext::RelPath) -> Option<Result<Box<dyn pe2_ext::FileWriter>>> {
@@ -2705,7 +2710,8 @@ impl Source for Node<'_> {
     }
 
     fn path_of(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::HostPath> {
-        self.host.path_of(&Node::content(name))
+        // What is no hash names no content of an operation's.
+        self.host.path_of(&Node::content(name).ok()?)
     }
 
     fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Option<Result<pe2_ext::HostPath>> {
@@ -2812,8 +2818,9 @@ fn item_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<Option
 
 fn file_to_wit(f: pe2_ext::File) -> types::File {
     let content = match f.content {
-        pe2_ext::Content::Inline(bytes) => types::Content::Inline(bytes),
-        pe2_ext::Content::Stored { sha1, size } => types::Content::Stored((sha1, size)),
+        pe2_ext::Content::Inline { bytes, len } => types::Content::Inline((bytes, len)),
+        pe2_ext::Content::Memory(bytes) => types::Content::Memory(bytes.to_vec()),
+        pe2_ext::Content::Stored { sha1, size } => types::Content::Stored((*sha1.bytes(), size)),
     };
     types::File { name: f.name.to_string(), content }
 }
@@ -2884,8 +2891,15 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
 /// A file as a component gives it: its name checked as it comes in.
 fn file_from_wit(f: types::File) -> Result<pe2_ext::File> {
     let content = match f.content {
-        types::Content::Inline(bytes) => pe2_ext::Content::Inline(bytes),
-        types::Content::Stored((sha1, size)) => pe2_ext::Content::Stored { sha1, size },
+        // A length past what is held in itself is a component's mistake: refused, never cut.
+        types::Content::Inline((bytes, len)) if usize::from(len) <= pe2_ext::INLINE => {
+            pe2_ext::Content::Inline { bytes, len }
+        }
+        types::Content::Inline((_, len)) => anyhow::bail!("a file named {} holds {len} bytes in itself", f.name),
+        types::Content::Memory(bytes) => pe2_ext::Content::owning(bytes),
+        types::Content::Stored((sha1, size)) => {
+            pe2_ext::Content::Stored { sha1: pe2_ext::Sha1::from_bytes(sha1), size }
+        }
     };
     let name = pe2_path::RelPath::new(&f.name).with_context(|| format!("a file named {}", f.name))?;
     Ok(pe2_ext::File { name: name.to_owned(), content })

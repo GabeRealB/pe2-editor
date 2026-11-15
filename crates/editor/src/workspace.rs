@@ -341,7 +341,7 @@ pub struct Workspace {
     /// What the window shows that an edit asked from outside it depends on, as the worker was last told.
     showing: Arc<Mutex<crate::takein::Showing>>,
     /// The contents the history keeps, as the History pane showed them: each read once, by its hash.
-    kept: std::cell::RefCell<HashMap<String, Kept>>,
+    kept: std::cell::RefCell<HashMap<pe2_ext::Sha1, Kept>>,
     /// What the window goes on with once work it asked of the worker is handed over, by its ticket; and what
     /// was handed over since the app last went on.
     asking: Vec<(u64, Then)>,
@@ -2044,7 +2044,7 @@ impl Workspace {
     }
 
     /// A content the history keeps, by its hash, as the History pane shows it: read once, and kept.
-    pub fn kept(&self, sha1: &str) -> Kept {
+    pub fn kept(&self, sha1: &pe2_ext::Sha1) -> Kept {
         let mut kept = self.kept.borrow_mut();
         if let Some(known) = kept.get(sha1) {
             return known.clone();
@@ -2058,7 +2058,7 @@ impl Workspace {
             Ok(Err(bytes)) => Kept::Bytes(bytes.into_bytes().len()),
             Err(_) => Kept::Gone,
         };
-        kept.insert(sha1.to_string(), read.clone());
+        kept.insert(*sha1, read.clone());
         read
     }
 

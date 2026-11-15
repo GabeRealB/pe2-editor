@@ -1754,10 +1754,11 @@ fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &st
                     .files
                     .iter()
                     .map(|f| match &f.content {
-                        Content::Inline(bytes) => {
-                            format!("{} {} {}", f.name, bytes.len(), project::extract::sha1_hex(bytes))
-                        }
                         Content::Stored { sha1, size } => format!("{} {size} {sha1}", f.name),
+                        held => {
+                            let bytes = held.held().unwrap_or_default();
+                            format!("{} {} {}", f.name, bytes.len(), project::extract::sha1_of(bytes))
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\t"),

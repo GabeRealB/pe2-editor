@@ -140,11 +140,12 @@ interface types {
 
     enum style { normal, weak, note, strong, error }
 
-    /// A file's content: its bytes, or a blob the host keeps, by its hash and size - read through the node an
-    /// operation is lent, as its file named by the hash.
+    /// A file's content: up to 30 bytes held in itself, and how many; bytes held in memory; or a blob the host keeps,
+    /// by its SHA-1 and its size - read through the node an operation is lent, as its file named by the hash.
     variant content {
-        inline(list<u8>),
-        stored(tuple<string, u64>),
+        inline(tuple<list<u8, 30>, u8>),
+        memory(list<u8>),
+        stored(tuple<list<u8, 20>, u64>),
     }
 
     /// A file of a value's encoding: its name, its content.

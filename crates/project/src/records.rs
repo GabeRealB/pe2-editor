@@ -65,7 +65,7 @@ pub enum Kind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
     Text(String),
-    Stored { sha1: String, size: u64 },
+    Stored { sha1: pe2_ext::Sha1, size: u64 },
 }
 
 /// A file of an entry, as a record holds it: its content, none where the layer removes it; and, for an override's,
@@ -73,7 +73,7 @@ pub enum Content {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
     pub content: Option<Content>,
-    pub was: Option<String>,
+    pub was: Option<pe2_ext::Sha1>,
 }
 
 /// What a layer has of one entry.
@@ -116,13 +116,13 @@ pub fn extension_path(layer: &HostPath, id: &str) -> Result<HostPath, pe2_path::
 
 /// The text of a layer's record of an extension: holding the tree named, or (none) leaving below's off.
 #[must_use]
-pub fn extension_record(tree: Option<&str>) -> String {
+pub fn extension_record(tree: Option<&pe2_ext::Sha1>) -> String {
     let mut doc = toml_edit::DocumentMut::new();
     doc["format"] = toml_edit::value(FORMAT);
     doc["op"] = toml_edit::value(if tree.is_some() { "create" } else { "delete" });
     doc["kind"] = toml_edit::value("extension");
     if let Some(tree) = tree {
-        doc["tree"] = toml_edit::value(tree);
+        doc["tree"] = toml_edit::value(tree.to_string());
     }
     doc.to_string()
 }
@@ -131,7 +131,7 @@ pub fn extension_record(tree: Option<&str>) -> String {
 ///
 /// # Errors
 /// A record cannot be read, or is of a format this program does not know.
-pub fn extensions_of(layer: &HostPath) -> Result<BTreeMap<String, Option<String>>> {
+pub fn extensions_of(layer: &HostPath) -> Result<BTreeMap<String, Option<pe2_ext::Sha1>>> {
     let mut out = BTreeMap::new();
     for file in std::fs::read_dir(layer.join(&DIR).join(&EXTENSIONS)).into_iter().flatten().flatten() {
         let path = file.path();
@@ -150,7 +150,10 @@ pub fn extensions_of(layer: &HostPath) -> Result<BTreeMap<String, Option<String>
             bail!("{}: not an extension's record", path.display());
         }
         let tree = match word("op") {
-            Some("create") => Some(word("tree").with_context(|| format!("{}: no tree", path.display()))?.to_string()),
+            Some("create") => {
+                let tree = word("tree").with_context(|| format!("{}: no tree", path.display()))?;
+                Some(pe2_ext::Sha1::from_hex(tree).with_context(|| format!("{}: its tree", path.display()))?)
+            }
             Some("delete") => None,
             other => bail!("{}: an extension is created or deleted, not {other:?}", path.display()),
         };
@@ -168,7 +171,7 @@ pub struct HeldExtension {
     pub layer: HostPath,
     pub id: String,
     /// Its tree's hash.
-    pub tree: String,
+    pub tree: pe2_ext::Sha1,
     pub files: std::sync::Arc<crate::chunks::Tree>,
     pub store: crate::chunks::Store,
     /// When its record was written.
@@ -439,10 +442,10 @@ impl Content {
 
     /// Its SHA-1.
     #[must_use]
-    pub fn sha1(&self) -> String {
+    pub fn sha1(&self) -> pe2_ext::Sha1 {
         match self {
-            Content::Text(text) => crate::extract::sha1_hex(text.as_bytes()),
-            Content::Stored { sha1, .. } => sha1.clone(),
+            Content::Text(text) => crate::extract::sha1_of(text.as_bytes()),
+            Content::Stored { sha1, .. } => *sha1,
         }
     }
 }
@@ -486,6 +489,7 @@ impl Record {
                 (Some(text), None) => Some(Content::Text(text)),
                 (None, Some(sha1)) => {
                     let size = file.get("size").and_then(toml::Value::as_integer).context("a stored file's size")?;
+                    let sha1 = pe2_ext::Sha1::from_hex(&sha1).with_context(|| format!("{name}: its sha1"))?;
                     Some(Content::Stored { sha1, size: u64::try_from(size)? })
                 }
                 (None, None) if file.get("removed").and_then(toml::Value::as_bool) == Some(true) => None,
@@ -496,7 +500,8 @@ impl Record {
             if let Some((other, _)) = files.get_key_value(&*at) {
                 bail!("its files {other} and {name} are one name to a system that does not tell case or form apart");
             }
-            files.insert(at, File { content, was: field("was") });
+            let was = field("was").map(|was| pe2_ext::Sha1::from_hex(&was)).transpose();
+            files.insert(at, File { content, was: was.with_context(|| format!("{name}: what it was"))? });
         }
         Ok(Record { op, kind, parent, name, files })
     }
@@ -520,12 +525,12 @@ impl Record {
             for (name, file) in &self.files {
                 let mut table = toml_edit::Table::new();
                 if let Some(was) = &file.was {
-                    table["was"] = toml_edit::value(was.as_str());
+                    table["was"] = toml_edit::value(was.to_string());
                 }
                 match &file.content {
                     Some(Content::Text(text)) => table["text"] = toml_edit::value(text.as_str()),
                     Some(Content::Stored { sha1, size }) => {
-                        table["sha1"] = toml_edit::value(sha1.as_str());
+                        table["sha1"] = toml_edit::value(sha1.to_string());
                         table["size"] = toml_edit::value(i64::try_from(*size).unwrap_or(i64::MAX));
                     }
                     None => table["removed"] = toml_edit::value(true),
@@ -1172,7 +1177,7 @@ impl Set {
         let held = view.records.get(uid)?;
         Some(match held.record.files.get(name)?.content.as_ref()? {
             Content::Text(_) => Source::RecordText { record: path_of(&view.dir, *uid).ok()?, name: name.to_string() },
-            Content::Stored { sha1, .. } => Source::Stored { sha1: sha1.clone(), store: set.store.dir.clone() },
+            Content::Stored { sha1, .. } => Source::Stored { sha1: *sha1, store: set.store.dir.clone() },
         })
     }
 
@@ -1241,7 +1246,7 @@ impl Set {
                         .files
                         .iter()
                         .map(|(name, f)| {
-                            let base = crate::changeset::Base { was: f.was.clone(), removed: f.content.is_none() };
+                            let base = crate::changeset::Base { was: f.was, removed: f.content.is_none() };
                             (name.clone(), base)
                         })
                         .collect();
@@ -1373,7 +1378,7 @@ fn records_of_tree(
                 for (file, base) in bases {
                     let held_at = if file.is_root() { disk(&at) } else { disk(&at).join(file) };
                     let held = if base.removed { None } else { Some(content(&held_at)?) };
-                    files.insert(file.clone(), File { content: held, was: base.was.clone() });
+                    files.insert(file.clone(), File { content: held, was: base.was });
                 }
                 Record { op: Op::Override, kind, parent, name, files }
             }
@@ -1628,7 +1633,7 @@ fn override_files(
                 _ => held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()),
             }
         };
-        files.insert(file.clone(), File { content, was: base.was.clone() });
+        files.insert(file.clone(), File { content, was: base.was });
     }
     Ok(files)
 }
@@ -1653,7 +1658,8 @@ fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
                 }
             }
             crate::index::Kind::File => {
-                let _ = write!(said, " ={}", crate::content::sha1(&entry.disk).unwrap_or_default());
+                let sha1 = crate::content::sha1(&entry.disk).map_or_default(|sha1| sha1.to_string());
+                let _ = write!(said, " ={sha1}");
             }
             crate::index::Kind::Folder => {}
         }
@@ -1769,15 +1775,16 @@ mod tests {
         for (name, content) in [
             ("node.toml", text("type = \"data\"\n[settings]\nsize = 3\n")),
             ("odd.txt", text("\nleading, ''' and \"\"\", tab\there\r\nunterminated")),
-            ("native.texels", Some(Content::Stored { sha1: "9c1e".into(), size: 1_835_008 })),
+            ("native.texels", Some(Content::Stored { sha1: crate::extract::sha1_of(b"texels"), size: 1_835_008 })),
             ("old.bin", None),
         ] {
-            record.files.insert(rel(name), File { content, was: Some("3f2a".into()) });
+            record.files.insert(rel(name), File { content, was: Some(crate::extract::sha1_of(b"was")) });
         }
         let written = record.render();
         assert!(written.starts_with("format = 1\nop = \"override\"\n"), "{written}");
+        let was = crate::extract::sha1_of(b"was");
         assert!(
-            written.contains("[files.\"node.toml\"]\nwas = \"3f2a\"\ntext = \"\"\"\ntype = \"data\"\n"),
+            written.contains(&format!("[files.\"node.toml\"]\nwas = \"{was}\"\ntext = \"\"\"\ntype = \"data\"\n")),
             "{written}"
         );
         assert_eq!(Record::parse(&written).unwrap(), record);

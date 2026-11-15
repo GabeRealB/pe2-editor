@@ -619,10 +619,7 @@ mod tests {
         let files = typed
             .files
             .into_iter()
-            .map(|f| match f.content {
-                pe2_ext::Content::Inline(bytes) => (f.name.to_string(), bytes),
-                pe2_ext::Content::Stored { .. } => panic!("made stored"),
-            })
+            .map(|f| (f.name.to_string(), f.content.held().expect("made stored").to_vec()))
             .collect();
         Made { files, settings: typed.settings, notes: typed.notes }
     }

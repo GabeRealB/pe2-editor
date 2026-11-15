@@ -43,7 +43,7 @@ pub const RECORD: &Name = Name::constant("extraction.record.jsonl");
 #[derive(Clone, Debug)]
 pub struct Input {
     pub look_in: String,
-    pub discs: Vec<(String, u64, String)>,
+    pub discs: Vec<(String, u64, pe2_ext::Sha1)>,
 }
 /// The host's operations' version: another makes everything again.
 const VERSION: &str = "1";
@@ -64,7 +64,7 @@ struct Op {
     /// Its arguments, as JSON written as `serde_json` writes them: what its key hashes, read again where they are used.
     /// A plan's arguments are most of it, and held as values they would take several times its size.
     args: Box<str>,
-    sha1: Option<String>,
+    sha1: Option<pe2_ext::Sha1>,
 }
 
 impl Op {
@@ -117,7 +117,7 @@ pub struct Plan {
     checks: Vec<usize>,
     by_id: HashMap<String, usize>,
     /// The plan's text's sha1: what its record was made by.
-    pub sha1: String,
+    pub sha1: pe2_ext::Sha1,
 }
 
 /// What a plan is and needs, its first line: read alone where the rest is not wanted (`header`).
@@ -143,8 +143,9 @@ impl Header {
             let discs = discs
                 .map(|d| {
                     let text = |key: &str| d.get(key).and_then(Value::as_str).map(str::to_string);
-                    let disc = (|| Some((text("name")?, d.get("size").and_then(Value::as_u64)?, text("sha1")?)))();
-                    disc.with_context(|| format!("{release}: a disc said in part"))
+                    let sha1 = || pe2_ext::Sha1::from_hex(d.get("sha1")?.as_str()?).ok();
+                    let disc = (|| Some((text("name")?, d.get("size").and_then(Value::as_u64)?, sha1()?)))();
+                    disc.with_context(|| format!("{release}: a disc said in part, or by what is no sha1"))
                 })
                 .collect::<Result<_>>()?;
             inputs.insert(release.clone(), Input { look_in: look_in.to_string(), discs });
@@ -282,7 +283,8 @@ impl Plan {
                 );
             }
             let args = serde_json::to_string(line.get("args").unwrap_or(&Value::Null))?.into_boxed_str();
-            let sha1 = line.pointer("/expect/sha1").and_then(Value::as_str).map(str::to_string);
+            let sha1 = line.pointer("/expect/sha1").and_then(Value::as_str).map(pe2_ext::Sha1::from_hex).transpose();
+            let sha1 = sha1.with_context(|| format!("line {at}: what it expects"))?;
             anyhow::ensure!(!by_id.contains_key(&id), "line {at}: {id} is made twice");
             by_id.insert(id.clone(), ops.len());
             ops.push(Op { id, kind: op, takes, inputs, after, args, sha1 });
@@ -297,7 +299,7 @@ impl Plan {
                 given.prefix = given.candidates[0].1.clone();
             }
         }
-        Ok(Plan { inputs, order, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
+        Ok(Plan { inputs, order, requires, ops, emits, checks, by_id, sha1: crate::extract::sha1_of(text.as_bytes()) })
     }
 
     /// What it requires that the extensions do not have: each extension missing - not there, left off or not trusted -
@@ -405,14 +407,14 @@ pub enum Releases {
 }
 
 /// A disc a run looks for: its release, its name, size and sha1, and where it is looked for.
-type DiscSought<'a> = (&'a String, &'a (String, u64, String), Option<HostPath>);
+type DiscSought<'a> = (&'a String, &'a (String, u64, pe2_ext::Sha1), Option<HostPath>);
 
 /// The releases a run reads, and where each of their discs is, by its sha1.
 fn found_releases(
     project: &crate::Project,
     plan: &Plan,
     releases: &Releases,
-) -> Result<(std::collections::BTreeSet<String>, HashMap<String, HostPath>)> {
+) -> Result<(std::collections::BTreeSet<String>, HashMap<pe2_ext::Sha1, HostPath>)> {
     let asked: Vec<&String> = match releases {
         Releases::Only(names) => {
             for name in names {
@@ -438,7 +440,7 @@ fn found_releases(
     }
     for ((release, (name, _, sha1), look_in), path) in discs.iter().zip(found) {
         if let Some(path) = path {
-            paths.insert(sha1.clone(), path);
+            paths.insert(*sha1, path);
         } else {
             available.remove(*release);
             let place =
@@ -458,14 +460,14 @@ fn found_releases(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Written {
     key: String,
-    sha1: String,
+    sha1: Option<pe2_ext::Sha1>,
     size: u64,
     shared: bool,
 }
 
 impl Written {
     fn present(&self) -> bool {
-        !self.sha1.is_empty()
+        self.sha1.is_some()
     }
 }
 
@@ -499,6 +501,14 @@ fn read_record(path: &HostPath) -> Record {
         {
             let size = line.get("size").and_then(Value::as_u64).unwrap_or(0);
             let shared = line.get("shared").and_then(Value::as_bool) == Some(true);
+            // An optional file not made is recorded with no hash; one recorded by what is no hash is not recorded.
+            let sha1 = match sha1.as_str() {
+                "" => None,
+                written => match pe2_ext::Sha1::from_hex(written) {
+                    Ok(sha1) => Some(sha1),
+                    Err(_) => continue,
+                },
+            };
             record.files.insert((node, file), Written { key, sha1, size, shared });
         }
     }
@@ -509,8 +519,7 @@ fn write_record(path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
     let mut text = json!({"record": 1, "plan": plan.sha1, "releases": record.releases}).to_string();
     text.push('\n');
     for ((node, file), written) in &record.files {
-        let mut line =
-            json!({"node": node, "file": file, "key": written.key, "sha1": written.sha1, "size": written.size});
+        let mut line = json!({"node": node, "file": file, "key": written.key, "sha1": written.sha1.map_or_default(|sha1| sha1.to_string()), "size": written.size});
         if written.shared {
             line["shared"] = json!(true);
         }
@@ -605,7 +614,7 @@ impl crate::graph::exec::Node for Planned {
         NONE.get_or_init(toml::Table::new)
     }
 
-    fn file_sha1(&self, _: &RelPath) -> Option<String> {
+    fn file_sha1(&self, _: &RelPath) -> Option<pe2_ext::Sha1> {
         None
     }
 
@@ -920,7 +929,7 @@ fn joined(
         let op = &plan.ops[at];
         let args = op.args();
         let node = args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
-        let want = op.sha1.as_deref().with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
+        let want = op.sha1.with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
         let got = crate::extract::assembled_sha1(layers, node, engine, extensions).with_context(|| op.id.clone())?;
         anyhow::ensure!(got == want, "{}: what it joins has sha1 {got}, where the plan says {want}", op.id);
         Ok(at)
@@ -1096,7 +1105,7 @@ struct RunState<'a> {
     keys: &'a [String],
     /// Where each release's discs are looked for, and where those found are, by sha1.
     inputs: HashMap<String, HostPath>,
-    found: HashMap<String, HostPath>,
+    found: HashMap<pe2_ext::Sha1, HostPath>,
     /// The layer it writes; none where it only observes.
     layer: Option<&'a HostPath>,
     engine: &'a crate::graph::exec::Engine,
@@ -1152,12 +1161,17 @@ impl RunState<'_> {
                         // An optional file not made: recorded so, so that it is not asked for again.
                         let _ = crate::content::remove(&file_path(self.layer()?, node, &file));
                         self.lock_written()
-                            .push(((node.clone(), file), Written { key, sha1: String::new(), size: 0, shared: false }));
+                            .push(((node.clone(), file), Written { key, sha1: None, size: 0, shared: false }));
                         continue;
                     };
                     let path = file_path(self.layer()?, node, &file);
                     crate::content::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
-                    let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64, shared: false };
+                    let written = Written {
+                        key,
+                        sha1: Some(crate::extract::sha1_of(&bytes)),
+                        size: bytes.len() as u64,
+                        shared: false,
+                    };
                     self.lock_written().push(((node.clone(), file), written));
                     self.progress.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1234,12 +1248,13 @@ impl RunState<'_> {
         let crate::graph::Value::Typed(typed) = value else { bail!("it made {}, not files", value.ty()) };
         let mut files = BTreeMap::new();
         for file in &typed.files {
-            let bytes = match &file.content {
-                crate::graph::Content::Inline(bytes) => bytes.clone(),
-                crate::graph::Content::Stored { sha1, .. } => {
+            let bytes = match (&file.content, file.content.held()) {
+                (_, Some(bytes)) => bytes.to_vec(),
+                (crate::graph::Content::Stored { sha1, .. }, None) => {
                     let path = self.engine.store().context("no store")?.blob_path(sha1)?;
                     std::fs::read(&path).with_context(|| path.display().to_string())?
                 }
+                (_, None) => bail!("{}: its content is held nowhere", file.name),
             };
             files.insert(file.name.clone(), Arc::new(bytes));
         }
@@ -1293,7 +1308,7 @@ impl RunState<'_> {
                 let layout = discs::Layout {
                     image: field("name").context("its image has no name")?,
                     size: image.get("size").and_then(Value::as_u64).context("its image has no size")?,
-                    sha1: field("sha1").context("its image has no sha1")?,
+                    sha1: pe2_ext::Sha1::from_hex(&field("sha1").context("its image has no sha1")?)?,
                     slots,
                 };
                 if let Some(path) = self.found.get(&layout.sha1) {
@@ -1352,7 +1367,7 @@ impl RunState<'_> {
             other => bail!("no operation {other} runs in a plan"),
         };
         if let Some(want) = &op.sha1 {
-            let got = sha1_hex(&made);
+            let got = crate::extract::sha1_of(&made);
             anyhow::ensure!(got == *want, "it read sha1 {got}, where the plan says {want}");
         }
         Ok(Made::Bytes(Arc::new(made)))
@@ -1537,7 +1552,7 @@ pub fn verify(plan_file: &HostPath, layer: &HostPath, versions: &dyn Fn(&str) ->
         }
         match crate::content::sha1(&path) {
             Err(_) => Some((0, name)),
-            Ok(sha1) if sha1 != written.sha1 => Some((2, name)),
+            Ok(sha1) if Some(sha1) != written.sha1 => Some((2, name)),
             Ok(_) => None,
         }
     });
@@ -1562,7 +1577,7 @@ pub fn verify(plan_file: &HostPath, layer: &HostPath, versions: &dyn Fn(&str) ->
 #[cfg(test)]
 mod tests {
     use super::Plan;
-    use crate::extract::sha1_hex;
+    use crate::extract::sha1_of;
     use crate::testing::At as _;
 
     #[test]
@@ -1574,7 +1589,7 @@ mod tests {
         let plan_file = layer.with_suffix(crate::PLAN_SUFFIX);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::NoPlan);
         let plan = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[]}},"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
-{"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
+{"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"0000000000000000000000000000000000000000"},"slots":[]}}
 {"emit":"n/m","files":{"native.bin":"a"}}
 "#;
         std::fs::write(&plan_file, plan).unwrap();
@@ -1588,12 +1603,17 @@ mod tests {
     #[test]
     fn what_several_releases_make_alike_is_made_of_any_of_them_and_keyed_by_all() {
         let disc = |release: &str| {
+            let sha1 = sha1_of(release.as_bytes());
             format!(
-                r#"{{"id":"disc:{release}","op":"disc","args":{{"release":"{release}","image":{{"name":"{release}","size":1,"sha1":"{release}"}},"slots":[]}}}}"#
+                r#"{{"id":"disc:{release}","op":"disc","args":{{"release":"{release}","image":{{"name":"{release}","size":1,"sha1":"{sha1}"}},"slots":[]}}}}"#
             )
         };
         let text = [
-            r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[{"name":"USA","size":1,"sha1":"USA"}]},"EUR":{"look_in":"res://roms","discs":[{"name":"EUR","size":1,"sha1":"EUR"}]}}}"#.to_string(),
+            format!(
+                r#"{{"plan":1,"inputs":{{"USA":{{"look_in":"res://roms","discs":[{{"name":"USA","size":1,"sha1":"{}"}}]}},"EUR":{{"look_in":"res://roms","discs":[{{"name":"EUR","size":1,"sha1":"{}"}}]}}}}}}"#,
+                sha1_of(b"USA"),
+                sha1_of(b"EUR")
+            ),
             disc("USA"),
             disc("EUR"),
             r#"{"id":"a:USA","op":"slot","in":{"disc":"disc:USA"},"args":{"name":"A"}}"#.to_string(),
@@ -1634,7 +1654,7 @@ mod tests {
         let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
         for name in ["native.bin", "inflated"] {
             std::fs::write(layer.at("n.node").at(name), "x").unwrap();
-            let written = super::Written { key: key(&plan, name), sha1: "x".into(), size: 1, shared: false };
+            let written = super::Written { key: key(&plan, name), sha1: Some(sha1_of(b"x")), size: 1, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         let parsed = Plan::parse(&text).unwrap();
@@ -1646,7 +1666,8 @@ mod tests {
         std::fs::create_dir_all(layer.at("n.node/EUR")).unwrap();
         for (name, bytes) in [("own.bin", "same"), ("EUR/own.bin", "same"), ("inflated", "x"), ("EUR/inflated", "y")] {
             std::fs::write(layer.at("n.node").at(name), bytes).unwrap();
-            let written = super::Written { key: "k".into(), sha1: sha1_hex(bytes.as_bytes()), size: 4, shared: false };
+            let written =
+                super::Written { key: "k".into(), sha1: Some(sha1_of(bytes.as_bytes())), size: 4, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         assert_eq!(super::share_alike(&parsed, &layer, &mut record), 1);
@@ -1660,16 +1681,22 @@ mod tests {
 
     #[test]
     fn a_plan_reads_its_operations_in_order_and_keys_them_by_what_they_take() {
-        let text = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[{"name":"x","size":1,"sha1":"00"}]}}}
-{"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
-{"id":"b","op":"slot","in":{"disc":"a"},"args":{"name":"S"},"expect":{"sha1":"11"}}
+        let text = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[{"name":"x","size":1,"sha1":"0000000000000000000000000000000000000000"}]}}}
+{"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"0000000000000000000000000000000000000000"},"slots":[]}}
+{"id":"b","op":"slot","in":{"disc":"a"},"args":{"name":"S"},"expect":{"sha1":"1111111111111111111111111111111111111111"}}
 {"emit":"n/m","files":{"native.bin":"b"}}
 "#;
         let plan = Plan::parse(text).unwrap();
         assert_eq!((plan.ops.len(), plan.emits.len()), (2, 1));
         let keys = plan.keys(&|_| String::new());
         // Another disc is another key for everything reading it.
-        let other = Plan::parse(&text.replace("\"00\"", "\"01\"")).unwrap().keys(&|_| String::new());
+        let other =
+            Plan::parse(&text.replace(
+                "\"0000000000000000000000000000000000000000\"",
+                "\"0000000000000000000000000000000000000001\"",
+            ))
+            .unwrap()
+            .keys(&|_| String::new());
         assert_ne!(keys[1], other[1]);
         assert!(Plan::parse(&text.replace("\"in\":{\"disc\":\"a\"}", "\"in\":{\"disc\":\"z\"}")).is_err());
     }

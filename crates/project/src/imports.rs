@@ -408,7 +408,7 @@ impl Imports {
                     size: blob.size,
                     modified: (0, 0),
                     layer: layer.clone(),
-                    sha1: blob.sha1.clone(),
+                    sha1: blob.sha1,
                     made_by: Some(import.importer.clone()),
                 });
             }

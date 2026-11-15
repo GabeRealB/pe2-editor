@@ -229,7 +229,7 @@ fn bundle_types(r: &mut Registry) {
             };
             let files = bundle::extract(&chunk, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::owning(bytes) })
                 .collect();
             Ok(Data::Typed(Typed::new("bytes", files)))
         });

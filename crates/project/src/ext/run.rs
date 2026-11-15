@@ -168,7 +168,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
     let rewrite = texts(&settings, "rewrite");
     let mut made = Vec::new();
     if let Some(name) = &stdout {
-        made.push(File { name: name.clone(), content: Content::Inline(done.stdout.clone()) });
+        made.push(File { name: name.clone(), content: Content::of(&done.stdout) });
     }
     for name in &outputs {
         let file = laid.output.join(name);
@@ -176,7 +176,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
         if rewrite.iter().any(|r| named(r, first, &told) == name.as_str()) {
             bytes = rewritten(&String::from_utf8_lossy(&bytes), &laid).into_bytes();
         }
-        made.push(File { name: name.clone(), content: Content::Inline(bytes) });
+        made.push(File { name: name.clone(), content: Content::owning(bytes) });
     }
     let makes = settings.get("makes").and_then(Toml::as_str).unwrap_or(FILES);
     Ok(Value::Typed(Typed::new(makes, made)))

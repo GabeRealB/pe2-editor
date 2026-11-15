@@ -27,7 +27,13 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
     hex(&Sha1::digest(bytes))
 }
 
-pub(crate) fn sha1_file(path: &HostPath) -> Result<String> {
+/// The SHA-1 of bytes.
+#[must_use]
+pub fn sha1_of(bytes: &[u8]) -> pe2_ext::Sha1 {
+    pe2_ext::Sha1::from_bytes(Sha1::digest(bytes).into())
+}
+
+pub(crate) fn sha1_file(path: &HostPath) -> Result<pe2_ext::Sha1> {
     let mut f = fs::File::open(path)?;
     let (mut h, mut buf) = (Sha1::new(), vec![0; 1 << 22]);
     loop {
@@ -37,7 +43,7 @@ pub(crate) fn sha1_file(path: &HostPath) -> Result<String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(hex(&h.finalize()))
+    Ok(pe2_ext::Sha1::from_bytes(h.finalize().into()))
 }
 
 /// What makes an asset's source of its native files: the extensions, and the engine importing them back - which keeps
@@ -101,8 +107,8 @@ impl crate::graph::exec::Node for Lent<'_> {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
-        self.files.get(name).map(|bytes| sha1_hex(bytes))
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
+        self.files.get(name).map(|bytes| sha1_of(bytes))
     }
 
     fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
@@ -113,8 +119,8 @@ impl crate::graph::exec::Node for Lent<'_> {
         self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
     }
 
-    fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
-        let found = self.files.values().find(|bytes| sha1_hex(bytes) == sha1);
+    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
+        let found = self.files.values().find(|bytes| sha1_of(bytes) == *sha1);
         found.cloned().with_context(|| format!("{}: no content {sha1}", self.path))
     }
 }
@@ -123,11 +129,11 @@ impl Sourcing<'_> {
     /// A content, whole: inline, or kept in the store.
     fn read(&self, content: &crate::graph::Content) -> Result<Vec<u8>> {
         match content {
-            crate::graph::Content::Inline(bytes) => Ok(bytes.clone()),
             crate::graph::Content::Stored { sha1, .. } => {
                 let path = self.engine.store().context("no store")?.blob_path(sha1)?;
                 std::fs::read(&path).with_context(|| path.display().to_string())
             }
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
@@ -242,7 +248,7 @@ struct Written {
     dirs: [HostPath; 2],
     declaration: String,
     fields: toml::Table,
-    sha1s: std::sync::Mutex<HashMap<Arc<RelPath>, String>>,
+    sha1s: std::sync::Mutex<HashMap<Arc<RelPath>, pe2_ext::Sha1>>,
 }
 
 impl Written {
@@ -288,13 +294,13 @@ impl crate::graph::exec::Node for Written {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
         let mut sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sha1) = sha1s.get(name) {
-            return Some(sha1.clone());
+            return Some(*sha1);
         }
         let sha1 = crate::content::sha1(&self.at(name)).ok()?;
-        sha1s.insert(name.to_owned(), sha1.clone());
+        sha1s.insert(name.to_owned(), sha1);
         Some(sha1)
     }
 
@@ -318,7 +324,7 @@ impl crate::graph::exec::Node for Written {
         crate::content::head(&self.at(name), len)
     }
 
-    fn content_path(&self, sha1: &str) -> Option<HostPath> {
+    fn content_path(&self, sha1: &pe2_ext::Sha1) -> Option<HostPath> {
         let sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         sha1s.iter().find(|(_, s)| *s == sha1).map(|(name, _)| self.at(name))
     }
@@ -378,7 +384,7 @@ pub(crate) fn assembled_sha1(
     node: &str,
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
-) -> Result<String> {
+) -> Result<pe2_ext::Sha1> {
     // A records layer's changeset is what its records say.
     let changeset = match crate::records::Set::changeset(layers[0]) {
         Some(changeset) => changeset,
@@ -395,7 +401,7 @@ pub(crate) fn assembled_sha1(
 }
 
 /// What a node's stack makes of the layer, as one file: its sha1.
-fn joined_sha1(world: &Layer<'_>, path: &str, engine: &crate::graph::exec::Engine) -> Result<String> {
+fn joined_sha1(world: &Layer<'_>, path: &str, engine: &crate::graph::exec::Engine) -> Result<pe2_ext::Sha1> {
     let reach = crate::graph::exec::Reach { engine, world };
     let (node, plan) = crate::graph::exec::World::node(world, &toml::Value::String(path.to_string()))
         .with_context(|| format!("{path}: not written"))?;
@@ -409,8 +415,8 @@ fn joined_sha1(world: &Layer<'_>, path: &str, engine: &crate::graph::exec::Engin
         .with_context(|| format!("{path}: its movies could not be joined"))?;
     Ok(match given.value.as_deref() {
         Some(crate::graph::Value::Typed(typed)) => match &typed.file()?.content {
-            crate::graph::Content::Stored { sha1, .. } => sha1.clone(),
-            crate::graph::Content::Inline(bytes) => sha1_hex(bytes),
+            crate::graph::Content::Stored { sha1, .. } => *sha1,
+            held => sha1_of(held.held().unwrap_or_default()),
         },
         _ => bail!("{path}: its stack made no file"),
     })

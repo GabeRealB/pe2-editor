@@ -341,10 +341,10 @@ fn put_files(
     for (file, bytes) in files {
         let disk = at.disk(file);
         let now = below.files.iter().find(|(name, _)| name == *file).map(|(_, path)| path);
-        let now_sha1 = below.sha1s.get(*file).cloned();
+        let now_sha1 = below.sha1s.get(*file).copied();
         let held = out.exists(&disk);
         match bytes {
-            Some(bytes) if now_sha1.as_deref() == Some(crate::extract::sha1_hex(bytes).as_str()) => {
+            Some(bytes) if now_sha1 == Some(crate::extract::sha1_of(bytes)) => {
                 // As it is below: nothing to hold.
                 if held {
                     out.remove(&disk)?;
@@ -851,7 +851,7 @@ pub fn resolve(
             let mut kept = BTreeMap::new();
             for (file, base) in files {
                 let now = below.files.iter().find(|(name, _)| name == file).map(|(_, path)| path);
-                let now_sha1 = below.sha1s.get(file).cloned();
+                let now_sha1 = below.sha1s.get(file).copied();
                 // Mine over what is below now - mine where both changed the same thing - is what it holds from now.
                 if !base.removed
                     && base.was != now_sha1

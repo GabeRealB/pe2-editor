@@ -47,8 +47,8 @@ impl Node for Bundle {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
-        self.files.lock().unwrap().get(name).map(|b| crate::extract::sha1_hex(b))
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
+        self.files.lock().unwrap().get(name).map(|b| crate::extract::sha1_of(b))
     }
 
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
@@ -59,9 +59,9 @@ impl Node for Bundle {
         self.files.lock().unwrap().keys().cloned().collect()
     }
 
-    fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
+    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let files = self.files.lock().unwrap();
-        files.values().find(|b| crate::extract::sha1_hex(b) == sha1).cloned().context("no such content")
+        files.values().find(|b| crate::extract::sha1_of(b) == *sha1).cloned().context("no such content")
     }
 }
 
@@ -69,8 +69,8 @@ impl Node for Bundle {
 fn data(node: &Bundle, value: &Value) -> Vec<u8> {
     let Value::Typed(typed) = value else { panic!("not a file") };
     match &typed.file().unwrap().content {
-        Content::Inline(bytes) => bytes.clone(),
         Content::Stored { sha1, .. } => node.read_content(sha1).unwrap(),
+        held => held.held().unwrap().to_vec(),
     }
 }
 
@@ -125,7 +125,7 @@ fn ops() -> Ops {
         let Value::Typed(mut typed) = input.take() else { anyhow::bail!("not a file") };
         let mut bytes = call.read(&typed.file()?.content)?;
         bytes.make_ascii_uppercase();
-        typed.files[0].content = Content::Inline(bytes);
+        typed.files[0].content = Content::owning(bytes);
         Ok(Value::Typed(typed))
     }));
     ops.add(OpDef::new("t.tree", "Files of the project", "1").makes(file_type(), |call| {
@@ -777,7 +777,7 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     let stored = |given: &super::exec::Given| match &given.value.as_deref() {
         Some(Value::Typed(typed)) => match &typed.files[0].content {
             Content::Stored { sha1, .. } => std::fs::read(engine.store().unwrap().blob_path(sha1).unwrap()).unwrap(),
-            Content::Inline(_) => panic!("held in memory"),
+            _ => panic!("held in memory"),
         },
         _ => panic!("not a file"),
     };

@@ -31,7 +31,7 @@ use crate::cache::write_atomic;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Base {
     /// The SHA-1 of the version below it was made from, kept in the store; none where there was none (a file it adds).
-    pub was: Option<String>,
+    pub was: Option<pe2_ext::Sha1>,
     /// Removed, rather than held.
     pub removed: bool,
 }
@@ -118,12 +118,12 @@ impl Changeset {
                 };
                 let mut bases = BTreeMap::new();
                 for (name, base) in files {
+                    let hash = |was: &str| pe2_ext::Sha1::from_hex(was).with_context(|| format!("{uid_text}: {name}"));
                     let base = match base {
-                        toml::Value::String(was) => {
-                            Base { was: (!was.is_empty()).then(|| was.clone()), removed: false }
-                        }
+                        toml::Value::String(was) if was.is_empty() => Base { was: None, removed: false },
+                        toml::Value::String(was) => Base { was: Some(hash(was)?), removed: false },
                         toml::Value::Table(t) => Base {
-                            was: t.get("was").and_then(toml::Value::as_str).map(str::to_string),
+                            was: t.get("was").and_then(toml::Value::as_str).map(hash).transpose()?,
                             removed: t.get("removed").and_then(toml::Value::as_bool).unwrap_or(false),
                         },
                         _ => bail!("{uid_text}: {name}: neither a hash nor a table"),
@@ -171,11 +171,11 @@ impl Changeset {
                         let files: Vec<String> = files
                             .iter()
                             .map(|(name, base)| {
-                                let was = base.was.as_deref().unwrap_or_default();
+                                let was = base.was.map_or_default(|was| was.to_string());
                                 let base = if base.removed {
-                                    format!("{{ was = {}, removed = true }}", quote(was))
+                                    format!("{{ was = {}, removed = true }}", quote(&was))
                                 } else {
-                                    quote(was)
+                                    quote(&was)
                                 };
                                 format!("{} = {base}", quote(name.as_str()))
                             })
@@ -253,9 +253,9 @@ mod tests {
         changeset.entries.insert(uid("uid://b"), tree("z/b"));
         changeset.entries.insert(uid("uid://a"), tree("y/a"));
         let files = [
-            (rel("node.toml"), Base { was: Some("3f2a".into()), removed: false }),
+            (rel("node.toml"), Base { was: Some(crate::extract::sha1_of(b"node")), removed: false }),
             (rel("new.txt"), Base { was: None, removed: false }),
-            (rel("old.bin"), Base { was: Some("77ab".into()), removed: true }),
+            (rel("old.bin"), Base { was: Some(crate::extract::sha1_of(b"old")), removed: true }),
         ];
         changeset.ops.insert(uid("uid://o"), Op::Override { files: files.into_iter().collect(), to: Some(tree("w")) });
         changeset.ops.insert(uid("uid://p"), Op::Override { files: std::collections::BTreeMap::default(), to: None });

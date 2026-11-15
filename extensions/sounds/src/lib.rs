@@ -291,7 +291,7 @@ fn planned(r: &mut Registry) {
             };
             let files = extract_bank(&chunk, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::owning(bytes) })
                 .collect();
             Ok(pe2_ext::Data::Typed(Typed::new("bytes", files)))
         });
@@ -308,7 +308,7 @@ fn planned(r: &mut Registry) {
             };
             let files = extract_reverb(&exe, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::owning(bytes) })
                 .collect();
             Ok(pe2_ext::Data::Typed(Typed::new("bytes", files)))
         });

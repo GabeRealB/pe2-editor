@@ -196,19 +196,178 @@ impl fmt::Display for Type {
     }
 }
 
-/// A file's content: its bytes, or a blob the host keeps, by its hash, read on asking (`Call::read`).
+/// A content's SHA-1: what a stored content is found by. Twenty bytes, shown and written as forty hex digits.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sha1([u8; 20]);
+
+/// What is no SHA-1 written as hex: not forty hex digits.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotSha1(pub Box<str>);
+
+impl fmt::Display for NotSha1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: no SHA-1 (forty hex digits)", self.0)
+    }
+}
+
+impl std::error::Error for NotSha1 {}
+
+impl Sha1 {
+    /// A hash, by its bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 20]) -> Sha1 {
+        Sha1(bytes)
+    }
+
+    /// Its bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+
+    /// A hash written as forty hex digits, in either case.
+    ///
+    /// # Errors
+    /// It is not forty hex digits.
+    pub fn from_hex(text: &str) -> std::result::Result<Sha1, NotSha1> {
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        let refused = || NotSha1(text.into());
+        let digits = text.as_bytes();
+        if digits.len() != 40 {
+            return Err(refused());
+        }
+        let mut bytes = [0; 20];
+        for (byte, [high, low]) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
+            *byte = digit(*high).ok_or_else(refused)? << 4 | digit(*low).ok_or_else(refused)?;
+        }
+        Ok(Sha1(bytes))
+    }
+}
+
+impl fmt::Display for Sha1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for Sha1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Sha1({self})")
+    }
+}
+
+impl std::str::FromStr for Sha1 {
+    type Err = NotSha1;
+    fn from_str(text: &str) -> std::result::Result<Sha1, NotSha1> {
+        Sha1::from_hex(text)
+    }
+}
+
+impl serde::Serialize for Sha1 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Sha1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Sha1, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        Sha1::from_hex(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The most bytes a content holds in itself (`Content::Inline`): as many as keep a content as small as a stored one's
+/// hash and size.
+pub const INLINE: usize = 30;
+
+/// A file's content: a few bytes held in itself, bytes held in memory and shared, or a blob the host keeps by its hash,
+/// read on asking (`Call::read`). Made of bytes by `Content::of`, which holds what fits in itself; contents of the same
+/// bytes are equal however they are held.
+#[derive(Clone)]
 pub enum Content {
-    Inline(Vec<u8>),
-    Stored { sha1: String, size: u64 },
+    /// Up to `INLINE` bytes, the first `len` of `bytes`, the rest zero.
+    Inline {
+        bytes: [u8; INLINE],
+        len: u8,
+    },
+    Memory(Arc<[u8]>),
+    Stored {
+        sha1: Sha1,
+        size: u64,
+    },
 }
 
 impl Content {
+    /// Bytes as a content: in itself where they fit, else in memory.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Content {
+        match u8::try_from(bytes.len()) {
+            Ok(len) if bytes.len() <= INLINE => {
+                let mut inline = [0; INLINE];
+                inline[..bytes.len()].copy_from_slice(bytes);
+                Content::Inline { bytes: inline, len }
+            }
+            _ => Content::Memory(Arc::from(bytes)),
+        }
+    }
+
+    /// Bytes made as a content, kept without a copy where they do not fit in itself.
+    #[must_use]
+    pub fn owning(bytes: Vec<u8>) -> Content {
+        if bytes.len() <= INLINE { Content::of(&bytes) } else { Content::Memory(Arc::from(bytes)) }
+    }
+
+    /// The bytes it holds, where it holds them: none for a stored one, which is read on asking.
+    #[must_use]
+    pub fn held(&self) -> Option<&[u8]> {
+        match self {
+            Content::Inline { bytes, len } => Some(&bytes[..usize::from(*len).min(INLINE)]),
+            Content::Memory(bytes) => Some(bytes),
+            Content::Stored { .. } => None,
+        }
+    }
+
+    /// Up to `len` bytes of what it holds from `offset`, fewer at its end; none for a stored one.
+    #[must_use]
+    pub fn held_range(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let bytes = self.held()?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+        Some(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+    }
+
     #[must_use]
     pub fn size(&self) -> u64 {
         match self {
-            Content::Inline(bytes) => bytes.len() as u64,
             Content::Stored { size, .. } => *size,
+            held => held.held().map_or(0, |bytes| bytes.len() as u64),
+        }
+    }
+}
+
+impl PartialEq for Content {
+    fn eq(&self, other: &Content) -> bool {
+        match (self, other) {
+            (Content::Stored { sha1, size }, Content::Stored { sha1: theirs, size: their_size }) => {
+                sha1 == theirs && size == their_size
+            }
+            (Content::Stored { .. }, _) | (_, Content::Stored { .. }) => false,
+            (held, theirs) => held.held() == theirs.held(),
+        }
+    }
+}
+
+impl Eq for Content {}
+
+impl fmt::Debug for Content {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Content::Stored { sha1, size } => write!(f, "Stored({sha1}, {size})"),
+            held => write!(f, "Held({} bytes)", held.size()),
         }
     }
 }
@@ -252,7 +411,7 @@ impl File {
     /// A file made now, its bytes inline.
     #[must_use]
     pub fn new(name: &crate::RelPath, bytes: Vec<u8>) -> File {
-        File { name: name.to_owned(), content: Content::Inline(bytes) }
+        File { name: name.to_owned(), content: Content::owning(bytes) }
     }
 }
 
@@ -592,7 +751,7 @@ impl FileWriter for InMemory {
     }
 
     fn finish(self: Box<Self>) -> Result<File> {
-        Ok(File { name: self.name, content: Content::Inline(self.bytes) })
+        Ok(File { name: self.name, content: Content::owning(self.bytes) })
     }
 }
 
@@ -846,9 +1005,9 @@ impl Call<'_> {
     /// # Errors
     /// It cannot be read.
     pub fn read(&self, file: &File) -> Result<Vec<u8>> {
-        match &file.content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
-            stored @ Content::Stored { .. } => self.host.read(stored),
+        match file.content.held() {
+            Some(bytes) => Ok(bytes.to_vec()),
+            None => self.host.read(&file.content),
         }
     }
 
@@ -961,9 +1120,10 @@ impl Source for Lent<'_> {
     }
 
     fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
-        match &self.file(name)?.content {
-            Content::Inline(bytes) => Ok(bytes.clone()),
-            stored @ Content::Stored { .. } => self.host.read(stored),
+        let content = &self.file(name)?.content;
+        match content.held() {
+            Some(bytes) => Ok(bytes.to_vec()),
+            None => self.host.read(content),
         }
     }
 
@@ -972,12 +1132,10 @@ impl Source for Lent<'_> {
     }
 
     fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
-        match &self.file(name)?.content {
-            Content::Inline(bytes) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
-            }
-            stored @ Content::Stored { .. } => self.host.read_range(stored, offset, len),
+        let content = &self.file(name)?.content;
+        match content.held_range(offset, len) {
+            Some(bytes) => Ok(bytes),
+            None => self.host.read_range(content, offset, len),
         }
     }
 }

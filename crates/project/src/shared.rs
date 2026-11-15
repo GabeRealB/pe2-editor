@@ -258,7 +258,7 @@ fn place(disk: &HostPath, source: &Source) -> Vec<u8> {
         Source::Stored { sha1, store } => {
             out.push(2);
             text(&mut out, &disk.to_string_lossy());
-            text(&mut out, sha1);
+            text(&mut out, &sha1.to_string());
             text(&mut out, &store.to_string_lossy());
         }
     }
@@ -281,7 +281,7 @@ pub fn placed(said: &[u8]) -> Option<(HostPath, Source)> {
     let source = match kind {
         0 => Source::Disk,
         1 => Source::RecordText { record: place(text()?)?, name: text()? },
-        2 => Source::Stored { sha1: text()?, store: place(text()?)? },
+        2 => Source::Stored { sha1: pe2_ext::Sha1::from_hex(&text()?).ok()?, store: place(text()?)? },
         _ => return None,
     };
     Some((disk, source))
@@ -801,8 +801,10 @@ mod tests {
         let layers = HostPath::new(&std::env::temp_dir()).unwrap().join(&pe2_path::Name::constant("layers"));
         let record = layers.join(&pe2_path::RelPath::constant("top/.records/ab/uid.toml"));
         let record = Source::RecordText { record, name: "node.toml".into() };
-        let stored =
-            Source::Stored { sha1: "da39a3ee".into(), store: layers.join(&pe2_path::Name::constant(".store")) };
+        let stored = Source::Stored {
+            sha1: crate::extract::sha1_of(b""),
+            store: layers.join(&pe2_path::Name::constant(".store")),
+        };
         Listing::from([
             (t("rooms"), Shown::Folder),
             (t("rooms/patio"), Shown::Node),

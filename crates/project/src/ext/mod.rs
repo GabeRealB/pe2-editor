@@ -416,7 +416,7 @@ pub struct Extensions {
     /// The components of the extensions loaded, by id.
     components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
     /// The formats recognized in files, by their content's hash.
-    recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
+    recognized: Mutex<HashMap<pe2_ext::Sha1, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     type_aliases: HashMap<String, String>,
     /// Who provides each service: its provider's id.
@@ -1558,7 +1558,6 @@ impl Extensions {
         };
         let file = typed.files.first().with_context(|| format!("{}: {address} has no file", asset.path))?;
         match &file.content {
-            pe2_ext::Content::Inline(bytes) => Ok(bytes.clone()),
             // Made here, it is in the store; only what is stored with its node is found there.
             pe2_ext::Content::Stored { sha1, .. } => match engine.store() {
                 Some(store) if store.blob_path(sha1).is_ok_and(|path| path.exists()) => {
@@ -1566,6 +1565,7 @@ impl Extensions {
                 }
                 _ => graph::exec::Node::read_content(asset, sha1),
             },
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
@@ -2299,7 +2299,7 @@ impl Extensions {
         let found = known.unwrap_or_else(|| {
             let found = self.recognize_now(file);
             if let Ok(mut recognized) = self.recognized.lock() {
-                recognized.insert(file.sha1.clone(), found.clone());
+                recognized.insert(file.sha1, found.clone());
             }
             found
         });
@@ -2634,8 +2634,8 @@ fn start_stream(
     for value in inputs.iter().flatten() {
         graph::exec::stored_contents(value, &mut stored);
     }
-    let contents: HashMap<String, HostPath> =
-        stored.into_iter().filter_map(|sha1| Some((sha1.clone(), call.content_path(&sha1)?))).collect();
+    let contents: HashMap<pe2_ext::Sha1, HostPath> =
+        stored.into_iter().filter_map(|sha1| Some((sha1, call.content_path(&sha1)?))).collect();
     let hosted = Hosted::new(call);
     let lent_carried = pe2_ext::Call::carried_by(&inputs);
     let mut lent = pe2_ext::Call {
@@ -2673,11 +2673,11 @@ pub(crate) fn taken(place: &pe2_ext::HostPath) -> Result<HostPath> {
 
 struct StreamHost {
     path: Arc<crate::TreePath>,
-    contents: HashMap<String, HostPath>,
+    contents: HashMap<pe2_ext::Sha1, HostPath>,
 }
 
 impl StreamHost {
-    fn path_of(&self, sha1: &str) -> Result<&HostPath> {
+    fn path_of(&self, sha1: &pe2_ext::Sha1) -> Result<&HostPath> {
         self.contents.get(sha1).with_context(|| format!("{}: no content {sha1}", self.path))
     }
 }
@@ -2689,11 +2689,11 @@ impl pe2_ext::CallHost for StreamHost {
 
     fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
         match content {
-            pe2_ext::Content::Inline(_) => None,
             // A program is given a file: a chunked content assembled for it.
             pe2_ext::Content::Stored { sha1, .. } => {
                 StreamHost::path_of(self, sha1).ok().and_then(|p| crate::content::for_program(p).ok()).map(given)
             }
+            _ => None,
         }
     }
 
@@ -2703,24 +2703,21 @@ impl pe2_ext::CallHost for StreamHost {
 
     fn read(&self, content: &pe2_ext::Content) -> Result<Vec<u8>> {
         match content {
-            pe2_ext::Content::Inline(bytes) => Ok(bytes.clone()),
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
                 crate::content::read(path).with_context(|| path.display().to_string())
             }
+            held => Ok(held.held().unwrap_or_default().to_vec()),
         }
     }
 
     fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
         match content {
-            pe2_ext::Content::Inline(bytes) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
-            }
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
                 crate::content::read_range(path, offset, len).with_context(|| path.display().to_string())
             }
+            held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
     }
 }
@@ -2831,11 +2828,11 @@ impl pe2_ext::CallHost for Hosted<'_> {
 
     fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
         match content {
-            pe2_ext::Content::Inline(_) => None,
             // A program is given a file: a chunked content assembled for it.
             pe2_ext::Content::Stored { sha1, .. } => {
                 self.call.content_path(sha1).and_then(|p| crate::content::for_program(&p).ok()).map(given)
             }
+            _ => None,
         }
     }
 }

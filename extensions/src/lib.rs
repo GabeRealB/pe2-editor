@@ -682,7 +682,7 @@ fn file_stamp(file: &HostPath) -> String {
 /// tells its versions apart.
 fn own_stamp(folder: &HostPath) -> String {
     if let Some(held) = project::records::held(folder) {
-        return held.tree.clone();
+        return held.tree.to_string();
     }
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.retain(|entry| entry.file_name().is_none_or(|name| name != TESTS));
@@ -1000,7 +1000,7 @@ mod tests {
             &self.fields
         }
 
-        fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<String> {
+        fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<pe2_ext::Sha1> {
             None
         }
 

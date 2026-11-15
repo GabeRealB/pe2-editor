@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use super::exec::Reads;
 use super::{Content, File, Image, Pcm, Typed, Value};
 use crate::cache::{Cache, write_atomic};
-use crate::extract::sha1_hex;
+use crate::extract::sha1_of;
+use pe2_ext::Sha1;
 
 const DIR: &Name = Name::constant("store");
 const VALUES: &Name = Name::constant("values");
@@ -63,7 +64,7 @@ const BUILDS_KEPT: usize = 2;
 /// A blob as a value names it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blob {
-    pub sha1: String,
+    pub sha1: Sha1,
     pub size: u64,
 }
 
@@ -240,12 +241,12 @@ impl Store {
     ///
     /// # Errors
     /// Its hash is no name a file can have.
-    pub fn blob_path(&self, sha1: &str) -> Result<HostPath> {
-        Ok(self.dir.join(&BLOBS).join(&RelPath::sharded(sha1, "")?))
+    pub fn blob_path(&self, sha1: &Sha1) -> Result<HostPath> {
+        Ok(self.dir.join(&BLOBS).join(&RelPath::sharded(&sha1.to_string(), "")?))
     }
 
     fn put_blob(&self, bytes: &[u8]) -> Result<Blob> {
-        let sha1 = sha1_hex(bytes);
+        let sha1 = sha1_of(bytes);
         let path = self.blob_path(&sha1)?;
         if !path.exists() {
             if let Some(parent) = path.parent() {
@@ -287,7 +288,7 @@ impl Store {
     ///
     /// # Errors
     /// It cannot be moved.
-    pub fn adopt(&self, written: &HostPath, sha1: &str) -> Result<()> {
+    pub fn adopt(&self, written: &HostPath, sha1: &Sha1) -> Result<()> {
         let path = self.blob_path(sha1)?;
         if path.exists() {
             let _ = std::fs::remove_file(written);
@@ -322,9 +323,8 @@ impl Store {
     }
 
     /// Keep a content as a blob: inline, written; stored elsewhere (`locate` reads it, by its hash), copied.
-    fn put_content(&self, content: &Content, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Blob> {
+    fn put_content(&self, content: &Content, locate: &dyn Fn(&Sha1) -> Option<Vec<u8>>) -> Result<Blob> {
         match content {
-            Content::Inline(bytes) => self.put_blob(bytes),
             Content::Stored { sha1, size } => {
                 let path = self.blob_path(sha1)?;
                 if !path.exists() {
@@ -334,12 +334,13 @@ impl Store {
                     }
                     write_atomic(&path, &bytes)?;
                 }
-                Ok(Blob { sha1: sha1.clone(), size: *size })
+                Ok(Blob { sha1: *sha1, size: *size })
             }
+            held => self.put_blob(held.held().unwrap_or_default()),
         }
     }
 
-    fn put_file(&self, file: &File, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<KeptFile> {
+    fn put_file(&self, file: &File, locate: &dyn Fn(&Sha1) -> Option<Vec<u8>>) -> Result<KeptFile> {
         Ok(KeptFile { name: file.name.clone(), blob: self.put_content(&file.content, locate)? })
     }
 
@@ -348,7 +349,7 @@ impl Store {
     ///
     /// # Errors
     /// It cannot be written, or a content of it found.
-    pub fn put(&self, hash: &str, value: &Value, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<()> {
+    pub fn put(&self, hash: &str, value: &Value, locate: &dyn Fn(&Sha1) -> Option<Vec<u8>>) -> Result<()> {
         let _span = tracing::info_span!("store put").entered();
         // Kept already (one this store cannot read is found when it is read, and made again).
         if self.has(hash) {
@@ -582,7 +583,7 @@ impl Store {
             if values.contains(&hash)
                 && let Some(kept) = self.describe(&hash)
             {
-                blobs.extend(kept.blobs().into_iter().map(|b| b.sha1.clone()));
+                blobs.extend(kept.blobs().into_iter().map(|b| b.sha1.to_string()));
             } else if std::fs::remove_file(entry.path()).is_ok() {
                 swept.1 += 1;
             }
