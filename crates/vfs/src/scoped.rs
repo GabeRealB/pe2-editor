@@ -14,14 +14,15 @@
 //! A scope serves folders too (`content::serve_folders_with`): the files an operation hands a program, each where it is
 //! or held in memory, under `<scope>/run-<n>/` for as long as the operation runs - nothing written for them.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use project::content::{Folder, Given, Use};
+use pe2_path::{Name, RelPath};
+use project::content::{Folder, Given, GivenPath, Use};
 
 use crate::Served;
 use crate::backend::{self, Backend, Can, Job, Mount};
@@ -30,7 +31,7 @@ use crate::backend::{self, Backend, Can, Job, Mount};
 struct Scope {
     at: HostPath,
     served: Served,
-    files: BTreeMap<String, Given>,
+    files: BTreeMap<Arc<RelPath>, Given>,
     mounted: Option<Mounted>,
 }
 
@@ -44,7 +45,7 @@ pub struct Machine {
 
 impl Scope {
     /// Tell what serves it that what is now served under a path is about to be opened by it.
-    fn placed(&self, path: &str) {
+    fn placed(&self, path: &RelPath) {
         if let Some(Mounted { mount: Some(mount), .. }) = &self.mounted {
             mount.placed(&self.served, path);
         }
@@ -86,8 +87,9 @@ impl Scopes {
     /// Never: a process's number is a name.
     #[must_use]
     pub fn at(root: &HostPath) -> HostPath {
-        const SCOPE: pe2_path::Name = pe2_path::Name::constant("scope");
-        let process = pe2_path::Name::new(&std::process::id().to_string()).expect("a number is a name");
+        const SCOPE: &pe2_path::Name = pe2_path::Name::constant("scope");
+        let process = std::process::id().to_string();
+        let process = pe2_path::Name::new(&process).expect("a number is a name");
         root.join(&project::cache::DIR).join(&SCOPE).join(&process)
     }
 }
@@ -121,14 +123,14 @@ fn expose(held: &mut Held, disk: &HostPath) -> io::Result<HostPath> {
     let scope = scope_of(&mut held.scopes, &root);
     let sha1 = project::content::sha1(disk)?;
     let name = disk.file_name().map_or_else(|| "content".into(), |n| n.to_string_lossy().into_owned());
-    let path = format!("{sha1}/{name}");
-    if !scope.files.contains_key(&path) {
+    let path = RelPath::new(&format!("{sha1}/{name}")).map_err(io::Error::other)?.to_owned();
+    if !scope.files.contains_key(&*path) {
         scope.files.insert(path.clone(), Given::Disk(disk.clone()));
         scope.served.set_files(&scope.files);
     }
     mount(scope, &root, backend)?;
     scope.placed(&path);
-    Ok(scope.at.join(&pe2_path::RelPath::new(&path).map_err(io::Error::other)?))
+    Ok(scope.at.join(&*path))
 }
 
 /// A project's scope, made where it has none yet (what processes that ended left of theirs swept first).
@@ -149,7 +151,7 @@ fn scope_of<'a>(scopes: &'a mut BTreeMap<HostPath, Scope>, root: &HostPath) -> &
 fn serve(
     held: &Arc<Mutex<Held>>,
     root: Option<&HostPath>,
-    files: &BTreeMap<String, Given>,
+    files: &BTreeMap<Arc<GivenPath>, Given>,
     how: &Use,
 ) -> io::Result<Folder> {
     static RUN: AtomicU64 = AtomicU64::new(0);
@@ -158,10 +160,10 @@ fn serve(
     let machine = (scopes.machine)();
     // Laid out instead where that suits better: nothing is served, and whoever asked lays them out.
     let backend = chosen(&root, &machine, how, project::content::written_to_lay_out(files))?;
-    let run = format!("run-{}", RUN.fetch_add(1, Ordering::Relaxed));
+    let run = Name::new(&format!("run-{}", RUN.fetch_add(1, Ordering::Relaxed))).map_err(io::Error::other)?.to_owned();
     let scope = scope_of(&mut scopes.scopes, &root);
     for (name, given) in files {
-        scope.files.insert(format!("{run}/{name}"), given.clone());
+        scope.files.insert(run.as_rel().join_path(name.rel()), given.clone());
     }
     scope.served.set_files(&scope.files);
     let unserve = Unserve { held: Arc::clone(held), root: root.clone(), run: run.clone() };
@@ -170,8 +172,8 @@ fn serve(
         drop(unserve);
         return Err(e);
     }
-    scope.placed(&run);
-    let at = scope.at.join(&pe2_path::Name::new(&run).map_err(io::Error::other)?);
+    scope.placed(run.as_rel());
+    let at = scope.at.join(&*run);
     Ok(Folder::new(at, Box::new(unserve)))
 }
 
@@ -200,7 +202,7 @@ fn chosen(root: &HostPath, machine: &Machine, how: &Use, written: u64) -> io::Re
 struct Unserve {
     held: Arc<Mutex<Held>>,
     root: HostPath,
-    run: String,
+    run: Arc<Name>,
 }
 
 impl Drop for Unserve {
@@ -208,13 +210,13 @@ impl Drop for Unserve {
         let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(scope) = held.scopes.get_mut(&self.root) else { return };
         // Told first, while what it lists is still in the tree.
+        let run = self.run.as_rel();
         if let Some(Mounted { mount: Some(mount), .. }) = &scope.mounted {
-            mount.released(&self.run);
+            mount.released(run);
         }
-        let inside = format!("{}/", self.run);
-        scope.files.retain(|path, _| !path.starts_with(&inside));
+        scope.files.retain(|path, _| !path.starts_with(run));
         scope.served.set_files(&scope.files);
-        scope.served.forget(&self.run);
+        scope.served.forget(run);
     }
 }
 
@@ -353,8 +355,8 @@ fn mount(scope: &mut Scope, root: &HostPath, backend: &'static dyn Backend) -> i
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::Scopes;
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use sfs::HostPath;
+    use sfs::testing::At as _;
 
     /// Scopes served by the backend `PE2_TEST_SCOPES` names (how the tests are run through each backend of a system),
     /// else by the first of this system's that serves at a folder here: named, as what is served here is small
@@ -375,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_chunked_file_is_given_to_programs_in_its_scope() {
-        let root = pe2_path::testing::scratch("scope");
+        let root = sfs::testing::scratch("scope");
         let _ = std::fs::remove_dir_all(&root);
         let file = root.at(".layers/top/a.node/movie.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
@@ -401,12 +403,18 @@ mod tests {
     #[test]
     fn what_a_scope_serves_no_program_changes() {
         use project::content::Given;
-        let root = pe2_path::testing::scratch("scope-read-only");
+        let root = sfs::testing::scratch("scope-read-only");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let files = std::collections::BTreeMap::from([
-            ("kept.h".to_string(), Given::Bytes(std::sync::Arc::from(&b"#define A 1"[..]))),
-            ("sub/other.h".to_string(), Given::Bytes(std::sync::Arc::from(&b"#define B 2"[..]))),
+            (
+                project::content::GivenPath::new("kept.h").unwrap().to_owned(),
+                Given::Bytes(std::sync::Arc::from(&b"#define A 1"[..])),
+            ),
+            (
+                project::content::GivenPath::new("sub/other.h").unwrap().to_owned(),
+                Given::Bytes(std::sync::Arc::from(&b"#define B 2"[..])),
+            ),
         ]);
         let scopes = scopes();
         let folder =
@@ -444,7 +452,7 @@ mod tests {
     #[test]
     fn a_folder_is_served_to_programs_where_its_files_are_until_it_is_let_go_of() {
         use project::content::Given;
-        let root = pe2_path::testing::scratch("scope-folder");
+        let root = sfs::testing::scratch("scope-folder");
         let _ = std::fs::remove_dir_all(&root);
         let chunked = root.at(".layers/top/a.node/big.bin");
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
@@ -452,9 +460,12 @@ mod tests {
         let plain = root.at("plain.h");
         std::fs::write(&plain, "#define A 1\n").unwrap();
         let files = std::collections::BTreeMap::from([
-            ("units".to_string(), Given::Bytes(std::sync::Arc::from(&b"self/a.c"[..]))),
-            ("self/include/a.h".to_string(), Given::Disk(plain.clone())),
-            ("dep/big.bin".to_string(), Given::Disk(chunked)),
+            (
+                project::content::GivenPath::new("units").unwrap().to_owned(),
+                Given::Bytes(std::sync::Arc::from(&b"self/a.c"[..])),
+            ),
+            (project::content::GivenPath::new("self/include/a.h").unwrap().to_owned(), Given::Disk(plain.clone())),
+            (project::content::GivenPath::new("dep/big.bin").unwrap().to_owned(), Given::Disk(chunked)),
         ]);
         let scopes = scopes();
         let fallback = root.at("fallback");

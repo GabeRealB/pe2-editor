@@ -211,15 +211,20 @@ pub fn clear(space: &Space) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A path of the project a test writes.
+    fn t(path: &str) -> std::sync::Arc<project::TreePath> {
+        project::TreePath::new(path).unwrap().to_owned()
+    }
+
     fn folder(path: &str) -> Op {
-        Op::Folder { path: path.to_string() }
+        Op::Folder { path: t(path) }
     }
 
     #[test]
     fn what_is_due_is_taken_in_its_order_and_answered_to_who_said_it() {
         let space = Space::private().unwrap();
         let first = put(&space, &[folder("a"), folder("a/b")]).unwrap();
-        let second = put(&space, &[Op::Rename { from: "a".into(), to: "c".into() }]).unwrap();
+        let second = put(&space, &[Op::Rename { from: t("a"), to: t("c") }]).unwrap();
         assert!(any(&space.read().unwrap()));
         let found = due(&space.read().unwrap()).unwrap();
         let numbers: Vec<u64> = found.iter().map(|(number, _)| *number).collect();
@@ -248,11 +253,11 @@ mod tests {
 
     #[test]
     fn an_edit_follows_those_naming_a_path_at_in_or_above_its_own() {
-        let earlier = vec!["a/b".to_string(), "c.txt".to_string()];
+        let earlier = vec![t("a/b"), t("c.txt")];
         assert!(folder("a/b/inside").follows(&earlier), "in a folder they made");
         assert!(folder("a").follows(&earlier), "above one");
-        assert!(Op::Rename { from: "x".into(), to: "c.txt".into() }.follows(&earlier), "onto a file they wrote");
-        assert!(Op::Remove { path: "a/b".into() }.follows(&earlier));
+        assert!(Op::Rename { from: t("x"), to: t("c.txt") }.follows(&earlier), "onto a file they wrote");
+        assert!(Op::Remove { path: t("a/b") }.follows(&earlier));
         assert!(!folder("a/bc").follows(&earlier), "beside it, whatever its name starts with");
         assert!(!folder("d").follows(&earlier));
         assert!(!Op::Undo.follows(&earlier));
@@ -268,9 +273,9 @@ mod tests {
         assert_eq!(settle(&space, &said, false).unwrap(), [None, None]);
         // And a written file's content, long as its ranges are, is said as it is.
         let ranges = (0..4000u64).map(|at| (at * 4096, at * 9000, 4096)).collect::<Vec<_>>();
-        let log = pe2_path::testing::scratch("due-log");
+        let log = sfs::testing::scratch("due-log");
         let written = crate::write::Written::Logged { log, len: 4000 * 4096, ranges };
-        let op = Op::Write { path: "big.bin".into(), from: written };
+        let op = Op::Write { path: t("big.bin"), from: written };
         put(&space, std::slice::from_ref(&op)).unwrap();
         assert_eq!(due(&space.read().unwrap()).unwrap()[0].1, op);
     }

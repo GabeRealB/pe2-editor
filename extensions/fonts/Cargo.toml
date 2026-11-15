@@ -24,4 +24,4 @@ toml.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

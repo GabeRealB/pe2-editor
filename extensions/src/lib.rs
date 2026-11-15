@@ -5,23 +5,28 @@
 //! The same crates are linked in too: `PE2_EXTENSIONS=linked` runs them in the host instead of their components, to
 //! step through one in a debugger, profile it, or compare the two; what a project holds still runs as components.
 
-use pe2_path::HostPath;
+#![allow(
+    clippy::disallowed_methods,
+    reason = "it finds extensions and keeps what the user chose in the program's own folders: plain paths, joined of names it writes; a storage's place is a HostPath, joined only of checked names"
+)]
+
 use project::ext::component::{Described, Unsandboxed};
 use project::ext::{
     EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, folder, unsandboxed,
 };
 use project::{Project, Requirement};
+use sfs::HostPath;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use toml::{Table, Value};
 
 /// An extension's tests, in its folder.
-const TESTS: pe2_path::Name = pe2_path::Name::constant(project::ext::unsandboxed::TESTS);
+const TESTS: &pe2_path::Name = pe2_path::Name::constant(project::ext::unsandboxed::TESTS);
 /// The editor's settings, in its data folder.
-const SETTINGS: pe2_path::Name = pe2_path::Name::constant("settings.toml");
+const SETTINGS: &pe2_path::Name = pe2_path::Name::constant("settings.toml");
 /// Extensions kept to be added, in a folder.
-const EXTENSIONS: pe2_path::Name = pe2_path::Name::constant("extensions");
+const EXTENSIONS: &pe2_path::Name = pe2_path::Name::constant("extensions");
 
 pub mod archive;
 pub mod trust;
@@ -37,16 +42,17 @@ pub fn components() -> &'static [(&'static str, &'static [u8])] {
 /// A component built here and not embedded, by its file: what a test needs of one that has to be trusted.
 #[must_use]
 pub fn built_apart(file: &str) -> Option<Vec<u8>> {
-    let built = HostPath::new(Path::new(env!("PE2_BUILT"))).ok()?;
-    std::fs::read(built.join(&pe2_path::Name::new(file).ok()?)).ok()
+    let file = pe2_path::Name::new(file).ok()?;
+    std::fs::read(Path::new(env!("PE2_BUILT")).join(file.as_str())).ok()
 }
 
 /// The tests of the built-ins, each a `tests/` folder, as the build lays them out.
 #[must_use]
-pub fn built_suites() -> Vec<HostPath> {
-    let Ok(suites) = HostPath::new(Path::new(env!("PE2_SUITES"))) else { return Vec::new() };
-    let mut suites: Vec<HostPath> =
-        suites.entries().map(|entry| entry.join(&TESTS)).filter(|tests| tests.is_dir()).collect();
+pub fn built_suites() -> Vec<PathBuf> {
+    let Ok(listed) = std::fs::read_dir(env!("PE2_SUITES")) else { return Vec::new() };
+    let entries = listed.flatten().map(|entry| entry.path());
+    let mut suites: Vec<PathBuf> =
+        entries.map(|entry| entry.join(TESTS.as_str())).filter(|tests| tests.is_dir()).collect();
     suites.sort();
     suites
 }
@@ -298,8 +304,8 @@ fn offering(
 
 /// Where what extensions' setup fetches is kept on this machine: `setup` in the editor's data folder.
 #[must_use]
-pub fn setup_folder() -> Option<HostPath> {
-    Some(data_folder()?.join(&pe2_path::Name::constant("setup")))
+pub fn setup_folder() -> Option<PathBuf> {
+    Some(data_folder()?.join("setup"))
 }
 
 /// What an extension's setup has yet to fetch onto this machine, for this platform, optional or not.
@@ -522,7 +528,7 @@ pub struct FilesystemDefaults {
 #[must_use]
 pub fn filesystem_defaults() -> FilesystemDefaults {
     let read = || {
-        let text = std::fs::read_to_string(data_folder()?.join(&SETTINGS)).ok()?;
+        let text = std::fs::read_to_string(data_folder()?.join(SETTINGS)).ok()?;
         let Some(Value::Table(filesystem)) = toml::from_str::<Table>(&text).ok()?.remove("filesystem") else {
             return None;
         };
@@ -542,7 +548,7 @@ pub fn filesystem_defaults() -> FilesystemDefaults {
 /// The user's settings of extensions: `[extensions."<id>"]` in the editor's `settings.toml`, beside its other ones.
 #[must_use]
 pub fn user_settings() -> BTreeMap<String, Table> {
-    let Some(file) = data_folder().map(|d| d.join(&SETTINGS)) else { return BTreeMap::new() };
+    let Some(file) = data_folder().map(|d| d.join(SETTINGS)) else { return BTreeMap::new() };
     let Ok(text) = std::fs::read_to_string(file) else { return BTreeMap::new() };
     let Ok(mut settings) = toml::from_str::<Table>(&text) else { return BTreeMap::new() };
     let Some(Value::Table(extensions)) = settings.remove("extensions") else { return BTreeMap::new() };
@@ -625,45 +631,44 @@ fn loaded(found: &[Found], disabled: &[String], kept: &Kept, requires: Option<&[
 
 /// The user's own extensions folder: `extensions` in the editor's data folder.
 #[must_use]
-pub fn user_folder() -> Option<HostPath> {
-    Some(data_folder()?.join(&EXTENSIONS))
+pub fn user_folder() -> Option<PathBuf> {
+    Some(data_folder()?.join(EXTENSIONS))
 }
 
 /// The editor's data folder, as eframe places it: the XDG data folder on Linux, Application Support on macOS, the
 /// roaming application data on Windows.
 #[must_use]
-pub fn data_folder() -> Option<HostPath> {
+pub fn data_folder() -> Option<PathBuf> {
     if let Some(folder) = DATA_FOLDER.get() {
         return Some(folder.clone());
     }
-    // A folder the environment names, as the system names it.
-    let place = |path: &Path| path.is_absolute().then(|| HostPath::new(path).ok()).flatten();
-    let editor = pe2_path::Name::constant("pe2-editor");
+    // A folder the environment names, where it names one: a relative one names none.
+    let place = |path: PathBuf| path.is_absolute().then_some(path);
+    let editor = "pe2-editor";
     if cfg!(windows) {
-        let roaming = place(Path::new(&std::env::var_os("APPDATA")?))?;
-        Some(roaming.join(&editor).join(&pe2_path::Name::constant("data")))
+        let roaming = place(std::env::var_os("APPDATA")?.into())?;
+        Some(roaming.join(editor).join("data"))
     } else if cfg!(target_os = "macos") {
-        let home = place(&std::env::home_dir()?)?;
-        Some(home.join(&pe2_path::RelPath::constant("Library/Application Support")).join(&editor))
+        let home = place(std::env::home_dir()?)?;
+        Some(home.join("Library").join("Application Support").join(editor))
     } else {
-        let data = std::env::var_os("XDG_DATA_HOME").and_then(|data| place(Path::new(&data)));
-        let data =
-            data.or_else(|| Some(place(&std::env::home_dir()?)?.join(&pe2_path::RelPath::constant(".local/share"))));
-        Some(data?.join(&editor))
+        let data = std::env::var_os("XDG_DATA_HOME").and_then(|data| place(data.into()));
+        let data = data.or_else(|| Some(place(std::env::home_dir()?)?.join(".local").join("share")));
+        Some(data?.join(editor))
     }
 }
 
 /// In place of the user's data folder, for this process: what runs the editor in tests keeps away from the real one.
-pub fn use_data_folder(folder: HostPath) {
+pub fn use_data_folder(folder: PathBuf) {
     let _ = DATA_FOLDER.set(folder);
 }
 
-static DATA_FOLDER: std::sync::OnceLock<HostPath> = std::sync::OnceLock::new();
+static DATA_FOLDER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The extensions folder beside the editor.
 #[must_use]
-pub fn install_folder() -> Option<HostPath> {
-    Some(HostPath::new(&std::env::current_exe().ok()?).ok()?.parent()?.join(&EXTENSIONS))
+pub fn install_folder() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.with_file_name(EXTENSIONS.as_str()))
 }
 
 /// What tells a file's version from another: its size and time.
@@ -694,7 +699,10 @@ fn folder_stamp(folder: &HostPath) -> String {
 
 /// The extensions in a folder where they are kept, in name order: each a folder of its own (`<id>.extension`), or an
 /// archive of one (`<id>-<version>.extension.zip`).
-fn components_in(folder: &HostPath, origin: fn(HostPath) -> Origin) -> Vec<Found> {
+fn components_in(folder: &Path, origin: fn(HostPath) -> Origin) -> Vec<Found> {
+    // What it holds, as places: the extensions' folders and archives are where their programs are found and what is
+    // trusted of them. A folder the system cannot name holds none.
+    let Ok(folder) = HostPath::new(folder) else { return Vec::new() };
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.sort();
     let archived = |entry: HostPath| {
@@ -734,14 +742,16 @@ pub fn install_components() -> Vec<Found> {
 /// Where an extension of an id is kept to be added: your own extensions' first, then those beside the editor; in each
 /// its folder, else its archive (the last by name, where there are several).
 #[must_use]
-pub fn kept_apart(id: &str) -> Option<HostPath> {
-    let name = pe2_path::Name::new(&format!("{id}{}", folder::SUFFIX)).ok()?;
-    let in_place = |place: HostPath| {
-        let held = place.join(&name);
+pub fn kept_apart(id: &str) -> Option<PathBuf> {
+    let name = format!("{id}{}", folder::SUFFIX);
+    let name = pe2_path::Name::new(&name).ok()?;
+    let in_place = |place: PathBuf| {
+        let held = place.join(name);
         if held.is_dir() {
             return Some(held);
         }
-        let mut archives: Vec<HostPath> = place.entries().collect();
+        let listed = std::fs::read_dir(&place).into_iter().flatten().flatten();
+        let mut archives: Vec<PathBuf> = listed.map(|entry| entry.path()).collect();
         archives.retain(|file| archive::is_archive(file) && archive::id_of(file) == Some(id));
         archives.sort();
         archives.pop()
@@ -752,9 +762,9 @@ pub fn kept_apart(id: &str) -> Option<HostPath> {
 #[cfg(test)]
 mod tests {
     use super::{COMPONENTS, linked};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
     use project::ext::component;
+    use sfs::HostPath;
+    use sfs::testing::At as _;
 
     #[test]
     fn components_are_held_to_the_contract_this_editor_runs() {
@@ -822,7 +832,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> HostPath {
-        let dir = pe2_path::testing::scratch(&format!("ext-{name}"));
+        let dir = sfs::testing::scratch(&format!("ext-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1002,7 +1012,7 @@ mod tests {
     #[test]
     fn a_component_writes_a_large_file_through_the_host() {
         use project::graph::{Content, File, Typed, Value};
-        let dir = pe2_path::testing::scratch("ext-writer");
+        let dir = sfs::testing::scratch("ext-writer");
         let _ = std::fs::remove_dir_all(&dir);
         let store = project::graph::store::Store::at(dir.clone()).unwrap();
         let extensions = super::load();
@@ -1068,7 +1078,7 @@ mod tests {
 
     #[test]
     fn a_template_the_project_defines_is_offered_for_its_files_and_makes_a_node_using_its_operation() {
-        let dir = pe2_path::testing::scratch("ext-project-template");
+        let dir = sfs::testing::scratch("ext-project-template");
         let _ = std::fs::remove_dir_all(&dir);
         project::create(&dir).unwrap();
         let p = super::Project::load(&dir).unwrap();
@@ -1087,7 +1097,7 @@ mod tests {
             &index,
             "project",
             uid("uid://group"),
-            &tree("graph/passed"),
+            tree("graph/passed"),
             (group, &[]),
             &mut history,
         )
@@ -1097,7 +1107,7 @@ mod tests {
             &index,
             "project",
             uid("uid://template"),
-            &tree("graph/template"),
+            tree("graph/template"),
             (template, &[]),
             &mut history,
         )
@@ -1112,13 +1122,13 @@ mod tests {
         assert!(stack.contains("file = \"notes.txt\""), "{stack}");
         let made = format!("uid = \"uid://made\"\n\n{stack}");
         let notes = pe2_path::RelPath::new("notes.txt").unwrap();
-        let files: [(&pe2_path::RelPath, &[u8]); 1] = [(&notes, b"hello")];
-        project::edit::create(&p, &index, "project", uid("uid://made"), &tree("notes"), (&made, &files), &mut history)
+        let files: [(&pe2_path::RelPath, &[u8]); 1] = [(notes, b"hello")];
+        project::edit::create(&p, &index, "project", uid("uid://made"), tree("notes"), (&made, &files), &mut history)
             .unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
         let _ = extensions.take_definitions(&index);
         let engine = extensions.engine();
-        let given = extensions.output(&engine, &index, &index.assets[&tree("notes")], "text", true).unwrap();
+        let given = extensions.output(&engine, &index, &index.assets[tree("notes")], "text", true).unwrap();
         let project::graph::Value::Typed(typed) = &*given.value.unwrap() else { panic!("no file") };
         assert_eq!(typed.files[0].name, "notes.txt");
         let _ = std::fs::remove_dir_all(&dir);

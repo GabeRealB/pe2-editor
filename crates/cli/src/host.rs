@@ -8,8 +8,9 @@
 //! project, a while after nothing was asked of it and nothing keeps it.
 
 use anyhow::{Result, bail};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -93,7 +94,7 @@ struct Host {
 /// `pe2-cli project host`: hold the project in `directory`, and keep its folder served by `backend` (at `address`,
 /// dealing with what is not the project's there as `strays` says) unless that is `none`.
 pub fn run(
-    directory: &HostPath,
+    directory: &Path,
     backend: Option<&str>,
     address: Option<&str>,
     strays: crate::server::Strays,
@@ -333,7 +334,7 @@ impl Host {
             if let Err(e) = crate::whole(&reading.extensions) {
                 return Err(mcp::Reply::failed(format!("{e:#}")));
             }
-            let chosen = host.project.configs.iter().find(|c| config.as_deref().is_none_or(|name| c.name == name));
+            let chosen = host.project.configs.iter().find(|c| config.as_deref().is_none_or(|name| *c.name == *name));
             let Some(config) = chosen.cloned() else {
                 return Err(mcp::Reply::failed("no such config in project.toml".into()));
             };
@@ -785,6 +786,6 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
 ///
 /// # Errors
 /// The system cannot say where it is.
-pub(crate) fn this_program() -> std::io::Result<HostPath> {
-    HostPath::new(&std::env::current_exe()?)
+pub(crate) fn this_program() -> std::io::Result<PathBuf> {
+    std::env::current_exe()
 }

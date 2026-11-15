@@ -48,7 +48,8 @@ Chunk files of fixed-size pages, mapped by every process, holding B-trees:
   it starts empty and is refilled, and what it held is kept aside for what can still be salvaged.
 
 On the trees sits a small filesystem that knows nothing of projects (`sfs::fs`): names, nodes and a log of changes
-per commit. The served tree and the [project's model](../project/index-and-model.md) live there.
+per commit. A name is keyed by its fold, holding the number of what has it and the name as it is written: a lookup
+finds it however it is written, a folder holds one name of each fold, and a listing comes in the order names have. The served tree and the [project's model](../project/index-and-model.md) live there.
 
 ## The ring
 

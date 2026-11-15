@@ -4,7 +4,7 @@
 //! be.
 
 use anyhow::{Context, Result, bail};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
@@ -71,7 +71,7 @@ fn ignored(tx: &mut crate::history::Transaction<'_>, root: &HostPath, entry: &st
 /// # Errors
 /// The project has no such unmanaged mount, or the file cannot be written.
 pub fn locate(project: &Project, at: &str, path: &str) -> Result<()> {
-    anyhow::ensure!(project.unmanaged.iter().any(|m| m.at == at), "the project has no unmanaged mount {at}");
+    anyhow::ensure!(project.unmanaged.iter().any(|m| *m.at == *at), "the project has no unmanaged mount {at}");
     let file = project.root.join(&crate::LOCAL);
     let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
     table(&mut document, "mounts")?.insert(at, value(path));
@@ -92,7 +92,7 @@ pub fn add_mount(
     unmanaged: bool,
     history: &mut History,
 ) -> Result<()> {
-    if project.layers.iter().any(|l| l.name == at) || project.unmanaged.iter().any(|m| m.at == at) {
+    if project.layers.iter().any(|l| l.name == at) || project.unmanaged.iter().any(|m| *m.at == *at) {
         bail!("the project has a layer or mount {at} already");
     }
     anyhow::ensure!(unmanaged || path.is_some(), "a mount says where its tree is, but for an unmanaged one");
@@ -154,7 +154,7 @@ pub fn add_config(
     target: Option<&str>,
     history: &mut History,
 ) -> Result<()> {
-    anyhow::ensure!(project.configs.iter().all(|c| c.name != name), "the project has a config {name} already");
+    anyhow::ensure!(project.configs.iter().all(|c| *c.name != *name), "the project has a config {name} already");
     let mut document = read(&project.root)?;
     let configs = table(&mut document, "config")?;
     configs.set_implicit(true);
@@ -187,7 +187,7 @@ pub fn set_property(
     to: Option<&toml::Value>,
     history: &mut History,
 ) -> Result<()> {
-    anyhow::ensure!(project.configs.iter().any(|c| c.name == config), "the project has no config {config}");
+    anyhow::ensure!(project.configs.iter().any(|c| *c.name == *config), "the project has no config {config}");
     let declared = project.properties.iter().find(|p| p.name == property);
     let declared = declared.with_context(|| format!("the project declares no property {property}"))?;
     if let Some(why) = to.and_then(|v| declared.kind.refuses(v)) {
@@ -284,7 +284,7 @@ mod tests {
         assert!(ignored.contains("/.layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
         assert!(ignored.contains("/project.local.toml"), "{ignored}");
         // Where the discs are is this machine's.
-        let elsewhere = dir.with_suffix(&pe2_path::Name::constant(".elsewhere"));
+        let elsewhere = dir.with_suffix(pe2_path::Name::constant(".elsewhere"));
         super::locate(&made, "roms", &elsewhere.to_string()).unwrap();
         assert_eq!(project().unmanaged[0].path, elsewhere);
         // So are the links it wants.

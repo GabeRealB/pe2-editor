@@ -5,13 +5,14 @@
 use anyhow::{Context, Result};
 use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged, ProjectOpened};
-use pe2_path::{HostPath, RelPath, Uid};
+use pe2_path::{RelPath, Uid};
 use project::cache::Cache;
 use project::ext::{Extensions, Lens};
 use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
 use project::{Project, TreePath};
+use sfs::HostPath;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -24,10 +25,10 @@ use crate::settings::{Preview, Upscale};
 #[derive(Default)]
 pub struct Node {
     pub children: BTreeMap<String, Node>,
-    pub asset: Option<TreePath>,
+    pub asset: Option<Arc<TreePath>>,
     pub entry: Option<Entry>,
     /// The resolved entry here, by its real path.
-    pub path: Option<TreePath>,
+    pub path: Option<Arc<TreePath>>,
     pub file: bool,
 }
 
@@ -42,7 +43,7 @@ pub struct Browsing {
 /// where what was named is no path, why it is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Nav {
-    Asset(TreePath, Option<String>),
+    Asset(Arc<TreePath>, Option<String>),
     Part(String),
     Refused(String),
 }
@@ -50,7 +51,7 @@ pub enum Nav {
 impl Nav {
     /// An asset, nothing in it selected.
     #[must_use]
-    pub fn to(path: TreePath) -> Nav {
+    pub fn to(path: Arc<TreePath>) -> Nav {
         Nav::Asset(path, None)
     }
 
@@ -63,7 +64,7 @@ impl Nav {
         }
         let (asset, part) = text.split_once('#').map_or((text, None), |(asset, part)| (asset, Some(part.to_string())));
         match TreePath::new(asset) {
-            Ok(path) => Nav::Asset(path, part),
+            Ok(path) => Nav::Asset(path.to_owned(), part),
             Err(why) => Nav::Refused(format!("{asset}: {why}")),
         }
     }
@@ -72,19 +73,19 @@ impl Nav {
 /// A virtual entry: an image and one of its variants.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
-    pub image: TreePath,
+    pub image: Arc<TreePath>,
     pub look: String,
 }
 
 /// Where the look an asset is shown in is chosen.
-fn look_of(path: &TreePath) -> (TreePath, String) {
-    (path.clone(), project::ext::PICTURE.to_string())
+fn look_of(path: &TreePath) -> (Arc<TreePath>, String) {
+    (path.to_owned(), project::ext::PICTURE.to_string())
 }
 
 /// A path of the tree and the name of one of its children there: what the tree's nodes are named is their paths'.
 #[must_use]
-pub fn child_path(prefix: &TreePath, name: &str) -> TreePath {
-    prefix.join(&pe2_path::Name::new(name).expect("the tree names its folders and assets by their paths' names"))
+pub fn child_path(prefix: &TreePath, name: &str) -> Arc<TreePath> {
+    prefix.join(pe2_path::Name::new(name).expect("the tree names its folders and assets by their paths' names"))
 }
 
 impl Node {
@@ -122,7 +123,7 @@ impl Node {
     /// The node at a path below it.
     #[must_use]
     pub fn at(&self, path: &TreePath) -> Option<&Node> {
-        path.parts().try_fold(self, |node, step| node.children.get(step))
+        path.parts().try_fold(self, |node, step| node.children.get(step.as_str()))
     }
 
     pub fn sorted_children(&self) -> Vec<(&String, &Node)> {
@@ -219,7 +220,7 @@ impl LayerView {
     }
 }
 
-const LAYER_VIEW: pe2_path::RelPath = pe2_path::RelPath::constant("editor/layers.toml");
+const LAYER_VIEW: &pe2_path::RelPath = pe2_path::RelPath::constant("editor/layers.toml");
 
 /// How many of the history's kept contents are held as the History pane showed them.
 const KEPT: usize = 512;
@@ -264,11 +265,11 @@ pub struct Workspace {
     /// Asked of the graph in front.
     pub graph_ask: Option<GraphAsk>,
     /// The folder the assets' browser shows, and those it came from and went back from.
-    pub asset_folder: TreePath,
-    folders_back: Vec<TreePath>,
-    folders_forward: Vec<TreePath>,
+    pub asset_folder: Arc<TreePath>,
+    folders_back: Vec<Arc<TreePath>>,
+    folders_forward: Vec<Arc<TreePath>>,
     /// A folder chosen in the browser's grid: a click marks it, a double click opens it.
-    pub marked_folder: Option<TreePath>,
+    pub marked_folder: Option<Arc<TreePath>>,
     /// Whether the pointer was over the browser: where back and forward are its own.
     pub in_browser: bool,
     /// Whether the folder shown changed: the tree beside the grid goes to it.
@@ -280,17 +281,17 @@ pub struct Workspace {
     view_transport: Vec<pe2_ext::Transport>,
     played: HashSet<crate::panes::Pane>,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
-    views: HashMap<(egui::Id, TreePath, usize), Box<dyn pe2_ext::View>>,
+    views: HashMap<(egui::Id, Arc<TreePath>, usize), Box<dyn pe2_ext::View>>,
     /// What is inside assets, as their types said: asked again when the asset changes, not each frame.
-    contents: HashMap<TreePath, Arc<pe2_ext::Contents>>,
+    contents: HashMap<Arc<TreePath>, Arc<pe2_ext::Contents>>,
     /// Parts' sheets, as their types said: as `contents`.
-    part_sheets: HashMap<(TreePath, String), Arc<Option<pe2_ext::PartSheet>>>,
+    part_sheets: HashMap<(Arc<TreePath>, String), Arc<Option<pe2_ext::PartSheet>>>,
     /// Rows of the contents folded or unfolded by hand: by asset and row.
-    pub content_open: HashMap<(TreePath, String), bool>,
+    pub content_open: HashMap<(Arc<TreePath>, String), bool>,
     /// The row of the contents being renamed: the asset, the row, what is typed.
-    pub content_rename: Option<(TreePath, String, String)>,
+    pub content_rename: Option<(Arc<TreePath>, String, String)>,
     /// The view an asset is shown in, where its type has several.
-    pub view_choice: HashMap<TreePath, usize>,
+    pub view_choice: HashMap<Arc<TreePath>, usize>,
     /// What the views show, uploaded.
     textures: crate::ext_ui::Textures,
     pub layer_view: LayerView,
@@ -326,7 +327,7 @@ pub struct Workspace {
     /// The config in use.
     pub config: Option<project::Config>,
     /// The config the extensions were told, and which extensions were: told again once they are read again.
-    config_told: Option<(usize, Option<pe2_ext::data::BuildConfig>, Box<[TreePath]>)>,
+    config_told: Option<Told>,
     /// How the last epoch ended.
     pub last_epoch: Option<crate::runner::Finished>,
     /// The name of an event being defined.
@@ -361,24 +362,24 @@ pub struct Workspace {
     pub tree: Arc<Node>,
     /// The tree's paths (an asset's without `.node`) that can be modified, and the folders holding one: the rest is
     /// drawn dimmed.
-    editable: HashSet<TreePath>,
-    pub selected: Option<TreePath>,
+    editable: HashSet<Arc<TreePath>>,
+    pub selected: Option<Arc<TreePath>>,
     /// A point of the history shown, read-only, while it is.
     pub viewing: Option<Viewing>,
     /// What is selected inside an asset: its path, and a path in its declaration (`stack.1`, `stack.0.ops.draw`). The one
     /// address every pane showing the asset shares.
-    pub inner: Option<(TreePath, String)>,
+    pub inner: Option<(Arc<TreePath>, String)>,
     pub filter: String,
     /// How the asset browser shows the project.
     pub browsing: Browsing,
     /// An asset just navigated to: the tree opens its ancestors and scrolls to it once.
-    pub reveal: Option<TreePath>,
+    pub reveal: Option<Arc<TreePath>>,
     /// Decoded pictures by (image, variant, upscaling).
-    pictures: HashMap<(TreePath, usize, Upscale), Picture>,
+    pictures: HashMap<(Arc<TreePath>, usize, Upscale), Picture>,
     /// Parts of pictures (palettes' strips), as the inspector shows them.
     pub parts: Parts,
     /// The inspector views - the types', or the importers' - by (asset, the importer's, view).
-    inspector_views: HashMap<(TreePath, usize), Box<dyn pe2_ext::View>>,
+    inspector_views: HashMap<(Arc<TreePath>, usize), Box<dyn pe2_ext::View>>,
     /// The panels' views, by pane.
     panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
     /// What a view set of the asset it shows this frame, for the app to make after drawing.
@@ -391,10 +392,14 @@ pub struct Workspace {
     pub field_edit: Option<FieldEdit>,
     /// The files shown as text or bytes, and which file of an asset without a picture is shown.
     pub viewer: crate::viewer::Viewer,
-    pub viewed_file: HashMap<TreePath, RelPath>,
+    pub viewed_file: HashMap<Arc<TreePath>, Arc<RelPath>>,
     /// An asset's declaration being edited in the inspector, as text: the asset, the text.
-    pub declaration_draft: Option<(TreePath, String)>,
+    pub declaration_draft: Option<(Arc<TreePath>, String)>,
 }
+
+/// What the extensions were told of the config: which extensions (by the registry's address), the config as built,
+/// and the assets it leaves out.
+type Told = (usize, Option<pe2_ext::data::BuildConfig>, Box<[Arc<TreePath>]>);
 
 /// What the window does with what work it asked of the worker came to, once that is handed over: on its own
 /// thread, with all it has.
@@ -411,7 +416,7 @@ type Made = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(), String> + S
 
 /// Work for the worker that takes steps back or makes them again: the last one's label and what was selected
 /// when it was made, or why not.
-type Steps = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(String, Option<TreePath>), StepError> + Send>;
+type Steps = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(String, Option<Arc<TreePath>>), StepError> + Send>;
 
 /// An edit asked for in a pane, of the entry with this uid, made in the active layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,17 +425,17 @@ pub enum EditRequest {
     /// Override in this layer, not the active one: code, overridden in a files layer chosen for it.
     OverrideIn(Uid, String),
     /// Ask for a new name, then rename: the uid and the entry's real path.
-    Rename(Uid, TreePath),
+    Rename(Uid, Arc<TreePath>),
     /// Rename to this real path.
-    RenameTo(Uid, TreePath),
+    RenameTo(Uid, Arc<TreePath>),
     Delete(Uid),
     /// Take an entry gone from this layer out of its list: the layer and the uid. Any layer whose list can be written,
     /// its content read-only or not.
     Forget(String, Uid),
     /// List what a layer holds unlisted at a path, and under it: the layer and the path.
-    Adopt(String, TreePath),
+    Adopt(String, Arc<TreePath>),
     /// Remove what a layer holds unlisted at a path from its folder: the layer and the path.
-    RemoveUnlisted(String, TreePath),
+    RemoveUnlisted(String, Arc<TreePath>),
     Resolve(Uid, project::edit::Resolution),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
@@ -440,7 +445,7 @@ pub enum EditRequest {
     /// merge key made in a row are one step.
     Write {
         uid: Uid,
-        file: RelPath,
+        file: Arc<RelPath>,
         bytes: Vec<u8>,
         label: String,
         merge: Option<String>,
@@ -450,7 +455,7 @@ pub enum EditRequest {
 /// A node just made: its uid, its path, and what it was made as.
 pub struct NewNode {
     pub uid: Uid,
-    pub path: TreePath,
+    pub path: Arc<TreePath>,
     pub label: String,
 }
 
@@ -465,7 +470,7 @@ pub struct Viewing {
 
 /// A field of an asset's declaration being edited in the inspector: the asset, the field, the text typed.
 pub struct FieldEdit {
-    pub asset: TreePath,
+    pub asset: Arc<TreePath>,
     pub key: String,
     pub text: String,
 }
@@ -481,14 +486,14 @@ pub enum GraphAsk {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn adding(asset: &Asset, file: &HostPath) -> std::result::Result<EditRequest, String> {
+pub fn adding(asset: &Asset, file: &std::path::Path) -> std::result::Result<EditRequest, String> {
     let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
     let file_name = RelPath::new(name).map_err(|e| format!("{name}: {e}"))?;
     let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let short = asset.path.name().unwrap_or_default();
     Ok(EditRequest::Write {
         uid: asset.uid.ok_or("It has no uid")?,
-        file: file_name,
+        file: file_name.to_owned(),
         bytes,
         label: format!("Add {name} to {short}"),
         merge: None,
@@ -519,14 +524,14 @@ pub fn part_name(id: &str) -> &str {
 }
 
 /// A stack's preview as last drawn: by asset, output and revision, or why it could not be made.
-type Tapped = ((TreePath, String, u64), Result<egui::TextureHandle, String>);
+type Tapped = ((Arc<TreePath>, String, u64), Result<egui::TextureHandle, String>);
 
 /// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its type draws it.
 #[derive(Default)]
 pub struct Parts {
-    shown: HashMap<(TreePath, String), Picture>,
+    shown: HashMap<(Arc<TreePath>, String), Picture>,
     /// Those its type draws nothing of: asked once, like the others.
-    none: HashSet<(TreePath, String)>,
+    none: HashSet<(Arc<TreePath>, String)>,
 }
 
 impl Parts {
@@ -559,7 +564,7 @@ impl Parts {
         self.shown.get(&key)
     }
 
-    fn forget(&mut self, assets: &BTreeSet<TreePath>) {
+    fn forget(&mut self, assets: &BTreeSet<Arc<TreePath>>) {
         self.shown.retain(|(asset, _), _| !assets.contains(asset));
         self.none.retain(|(asset, _)| !assets.contains(asset));
     }
@@ -711,7 +716,7 @@ impl Drop for Leaving {
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
 /// one running, or `pe2-cli` beside the editor started as one. Where that is not there, none does.
 fn stand_by(root: &HostPath) {
-    let Some(program) = std::env::current_exe().ok().and_then(|exe| HostPath::new(&exe).ok()) else { return };
+    let Ok(program) = std::env::current_exe() else { return };
     let program = project::host::cli_beside(&program);
     if !program.is_file() {
         return;
@@ -819,7 +824,7 @@ impl Workspace {
         });
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
-        let old = cache.path(&pe2_path::Name::constant("artifacts"));
+        let old = cache.path(pe2_path::Name::constant("artifacts"));
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
@@ -942,7 +947,7 @@ impl Workspace {
             tests: crate::tests_pane::Tests::default(),
             thumbs,
             graph_ask: None,
-            asset_folder: TreePath::root(),
+            asset_folder: TreePath::root().to_owned(),
             folders_back: Vec::new(),
             folders_forward: Vec::new(),
             marked_folder: None,
@@ -1203,7 +1208,7 @@ impl Workspace {
         let quoted = toml::Value::String(name.to_string());
         let declaration = format!("uid = \"{uid}\"\n\n[[stack]]\nop = \"pe2.events@event\"\nlabel = {quoted}\n");
         let slug = pe2_path::Name::new(&slug).map_err(|e| format!("{name}: {e}"))?;
-        let path = TreePath::new("events").expect("a name").join(&slug);
+        let path = TreePath::new("events").expect("a name").join(slug);
         let work = move |w: &mut crate::takein::Worker| {
             project::edit::create(
                 &w.core.project,
@@ -1228,7 +1233,7 @@ impl Workspace {
     pub fn new_node(
         &mut self,
         template: &str,
-        file: Option<&HostPath>,
+        file: Option<&std::path::Path>,
         folder: &TreePath,
         then: impl FnOnce(&mut crate::app::Editor, Result<NewNode, String>) + 'static,
     ) -> Result<(), String> {
@@ -1245,7 +1250,7 @@ impl Workspace {
     pub fn new_node_now(
         &mut self,
         template: &str,
-        file: Option<&HostPath>,
+        file: Option<&std::path::Path>,
         folder: &TreePath,
     ) -> Result<NewNode, String> {
         let (node, work) = self.new_node_work(template, file, folder)?;
@@ -1260,7 +1265,7 @@ impl Workspace {
     fn new_node_work(
         &self,
         template: &str,
-        file: Option<&HostPath>,
+        file: Option<&std::path::Path>,
         folder: &TreePath,
     ) -> Result<(NewNode, Made), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
@@ -1272,7 +1277,7 @@ impl Workspace {
             stem.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let at = |n: usize| {
             let leaf = if n == 0 { slug.clone() } else { format!("{slug}_{n}") };
-            pe2_path::Name::new(&leaf).map(|leaf| folder.join(&leaf)).map_err(|e| format!("{leaf}: {e}"))
+            pe2_path::Name::new(&leaf).map(|leaf| folder.join(leaf)).map_err(|e| format!("{leaf}: {e}"))
         };
         // One more than there are assets: one of them is free.
         let path = (0..=self.index.assets.len())
@@ -1284,12 +1289,16 @@ impl Workspace {
         let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
         let uid = project::uid::new(|uid| self.index.by_uid.contains_key(&uid)).map_err(|e| e.to_string())?;
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
-        let file = file.cloned();
-        let named = if file.is_some() { Some(RelPath::new(&name).map_err(|e| format!("{name}: {e}"))?) } else { None };
+        let file = file.map(std::path::Path::to_path_buf);
+        let named = if file.is_some() {
+            Some(RelPath::new(&name).map_err(|e| format!("{name}: {e}"))?.to_owned())
+        } else {
+            None
+        };
         let made_at = path.clone();
         let work: Made = Box::new(move |w| {
             let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
-            let files: Vec<(&RelPath, &[u8])> = named.as_ref().zip(bytes.as_deref()).into_iter().collect();
+            let files: Vec<(&RelPath, &[u8])> = named.as_deref().zip(bytes.as_deref()).into_iter().collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, uid, &made_at, node, &mut w.history)
                 .map(drop)
@@ -1300,9 +1309,9 @@ impl Workspace {
 
     /// The folder new nodes go in: the one the asset in use is in, else the one the browser shows.
     #[must_use]
-    pub fn new_node_folder(&self, in_use: Option<&TreePath>) -> TreePath {
+    pub fn new_node_folder(&self, in_use: Option<&TreePath>) -> Arc<TreePath> {
         match in_use.filter(|path| self.index.assets.contains_key(*path)) {
-            Some(path) => path.parent().unwrap_or_default(),
+            Some(path) => path.parent().unwrap_or_default().to_owned(),
             None => self.asset_folder.clone(),
         }
     }
@@ -1315,13 +1324,13 @@ impl Workspace {
     pub fn make_node(&mut self, uid: &str, path: &str, node: (&str, &[(&str, &[u8])])) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let uid = Uid::new(uid).map_err(|e| format!("{uid}: {e}"))?;
-        let path = TreePath::new(path).map_err(|e| format!("{path}: {e}"))?;
+        let path = TreePath::new(path).map_err(|e| format!("{path}: {e}"))?.to_owned();
         let declaration = node.0.to_string();
-        let files = node.1.iter().map(|(name, bytes)| Ok((RelPath::new(name)?, bytes.to_vec())));
-        let files: Vec<(RelPath, Vec<u8>)> =
+        let files = node.1.iter().map(|(name, bytes)| Ok((RelPath::new(name)?.to_owned(), bytes.to_vec())));
+        let files: Vec<(Arc<RelPath>, Vec<u8>)> =
             files.collect::<Result<_, pe2_path::PathError>>().map_err(|e| e.to_string())?;
         self.held(move |w| {
-            let files: Vec<(&RelPath, &[u8])> = files.iter().map(|(name, bytes)| (name, bytes.as_slice())).collect();
+            let files: Vec<(&RelPath, &[u8])> = files.iter().map(|(name, bytes)| (&**name, bytes.as_slice())).collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, uid, &path, node, &mut w.history)
                 .map(drop)
@@ -1336,7 +1345,7 @@ impl Workspace {
     pub fn set_disabled(&mut self, path: &TreePath, disabled: bool) -> Result<(), String> {
         let config = self.config.as_ref().ok_or("the project has no config")?.name.clone();
         let file = self.project.root.join(&project::FILE);
-        let path = path.clone();
+        let path = path.to_owned();
         let work = move |w: &mut crate::takein::Worker| {
             let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
             let mut step = w.history.begin(label);
@@ -1435,7 +1444,7 @@ impl Workspace {
         for (request, reply) in arrived {
             if let mcp::Request::Signal { events, config } = &request {
                 let config =
-                    config.as_ref().and_then(|name| self.project.configs.iter().find(|c| c.name == *name)).cloned();
+                    config.as_ref().and_then(|name| self.project.configs.iter().find(|c| *c.name == **name)).cloned();
                 self.signal_all(events.clone(), config, Some(reply));
                 continue;
             }
@@ -1710,7 +1719,7 @@ impl Workspace {
                 self.pictures.retain(|(image, ..), _| !changed.contains(image));
                 self.parts.forget(changed);
                 self.panels.clear();
-                self.thumbs.forget(changed);
+                self.thumbs.forget(changed.iter().map(|path| &**path));
                 // A view shows what it refers to as well: a model what its material says.
                 let reached = reached_from(&self.index, changed);
                 self.inspector_views.retain(|(asset, ..), _| !reached.contains(asset));
@@ -1781,7 +1790,7 @@ impl Workspace {
         &mut self,
         (redo, force, count): (bool, bool, usize),
         scope: Option<Uid>,
-        then: impl FnOnce(&mut crate::app::Editor, Result<(String, Option<TreePath>), StepError>) + 'static,
+        then: impl FnOnce(&mut crate::app::Editor, Result<(String, Option<Arc<TreePath>>), StepError>) + 'static,
     ) -> Result<(), StepError> {
         let work = self.steps(redo, force, scope, count)?;
         self.ask(work, then);
@@ -1821,7 +1830,7 @@ impl Workspace {
         if self.index.assets.contains_key(path) {
             return None;
         }
-        self.index.entries.get_key_value(path)
+        self.index.entries.get_key_value(path).map(|(path, entry)| (&**path, entry))
     }
 
     /// Whether a tree path is an asset or an entry of the view.
@@ -1943,7 +1952,7 @@ impl Workspace {
             let mut path = if entry.kind == Kind::Asset { project::index::asset_of(real) } else { real.clone() };
             while !path.is_root() && editable.insert(path.clone()) {
                 let Some(parent) = path.parent() else { break };
-                path = parent;
+                path = parent.to_owned();
             }
         }
         self.editable = editable;
@@ -2049,7 +2058,7 @@ impl Workspace {
     }
 
     /// The documents with unsaved changes: their uids and paths.
-    pub fn unsaved_documents(&self) -> Vec<(Uid, TreePath)> {
+    pub fn unsaved_documents(&self) -> Vec<(Uid, Arc<TreePath>)> {
         self.history.documents().iter().map(|(uid, d)| (*uid, d.path.clone())).collect()
     }
 
@@ -2449,7 +2458,7 @@ impl Workspace {
             index: &self.index,
             extensions: &self.extensions,
             chosen: Some(&self.chosen),
-            selection: self.selected.as_ref(),
+            selection: self.selected.as_deref(),
             revision: self.revision,
         };
         let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
@@ -2470,7 +2479,7 @@ impl Workspace {
     }
 
     /// Show a folder in the browser, the one left to go back to.
-    pub fn open_folder(&mut self, folder: TreePath) {
+    pub fn open_folder(&mut self, folder: Arc<TreePath>) {
         if folder != self.asset_folder {
             self.folders_back.push(std::mem::replace(&mut self.asset_folder, folder));
             self.folders_forward.clear();
@@ -2498,7 +2507,7 @@ impl Workspace {
     /// The folder holding the one shown.
     pub fn folder_up(&mut self) {
         if let Some(parent) = self.asset_folder.parent() {
-            self.open_folder(parent);
+            self.open_folder(parent.to_owned());
         }
     }
 
@@ -2531,7 +2540,7 @@ impl Workspace {
             Some(make) => {
                 let mut body = |ui: &mut egui::Ui, playing: Option<pe2_ext::Playing>| {
                     self.view_playback = playing;
-                    let key = (egui::Id::unique(("played", pane)), path.clone(), 0);
+                    let key = (egui::Id::unique(("played", pane)), path.to_owned(), 0);
                     self.draw_view(ui, key, &*make, (preview, 1), nav, None);
                     self.view_playback = None;
                     std::mem::take(&mut self.view_transport)
@@ -2556,7 +2565,7 @@ impl Workspace {
     ///
     /// # Errors
     /// Nothing makes this file of this asset, or it cannot be read.
-    pub fn replacing(&self, asset: &Asset, file: &HostPath) -> std::result::Result<Vec<EditRequest>, String> {
+    pub fn replacing(&self, asset: &Asset, file: &std::path::Path) -> std::result::Result<Vec<EditRequest>, String> {
         let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
         let stack = self.extensions.stack_for(asset, name).ok_or("Nothing imports it over this")??;
         let uid = asset.uid.ok_or("It has no uid")?;
@@ -2565,14 +2574,17 @@ impl Workspace {
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let short = asset.path.name().unwrap_or_default();
         let (label, merge) = (format!("Import {name} over {short}"), Some(format!("import {}", asset.path)));
-        let write = |file: RelPath, bytes: Vec<u8>| EditRequest::Write {
+        let write = |file: Arc<RelPath>, bytes: Vec<u8>| EditRequest::Write {
             uid,
             file,
             bytes,
             label: label.clone(),
             merge: merge.clone(),
         };
-        Ok(vec![write(named, bytes), write(RelPath::from(project::index::NODE_FILE), declaration.into_bytes())])
+        Ok(vec![
+            write(named.to_owned(), bytes),
+            write(project::index::NODE_FILE.as_rel().to_owned(), declaration.into_bytes()),
+        ])
     }
 
     /// Whether an entry opens as a document: an asset, a container folder among them, or a plain file; a filesystem
@@ -2604,7 +2616,7 @@ impl Workspace {
 
     /// Look at an asset in a member of a family: all that shows it is made again.
     pub fn choose_member(&mut self, path: &TreePath, family: String, member: String) {
-        self.chosen.insert((path.clone(), family), member);
+        self.chosen.insert((path.to_owned(), family), member);
         self.contents.remove(path);
         self.part_sheets.retain(|(asset, _), _| asset != path);
         self.views.retain(|(_, asset, _), _| asset != path);
@@ -2644,7 +2656,7 @@ impl Workspace {
         self.inner.as_ref().filter(|(of, _)| of == asset).map(|(_, inner)| inner.as_str())
     }
 
-    pub fn navigate(&mut self, path: TreePath) {
+    pub fn navigate(&mut self, path: Arc<TreePath>) {
         if self.selected.as_ref() == Some(&path) {
             return;
         }
@@ -2672,7 +2684,7 @@ impl Workspace {
 
     /// Select an asset picked in the tree: like `navigate`, but the tree does not move. Picking the selected image
     /// again shows it in its first variant.
-    pub fn select(&mut self, path: TreePath) {
+    pub fn select(&mut self, path: Arc<TreePath>) {
         if self.selected.as_ref() == Some(&path) {
             self.chosen.remove(&look_of(&path));
             return;
@@ -2713,7 +2725,7 @@ impl Workspace {
     /// An asset's picture in its look, uploaded: drawn off the window's thread, none until it is.
     pub fn picture(&mut self, ctx: &egui::Context, path: &TreePath, upscale: Upscale) -> Option<&Picture> {
         let chosen = self.variant(path);
-        let key = (path.clone(), chosen, upscale);
+        let key = (path.to_owned(), chosen, upscale);
         if !self.pictures.contains_key(&key) {
             let drawn = self.textures.pictures.as_mut()?.get(path, chosen)?;
             self.pictures.insert(key.clone(), drawn.map(|image| show(ctx, path, chosen, upscale, &image)));
@@ -2731,11 +2743,11 @@ impl Workspace {
 
     /// The assets the preview shows for an asset, as (label, asset): itself, where it has a view; or what a container's
     /// slots hold - the assets filling them, the images its image slots upload.
-    pub fn previews_of(&self, asset: &Asset) -> Vec<(Option<String>, TreePath)> {
+    pub fn previews_of(&self, asset: &Asset) -> Vec<(Option<String>, Arc<TreePath>)> {
         if self.has_view(&asset.path) {
             return vec![(None, asset.path.clone())];
         }
-        let mut out: Vec<(Option<String>, TreePath)> = Vec::new();
+        let mut out: Vec<(Option<String>, Arc<TreePath>)> = Vec::new();
         let mut push = |label: String, a: &Asset| {
             if self.has_view(&a.path) && !out.iter().any(|(_, p)| *p == a.path) {
                 out.push((Some(label), a.path.clone()));
@@ -2783,10 +2795,10 @@ impl Workspace {
                     ui.selectable_value(&mut chosen, i, &view.name);
                 }
             });
-            self.view_choice.insert(path.clone(), chosen);
+            self.view_choice.insert(path.to_owned(), chosen);
         }
         let make = views[chosen].make.clone();
-        self.draw_view(ui, (pane, path.clone(), chosen), &*make, (preview, count), nav, None);
+        self.draw_view(ui, (pane, path.to_owned(), chosen), &*make, (preview, count), nav, None);
     }
 
     /// Show an editor an extension gives an asset, made when first shown.
@@ -2810,12 +2822,12 @@ impl Workspace {
             .find_map(|(at, shown)| Some((at, shown.viewer.filter(|def| def.name == name)?, &shown.output)));
         if let Some((at, def, output)) = viewer {
             let (at, make, output) = (views + editors.len() + at, def.make.clone(), output.clone());
-            self.draw_view(ui, (pane, path.clone(), at), &*make, (preview, 1), nav, Some(&output));
+            self.draw_view(ui, (pane, path.to_owned(), at), &*make, (preview, 1), nav, Some(&output));
             return;
         }
         let Some((at, def)) = editors.iter().enumerate().find(|(_, def)| def.name == name) else { return };
         let (at, make) = (views + at, def.make.clone());
-        self.draw_view(ui, (pane, path.clone(), at), &*make, (preview, 1), nav, None);
+        self.draw_view(ui, (pane, path.to_owned(), at), &*make, (preview, 1), nav, None);
     }
 
     /// Show a preview an asset's stack asks for: by a viewer of what it is, else - a picture - as the host draws one.
@@ -2865,7 +2877,7 @@ impl Workspace {
     fn draw_view(
         &mut self,
         ui: &mut egui::Ui,
-        key: (egui::Id, TreePath, usize),
+        key: (egui::Id, Arc<TreePath>, usize),
         make: &pe2_ext::MakeView,
         (preview, count): (Preview, usize),
         nav: &mut Option<Nav>,
@@ -2880,7 +2892,7 @@ impl Workspace {
         let lens = Lens {
             index: &self.index,
             extensions: &self.extensions,
-            selection: self.selected.as_ref(),
+            selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
             revision: self.revision,
         };
@@ -3000,12 +3012,12 @@ impl Workspace {
         let lens = Lens {
             index: &self.index,
             extensions: &self.extensions,
-            selection: self.selected.as_ref(),
+            selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
             revision: self.revision,
         };
         for (i, def) in chosen(&self.extensions, asset) {
-            let key = (path.clone(), i);
+            let key = (path.to_owned(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
             let frame = crate::ext_ui::Frame {
                 asset: Some(asset),
@@ -3043,7 +3055,7 @@ impl Workspace {
         let lens = Lens {
             index: &self.index,
             extensions: &self.extensions,
-            selection: self.selected.as_ref(),
+            selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
             revision: self.revision,
         };
@@ -3065,9 +3077,9 @@ impl Workspace {
 }
 
 /// What changed, and everything that refers to it, however far off.
-fn reached_from(index: &project::index::Index, changed: &BTreeSet<TreePath>) -> BTreeSet<TreePath> {
+fn reached_from(index: &project::index::Index, changed: &BTreeSet<Arc<TreePath>>) -> BTreeSet<Arc<TreePath>> {
     let mut reached = changed.clone();
-    let mut waiting: Vec<&TreePath> = changed.iter().collect();
+    let mut waiting: Vec<&TreePath> = changed.iter().map(|path| &**path).collect();
     while let Some(path) = waiting.pop() {
         for reference in index.referenced_by.get(path).into_iter().flatten() {
             if reached.insert(reference.from.clone()) {

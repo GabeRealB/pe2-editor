@@ -2,11 +2,13 @@
 //! What is wired to what is read from the plans of every asset, and a build is only the `build` event: the outputs that answer it say so.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use pe2_ext::data::BuildConfig;
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 
 use crate::events::{Action, Effects, Expr, Outcome, Report, Trigger, order, schedule};
 use crate::ext::Extensions;
@@ -130,19 +132,19 @@ struct Site<'a> {
     index: &'a Index,
     extensions: &'a Extensions,
     /// The config's name, which names its folder of what is deployed.
-    config_name: Name,
+    config_name: Arc<Name>,
     engine: Engine,
 }
 
 /// Where in the project builds are deployed, each config's in a folder of its name.
-const BUILT: Name = Name::constant("build");
+const BUILT: &Name = Name::constant("build");
 
 /// Where in the project an output's `deploy` puts its file: the place it names, `{config}` the config's name, or in it
 /// where it ends in `/`.
-fn deployed(place: &str, config: &Name, file: &str) -> Result<RelPath> {
+fn deployed(place: &str, config: &Name, file: &str) -> Result<Arc<RelPath>> {
     let place = place.replace("{config}", config.as_str());
     let path = if place.ends_with('/') { format!("{place}{file}") } else { place };
-    RelPath::new(&path).with_context(|| format!("the place it is deployed at, {path}"))
+    (RelPath::new(&path).with_context(|| format!("the place it is deployed at, {path}"))).map(ToOwned::to_owned)
 }
 
 impl Site<'_> {
@@ -150,7 +152,7 @@ impl Site<'_> {
     fn output<'b>(&'b self, asset: &str, output: &str) -> Result<(&'b Asset, Plan, usize)> {
         let found = crate::TreePath::new(asset)
             .ok()
-            .and_then(|at| self.index.assets.get(&at))
+            .and_then(|at| self.index.assets.get(at))
             .with_context(|| format!("{asset}: no such asset"))?;
         let (plan, _) = self.extensions.plan(found);
         let at = plan
@@ -186,7 +188,7 @@ impl Site<'_> {
                 crate::cache::write_atomic(&to, &bytes)?;
             }
             for (link, target) in &self.project.links {
-                if RelPath::new(target).is_ok_and(|target| target == relative) {
+                if RelPath::new(target).is_ok_and(|target| *target == *relative) {
                     link_to(&to, &crate::resolve_path(&self.project.root, link)?)?;
                 }
             }

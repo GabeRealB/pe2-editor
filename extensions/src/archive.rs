@@ -5,7 +5,7 @@
 //! Every entry is in the one folder, `<id>.extension/`, and nothing in it names a place outside it: what an archive
 //! holds is checked before anything is written.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,14 +15,14 @@ use project::ext::{EXTENSION_COMPONENT, folder};
 
 /// Whether a file is an extension's archive, by its name.
 #[must_use]
-pub fn is_archive(path: &HostPath) -> bool {
+pub fn is_archive(path: &std::path::Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.ends_with(folder::ARCHIVE_SUFFIX))
         && path.is_file()
 }
 
 /// The id an archive is named for: `<id>` of `<id>-<version>.extension.zip`.
 #[must_use]
-pub fn id_of(path: &HostPath) -> Option<&str> {
+pub fn id_of(path: &std::path::Path) -> Option<&str> {
     let named = path.file_name()?.to_str()?.strip_suffix(folder::ARCHIVE_SUFFIX)?;
     named.rsplit_once('-').map(|(id, _)| id).filter(|id| !id.is_empty())
 }
@@ -92,7 +92,7 @@ impl Drop for Unpacked {
 /// # Errors
 /// It cannot be read, is no extension's archive, names a place outside its folder, its manifest is not its
 /// component's, or it cannot be written.
-pub fn unpack(file: &HostPath) -> Result<Unpacked> {
+pub fn unpack(file: &std::path::Path) -> Result<Unpacked> {
     static UNPACKED: AtomicUsize = AtomicUsize::new(0);
     let bytes = std::fs::read(file).with_context(|| file.display().to_string())?;
     let archive = open(&bytes)?;
@@ -133,8 +133,8 @@ pub fn unpack(file: &HostPath) -> Result<Unpacked> {
 mod tests {
     use super::{id_of, read, unpack};
     use codecs::zip::{Entry, write};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use sfs::HostPath;
+    use sfs::testing::At as _;
 
     fn archive(dir: &HostPath, name: &str, entries: &[(&str, &[u8], u32)]) -> HostPath {
         let entries: Vec<Entry> =
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn an_archive_holds_one_folder_and_nothing_outside_it() {
-        let dir = pe2_path::testing::scratch("archive");
+        let dir = sfs::testing::scratch("archive");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let refused = |name: &str, entries: &[(&str, &[u8], u32)]| {
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn an_archive_unpacks_as_its_folder_was() {
-        let dir = pe2_path::testing::scratch("archive-folder");
+        let dir = sfs::testing::scratch("archive-folder");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bytes = crate::components().iter().find(|(p, _)| *p == "pe2-events").unwrap().1;

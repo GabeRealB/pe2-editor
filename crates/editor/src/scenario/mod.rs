@@ -5,7 +5,8 @@
 //!
 //! Work goes on off the window's thread, so that a harness with no repaint to make has not finished: `settle` waits until
 //! the editor says it has nothing going on.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
+use std::sync::Arc;
 
 // What only the scenarios here use is left over in a build for running a project's tests.
 #[cfg(test)]
@@ -35,7 +36,7 @@ mod taking_in;
 #[cfg(all(test, unix))]
 mod tests_pane;
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::fmt::Write as _;
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -68,7 +69,7 @@ fn isolate() {
         let _ = std::fs::remove_dir_all(folder());
         let data = folder().at("data");
         std::fs::create_dir_all(&data).expect("a data folder");
-        extensions::use_data_folder(data);
+        extensions::use_data_folder(data.into_path_buf());
         extensions::test_mode(host::extension);
         project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
         // A test reaches no network: what an extension would fetch, it is told is not there.
@@ -139,21 +140,30 @@ pub fn main() -> i32 {
     let mut args = std::env::args_os().skip(1).peekable();
     let (mut project, mut folders, mut filters, mut built) = (None, Vec::new(), Vec::new(), false);
     let mut out = suite::Out::default();
+    // A place it is given that the system cannot name is refused, as a program refuses a wrong argument.
+    let place = |at: std::ffi::OsString| {
+        HostPath::new(std::path::Path::new(&at)).map_err(|e| eprintln!("{}: {e}", at.to_string_lossy())).ok()
+    };
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--project") => project = args.next().and_then(|at| HostPath::new(std::path::Path::new(&at)).ok()),
+            Some("--project") => match args.next().map(place) {
+                Some(Some(at)) => project = Some(at),
+                _ => return 2,
+            },
             Some("--built") => built = true,
             Some("--suites") => {
                 while let Some(folder) = args.next_if(|arg| !arg.to_string_lossy().starts_with("--")) {
-                    folders.extend(HostPath::new(std::path::Path::new(&folder)).ok());
+                    let Some(folder) = place(folder) else { return 2 };
+                    folders.push(folder);
                 }
             }
             Some("--filter") => filters.extend(args.next().map(|text| text.to_string_lossy().into_owned())),
             Some("--list") => out.list = true,
             Some("--json") => out.json = true,
-            Some("--artifacts") => {
-                out.artifacts = args.next().and_then(|at| HostPath::new(std::path::Path::new(&at)).ok());
-            }
+            Some("--artifacts") => match args.next().map(place) {
+                Some(Some(at)) => out.artifacts = Some(at),
+                _ => return 2,
+            },
             Some("--trust-everything") => extensions::trust::trust_everything(),
             _ => {
                 eprintln!("{}: not something this takes", arg.to_string_lossy());
@@ -236,7 +246,7 @@ impl Scenario {
                 crate::install_gpu(state);
             }
             let start = Start {
-                project: Some(root),
+                project: Some(root.into_path_buf()),
                 select: None,
                 show,
                 screenshot: None,
@@ -654,7 +664,7 @@ impl Scenario {
         let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
         for template in &templates {
             let top = project::TreePath::root();
-            self.workspace().new_node_now(template, None, &top).map_err(|why| format!("{template}: {why}"))?;
+            self.workspace().new_node_now(template, None, top).map_err(|why| format!("{template}: {why}"))?;
             self.settle();
         }
         Ok(i64::try_from(templates.len()).unwrap_or(i64::MAX))
@@ -828,7 +838,7 @@ impl Scenario {
 
     /// A file with nothing to do with the project, as one to drop on the window is.
     pub fn file_elsewhere(&self, name: &str, bytes: &[u8]) -> HostPath {
-        let file = self.fixture.root().with_suffix(&pe2_path::Name::constant(".files")).at(name);
+        let file = self.fixture.root().with_suffix(pe2_path::Name::constant(".files")).at(name);
         std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder");
         std::fs::write(&file, bytes).expect("a file");
         file
@@ -847,13 +857,13 @@ impl Scenario {
 }
 
 /// A path of the project a scenario names, as text: checked where the harness takes it.
-fn tree(text: &str) -> Result<project::TreePath, String> {
-    project::TreePath::new(text).map_err(|why| format!("{text}: {why}"))
+fn tree(text: &str) -> Result<Arc<project::TreePath>, String> {
+    (project::TreePath::new(text).map_err(|why| format!("{text}: {why}"))).map(ToOwned::to_owned)
 }
 
 /// A path of the project a test names.
 #[track_caller]
 #[must_use]
-pub fn path(text: &str) -> project::TreePath {
+pub fn path(text: &str) -> Arc<project::TreePath> {
     tree(text).unwrap_or_else(|why| panic!("{why}"))
 }

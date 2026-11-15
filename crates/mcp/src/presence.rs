@@ -6,8 +6,9 @@
 //! A process also says whether its program was rebuilt since it started, by the program's time then and now: one that
 //! was runs the code it started with, which may read and write a project as that code did.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -44,8 +45,13 @@ pub struct Presence {
 }
 
 /// Where the editors keep their files.
-fn folder() -> Option<HostPath> {
-    Some(extensions::data_folder()?.join(&pe2_path::Name::constant("editors")))
+fn folder() -> Option<PathBuf> {
+    Some(extensions::data_folder()?.join("editors"))
+}
+
+/// What a folder holds, as places: what the system lists, nothing where it lists nothing.
+fn entries(folder: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
 }
 
 /// Seconds since the epoch.
@@ -74,8 +80,8 @@ pub fn this_program() -> (Option<HostPath>, Option<u64>) {
 
 /// What keeps an editor's presence: its files, held while it lives, and what it last wrote.
 pub struct Keeper {
-    json: HostPath,
-    lock: HostPath,
+    json: PathBuf,
+    lock: PathBuf,
     _held: std::fs::File,
     base: Presence,
     written: Option<(Presence, Instant)>,
@@ -92,12 +98,12 @@ impl Keeper {
         std::fs::create_dir_all(&folder).ok()?;
         sweep(&folder);
         let pid = std::process::id();
-        let lock = folder.join(&pe2_path::Name::new(&format!("{pid}.lock")).ok()?);
+        let lock = folder.join(format!("{pid}.lock"));
         let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).ok()?;
         held.try_lock().ok()?;
         let (program, built) = this_program();
         let base = Presence { pid, program, built, started: seconds(SystemTime::now()), ..Presence::default() };
-        let json = folder.join(&pe2_path::Name::new(&format!("{pid}.json")).ok()?);
+        let json = folder.join(format!("{pid}.json"));
         Some(Keeper { json, lock, _held: held, base, written: None })
     }
 
@@ -120,7 +126,7 @@ impl Keeper {
             return;
         }
         let Ok(text) = serde_json::to_string_pretty(&presence) else { return };
-        let partial = self.json.with_suffix(&pe2_path::Name::constant(".part"));
+        let partial = self.json.with_extension("json.part");
         if std::fs::write(&partial, text).is_ok() && std::fs::rename(&partial, &self.json).is_ok() {
             self.written = Some((presence, Instant::now()));
         }
@@ -135,8 +141,8 @@ impl Drop for Keeper {
 }
 
 /// Remove what editors gone left: a presence whose lock nobody holds.
-fn sweep(folder: &HostPath) {
-    for path in folder.entries() {
+fn sweep(folder: &Path) {
+    for path in entries(folder) {
         if path.extension().is_none_or(|e| e != "lock") {
             continue;
         }
@@ -154,9 +160,8 @@ fn sweep(folder: &HostPath) {
 pub fn running() -> BTreeMap<u32, Presence> {
     let Some(folder) = folder() else { return BTreeMap::new() };
     sweep(&folder);
-    let read = |path: HostPath| serde_json::from_str::<Presence>(&std::fs::read_to_string(path).ok()?).ok();
-    folder
-        .entries()
+    let read = |path: PathBuf| serde_json::from_str::<Presence>(&std::fs::read_to_string(path).ok()?).ok();
+    entries(&folder)
         .filter(|path| path.extension().is_some_and(|e| e == "json"))
         .filter_map(read)
         .map(|presence| (presence.pid, presence))
@@ -217,13 +222,13 @@ pub fn note_start() {
 #[cfg(test)]
 mod tests {
     use super::{Keeper, Presence, rebuilt, running, sweep};
-    use pe2_path::testing::At as _;
+    use sfs::testing::At as _;
 
     #[test]
     fn an_editor_is_found_while_it_lives_and_gone_with_it() {
-        let data = pe2_path::testing::scratch("presence");
+        let data = sfs::testing::scratch("presence");
         let _ = std::fs::remove_dir_all(&data);
-        extensions::use_data_folder(data.clone());
+        extensions::use_data_folder(data.to_path_buf());
         // What a crashed editor left: a lock nobody holds.
         let folder = data.at("editors");
         std::fs::create_dir_all(&folder).unwrap();

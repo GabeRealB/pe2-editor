@@ -1,7 +1,7 @@
 //! Projects for scenarios, written where each scenario has its own: nothing here comes from a disc.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 

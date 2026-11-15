@@ -73,14 +73,19 @@ What holds whatever is being changed:
   `licenses/licenses.toml` does not allow, or with no license text to show. Nothing whose license asks anything of
   what is loaded beside it is allowed: the editor loads extensions of any license. A crate only another platform
   links is checked from this one with `PE2_LICENSES_FOR=<target triple> cargo check -p licenses`.
-- **No text is a path.** A path is one of `pe2-path`'s types, made by a checked constructor where it comes in - an
-  argument, a setting, a file read, a frame from another process, what the system or an extension says: `HostPath`
-  for a place on disk (absolute, links resolved, in the plain form, so two of one place are equal), `Name` and
-  `RelPath` for names within one, `Uid` and `ResourcePath` for what a reference names. A disk path is joined only by
-  checked names (`HostPath::join`), never by text: `Path::join`, `PathBuf::push` and `canonicalize` are refused by
-  the build (`clippy.toml`) but in `pe2-path`, build scripts and `xtask`. Text goes back to a path's form only where it
-  leaves - a message, a file written, a program's argument (`HostPath::argument`: the path within with `/`, as a
-  program's patterns are written).
+- **No text is a path.** A name is one of `pe2-path`'s types, made by a checked constructor where it comes in - a
+  setting, a file read, a frame from another process, what the system or an extension says: `Name` and `RelPath` for
+  names within a folder, `VfsPath` for a path within a scope, `Uid` and `ResourcePath` for what a reference names.
+- **A place on disk is storage's or a plain path.** Where the filesystem is implemented - `sfs`, `vfs`, the project's
+  storage, the holder, and what compares places across processes (the lock, presence, trust) - a place is an
+  `sfs::HostPath` (absolute, links resolved, in the plain form, so two of one place are equal), joined only of checked
+  names (`HostPath::join`). What is no storage's - an argument, a file the user picks, the program's own folders, a
+  program to start, the temporary folder - is a `Path` or `PathBuf`; a storage function given one takes a `&Path` and
+  makes its `HostPath` itself, and an opened project carries its own. `Path::join`, `PathBuf::push` and `canonicalize`
+  are refused by the build (`clippy.toml`) but in `sfs`'s `HostPath`, build scripts, `xtask`, `pe2-setup` and the
+  crates at the edges (the CLI, the editor, the MCP server, `extensions`), each saying why. Text goes back to a path's
+  form only where it leaves - a message, a file written, a program's argument (`HostPath::argument`: the path within
+  with `/`, as a program's patterns are written).
 - **A path that fails its check is refused, never replaced or passed over.** A conversion says why it failed
   (`PathError`, `NotWithin`: elsewhere, or within by a name no path takes), and its caller decides on each answer:
   it refuses the operation, or says the problem (`Problem::Refused`), or - only where nothing is lost by it - goes
@@ -90,9 +95,10 @@ What holds whatever is being changed:
   invalid name.
 - **A growable container only where it grows.** `String` and `Vec<T>` hold what is being built; what is kept once
   made is `Box<str>` or `Box<[T]>`, or `Arc<str>` or `Arc<[T]>` where it is shared or cloned.
-- **A test makes its folders as the program does** (`pe2_path::testing`: `scratch` for a folder of its own, `At`
-  for a place in one written as text, `root.at("a/b")`). Every edit the project crate's tests make is held to an
-  index opened afresh and to the project's model; an edit added goes through the same harness.
+- **A test makes its folders as the program does** (`sfs::testing`: `scratch` for a folder of its own, `At` for a
+  place in one written as text, `root.at("a/b")` - a `HostPath` within a storage's, a `PathBuf` within a plain one).
+  Every edit the project crate's tests make is held to an index opened afresh and to the project's model; an edit
+  added goes through the same harness.
 - **A test or an example takes what it reads from what it is given**, never from a place outside the workspace:
   an example that needs a release's discs or an extraction takes its folder as an argument.
 

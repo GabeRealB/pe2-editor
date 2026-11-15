@@ -1,6 +1,6 @@
 //! Documents: an asset edited is unsaved until it is saved, its working copy shown everywhere; the disk changing under
 //! it makes it stale; undo follows the document in use.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use eframe::egui;
 
@@ -68,7 +68,7 @@ fn undo_takes_back_the_document_in_use_and_no_other() {
     let uid = editor.workspace().index.assets[&super::path("rig/notes")].uid.expect("a uid");
     let request = EditRequest::Write {
         uid,
-        file: pe2_path::RelPath::from(project::index::NODE_FILE),
+        file: project::index::NODE_FILE.as_rel().to_owned(),
         bytes: b"[[stack]]\nop = \"settings\"\nnote = \"two\"\n".to_vec(),
         label: "Edit notes".into(),
         merge: None,
@@ -100,11 +100,11 @@ fn back_and_forward_go_through_the_documents_visited() {
     let mut editor = Scenario::open(fixture);
     editor.show("rig/skeleton");
     editor.show("rig/notes");
-    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/notes"));
+    assert_eq!(editor.editor().document_in_use().as_deref().map(project::TreePath::as_str), Some("rig/notes"));
     editor.alt(egui::Key::ArrowLeft);
-    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/skeleton"));
+    assert_eq!(editor.editor().document_in_use().as_deref().map(project::TreePath::as_str), Some("rig/skeleton"));
     editor.alt(egui::Key::ArrowRight);
-    assert_eq!(editor.editor().document_in_use().as_ref().map(project::TreePath::as_str), Some("rig/notes"));
+    assert_eq!(editor.editor().document_in_use().as_deref().map(project::TreePath::as_str), Some("rig/notes"));
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn a_point_of_the_history_is_shown_read_only_and_restored() {
     let uid = editor.workspace().index.assets[&super::path("rig/skeleton")].uid.expect("a uid");
     let refused = editor.workspace().edit_now(&EditRequest::Write {
         uid,
-        file: pe2_path::RelPath::from(project::index::NODE_FILE),
+        file: project::index::NODE_FILE.as_rel().to_owned(),
         bytes: b"x = 1".to_vec(),
         label: "Edit".into(),
         merge: None,

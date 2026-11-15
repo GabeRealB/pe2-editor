@@ -15,8 +15,9 @@
 //! so a project opens without importing. Like the rest of the cache, any of it may be deleted at the cost of time only.
 
 use anyhow::{Context, Result};
-use pe2_path::{HostPath, RelPath};
+use pe2_path::RelPath;
 use pe2_value as V;
+use sfs::HostPath;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,7 @@ use crate::graph::{self, Plan};
 use crate::index::{Asset, BundleFile, Imported, Index, Problem, Report};
 
 /// Where imports were kept before the store, removed on opening.
-const OLD: pe2_path::Name = pe2_path::Name::constant("imports");
+const OLD: &pe2_path::Name = pe2_path::Name::constant("imports");
 
 /// What attaching found.
 #[derive(Debug, Default)]
@@ -40,7 +41,7 @@ pub struct Attached {
     pub made: usize,
     pub kept: usize,
     /// Imports that failed, with why: their assets have no native files.
-    pub failed: Vec<(TreePath, String)>,
+    pub failed: Vec<(Arc<TreePath>, String)>,
 }
 
 /// The project's imports.
@@ -50,7 +51,7 @@ pub struct Imports {
     /// a refresh finds them here rather than on disk while that holds.
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The nodes each asset's last import read outputs of (as traces name them), by its path.
-    read_from: Mutex<HashMap<TreePath, BTreeSet<String>>>,
+    read_from: Mutex<HashMap<Arc<TreePath>, BTreeSet<String>>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from: kept
     /// in the cache (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
     addresses: Mutex<HashMap<String, Listed>>,
@@ -64,7 +65,7 @@ pub struct Imports {
 type Listed = (String, Arc<HashSet<String>>);
 
 /// Where the addresses listed are kept, in the cache, with the extensions that listed them.
-const LISTED: pe2_path::Name = pe2_path::Name::constant("listed.json");
+const LISTED: &pe2_path::Name = pe2_path::Name::constant("listed.json");
 
 /// What tells the extensions loaded apart from others: each one's id, version and build.
 fn builds_of(extensions: &Extensions) -> String {
@@ -169,7 +170,7 @@ impl Imports {
     /// # Errors
     /// The store cannot be opened.
     pub fn open(cache: &Cache) -> Result<Imports> {
-        let old = cache.path(&OLD);
+        let old = cache.path(OLD);
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
@@ -178,7 +179,7 @@ impl Imports {
             known: Mutex::default(),
             read_from: Mutex::default(),
             addresses: Mutex::default(),
-            listed_at: cache.path(&LISTED),
+            listed_at: cache.path(LISTED),
             stop: Arc::default(),
         })
     }
@@ -224,7 +225,12 @@ impl Imports {
     /// their outputs (`Extensions::dependents`), the others keeping theirs: their problems made again, and those of the
     /// references from or to them naming outputs. What it costs is what changed; imports no asset makes any more are
     /// removed by the next full attach.
-    pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<TreePath>) -> Attached {
+    pub fn attach_changed(
+        &self,
+        index: &mut Index,
+        extensions: &Extensions,
+        changed: &BTreeSet<Arc<TreePath>>,
+    ) -> Attached {
         let mut changed = changed.clone();
         let depending = tracing::info_span!("attach: what depends on what changed").entered();
         changed.extend(extensions.dependents(index, &changed));
@@ -233,10 +239,10 @@ impl Imports {
         // What failed may have failed for what another made, which it did not get to say it read: it is tried again.
         // A problem says its asset's path as text: made of one, it is one.
         let failed = index.problems.iter().filter_map(|p| match p {
-            Problem::Import { asset, .. } => TreePath::new(asset).ok(),
+            Problem::Import { asset, .. } => TreePath::new(asset).ok().map(ToOwned::to_owned),
             _ => None,
         });
-        let failed: Vec<TreePath> = failed.collect();
+        let failed: Vec<Arc<TreePath>> = failed.collect();
         changed.extend(failed.iter().cloned());
         changed.extend(self.readers(index, &failed.into_iter().collect()));
         self.attach_some(index, extensions, Some(&changed), &|_, _, _| {})
@@ -244,10 +250,10 @@ impl Imports {
 
     /// The assets whose last import read an output of one of these, through others or not: what an operation reads of
     /// another node as it runs (`Call::output_of`), which no `references` layer says. These not among them.
-    fn readers(&self, index: &Index, changed: &BTreeSet<TreePath>) -> BTreeSet<TreePath> {
+    fn readers(&self, index: &Index, changed: &BTreeSet<Arc<TreePath>>) -> BTreeSet<Arc<TreePath>> {
         let read_from = self.read_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut found = BTreeSet::new();
-        let mut next: Vec<TreePath> = changed.iter().cloned().collect();
+        let mut next: Vec<Arc<TreePath>> = changed.iter().cloned().collect();
         while let Some(path) = next.pop() {
             let Some(asset) = index.assets.get(&path) else { continue };
             let node = graph::exec::id(&**asset);
@@ -271,13 +277,13 @@ impl Imports {
         &self,
         index: &mut Index,
         extensions: &Extensions,
-        only: Option<&BTreeSet<TreePath>>,
+        only: Option<&BTreeSet<Arc<TreePath>>>,
         report: &Report<'_>,
     ) -> Attached {
         let mut attached = Attached::default();
         let of = |path: &TreePath| only.is_none_or(|o| o.contains(path));
         // What a problem says of an asset, as text: of these where it is the text of one of them.
-        let said_of = |path: &str| only.is_none_or(|o| TreePath::new(path).is_ok_and(|path| o.contains(&path)));
+        let said_of = |path: &str| only.is_none_or(|o| TreePath::new(path).is_ok_and(|path| o.contains(path)));
         // What the project defines, for the stacks laying it in.
         let defined = definitions(index, extensions, only);
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
@@ -299,10 +305,10 @@ impl Imports {
         });
         let mut made = tracing::info_span!("attach: imports made")
             .in_scope(|| self.make(&world, &assets, &looked, extensions, reach, report));
-        let mut found: Vec<(TreePath, String, Arc<Known>)> = Vec::new();
+        let mut found: Vec<(Arc<TreePath>, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
         let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
-        let mut read_from: Vec<(TreePath, BTreeSet<String>)> = Vec::new();
+        let mut read_from: Vec<(Arc<TreePath>, BTreeSet<String>)> = Vec::new();
         if self.stopping() {
             return attached;
         }
@@ -379,7 +385,7 @@ impl Imports {
 
     /// What each asset's import comes to, given it: what they make among its files, and its settings resolved. Worked out
     /// at the same time, as that only reads. Returns what is wrong with them.
-    fn give(&self, index: &mut Index, found: Vec<(TreePath, String, Arc<Known>)>) -> Vec<Problem> {
+    fn give(&self, index: &mut Index, found: Vec<(Arc<TreePath>, String, Arc<Known>)>) -> Vec<Problem> {
         let mut problems = Vec::new();
         let resolved = crate::parallel(&found, |(path, _, import)| {
             let asset = index.assets.get(path)?;
@@ -391,7 +397,7 @@ impl Imports {
             else {
                 continue;
             };
-            asset.files.retain(|f| !import.files.iter().any(|(name, _)| f.name == name.as_str()));
+            asset.files.retain(|f| !import.files.iter().any(|(name, _)| *f.name == *name.as_str()));
             for (name, blob, path) in self.kept_files(&import.files) {
                 // What an importer made is named as it said: one that is no path is said, and no file of the asset.
                 let name = match RelPath::new(name) {
@@ -404,7 +410,7 @@ impl Imports {
                 };
                 asset.files.push(BundleFile {
                     path,
-                    name,
+                    name: name.to_owned(),
                     size: blob.size,
                     modified: (0, 0),
                     layer: layer.clone(),
@@ -435,7 +441,7 @@ impl Imports {
         &self,
         index: &Index,
         extensions: &Extensions,
-        only: Option<&BTreeSet<TreePath>>,
+        only: Option<&BTreeSet<Arc<TreePath>>>,
     ) -> Vec<Problem> {
         let mut known = self.addresses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // What an earlier run listed, with these extensions.
@@ -448,13 +454,13 @@ impl Imports {
         let targets: Vec<_> = match only {
             None => index.referenced_by.iter().collect(),
             Some(only) => {
-                let mut around: BTreeSet<TreePath> = only.clone();
+                let mut around: BTreeSet<Arc<TreePath>> = only.clone();
                 for reference in only.iter().flat_map(|path| index.references_from(path)) {
                     // Named by its uid, or by its path where that names nothing - each as the declaration writes it:
                     // what is neither names no asset, and the link says it dangles.
                     let by_uid = pe2_path::Uid::new(&reference.uid).ok().and_then(|uid| index.by_uid.get(&uid));
                     around.extend(by_uid.cloned());
-                    around.extend(TreePath::new(&reference.target).ok());
+                    around.extend(TreePath::new(&reference.target).ok().map(ToOwned::to_owned));
                 }
                 around.iter().filter_map(|target| index.referenced_by.get_key_value(target)).collect()
             }
@@ -566,7 +572,7 @@ impl Imports {
             return made;
         }
         report("Making what the importers make", 0, to_make.len());
-        let paths: Vec<&TreePath> = to_make.iter().map(|(at, ..)| &assets[*at].path).collect();
+        let paths: Vec<&TreePath> = to_make.iter().map(|(at, ..)| &*assets[*at].path).collect();
         for level in in_order(world.index, &paths) {
             let level: Vec<_> = level.into_iter().map(|at| to_make[at]).collect();
             let done = crate::parallel(&level, |(at, key, importer, plan, output)| {
@@ -600,7 +606,7 @@ impl Imports {
 /// What the project defines taken from its index (`Extensions::take_definitions`), and what is wrong with it:
 /// taken again where an asset that defines - or did - is among those that changed, and left as it was taken
 /// otherwise, nothing of the project looked through for it.
-fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<TreePath>>) -> Vec<Problem> {
+fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<Arc<TreePath>>>) -> Vec<Problem> {
     if only.is_some_and(|only| !extensions.definitions_among(index, only)) {
         return Vec::new();
     }
@@ -611,7 +617,7 @@ fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<Tr
 /// something goes.
 fn forget_imports(index: &mut Index, of: &dyn Fn(&TreePath) -> bool) {
     let imported = |a: &Asset| a.imported.is_some() || a.files.iter().any(|f| f.made_by.is_some());
-    let going: Vec<TreePath> =
+    let going: Vec<Arc<TreePath>> =
         index.assets.values().filter(|a| of(&a.path) && imported(a)).map(|a| a.path.clone()).collect();
     if going.is_empty() {
         return;
@@ -634,7 +640,7 @@ fn in_order(index: &Index, paths: &[&TreePath]) -> Vec<Vec<usize>> {
         index
             .references_from(paths[at])
             .into_iter()
-            .filter_map(|r| places.get(&index.resolve(&r.uid, &r.target)?.path).copied())
+            .filter_map(|r| places.get(&*index.resolve(&r.uid, &r.target)?.path).copied())
     };
     let mut waiting: Vec<(usize, HashSet<usize>)> =
         (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();
@@ -936,7 +942,7 @@ mod attaching {
     use crate::testing::tree;
     use pe2_ext::ty::{self, Files, Registered};
     use pe2_ext::{Extension, File, Image, Registry, Result, Signature, Table, Typed, Value};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     /// A strip's source: a line of cell names, recognized by its name.
     struct Line;
@@ -1611,7 +1617,7 @@ mod attaching {
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (1, 0, 0));
         let s = &index.assets[&tree("s")];
-        let made = s.files.iter().find(|f| f.name == "native.bin").unwrap();
+        let made = s.files.iter().find(|f| *f.name == *"native.bin").unwrap();
         assert_eq!(made.made_by.as_deref(), Some("test.strips@line"));
         assert_eq!(std::fs::read(&made.path).unwrap(), b"b a");
         let settings = s.settings().to_toml();

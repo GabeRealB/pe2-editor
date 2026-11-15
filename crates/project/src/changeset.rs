@@ -20,8 +20,10 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, RelPath, Tree, Uid, VfsPath};
+use pe2_path::{RelPath, Tree, Uid, VfsPath};
+use sfs::HostPath;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::cache::write_atomic;
 
@@ -40,11 +42,11 @@ pub enum Op {
     /// Its own version, at the entry's resolved path in the layer: the files it changes, by name (a plain file's own,
     /// ""), and `to` a move with it.
     Override {
-        files: BTreeMap<RelPath, Base>,
-        to: Option<VfsPath<Tree>>,
+        files: BTreeMap<Arc<RelPath>, Base>,
+        to: Option<Arc<VfsPath<Tree>>>,
     },
     Move {
-        to: VfsPath<Tree>,
+        to: Arc<VfsPath<Tree>>,
     },
     Delete,
 }
@@ -54,7 +56,7 @@ pub struct Changeset {
     pub read_only: bool,
     pub ignore: Vec<String>,
     /// What the layer creates: uid -> path.
-    pub entries: BTreeMap<Uid, VfsPath<Tree>>,
+    pub entries: BTreeMap<Uid, Arc<VfsPath<Tree>>>,
     /// What it does to entries from below, by uid.
     pub ops: BTreeMap<Uid, Op>,
 }
@@ -64,9 +66,9 @@ fn string(value: &toml::Value, what: &str) -> Result<String> {
 }
 
 /// A path of the project's tree a changeset names, checked as it is read.
-fn tree_path(value: &toml::Value, what: &str) -> Result<VfsPath<Tree>> {
+fn tree_path(value: &toml::Value, what: &str) -> Result<Arc<VfsPath<Tree>>> {
     let text = string(value, what)?;
-    VfsPath::new(&text).with_context(|| format!("{what}: {text}"))
+    VfsPath::new(&text).map(ToOwned::to_owned).with_context(|| format!("{what}: {text}"))
 }
 
 /// A uid a changeset names, checked as it is read.
@@ -127,7 +129,7 @@ impl Changeset {
                         _ => bail!("{uid_text}: {name}: neither a hash nor a table"),
                     };
                     let file = RelPath::new(name).with_context(|| format!("{uid_text}: {name}"))?;
-                    bases.insert(file, base);
+                    bases.insert(file.to_owned(), base);
                 }
                 Op::Override { files: bases, to }
             } else if let Some(to) = to {
@@ -153,7 +155,7 @@ impl Changeset {
             lines.push(format!("ignore = [{}]", self.ignore.iter().map(|i| quote(i)).collect::<Vec<_>>().join(", ")));
         }
         lines.extend([String::new(), "[entries]".into()]);
-        let mut entries: Vec<(&Uid, &VfsPath<Tree>)> = self.entries.iter().collect();
+        let mut entries: Vec<(&Uid, &VfsPath<Tree>)> = self.entries.iter().map(|(uid, path)| (uid, &**path)).collect();
         entries.sort_by(|a, b| a.1.cmp(b.1));
         lines.extend(
             entries.into_iter().map(|(uid, path)| format!("{} = {}", quote(&uid.to_string()), quote(path.as_str()))),

@@ -17,6 +17,7 @@ extensions.workspace = true
 pe2-ext.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+sfs.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -29,4 +30,4 @@ vfs.workspace = true
 sha1.workspace = true
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

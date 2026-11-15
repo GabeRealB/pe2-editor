@@ -27,6 +27,7 @@ tracing.workspace = true
 codecs.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+sfs.workspace = true
 vfs.workspace = true
 extensions.workspace = true
 pe2-ext.workspace = true
@@ -59,7 +60,7 @@ tracy = ["project/tracy"]
 tests = ["dep:egui_kittest"]
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }
 egui_kittest.workspace = true
 
 # Ended by a signal, the editor unmounts what it mounted (its scoped mounts).

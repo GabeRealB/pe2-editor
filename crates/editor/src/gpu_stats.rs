@@ -161,10 +161,10 @@ struct FdInfo {
 impl FdInfo {
     fn read(&mut self) -> Option<Reading> {
         let mut clients: HashMap<String, Client> = HashMap::new();
-        let descriptors = pe2_path::HostPath::new(Path::new("/proc/self/fd")).ok()?;
+        let descriptors = Path::new("/proc/self/fd");
         for entry in std::fs::read_dir("/proc/self/fdinfo").ok()?.flatten() {
             let is_gpu =
-                std::fs::read_link(descriptors.entry(&entry.file_name())).is_ok_and(|to| to.starts_with("/dev/dri"));
+                std::fs::read_link(descriptors.join(entry.file_name())).is_ok_and(|to| to.starts_with("/dev/dri"));
             // A connection opened twice is one client.
             if is_gpu && let Some(client) = std::fs::read_to_string(entry.path()).ok().as_deref().and_then(parse_fdinfo)
             {

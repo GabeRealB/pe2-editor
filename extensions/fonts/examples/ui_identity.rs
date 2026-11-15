@@ -4,8 +4,7 @@
 //!
 //! The page (stage 0 file 20162's font image) and Medium's, Large's and Small's tables (the executable's
 //! `_gFontGlyphs*`) are read into the faces' glyphs and the atlas's layout, made again from them, and compared.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use pe2_fonts::atlas::{self, FaceSpec, PageSpec};
 use pe2_fonts::encoding::Encoding;
@@ -17,7 +16,7 @@ const HEADER: usize = 0x800;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let assets = HostPath::new(Path::new(&args[0])).expect("the assets' folder");
+    let assets = Path::new(&args[0]);
     let exe = std::fs::read(&args[1]).expect("the executable");
     let payload = std::fs::read(assets.at("raw/pe2img/ui/font/image.pe2img")).expect("the font page");
     let pages = codecs::texture::pages(&payload).expect("its pages");
@@ -76,8 +75,8 @@ fn main() {
             layout.faces[&spec.name].rows.len()
         );
     }
-    let out = args.get(2).map(|out| HostPath::new(Path::new(out)).expect("the folder to write in"));
-    let read_back = through_ufo(&specs, &glyphs, out.as_ref());
+    let out = args.get(2).map(Path::new);
+    let read_back = through_ufo(&specs, &glyphs, out);
     let layout = pe2_fonts::layout_of(&pe2_fonts::layout_text(&layout)).expect("the layout reads back");
     let (made, made_tables) = atlas::generate(&page, &specs, &read_back, &layout).expect("made");
     let differ = made.iter().zip(&texels).filter(|(a, b)| a != b).count();
@@ -123,7 +122,7 @@ fn packing(page: &PageSpec, specs: &[FaceSpec], fonts: &[Vec<atlas::Glyph>], lay
 }
 
 /// Through UFO: each face written as a font editor opens it (into `out`, where given), and read back.
-fn through_ufo(specs: &[FaceSpec], glyphs: &[Vec<atlas::Glyph>], out: Option<&HostPath>) -> Vec<Vec<atlas::Glyph>> {
+fn through_ufo(specs: &[FaceSpec], glyphs: &[Vec<atlas::Glyph>], out: Option<&Path>) -> Vec<Vec<atlas::Glyph>> {
     let mut read_back = Vec::new();
     for (spec, face) in specs.iter().zip(glyphs) {
         let files = pe2_fonts::face::ufo_files(

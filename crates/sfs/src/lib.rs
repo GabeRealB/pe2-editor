@@ -22,15 +22,19 @@
 pub mod content;
 pub mod fs;
 pub mod header;
+mod host;
 pub mod log;
 pub mod ops;
 pub mod ring;
 pub mod space;
 pub mod storage;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tree;
 
 pub use content::Content;
 pub use header::Header;
+pub use host::{HostPath, NotWithin};
 pub use log::{Log, Record};
 pub use ops::Op;
 pub use space::Space;

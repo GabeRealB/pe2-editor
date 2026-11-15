@@ -7,7 +7,7 @@
 //! are neither reordered nor removed here.
 
 use anyhow::{Context, Result, bail};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
@@ -191,7 +191,7 @@ mod tests {
         LayerInfo {
             name: name.into(),
             kind: LayerKind::Assets,
-            at: crate::TreePath::root(),
+            at: crate::TreePath::root().to_owned(),
             read_only: false,
             writable: true,
             mounted: false,

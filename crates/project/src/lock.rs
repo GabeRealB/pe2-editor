@@ -16,14 +16,15 @@
 //! and a WSL one would not see each other's locks across that share anyway.
 
 use anyhow::{Context, Result};
-use pe2_path::{HostPath, Name};
+use pe2_path::Name;
+use sfs::HostPath;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::cache::DIR;
 
-const LOCK: Name = Name::constant("lock");
-const OWNER: Name = Name::constant("lock.owner");
+const LOCK: &Name = Name::constant("lock");
+const OWNER: &Name = Name::constant("lock.owner");
 const HELD: &str = "PE2_PROJECT_LOCKED";
 
 /// A project held: the lock lasts until this is dropped. None when a parent process holds it for this one.

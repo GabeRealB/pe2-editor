@@ -13,14 +13,20 @@
 //! undoable ones. The rest is read-only: writes wait for the write path, where they become operations in the active
 //! layer.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the editors' presence is kept in the program's own folder: plain paths; a project's places are HostPaths, joined only of checked names"
+)]
+
 pub mod link;
 pub mod presence;
 pub mod server;
 mod tools;
 
-use pe2_path::HostPath;
 use rmcp::model::{CallToolResult, ReadResourceResult};
 use serde::{Deserialize, Serialize};
+use sfs::HostPath;
+use std::sync::Arc;
 
 pub use tools::{ActArgs, EDITOR_UI, RunArgs, ScreenshotArgs, TypeArgs, UiArgs, definitions};
 
@@ -59,7 +65,7 @@ pub struct Holder {
     pub pid: u32,
     pub program: Option<HostPath>,
     pub built: Option<u64>,
-    pub data: Option<HostPath>,
+    pub data: Option<std::path::PathBuf>,
     pub trusts_everything: bool,
 }
 
@@ -177,11 +183,11 @@ impl Request {
 /// What the editor shows, where the editor answers: its selection, and an asset an agent asked it to show.
 #[derive(Default)]
 pub struct EditorState {
-    pub selection: Option<project::TreePath>,
+    pub selection: Option<Arc<project::TreePath>>,
     /// The look the selection is shown in, by name.
     pub variant: Option<String>,
     /// Set by a request: the asset to show.
-    pub show: Option<project::TreePath>,
+    pub show: Option<Arc<project::TreePath>>,
     /// What the editor is costing now.
     pub performance: serde_json::Value,
 }

@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 
 use crate::View;
 
@@ -378,8 +379,8 @@ fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
 }
 
 /// A path of the tree an agent names, checked as it comes in.
-fn tree(text: &str) -> Result<project::TreePath, String> {
-    project::TreePath::new(text).map_err(|e| format!("{text}: {e}"))
+fn tree(text: &str) -> Result<Arc<project::TreePath>, String> {
+    (project::TreePath::new(text).map_err(|e| format!("{text}: {e}"))).map(ToOwned::to_owned)
 }
 
 fn summary(extensions: &Extensions, asset: &Asset) -> Value {
@@ -448,8 +449,11 @@ fn find_assets(index: &Index, extensions: &Extensions, args: &FindArgs) -> Value
 fn list_folder(index: &Index, extensions: &Extensions, path: Option<&str>) -> Result<Value, String> {
     let folder = tree(path.unwrap_or_default().trim_matches('/'))?;
     let (mut folders, mut assets, mut files) = (vec![], vec![], vec![]);
-    // What is under it sits after it in the index's order, among others sharing its text (`a-b` after `a`).
-    let after = index.entries.range(folder.clone()..).take_while(|(key, _)| key.as_str().starts_with(folder.as_str()));
+    // Paths order name by name: what is under it follows it, before anything that is not.
+    let after = index
+        .entries
+        .range::<project::TreePath, _>(pe2_path::from(&*folder))
+        .take_while(|(key, _)| key.starts_with(&folder));
     for (key, entry) in after {
         let Some(name) = key.strip_prefix(&folder) else { continue };
         if name.parts().count() != 1 {
@@ -710,7 +714,7 @@ fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -
         extensions.tools().iter().find(|t| t.name.local() == name).ok_or_else(|| format!("no tool is named {name}"))?;
     let arguments: toml::Value =
         serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
-    let selection = view.editor.as_ref().and_then(|e| e.selection.as_ref());
+    let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());
     let lens = Lens { index: view.index, extensions, selection, chosen: None, revision: 0 };
     let answer = (tool.run)(&lens, &arguments).map_err(|e| format!("{e:#}"))?;
     serde_json::to_value(answer).map_err(|e| e.to_string())

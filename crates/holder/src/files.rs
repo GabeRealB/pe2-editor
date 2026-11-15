@@ -14,7 +14,7 @@
 //! The server does not serve over files in the folder that are not the project's (`vfs::strays`): the user chooses to
 //! set them aside or take them in, and the server is started again to.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -198,8 +198,8 @@ fn who() -> &'static str {
 }
 
 /// `pe2-cli`, which the server is: this program where it is that, else the one beside it.
-fn cli() -> anyhow::Result<HostPath> {
-    let program = HostPath::new(&std::env::current_exe()?)?;
+fn cli() -> anyhow::Result<std::path::PathBuf> {
+    let program = std::env::current_exe()?;
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned());
     let cli = if name.as_deref() == Some("pe2-cli") { program } else { project::host::cli_beside(&program) };
     if !cli.is_file() {

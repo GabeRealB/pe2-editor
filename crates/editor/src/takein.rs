@@ -16,13 +16,14 @@
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use holder::core::{Core, Queue};
-use pe2_path::{HostPath, Uid};
+use pe2_path::Uid;
 use project::Project;
 use project::cache::Cache;
 use project::ext::Extensions;
 use project::history::History;
 use project::imports::Imports;
 use project::index::{Index, LayerInfo, Working};
+use sfs::HostPath;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -68,7 +69,7 @@ pub struct Showing {
     pub viewing: bool,
     pub author: &'static str,
     /// The asset selected: what an extension's tool asked for by an agent works on where it names none.
-    pub selected: Option<project::TreePath>,
+    pub selected: Option<Arc<project::TreePath>>,
     /// The config in use: what an event signaled with none named is for.
     pub config: Option<project::Config>,
     /// Whether the window holds events back - a plan is filling a layer: they are signaled once it has.
@@ -197,7 +198,7 @@ pub struct Snapshot {
     pub tree: Arc<Node>,
     pub layers: Vec<LayerInfo>,
     /// The assets whose content or entry changed; every asset where `all`.
-    pub changed: BTreeSet<project::TreePath>,
+    pub changed: BTreeSet<Arc<project::TreePath>>,
     /// It took in files changed, assets or not.
     pub files: bool,
     pub all: bool,
@@ -212,7 +213,7 @@ pub struct Snapshot {
     /// It took in what other programs changed.
     pub others: bool,
     /// What was selected when a step undone or made again from outside the window was made: shown again.
-    pub select: Option<project::TreePath>,
+    pub select: Option<Arc<project::TreePath>>,
     /// What the work the window asked for came to (`TakeIn::ask`), by its ticket.
     pub outcomes: Vec<(u64, Outcome)>,
 }
@@ -264,7 +265,7 @@ pub struct Worker {
     /// Whether what the importers made is attached: an epoch works from the project with it.
     attached: bool,
     /// What a step undone from outside the window had selected, until it is handed over.
-    select: Option<project::TreePath>,
+    select: Option<Arc<project::TreePath>>,
     /// What the work the window asked for came to, until it is handed over.
     outcomes: Vec<(u64, Outcome)>,
     /// What went wrong off a take-in - the layers' watch failing - until it is handed over.
@@ -736,7 +737,7 @@ impl Worker {
         if !self.attached || showing.holding {
             return Err((events, config));
         }
-        let named = config.as_ref().and_then(|name| self.core.project.configs.iter().find(|c| c.name == *name));
+        let named = config.as_ref().and_then(|name| self.core.project.configs.iter().find(|c| *c.name == **name));
         let (reply, answered) = mpsc::channel();
         let Some(config) = named.cloned().or(showing.config) else {
             let _ = reply.send(mcp::Reply::failed("the project has no config".to_string()));
@@ -959,7 +960,7 @@ impl Worker {
     fn snapshot(
         &mut self,
         ticket: u64,
-        changed: BTreeSet<project::TreePath>,
+        changed: BTreeSet<Arc<project::TreePath>>,
         all: bool,
         error: Option<String>,
         (files, others): (bool, bool),

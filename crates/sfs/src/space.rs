@@ -43,7 +43,8 @@
 //!   is found not to be the one pointed to - what is read there is right, of the last commit or one before it,
 //!   or said damaged.
 
-use pe2_path::{HostPath, Name};
+use crate::HostPath;
+use pe2_path::Name;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io;
@@ -81,28 +82,28 @@ const PIECE: usize = 1 << 16;
 /// The most pieces a list has: room for more entries than a space has pages.
 const PIECES: usize = 2048;
 /// Where what a space held is kept, in its folder, when it is begun anew for not being trusted.
-const LEFT: Name = Name::constant("left");
+const LEFT: &Name = Name::constant("left");
 /// The files a space is kept in, in its folder: what it says of itself, its head, its free lists, who writes it, who
 /// is attached, what is pinned; what grows it, and what is set aside when it is found damaged.
-const CLEAN: Name = Name::constant("clean");
-const HEAD: Name = Name::constant("head");
-const FREE: Name = Name::constant("free");
-const WRITER: Name = Name::constant("writer");
-const ATTACHED_FILE: Name = Name::constant("attached");
-const PINS_FILE: Name = Name::constant("pins");
-const GROW: Name = Name::constant("grow");
-const DAMAGED: Name = Name::constant("damaged");
+const CLEAN: &Name = Name::constant("clean");
+const HEAD: &Name = Name::constant("head");
+const FREE: &Name = Name::constant("free");
+const WRITER: &Name = Name::constant("writer");
+const ATTACHED_FILE: &Name = Name::constant("attached");
+const PINS_FILE: &Name = Name::constant("pins");
+const GROW: &Name = Name::constant("grow");
+const DAMAGED: &Name = Name::constant("damaged");
 
 /// A file of a space's own, named as the space names it (a number and what it holds).
-fn named(text: &str) -> io::Result<Name> {
-    Name::new(text).map_err(io::Error::other)
+fn named(text: &str) -> io::Result<Arc<Name>> {
+    Name::new(text).map(Name::to_owned).map_err(io::Error::other)
 }
 /// What a page begins with: its kind (1), nothing (3), its own number (4), the generation that wrote it (8).
 pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
 const PROBE: Duration = Duration::from_millis(100);
 
-const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x03");
+const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x04");
 
 /// Where each value of the shared header (page 0 of `head`) is.
 mod at {
@@ -1940,7 +1941,7 @@ impl Drop for Txn<'_> {
 }
 
 /// The spaces this process has attached (`shared`), each by its folder: for as long as it runs.
-static OPEN: Mutex<Vec<(pe2_path::HostPath, Arc<Space>)>> = Mutex::new(Vec::new());
+static OPEN: Mutex<Vec<(crate::HostPath, Arc<Space>)>> = Mutex::new(Vec::new());
 
 /// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::leave`): what a
 /// process does last as it ends in order - one that ends runs nothing more of its own, and whatever of it still
@@ -1959,7 +1960,7 @@ pub fn rest_all() -> io::Result<()> {
 ///
 /// # Errors
 /// As `Space::open`.
-pub fn shared(dir: &pe2_path::HostPath) -> io::Result<Arc<Space>> {
+pub fn shared(dir: &crate::HostPath) -> io::Result<Arc<Space>> {
     std::fs::create_dir_all(dir)?;
     let dir = dir.clone();
     let mut open = lock(&OPEN);

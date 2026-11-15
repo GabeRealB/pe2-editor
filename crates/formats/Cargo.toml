@@ -12,4 +12,3 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }

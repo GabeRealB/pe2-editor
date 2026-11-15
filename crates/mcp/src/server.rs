@@ -2,7 +2,6 @@
 //! otherwise answered here under the project lock, taken for that request alone.
 
 use anyhow::Context as _;
-use pe2_path::HostPath;
 use project::Project;
 use project::cache::Cache;
 use project::index::Index;
@@ -14,6 +13,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
+use sfs::HostPath;
 use std::time::Duration;
 
 use crate::{Reply, Request, View, answer, link};

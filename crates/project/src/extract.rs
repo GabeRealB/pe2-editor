@@ -3,7 +3,8 @@
 //! bundles were given into what a container assembled from them is (`assembled_sha1`: a disc's movie file).
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, RelPath};
+use pe2_path::RelPath;
+use sfs::HostPath;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -242,7 +243,8 @@ struct Written {
 
 impl Written {
     fn open(layers: [&HostPath; 2], path: &str, uid: &str) -> Result<Written> {
-        let bundle = RelPath::new(&format!("{path}{}", crate::index::BUNDLE_SUFFIX))?;
+        let bundle = format!("{path}{}", crate::index::BUNDLE_SUFFIX);
+        let bundle = RelPath::new(&bundle)?;
         let dirs = layers.map(|layer| layer.join(&bundle));
         let declaration = crate::content::read_to_string(&dirs[0].join(&crate::index::NODE_FILE))
             .with_context(|| format!("{path}: its node.toml"))?;
@@ -383,7 +385,7 @@ pub(crate) fn assembled_sha1(
     // A records layer's changeset is what its records say.
     let changeset = match crate::records::Set::changeset(layers[0]) {
         Some(changeset) => changeset,
-        None => Changeset::load(&layers[0].with_suffix(&crate::CHANGESET_SUFFIX))?,
+        None => Changeset::load(&layers[0].with_suffix(crate::CHANGESET_SUFFIX))?,
     };
     let all = changeset
         .entries

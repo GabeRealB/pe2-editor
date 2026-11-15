@@ -138,7 +138,7 @@ pub struct Ring {
     /// How many slots it has: a multiple of `WAYS`.
     slots: usize,
     /// A file of memory it is in, held while it is mapped here: removed by the last process to let go of it.
-    shared: Option<(std::fs::File, pe2_path::HostPath)>,
+    shared: Option<(std::fs::File, crate::HostPath)>,
 }
 
 impl Drop for Ring {
@@ -215,7 +215,7 @@ impl Ring {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, "no memory to name here"));
             }
             let name = pe2_path::Name::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let path = pe2_path::HostPath::new(memory)?.join(&name);
+            let path = crate::HostPath::new(memory)?.join(&name);
             // Held shared while it is mapped here: who lets go of it last removes it.
             let held = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
             // One of another length is made anew only where no process has it: it is not cut short under one that
@@ -431,7 +431,7 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pe2_path::HostPath;
+    use crate::HostPath;
     use std::sync::atomic::AtomicBool;
 
     /// A page's bytes, as its key alone says them: what is read back is held to it.
@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn file(name: &str) -> HostPath {
-        let path = pe2_path::testing::scratch(&format!("sfs-ring-{name}"));
+        let path = crate::testing::scratch(&format!("sfs-ring-{name}"));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -616,7 +616,10 @@ mod tests {
         let anew = Ring::shared(&name, 4 << 20).unwrap();
         assert_eq!(anew.get(&key, &mut out), None, "made anew once nobody had it");
         drop(anew);
-        assert!(!HostPath::new(Path::new("/dev/shm")).unwrap().join(&pe2_path::Name::new(&name).unwrap()).exists(), "left behind");
+        assert!(
+            !HostPath::new(Path::new("/dev/shm")).unwrap().join(&pe2_path::Name::new(&name).unwrap()).exists(),
+            "left behind"
+        );
     }
 
     #[test]

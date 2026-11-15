@@ -18,7 +18,7 @@
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -64,8 +64,9 @@ pub const LINKS: usize = 12;
 
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
-/// of the files changes.
-const FORMAT: u32 = 5;
+/// of the files changes, and one whose names were compared by another version of Unicode
+/// (`pe2_path::UNICODE_VERSION`), by which names are one name.
+const FORMAT: u32 = 6;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.
@@ -188,7 +189,7 @@ pub(crate) fn name(root: &HostPath, path: &HostPath) -> String {
     // same (`named`).
     match path.within(root) {
         Ok(within) => format!("/{within}"),
-        Err(pe2_path::NotWithin::Outside | pe2_path::NotWithin::Refused(_)) => format!("={path}"),
+        Err(sfs::NotWithin::Outside | sfs::NotWithin::Refused(_)) => format!("={path}"),
     }
 }
 
@@ -323,7 +324,7 @@ fn text(text: &str) -> Vec<u8> {
 pub enum Held {
     Folder,
     File(HostPath),
-    Bundle(BTreeMap<pe2_path::RelPath, HostPath>),
+    Bundle(BTreeMap<Arc<pe2_path::RelPath>, HostPath>),
     Refused(Box<str>),
 }
 
@@ -404,7 +405,7 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
         Kind::File => 2,
     });
     out.maybe(record.parent.map(|parent| parent.to_string()).as_deref());
-    out.maybe(record.name.as_ref().map(pe2_path::Name::as_str));
+    out.maybe(record.name.as_ref().map(|path| path.as_str()));
     out.u32(u32::try_from(record.files.len()).unwrap_or(u32::MAX));
     for (file, held) in &record.files {
         out.text(file.as_str());
@@ -446,12 +447,12 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
         None => None,
     };
     let name = match name {
-        Some(name) => Some(pe2_path::Name::new(&name).ok()?),
+        Some(name) => Some(pe2_path::Name::new(&name).ok()?.to_owned()),
         None => None,
     };
     let mut files = BTreeMap::new();
     for _ in 0..read.u32()? {
-        let file = pe2_path::RelPath::new(&read.text()?).ok()?;
+        let file = pe2_path::RelPath::new(&read.text()?).ok()?.to_owned();
         let content = match read.u8()? {
             0 => None,
             1 => Some(Content::Text(read.text()?)),
@@ -510,7 +511,9 @@ fn held_of(root: &HostPath, value: &[u8]) -> Option<(Held, Option<String>)> {
         4 => Held::File(named(root, &read.text()?)?),
         8 => {
             // Each name checked as it is read back: a model naming one that is none is no model to open over.
-            let file = |read: &mut In| Some((pe2_path::RelPath::new(&read.text()?).ok()?, named(root, &read.text()?)?));
+            let file = |read: &mut In| {
+                Some((pe2_path::RelPath::new(&read.text()?).ok()?.to_owned(), named(root, &read.text()?)?))
+            };
             let files = (0..read.u32()?).map(|_| file(&mut read)).collect::<Option<_>>()?;
             Held::Bundle(files)
         }
@@ -633,8 +636,11 @@ const TREES: [usize; 5] = [INPUTS, RECORDS, STACK, ASSETS, LINKS];
 /// Whether the trees hold a model of this format.
 fn is_begun(pages: &impl Pages) -> Result<bool> {
     let said = sfs::tree::get_in(pages, INPUTS, &[META])?;
-    let said = said.as_deref().and_then(In::after_stamp).and_then(|mut said| Some((said.u32()?, said.u32()?)));
-    Ok(said == Some((FORMAT, crate::cache::SCHEMA)))
+    let said = said.as_deref().and_then(In::after_stamp);
+    let said = said.and_then(|mut said| Some((said.u32()?, said.u32()?, said.text()?)));
+    Ok(said.is_some_and(|(format, schema, unicode)| {
+        (format, schema, unicode.as_str()) == (FORMAT, crate::cache::SCHEMA, pe2_path::UNICODE_VERSION)
+    }))
 }
 
 /// Have the trees hold a model of this format: one of another, or what a space keeps of none, is taken away, for
@@ -662,6 +668,7 @@ fn meta(generation: u64) -> Vec<u8> {
     out.0[..8].copy_from_slice(&generation.to_le_bytes());
     out.u32(FORMAT);
     out.u32(crate::cache::SCHEMA);
+    out.text(pe2_path::UNICODE_VERSION);
     out.0
 }
 
@@ -955,7 +962,7 @@ mod tests {
     use super::*;
     use crate::testing::At as _;
     use crate::testing::{rel, uid};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     fn a_record(n: u64, declared: bool) -> Record {
         let declaration = declared.then(|| Declaration {
@@ -997,7 +1004,7 @@ mod tests {
     /// What two layers hold, as a walk of them finds it: folders, plain files, bundles - one of a name no key holds.
     fn held_by(root: &HostPath) -> Layers {
         let game = root.at(".layers/game");
-        let bundle = |n: u64| -> BTreeMap<pe2_path::RelPath, HostPath> {
+        let bundle = |n: u64| -> BTreeMap<Arc<pe2_path::RelPath>, HostPath> {
             let folder = game.at(&format!("rooms/r{n}.node"));
             (0..=n % 3).map(|f| (rel(&format!("file{f}.bin")), folder.at(&format!("file{f}.bin")))).collect()
         };
@@ -1094,7 +1101,7 @@ mod tests {
                 op,
                 kind,
                 parent: (placed && n % 2 == 0).then(|| uid(&format!("uid://parent{n}"))),
-                name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap()),
+                name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap().to_owned()),
                 files,
             };
             (format!("uid://{n:012}"), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
@@ -1384,6 +1391,7 @@ mod tests {
         let mut said = Out::new();
         said.u32(FORMAT + 1);
         said.u32(crate::cache::SCHEMA);
+        said.text(pe2_path::UNICODE_VERSION);
         sfs::tree::put(&mut txn, INPUTS, &[META], &said.0).unwrap();
         sfs::tree::put(&mut txn, INPUTS, b"f/old", b"what it held").unwrap();
         sfs::tree::put(&mut txn, ASSETS, b"an asset", b"of then").unwrap();

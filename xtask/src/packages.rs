@@ -503,8 +503,11 @@ fn build(
 /// files a step reads are (a generated source's path, which an assertion's message carries), and no path of the
 /// folders the packages are built in - either would make what anyone else builds differ from what is released.
 fn names_no_build_path(out: &Path, work: &Path) -> Result<()> {
-    let work = pe2_path::HostPath::new(work).with_context(|| work.display().to_string())?;
-    let needles = [".zig-cache/".to_owned(), work.to_string_lossy().into_owned()];
+    // As a build sees it: absolute, its links resolved - in the plain form, not Windows' `\\?\` one.
+    let work = std::fs::canonicalize(work).with_context(|| work.display().to_string())?;
+    let work = work.to_string_lossy();
+    let work = work.strip_prefix(r"\\?\").filter(|plain| !plain.starts_with("UNC\\")).unwrap_or(&work);
+    let needles = [".zig-cache/".to_owned(), work.to_owned()];
     let mut files = Vec::new();
     crate::gather(out, "", &mut files)?;
     for (name, bytes, _) in &files {
@@ -979,8 +982,7 @@ fn setup(config: &Config, name: &str, tag: &str, built: &[Archive]) -> Result<St
             let windows = archive.platform.starts_with("windows");
             let exe = if windows && archive.built.join(format!("{program}.exe")).is_file() { ".exe" } else { "" };
             let (program, to) = (format!("{program}{exe}"), format!("{to}{exe}"));
-            let sha256 =
-                pe2_setup::hash(&pe2_path::HostPath::new(&archive.built)?.join(&pe2_path::Name::new(&program)?))?;
+            let sha256 = pe2_setup::hash(&archive.built.join(&program))?;
             take.push(format!("{program:?} = {{ to = {to:?}, sha256 = {sha256:?} }}"));
         }
         let _ = write!(

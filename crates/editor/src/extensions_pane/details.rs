@@ -4,7 +4,6 @@
 
 use eframe::egui::{self, RichText};
 use pe2_ext::{Scope, Setting};
-use pe2_path::HostPath;
 use project::ext::{Dependency, Origin, Present, Status};
 use std::collections::BTreeSet;
 
@@ -510,7 +509,7 @@ pub(super) fn fetch_state_ui(
     ws: &mut Workspace,
     p: &Present,
     setup: &project::ext::setup::Setup,
-    store: &HostPath,
+    store: &std::path::Path,
     runs: bool,
     message: &mut Option<String>,
 ) {

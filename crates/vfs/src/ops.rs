@@ -4,7 +4,9 @@
 //! (`forget`, `adopt`, `remove-unlisted`) is a layer's own path, as the problem gives it. A file's content goes by the
 //! path of a file holding it (`from`), never inline: what applies it reads it there.
 
-use pe2_path::{HostPath, Uid};
+use pe2_path::Uid;
+use sfs::HostPath;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use project::edit::{self, Resolution};
@@ -21,52 +23,52 @@ use crate::write::Change;
 pub enum Op {
     /// Write a file - of a node, or a plain one - with what a file holds; a `node.toml` in a folder makes it a node.
     Write {
-        path: String,
+        path: Arc<TreePath>,
         from: crate::write::Written,
     },
     /// Make a folder.
     Folder {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Delete an entry (a node with what is inside it), or remove a file of a node.
     Remove {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Rename or move an entry, or a file within its node.
     Rename {
-        from: String,
-        to: String,
+        from: Arc<TreePath>,
+        to: Arc<TreePath>,
     },
     /// Make the layer's own version of an entry from below.
     Override {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Drop the layer's operation on an entry - an override, a move, a delete - and what it holds of it.
     Drop {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Keep the layer's version of a stale override: its base is what is below now.
     KeepMine {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Give up the layer's version of an entry for the one below (a move with it stays).
     TakeBase {
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Take an entry a layer lists and no longer holds out of its list, by the layer's own path.
     Forget {
         layer: String,
-        path: String,
+        path: Arc<TreePath>,
     },
     /// List what a layer holds unlisted at and under its own path.
     Adopt {
         layer: String,
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Remove what a layer holds unlisted at its own path from its folder.
     RemoveUnlisted {
         layer: String,
-        path: String,
+        path: Arc<TreePath>,
     },
     /// Take back the last step, or do again the last taken back.
     Undo,
@@ -99,7 +101,7 @@ impl Op {
 
     /// The paths of the tree it names.
     #[must_use]
-    pub fn paths(&self) -> Vec<&str> {
+    pub fn paths(&self) -> Vec<&TreePath> {
         match self {
             Op::Rename { from, to } => vec![from, to],
             Op::Write { path, .. }
@@ -121,12 +123,9 @@ impl Op {
     /// one they made, a file moved that they wrote - where edits that have nothing to do with each other are
     /// made over the project as it was and taken in once.
     #[must_use]
-    pub fn follows(&self, earlier: &[String]) -> bool {
-        let within = |inner: &str, outer: &str| {
-            inner.strip_prefix(outer).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        };
+    pub fn follows(&self, earlier: &[Arc<TreePath>]) -> bool {
         let paths = self.paths();
-        earlier.iter().any(|before| paths.iter().any(|path| within(path, before) || within(before, path)))
+        earlier.iter().any(|before| paths.iter().any(|path| path.starts_with(before) || before.starts_with(path)))
     }
 
     /// Whether what it asks, as a program asks it through the folder, is so already (`write::so_already`).
@@ -137,15 +136,9 @@ impl Op {
 }
 
 /// The uid of the entry at a path of the tree: a node's (`x` for `x.node`), a folder's or a file's.
-fn uid_at(index: &Index, path: &str) -> Result<Uid> {
-    let path = tree(path)?;
-    let entry = index.entries.get(&bundle_named(&path)).or_else(|| index.entries.get(&path));
+fn uid_at(index: &Index, path: &TreePath) -> Result<Uid> {
+    let entry = index.entries.get(&*bundle_named(path)).or_else(|| index.entries.get(path));
     entry.map(|e| e.uid).with_context(|| format!("{path}: nothing is there"))
-}
-
-/// A path an edit names, as text: checked where it becomes an edit of the project.
-fn tree(text: &str) -> Result<TreePath> {
-    TreePath::new(text).with_context(|| format!("{text}: no path of the project"))
 }
 
 /// Apply an edit to a layer, as a step of the history: the step's label, and the paths it touched for the index to take
@@ -172,11 +165,11 @@ pub fn apply(
             edit::resolve(project, index, layer, uid_at(index, path)?, Resolution::TakeBase, history)?
         }
         Op::Forget { layer: of, path } => {
-            let uid = index.listed(of, &tree(path)?).with_context(|| format!("{of} does not list {path}"))?;
+            let uid = index.listed(of, path).with_context(|| format!("{of} does not list {path}"))?;
             edit::forget(project, index, of, uid, history)?
         }
-        Op::Adopt { layer: of, path } => edit::adopt(project, index, of, &tree(path)?, history)?,
-        Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, &tree(path)?, history)?,
+        Op::Adopt { layer: of, path } => edit::adopt(project, index, of, path, history)?,
+        Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, path, history)?,
         Op::Undo => {
             let step = history.undo(index, None, false).map_err(|e| anyhow::anyhow!("{e}"))?;
             return Ok((format!("Undid {}", step.label), step.paths()));
@@ -203,10 +196,13 @@ mod tests {
 
     #[test]
     fn an_op_is_json_by_its_name() {
-        let op = Op::Rename { from: "a".into(), to: "b".into() };
+        let path = |text: &str| project::TreePath::new(text).unwrap().to_owned();
+        let op = Op::Rename { from: path("a"), to: path("b") };
         let text = serde_json::to_string(&op).unwrap();
         assert_eq!(text, r#"{"op":"rename","from":"a","to":"b"}"#);
         assert_eq!(serde_json::from_str::<Op>(&text).unwrap(), op);
         assert_eq!(serde_json::to_string(&Op::Undo).unwrap(), r#"{"op":"undo"}"#);
+        // A path is checked as it is read: one that is none is no op.
+        assert!(serde_json::from_str::<Op>(r#"{"op":"remove","path":"a/../b"}"#).is_err());
     }
 }

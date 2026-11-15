@@ -45,7 +45,8 @@ use std::path::Path;
 fn sharded(dir: &HostPath, key: &str) -> io::Result<HostPath> {
     Ok(dir.join(&RelPath::sharded(key, "").map_err(io::Error::other)?))
 }
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::time::{Duration, SystemTime};
 
 /// Files this long or longer are stored as chunks.
@@ -79,15 +80,15 @@ pub fn sync_written(root: &HostPath) {
     }
 }
 /// The name a manifest adds to its file's.
-pub const SUFFIX: Name = Name::constant(".chunks");
+pub const SUFFIX: &Name = Name::constant(".chunks");
 /// The store, among a project's layers.
-pub const STORE: Name = Name::constant(".store");
+pub const STORE: &Name = Name::constant(".store");
 /// Where the store keeps whole files by their SHA-1 - a manifest of chunks each, whatever their size: the versions an
 /// override was made from (`changeset::Base`), what a layer holds of its own.
-const FILES: Name = Name::constant("files");
+const FILES: &Name = Name::constant("files");
 /// Where it keeps whole objects, and trees of them.
-const OBJECTS: Name = Name::constant("objects");
-const TREES: Name = Name::constant("trees");
+const OBJECTS: &Name = Name::constant("objects");
+const TREES: &Name = Name::constant("trees");
 const TREE_HEADER: &str = "pe2 tree 1";
 const HEADER: &str = "pe2 chunks 1";
 const MIN: usize = 16 << 10;
@@ -452,7 +453,7 @@ impl Store {
 
     /// Every file kept whole, by SHA-1, with its manifest's text.
     fn files(&self) -> Vec<(String, HostPath)> {
-        self.kept_in(&FILES)
+        self.kept_in(FILES)
     }
 
     /// The store of the project whose layers hold a path: none for a path in no project's `.layers`.
@@ -529,13 +530,13 @@ impl Store {
 /// A file's manifest: its path with `.chunks` added.
 #[must_use]
 pub fn manifest_path(path: &HostPath) -> HostPath {
-    path.with_suffix(&SUFFIX)
+    path.with_suffix(SUFFIX)
 }
 
 /// The file a manifest stands for: its path without `.chunks`; none for a path that is no manifest.
 #[must_use]
 pub fn logical(path: &HostPath) -> Option<HostPath> {
-    path.without_suffix(&SUFFIX)
+    path.without_suffix(SUFFIX)
 }
 
 /// The chunks no manifest names: of the store, those absent from `named`.
@@ -557,7 +558,7 @@ fn files_under(dir: &HostPath, out: &mut Vec<HostPath>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = dir.entry(&entry.file_name());
         match entry.file_type() {
-            Ok(t) if t.is_dir() && entry.file_name() != STORE => files_under(&path, out),
+            Ok(t) if t.is_dir() && entry.file_name() != *STORE => files_under(&path, out),
             Ok(t) if t.is_file() => out.push(path),
             _ => {}
         }
@@ -629,7 +630,7 @@ pub fn sweep(project: &crate::Project) -> io::Result<(usize, u64)> {
 pub const SWEEP_EVERY: Duration = Duration::from_hours(24);
 pub const SETTLED: Duration = Duration::from_hours(1);
 /// When it was swept last, in the cache.
-const SWEPT: Name = Name::constant("chunks.swept");
+const SWEPT: &Name = Name::constant("chunks.swept");
 
 /// Sweep the store where it was not swept for `SWEEP_EVERY`, of chunks nothing names and stored longer ago than
 /// `SETTLED`, while the project is written: how many went and the bytes they held, none where it was not due.
@@ -680,7 +681,7 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     };
     // A tree named keeps its objects; one nothing names goes, and so does an object neither a tree nor a text names.
     let (mut gone_files, mut freed) = (0, 0);
-    for (sha1, path) in store.kept_in(&TREES) {
+    for (sha1, path) in store.kept_in(TREES) {
         if kept.contains(&sha1) || !old(&path) {
             let tree = std::fs::read_to_string(&path).ok().and_then(|t| Tree::parse(&t).ok()).unwrap_or_default();
             kept.extend(tree.files.into_values().map(|file| file.sha1));
@@ -690,7 +691,7 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
             let _ = std::fs::remove_file(&path);
         }
     }
-    for (sha1, path) in store.kept_in(&OBJECTS) {
+    for (sha1, path) in store.kept_in(OBJECTS) {
         if !kept.contains(&sha1) && old(&path) {
             freed += std::fs::metadata(&path).map_or(0, |m| m.len());
             gone_files += 1;

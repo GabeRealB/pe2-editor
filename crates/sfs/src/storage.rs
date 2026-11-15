@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn sets_that_are_whole_are_found_again_and_the_others_are_nothing() {
-        let dir = pe2_path::testing::scratch("sfs-storage");
+        let dir = crate::testing::scratch("sfs-storage");
         let _ = std::fs::remove_dir_all(&dir);
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 22 }).unwrap();
         // One whole, with a file longer than a record and a record of another kind among it.

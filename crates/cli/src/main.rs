@@ -2,6 +2,10 @@
 //! It dispatches on its subcommand (`pe2-cli project extract`) or, run under a tool's name (a link in the editor's
 //! own `bin/`), on that name (`project extract`).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "what it is given and the program's own files are plain paths; a project's places are HostPaths, joined only of checked names"
+)]
 // The host holds what runs its epochs, whose types are Send through a deep chain: proving it needs a higher limit.
 #![recursion_limit = "256"]
 
@@ -11,8 +15,8 @@ mod server;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pe2_ext::events::{Build, Clean, Event};
-use pe2_path::HostPath;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "pe2-cli", about = "The Parasite Eve II editor's tools")]
@@ -56,7 +60,7 @@ enum Tool {
     Mcp {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// The editor, started and waited on, as scripts and checks drive it
     Editor {
@@ -83,7 +87,7 @@ enum Tool {
         within: Option<String>,
         /// A project's directory: what its extensions fetch onto a machine is listed after, with each one's license
         #[arg(long)]
-        project: Option<HostPath>,
+        project: Option<PathBuf>,
     },
 }
 
@@ -93,13 +97,13 @@ enum PlanCommand {
     /// nothing. Nothing is written but what is kept: a release's discs surveyed
     Observe {
         /// The plan
-        plan: HostPath,
+        plan: PathBuf,
         /// Where every release's discs are looked for, whatever the plan says
         #[arg(long)]
-        roms: HostPath,
+        roms: PathBuf,
         /// Keep what each operation read here, by its sha1
         #[arg(long)]
-        keep: Option<HostPath>,
+        keep: Option<PathBuf>,
         /// Keep what operations of these kinds read only (`inflate`, `slice`)
         #[arg(long, value_delimiter = ',')]
         keep_kinds: Vec<String>,
@@ -114,7 +118,7 @@ enum EditorCommand {
     Start {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// Hold its opening once agents can reach it, until the first asks it something
         #[arg(long)]
         wait_for_agent: bool,
@@ -130,7 +134,7 @@ enum EditorCommand {
     Wait {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// Until it is idle, or until it exits
         #[arg(long, value_enum, default_value_t = Until::Idle)]
         until: Until,
@@ -152,7 +156,7 @@ enum FetchedCommand {
     List {
         /// The project's directory, whose extensions' packages are marked
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Remove from the store: with nothing named, what is due to go now - unused for 30 days and not the project's,
     /// and what fetches left unfinished; or what is named, by key (its start) or name. Each is fetched again where
@@ -165,7 +169,7 @@ enum FetchedCommand {
         unused: bool,
         /// The project's directory, whose extensions' packages are kept
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
@@ -176,7 +180,7 @@ enum AuthorCommand {
     /// written bare (`"<path>" = "<to>"`, `take = "<file>"`) until then
     Hash {
         /// The extension's manifest (`extension.toml`)
-        manifest: HostPath,
+        manifest: PathBuf,
         /// Write them into the manifest; otherwise only what differs is said
         #[arg(long)]
         write: bool,
@@ -186,29 +190,29 @@ enum AuthorCommand {
     Pins {
         /// The extensions' manifests (`extension.toml`)
         #[arg(required = true)]
-        manifests: Vec<HostPath>,
+        manifests: Vec<PathBuf>,
     },
 }
 
 #[derive(Subcommand)]
 enum ConvertCommand {
     /// A BS picture (a background) to a PNG
-    Bs { input: HostPath, output: HostPath },
+    Bs { input: PathBuf, output: PathBuf },
     /// An image's first page to a PNG, at a bit depth, through a palette row (from a palette chunk) or in grey
     Texture {
-        input: HostPath,
-        output: HostPath,
+        input: PathBuf,
+        output: PathBuf,
         #[arg(long)]
         bpp: u8,
         #[arg(long)]
-        palette: Option<HostPath>,
+        palette: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         row: usize,
         #[arg(long, default_value_t = 0)]
         column: usize,
     },
     /// A palette chunk to a PNG, a row of pixels a palette
-    Palette { input: HostPath, output: HostPath },
+    Palette { input: PathBuf, output: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -231,7 +235,7 @@ enum LayerCommand {
         fills: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Make a layer's records those of a tree of files and its changeset (`<folder>.toml` beside it), in place of all it
     /// had: what a tool writes as files
@@ -239,20 +243,20 @@ enum LayerCommand {
         name: String,
         /// The tree
         #[arg(long)]
-        from: HostPath,
+        from: PathBuf,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Write a records layer's entries out as a tree of files, its changeset beside it (`<folder>.toml`)
     Export {
         name: String,
         /// Where
         #[arg(long)]
-        to: HostPath,
+        to: PathBuf,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
@@ -272,7 +276,7 @@ enum MountCommand {
         unmanaged: bool,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Say where an unmanaged mount is on this machine (`project.local.toml`)
     Locate {
@@ -281,7 +285,7 @@ enum MountCommand {
         path: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
@@ -296,7 +300,7 @@ enum LinkCommand {
         deployed: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
@@ -311,7 +315,7 @@ enum ConfigCommand {
         target: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Set a config's property: a TOML value (`fr`, `2`, `["-O2"]`), text where it is none
     Set {
@@ -320,7 +324,7 @@ enum ConfigCommand {
         value: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Leave a config's property to its default
     Unset {
@@ -328,7 +332,7 @@ enum ConfigCommand {
         property: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Declare a property the configs can set: its type, or the values it can be, and its default
     Declare {
@@ -344,13 +348,13 @@ enum ConfigCommand {
         default: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// List the configs, each with its properties
     List {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
@@ -364,7 +368,7 @@ fn toml_value(text: &str) -> toml::Value {
 struct EditAt {
     /// The project's directory
     #[arg(long, default_value = ".")]
-    project: HostPath,
+    project: PathBuf,
     /// The layer it goes to: by default, the highest the project lets be written
     #[arg(long)]
     layer: Option<String>,
@@ -377,20 +381,20 @@ enum StoreCommand {
     Migrate {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Remove the chunks nothing names any more: no layer's manifest or listing, nor the history
     Gc {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Pack a generated layer: its files kept in one listing (`.pack`), their chunks in the store, `project.toml`
     /// saying so (`storage = "packed"`)
     Pack {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The layer
         #[arg(long)]
         layer: String,
@@ -399,7 +403,7 @@ enum StoreCommand {
     Unpack {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The layer
         #[arg(long)]
         layer: String,
@@ -409,7 +413,7 @@ enum StoreCommand {
     Convert {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The layer
         #[arg(long)]
         layer: String,
@@ -423,7 +427,7 @@ enum ProjectCommand {
     Extract {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// This generated layer alone
         #[arg(long)]
         layer: Option<String>,
@@ -436,7 +440,7 @@ enum ProjectCommand {
     Build {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The config (the project's first by default)
         #[arg(long)]
         config: Option<String>,
@@ -447,7 +451,7 @@ enum ProjectCommand {
     /// Make an empty project: a `project.toml` naming a layer of its own
     New {
         /// The directory to make it in (made where missing)
-        directory: HostPath,
+        directory: PathBuf,
     },
     /// The project's layers
     Layer {
@@ -476,7 +480,7 @@ enum ProjectCommand {
         path: String,
         /// The file whose content to write; standard input where none
         #[arg(long)]
-        from: Option<HostPath>,
+        from: Option<PathBuf>,
         #[command(flatten)]
         at: EditAt,
     },
@@ -564,7 +568,7 @@ enum ProjectCommand {
     Problems {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// The project's chunk store, where its large files' content is kept
     Store {
@@ -577,7 +581,7 @@ enum ProjectCommand {
     Serve {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// What serves it - a backend's name (`project backends` lists them), or `auto` for the best suited - in
         /// place of what `project.local.toml` (`[filesystem] serve`) and then this machine's settings say
         #[arg(long)]
@@ -603,14 +607,14 @@ enum ProjectCommand {
     Backends {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Hold a project while no editor does, answering what is asked of it, and keep its folder served (unless
     /// `--backend none`): what commands, agents and `serve` start, and keep
     #[command(hide = true)]
     Host {
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         #[arg(long)]
         backend: Option<String>,
         #[arg(long)]
@@ -623,7 +627,7 @@ enum ProjectCommand {
     #[command(hide = true)]
     Server {
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         #[arg(long)]
         backend: Option<String>,
         #[arg(long)]
@@ -636,7 +640,7 @@ enum ProjectCommand {
     Status {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// This generated layer alone
         #[arg(long)]
         layer: Option<String>,
@@ -646,7 +650,7 @@ enum ProjectCommand {
     Verify {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// This generated layer alone
         #[arg(long)]
         layer: Option<String>,
@@ -666,7 +670,7 @@ enum ProjectCommand {
         config: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// What a project's extensions offer whoever writes its nodes, as JSON: each template - its node type, the files it
     /// takes, its stack with `{file}` for the node's stored file - each operation a stack may name - its ports, output,
@@ -674,13 +678,13 @@ enum ProjectCommand {
     Registry {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Remove what a build deployed, and make it again next time
     Clean {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The config (the project's first by default)
         #[arg(long)]
         config: Option<String>,
@@ -690,7 +694,7 @@ enum ProjectCommand {
     Trust {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// All that is inside the project (not what is mounted from outside it)
         #[arg(long)]
         all: bool,
@@ -699,7 +703,7 @@ enum ProjectCommand {
         layer: Vec<String>,
         /// A folder
         #[arg(long)]
-        path: Vec<HostPath>,
+        path: Vec<PathBuf>,
         /// Stop trusting those named, or all of the project's
         #[arg(long)]
         revoke: bool,
@@ -715,7 +719,7 @@ enum ProjectCommand {
         event: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
         /// The config (the project's first by default)
         #[arg(long)]
         config: Option<String>,
@@ -728,7 +732,7 @@ enum ExtensionCommand {
     List {
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Add one to the project, copied whole: an extension's folder (`<id>.extension`) or its archive
     /// (`<id>-<version>.extension.zip`), or by id from your own extensions or those beside the editor
@@ -740,7 +744,7 @@ enum ExtensionCommand {
         layer: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Copy one the project holds again, from where it is kept or from a folder
     Update {
@@ -748,10 +752,10 @@ enum ExtensionCommand {
         id: String,
         /// Its folder (`<id>.extension`) or archive, in place of where it is kept
         #[arg(long)]
-        from: Option<HostPath>,
+        from: Option<PathBuf>,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// What the project's extensions fetch onto this machine, as their manifests declare: shown, and fetched ahead of
     /// time - what they require, and what is optional and on. Trusting them is consenting to it
@@ -769,7 +773,7 @@ enum ExtensionCommand {
         verify: bool,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
     /// Remove one from the project
     Remove {
@@ -777,13 +781,13 @@ enum ExtensionCommand {
         id: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
-        project: HostPath,
+        project: PathBuf,
     },
 }
 
 const TOOLS: &[&str] = &["project", "convert", "uid"];
 
-fn write_png(output: &HostPath, width: usize, height: usize, color: png::ColorType, pixels: &[u8]) -> Result<()> {
+fn write_png(output: &Path, width: usize, height: usize, color: png::ColorType, pixels: &[u8]) -> Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(output)?);
     let mut encoder = png::Encoder::new(file, u32::try_from(width)?, u32::try_from(height)?);
     encoder.set_color(color);
@@ -792,17 +796,12 @@ fn write_png(output: &HostPath, width: usize, height: usize, color: png::ColorTy
     Ok(())
 }
 
-fn bs_to_png(input: &HostPath, output: &HostPath) -> Result<()> {
+fn bs_to_png(input: &Path, output: &Path) -> Result<()> {
     let picture = codecs::bs::decode(&std::fs::read(input)?)?;
     write_png(output, picture.width, picture.height, png::ColorType::Rgb, &picture.rgb)
 }
 
-fn texture_to_png(
-    input: &HostPath,
-    output: &HostPath,
-    bpp: u8,
-    palette: Option<(&HostPath, usize, usize)>,
-) -> Result<()> {
+fn texture_to_png(input: &Path, output: &Path, bpp: u8, palette: Option<(&Path, usize, usize)>) -> Result<()> {
     let pages = codecs::texture::pages(&std::fs::read(input)?)?;
     let page = pages.first().context("an image without pages")?;
     let colors = match palette {
@@ -816,7 +815,7 @@ fn texture_to_png(
     write_png(output, width, page.rows, png::ColorType::Rgba, &rgba)
 }
 
-fn palette_to_png(input: &HostPath, output: &HostPath) -> Result<()> {
+fn palette_to_png(input: &Path, output: &Path) -> Result<()> {
     let palette = codecs::texture::palette(&std::fs::read(input)?)?;
     let rgba: Vec<u8> = palette.rows.iter().flatten().flat_map(|&c| codecs::texture::rgba(c)).collect();
     write_png(output, palette.width.max(1), palette.rows.len().max(1), png::ColorType::Rgba, &rgba)
@@ -824,11 +823,10 @@ fn palette_to_png(input: &HostPath, output: &HostPath) -> Result<()> {
 
 /// Run an epoch for each of these events, in turn, and say what came of them.
 /// The editor's program: beside this one, else as the system finds it.
-fn editor_program() -> project::ext::unsandboxed::Runnable {
-    use project::ext::unsandboxed::Runnable;
+fn editor_program() -> PathBuf {
     let name = format!("pe2-editor{}", std::env::consts::EXE_SUFFIX);
-    let beside = host::this_program().ok().and_then(|exe| Some(exe.parent()?.join(&pe2_path::Name::new(&name).ok()?)));
-    beside.filter(|program| program.exists()).map_or_else(|| Runnable::Named("pe2-editor".into()), Runnable::At)
+    let beside = host::this_program().ok().map(|exe| exe.with_file_name(name));
+    beside.filter(|program| program.exists()).unwrap_or_else(|| PathBuf::from("pe2-editor"))
 }
 
 /// What keeps an editor from going on, where something does: an error it shows, a question the project asks.
@@ -844,8 +842,8 @@ fn blocked(presence: &mcp::presence::Presence) -> Option<String> {
 }
 
 /// Start the editor on a project, and wait until it is up: waiting for an agent, or the project open.
-fn start_editor(project: &HostPath, wait_for_agent: bool, timeout: u64, args: &[String]) -> anyhow::Result<()> {
-    let root = project;
+fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[String]) -> anyhow::Result<()> {
+    let root = &project::Project::load(project)?.root;
     if let Some(pid) = mcp::presence::claimed_by(root) {
         anyhow::bail!("{root}: the editor in process {pid} has it open");
     }
@@ -888,8 +886,8 @@ fn start_editor(project: &HostPath, wait_for_agent: bool, timeout: u64, args: &[
 const WAITING_FOR_AGENT: &str = "Waiting for an agent";
 
 /// Wait for the editor that has a project open: until it is idle, or until it exits.
-fn wait_editor(project: &HostPath, until: Until, timeout: u64) -> anyhow::Result<()> {
-    let root = project;
+fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()> {
+    let root = &project::Project::load(project)?.root;
     let Some(pid) = mcp::presence::claimed_by(root) else {
         // Waited for to exit, an editor that is not there has.
         if until == Until::Exit {
@@ -918,7 +916,7 @@ fn wait_editor(project: &HostPath, until: Until, timeout: u64) -> anyhow::Result
     }
 }
 
-fn signal(project: &HostPath, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
+fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
     let p = project::Project::load(project)?;
     // Whoever holds the project runs them, and says what came of them: an editor, or a host - started for it where
     // nothing does.
@@ -931,7 +929,7 @@ fn signal(project: &HostPath, config: Option<&str>, events: &[&str]) -> anyhow::
         }
         return Ok(());
     }
-    let chosen = p.configs.iter().find(|c| config.is_none_or(|name| c.name == name));
+    let chosen = p.configs.iter().find(|c| config.is_none_or(|name| *c.name == *name));
     let chosen = chosen.with_context(|| "no such config in project.toml")?.clone();
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", |owner| {
         eprintln!("waiting: the project is in use by {owner}");
@@ -1028,7 +1026,7 @@ fn swept(swept: Option<project::ext::setup::kept::Swept>) {
 }
 
 /// `pe2-cli licenses`: what ships, by its license, and what a project's extensions fetch besides.
-fn licenses(texts: bool, json: bool, within: Option<&str>, project: Option<&HostPath>) -> Result<()> {
+fn licenses(texts: bool, json: bool, within: Option<&str>, project: Option<&Path>) -> Result<()> {
     let listing = licenses::listing();
     if let Some(within) = within {
         let known: std::collections::BTreeSet<&str> =
@@ -1131,8 +1129,8 @@ fn fetched(command: FetchedCommand) -> Result<()> {
 }
 
 /// Where an extension to add is: a folder or an archive given, or one of that id kept to be added.
-fn kept_folder(p: &project::Project, what: &str) -> Result<HostPath> {
-    let given = HostPath::new(Path::new(what))?;
+fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
+    let given = PathBuf::from(what);
     if given.is_dir() || extensions::archive::is_archive(&given) {
         return Ok(given);
     }
@@ -1154,7 +1152,7 @@ fn kept_folder(p: &project::Project, what: &str) -> Result<HostPath> {
 /// An extension added to a project from a folder, or from an archive unpacked first.
 fn add_from(
     p: &project::Project,
-    from: &HostPath,
+    from: &Path,
     into: Option<&str>,
     history: &mut project::history::History,
     label: String,
@@ -1353,18 +1351,18 @@ fn untrusted(extensions: &project::ext::Extensions) {
 }
 
 /// `pe2-cli project trust`.
-fn trust(project: &HostPath, all: bool, layers: &[String], paths: Vec<HostPath>, revoke: bool) -> Result<()> {
+fn trust(project: &Path, all: bool, layers: &[String], paths: Vec<PathBuf>, revoke: bool) -> Result<()> {
     use extensions::trust as places;
     let p = project::Project::load(project)?;
     let mut named = paths;
-    named.extend(all.then(|| p.root.clone()));
+    named.extend(all.then(|| p.root.to_path_buf()));
     for name in layers {
         let layer = p.layers.iter().find(|layer| layer.name == *name);
         let Some(layer) = layer else {
             let known: Vec<&str> = p.layers.iter().map(|layer| layer.name.as_str()).collect();
             anyhow::bail!("the project has no layer {name}; it has {}", known.join(", "));
         };
-        named.push(layer.path.clone());
+        named.push(layer.path.to_path_buf());
     }
     match (revoke, named.is_empty()) {
         (true, _) => places::distrust(&p.root, &named)?,
@@ -1399,9 +1397,7 @@ fn main() -> Result<()> {
         let machine = extensions::filesystem_defaults();
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
-    vfs::backend::keep_apart_by(|| {
-        extensions::filesystem_defaults().cache.and_then(|cache| HostPath::new(Path::new(&cache)).ok())
-    });
+    vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(PathBuf::from));
     // What is asked of a project nothing holds is answered by a host, started as this program.
     if let Ok(program) = host::this_program() {
         project::host::start_hosts_with(program);
@@ -1497,7 +1493,7 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
         ProjectCommand::Layer { command: LayerCommand::Export { name, to, project } } => {
             let p = project::Project::load(&project)?;
             let count = project::records::export(&p, &name, &to)?;
-            println!("{name}: {count} entries written to {to}");
+            println!("{name}: {count} entries written to {}", to.display());
         }
         ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, unmanaged, project } } => {
             edit_project(&project, |p, history| {
@@ -1534,7 +1530,7 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
 
 /// Edit a project's setup, holding its lock, as a step of its history.
 fn edit_project(
-    project: &HostPath,
+    project: &Path,
     edit: impl FnOnce(&project::Project, &mut project::history::History) -> Result<()>,
 ) -> Result<()> {
     let p = project::Project::load(project)?;
@@ -1633,44 +1629,49 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
 
 /// The edit a project command is, and where it goes; none for another command.
 fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> {
+    made_of(command).transpose()
+}
+
+/// As `edit_of`: the paths it is given checked where they become an edit, one that is none refused.
+fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> {
     use vfs::ops::Op;
-    let path = |p: &String| p.trim_matches('/').to_string();
-    Some(Ok(match command {
+    let path = |p: &String| -> Result<Arc<project::TreePath>> {
+        let path =
+            project::TreePath::new(p.trim_matches('/')).with_context(|| format!("{p}: no path of the project"))?;
+        Ok(path.to_owned())
+    };
+    Ok(Some(match command {
         ProjectCommand::Write { path: at_path, from, at } => {
             let from = match from {
-                Some(from) => Ok(from.clone()),
-                None => read_stdin_to_file(),
+                Some(from) => from.clone(),
+                None => read_stdin_to_file()?,
             };
-            match from {
-                Ok(from) => (Op::Write { path: path(at_path), from: from.into() }, at),
-                Err(e) => return Some(Err(e)),
-            }
+            (Op::Write { path: path(at_path)?, from: vfs::write::Written::file(&from)? }, at)
         }
-        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: path(p) }, at),
-        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: path(p) }, at),
-        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: path(from), to: path(to) }, at),
-        ProjectCommand::Override { path: p, at } => (Op::Override { path: path(p) }, at),
-        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: path(p) }, at),
-        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: path(p) }, at),
-        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: path(p) }, at),
-        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: path(p) }, at),
-        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: path(p) }, at),
+        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: path(p)? }, at),
+        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: path(p)? }, at),
+        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: path(from)?, to: path(to)? }, at),
+        ProjectCommand::Override { path: p, at } => (Op::Override { path: path(p)? }, at),
+        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: path(p)? }, at),
+        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: path(p)? }, at),
+        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: path(p)? }, at),
+        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: path(p)? }, at),
+        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: path(p)? }, at),
         ProjectCommand::RemoveUnlisted { of, path: p, at } => {
-            (Op::RemoveUnlisted { layer: of.clone(), path: path(p) }, at)
+            (Op::RemoveUnlisted { layer: of.clone(), path: path(p)? }, at)
         }
         ProjectCommand::Undo { at } => (Op::Undo, at),
         ProjectCommand::Redo { at } => (Op::Redo, at),
-        _ => return None,
+        _ => return Ok(None),
     }))
 }
 
 /// Standard input kept in a file, for what applies a write to read: the file's path.
-fn read_stdin_to_file() -> Result<HostPath> {
+fn read_stdin_to_file() -> Result<PathBuf> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
     std::io::stdin().read_to_end(&mut bytes)?;
-    let temporary = HostPath::new(&std::env::temp_dir())?;
-    let file = temporary.join(&pe2_path::Name::new(&format!("pe2-write-{}", std::process::id()))?);
+    let file = std::env::temp_dir().join(format!("pe2-write-{}", std::process::id()));
     std::fs::write(&file, bytes)?;
     Ok(file)
 }
@@ -1685,7 +1686,7 @@ fn edit(op: &vfs::ops::Op, at: &EditAt) -> Result<()> {
 }
 
 /// `pe2-cli project problems`: asked of whoever holds the project, or read here.
-fn problems(project: &HostPath) -> Result<()> {
+fn problems(project: &Path) -> Result<()> {
     let root = project::Project::load(project)?.root;
     let request = mcp::Request::Call { name: "problems".into(), arguments: serde_json::Map::new() };
     let told = mcp::server::execute(&root, &request).told().map_err(anyhow::Error::msg)?;
@@ -1706,13 +1707,7 @@ fn problems(project: &HostPath) -> Result<()> {
 
 /// `pe2-cli project output`: an output of assets made for a config, under the project's lock - a line an asset, its file
 /// by name, size and SHA-1, a table as TOML, or why nothing was made. Fails where any was not.
-fn outputs(
-    project: &HostPath,
-    assets: &[String],
-    of_type: Option<&str>,
-    output: &str,
-    config: Option<&str>,
-) -> Result<()> {
+fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &str, config: Option<&str>) -> Result<()> {
     use project::graph::{Content, Value};
     let p = project::Project::load(project)?;
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", |owner| {
@@ -1722,7 +1717,7 @@ fn outputs(
     let mut index = project::index::Index::open(&p, &cache)?;
     let extensions = project_extensions(&p);
     let chosen = match config {
-        Some(name) => Some(p.configs.iter().find(|c| c.name == name).with_context(|| format!("no config {name}"))?),
+        Some(name) => Some(p.configs.iter().find(|c| *c.name == *name).with_context(|| format!("no config {name}"))?),
         None => p.configs.first(),
     };
     if let Some(chosen) = chosen {
@@ -1731,14 +1726,16 @@ fn outputs(
     let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
     extensions.keep_in(project::graph::store::Store::open(&cache)?);
     let engine = extensions.engine();
-    let mut paths: Vec<project::TreePath> = Vec::new();
+    let mut paths: Vec<Arc<project::TreePath>> = Vec::new();
     for name in assets {
         // An asset named by its uid or its path, as given on the command line.
         let path = if name.starts_with("uid://") {
             let uid = pe2_path::Uid::new(name).with_context(|| format!("{name}: no uid"))?;
             index.by_uid.get(&uid).cloned()
         } else {
-            Some(project::TreePath::new(name).with_context(|| format!("{name}: no path of the project"))?)
+            Some(ToOwned::to_owned(
+                project::TreePath::new(name).with_context(|| format!("{name}: no path of the project"))?,
+            ))
         };
         let path = path.filter(|path| index.assets.contains_key(path));
         paths.push(path.with_context(|| format!("the project has no asset {name}"))?);
@@ -1833,7 +1830,7 @@ fn store(command: &StoreCommand) -> Result<()> {
 /// `pe2-cli project serve`: a host keeps the project's folder served while this runs - started where none runs,
 /// and starting the server that serves it - or, with `--stop`, both stop.
 fn serve_project(
-    project: &HostPath,
+    project: &Path,
     backend: Option<&str>,
     address: Option<&str>,
     stop: bool,
@@ -1901,7 +1898,7 @@ fn serve_project(
 }
 
 /// No longer know a project's folder where a backend registers it with the system (a sync root, on Windows).
-fn forget_served(project: &HostPath) -> Result<()> {
+fn forget_served(project: &Path) -> Result<()> {
     let p = project::Project::load(project)?;
     for backend in vfs::backend::all() {
         backend.forget(&p.filesystem.at, &server::served_name(&p)).with_context(|| format!("`{}`", backend.name()))?;
@@ -1912,7 +1909,7 @@ fn forget_served(project: &HostPath) -> Result<()> {
 
 /// `pe2-cli project backends`: what can serve a project here - each backend, what it can do and whether it is
 /// available - and what serves its folder and its scopes as the project and this machine say.
-fn backends(project: &HostPath) -> Result<()> {
+fn backends(project: &Path) -> Result<()> {
     use project::content::Use;
     use vfs::backend::{Can, choose, setting};
     let p = project::Project::load(project)?;
@@ -1988,7 +1985,7 @@ fn backends(project: &HostPath) -> Result<()> {
     Ok(())
 }
 
-fn verify_layer(project: &HostPath, only: Option<&str>) -> Result<()> {
+fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
     let p = project::Project::load(project)?;
     let extensions = project_extensions(&p);
     let mut whole = true;
@@ -2023,7 +2020,7 @@ fn verify_layer(project: &HostPath, only: Option<&str>) -> Result<()> {
 }
 
 /// The project's extensions' registry, as JSON: of those that load, the rest said.
-fn print_registry(project: &HostPath) -> Result<()> {
+fn print_registry(project: &Path) -> Result<()> {
     let p = project::Project::load(project)?;
     let extensions = project_extensions(&p);
     // What the project defines - its own operations and templates - read off its nodes as they are.
@@ -2033,11 +2030,10 @@ fn print_registry(project: &HostPath) -> Result<()> {
 }
 
 /// `pe2-cli plan observe`: what each operation of a plan read, as JSON lines.
-fn observe_plan(plan: &HostPath, roms: &HostPath, keep: Option<&HostPath>, keep_kinds: &[String]) -> Result<()> {
+fn observe_plan(plan: &Path, roms: &Path, keep: Option<&Path>, keep_kinds: &[String]) -> Result<()> {
     let extensions = extensions::shared();
     let engine = extensions.engine();
-    let roms = roms.clone();
-    let seen = project::plan::observe(plan, &|_| Ok(roms.clone()), &engine, &extensions, keep, keep_kinds)?;
+    let seen = project::plan::observe(plan, &|_| Ok(roms.to_path_buf()), &engine, &extensions, keep, keep_kinds)?;
     let lines: Vec<String> = seen.iter().map(serde_json::to_string).collect::<Result<_, _>>()?;
     println!("{}", lines.join("\n"));
     Ok(())
@@ -2050,11 +2046,11 @@ fn run(cli: Cli) -> Result<()> {
     }
     match cli.tool {
         Tool::Plan { command: PlanCommand::Observe { plan, roms, keep, keep_kinds } } => {
-            observe_plan(&plan, &roms, keep.as_ref(), &keep_kinds)?;
+            observe_plan(&plan, &roms, keep.as_deref(), &keep_kinds)?;
         }
         Tool::Convert { command: ConvertCommand::Bs { input, output } } => bs_to_png(&input, &output)?,
         Tool::Convert { command: ConvertCommand::Texture { input, output, bpp, palette, row, column } } => {
-            texture_to_png(&input, &output, bpp, palette.as_ref().map(|p| (p, row, column)))?;
+            texture_to_png(&input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
         }
         Tool::Convert { command: ConvertCommand::Palette { input, output } } => palette_to_png(&input, &output)?,
         Tool::Editor { command: EditorCommand::Start { project, wait_for_agent, timeout, args } } => {
@@ -2122,7 +2118,9 @@ fn run(cli: Cli) -> Result<()> {
             });
         }
         Tool::Fetched { command } => fetched(command)?,
-        Tool::Licenses { texts, json, within, project } => licenses(texts, json, within.as_deref(), project.as_ref())?,
+        Tool::Licenses { texts, json, within, project } => {
+            licenses(texts, json, within.as_deref(), project.as_deref())?;
+        }
         Tool::Extension { command: AuthorCommand::Pins { manifests } } => {
             let mut gone = Vec::new();
             for manifest in &manifests {

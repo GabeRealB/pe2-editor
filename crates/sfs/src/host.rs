@@ -1,4 +1,6 @@
-//! A place on disk, for the filesystem's implementations alone.
+//! A place on disk, for the filesystem's implementations alone: where the project's storage, the shared space and the
+//! served folder keep what they keep. What only reads or writes files somewhere - a file the user picked, a program's
+//! own folder - takes a `std::path::Path`.
 
 #![allow(clippy::disallowed_methods, reason = "where a place is joined and resolved: the one module that does")]
 
@@ -7,8 +9,16 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::{NotWithin, PathError, Why};
-use crate::name::{Name, Names, RelPath, refused};
+use pe2_path::{Name, Names, PathError, RelPath, Why};
+
+/// Why a place on disk is no place within another, by names: it is elsewhere, or a name in its way is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotWithin {
+    /// It is not in the other place at all.
+    Outside,
+    /// It is in it, but by a name that is no path's (`Why`).
+    Refused(PathError),
+}
 
 /// A place on disk: absolute, the links that were there when it was made resolved, and in the plain form the system
 /// names it by (`C:\a`, `\\server\share\a`; never `\\?\C:\a` where `C:\a` names the same place). Two of the same place
@@ -65,7 +75,7 @@ impl HostPath {
 
     /// A place within it - a name, a path - joined name by name, in the system's own separators.
     #[must_use]
-    pub fn join(&self, within: &impl Names) -> HostPath {
+    pub fn join(&self, within: &(impl Names + ?Sized)) -> HostPath {
         let mut at = self.0.to_path_buf();
         at.extend(within.names());
         HostPath(at.into())
@@ -144,21 +154,23 @@ impl HostPath {
     /// It is not within `base` ([`NotWithin::Outside`]), or it is by a name that is no path's
     /// ([`NotWithin::Refused`]): two answers a caller has to tell apart - what is elsewhere is no business of its, but
     /// what is within by a name it cannot take is, and is said, never passed over.
-    pub fn within(&self, base: &HostPath) -> Result<RelPath, NotWithin> {
+    pub fn within(&self, base: &HostPath) -> Result<std::sync::Arc<RelPath>, NotWithin> {
         let rest = self.0.strip_prefix(&base.0).map_err(|_| NotWithin::Outside)?;
         let shown = || rest.to_string_lossy().into_owned();
         let mut names = Vec::new();
         for part in rest.components() {
             let Component::Normal(name) = part else {
-                return Err(NotWithin::Refused(PathError::new(&shown(), Why::Dot)));
+                return Err(NotWithin::Refused(PathError { text: shown().into(), why: Why::Dot }));
             };
-            let name = name.to_str().ok_or_else(|| NotWithin::Refused(PathError::new(&shown(), Why::NotText)))?;
-            if let Some(why) = refused(name) {
-                return Err(NotWithin::Refused(PathError::new(&shown(), why)));
+            let name = name
+                .to_str()
+                .ok_or_else(|| NotWithin::Refused(PathError { text: shown().into(), why: Why::NotText }))?;
+            if let Err(refused) = Name::new(name) {
+                return Err(NotWithin::Refused(PathError { text: shown().into(), why: refused.why }));
             }
             names.push(name);
         }
-        RelPath::new(&names.join("/")).map_err(NotWithin::Refused)
+        RelPath::new(&names.join("/")).map(RelPath::to_owned).map_err(NotWithin::Refused)
     }
 
     /// The place it is at once what `from` holds is moved to `to`: by its own parts, which need be no names; none
@@ -249,7 +261,7 @@ fn plain(path: &Path) -> PathBuf {
         let rest: Vec<_> = parts.collect();
         let safe = rest.iter().all(|part| match part {
             Component::RootDir => true,
-            Component::Normal(name) => name.to_str().is_some_and(|name| refused(name).is_none()),
+            Component::Normal(name) => name.to_str().is_some_and(|name| Name::new(name).is_ok()),
             _ => false,
         });
         let start = match prefix.kind() {
@@ -322,10 +334,21 @@ impl<'de> serde::Deserialize<'de> for HostPath {
     }
 }
 
+impl fmt::Display for NotWithin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotWithin::Outside => f.write_str("it is elsewhere"),
+            NotWithin::Refused(why) => why.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NotWithin {}
+
 #[cfg(test)]
 mod tests {
     use super::HostPath;
-    use crate::RelPath;
+    use pe2_path::RelPath;
     use std::path::Path;
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -339,8 +362,8 @@ mod tests {
     fn a_place_within_is_given_to_a_program_with_its_path_within_written_with_slashes() {
         let dir = HostPath::new(&scratch("argument")).unwrap();
         let sep = std::path::MAIN_SEPARATOR;
-        assert_eq!(dir.argument(&RelPath::new("self/src/a.o").unwrap()), format!("{dir}{sep}self/src/a.o"));
-        assert_eq!(dir.argument(&RelPath::root()), dir.to_string());
+        assert_eq!(dir.argument(RelPath::new("self/src/a.o").unwrap()), format!("{dir}{sep}self/src/a.o"));
+        assert_eq!(dir.argument(RelPath::root()), dir.to_string());
     }
 
     #[test]
@@ -351,8 +374,8 @@ mod tests {
         assert_eq!(HostPath::new(&dir.join(".")).unwrap(), made);
         let missing = HostPath::new(&dir.join("x").join("..").join("y").join("z")).unwrap();
         assert_eq!(missing, made.join(&RelPath::new("y/z").unwrap()));
-        assert_eq!(missing.within(&made), Ok(RelPath::new("y/z").unwrap()));
-        assert_eq!(made.within(&missing), Err(crate::NotWithin::Outside));
+        assert_eq!(missing.within(&made).as_deref(), Ok(RelPath::new("y/z").unwrap()));
+        assert_eq!(made.within(&missing), Err(super::NotWithin::Outside));
         assert_eq!(missing.moved(&made, &missing), Some(missing.join(&RelPath::new("y/z").unwrap())));
         assert_eq!(made.moved(&missing, &made), None);
         // Within, but by a name no path takes: said so, and why - never taken for elsewhere. (Where Windows names
@@ -362,7 +385,7 @@ mod tests {
             let refused = HostPath::new(&dir.join("CON")).unwrap();
             assert!(matches!(
                 refused.within(&made),
-                Err(crate::NotWithin::Refused(crate::PathError { why: crate::Why::Reserved, .. }))
+                Err(super::NotWithin::Refused(pe2_path::PathError { why: pe2_path::Why::Reserved, .. }))
             ));
         }
         assert!(missing.starts_with(&made));
@@ -379,10 +402,10 @@ mod tests {
         let made = HostPath::new(&dir).unwrap();
         let joined = made.join(&RelPath::new("a/b/c.txt").unwrap());
         assert_eq!(joined.as_path(), made.as_path().join("a").join("b").join("c.txt"));
-        let beside = joined.parent().unwrap().with_suffix(&crate::Name::constant(".toml"));
+        let beside = joined.parent().unwrap().with_suffix(pe2_path::Name::constant(".toml"));
         assert_eq!(beside.as_path(), made.as_path().join("a").join("b.toml"));
-        assert_eq!(beside.without_suffix(&crate::Name::constant(".toml")), joined.parent());
-        assert_eq!(made.entry(std::ffi::OsStr::new("a")), made.join(&crate::Name::constant("a")));
+        assert_eq!(beside.without_suffix(pe2_path::Name::constant(".toml")), joined.parent());
+        assert_eq!(made.entry(std::ffi::OsStr::new("a")), made.join(&pe2_path::Name::constant("a")));
         assert_eq!(joined.ancestors().nth(3), Some(made.clone()));
         assert!(!joined.to_string().contains(if cfg!(windows) { '/' } else { '\\' }));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -16,7 +16,7 @@ pub mod requests;
 pub mod setup {
     pub use pe2_setup::*;
 
-    use pe2_path::HostPath;
+    use sfs::HostPath;
     use std::sync::atomic::AtomicBool;
 
     /// `pe2_setup::fetch`, what the extension's folder holds read through the project's content.
@@ -25,13 +25,13 @@ pub mod setup {
     /// As `pe2_setup::fetch`.
     pub fn fetch(
         setup: &Setup,
-        store: &HostPath,
+        store: &std::path::Path,
         folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
     ) -> anyhow::Result<()> {
-        pe2_setup::read_folder_files_with(crate::content::read);
-        pe2_setup::fetch(setup, store, folder, progress, cancel)
+        pe2_setup::read_folder_files_with(read_through_content);
+        pe2_setup::fetch(setup, store, folder.map(HostPath::as_path), progress, cancel)
     }
 
     /// `pe2_setup::hashes`, what the extension's folder holds read through the project's content.
@@ -40,13 +40,18 @@ pub mod setup {
     /// As `pe2_setup::hashes`.
     pub fn hashes(
         setup: &Setup,
-        scratch: &HostPath,
+        scratch: &std::path::Path,
         folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
     ) -> anyhow::Result<(String, Vec<String>)> {
-        pe2_setup::read_folder_files_with(crate::content::read);
-        pe2_setup::hashes(setup, scratch, folder, progress, cancel)
+        pe2_setup::read_folder_files_with(read_through_content);
+        pe2_setup::hashes(setup, scratch, folder.map(HostPath::as_path), progress, cancel)
+    }
+
+    /// A file of an extension's folder as the project's content has it - one a layer holds as records is on no disk.
+    fn read_through_content(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        crate::content::read(&HostPath::new(path)?)
     }
 }
 pub mod run;
@@ -57,7 +62,7 @@ use pe2_ext::{
     Asset, Extension, Field, Icon, Image, PanelDef, Project, Recognized, Registry, Signature, Source, Table, Tint,
     ToolDef, TypeDef, Value, ViewDef,
 };
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -83,7 +88,7 @@ pub struct Preview<'a> {
 }
 
 /// The file an extension's folder holds its component in (`folder`).
-pub const EXTENSION_COMPONENT: pe2_path::Name = pe2_path::Name::constant("extension.wasm");
+pub const EXTENSION_COMPONENT: &pe2_path::Name = pe2_path::Name::constant("extension.wasm");
 
 /// Where an extension runs from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -356,7 +361,7 @@ pub struct Extensions {
     /// The config being built.
     config: std::sync::RwLock<Option<pe2_ext::data::BuildConfig>>,
     /// The assets it leaves out.
-    disabled: std::sync::RwLock<std::collections::BTreeSet<crate::TreePath>>,
+    disabled: std::sync::RwLock<std::collections::BTreeSet<Arc<crate::TreePath>>>,
     /// The events extensions declare, by name, with their labels.
     pub events: Vec<(String, String)>,
     /// What extensions run where events are signaled.
@@ -398,7 +403,7 @@ pub struct Extensions {
     definitions: RwLock<Arc<graph::Definitions>>,
     /// The assets that defined an operation or a template when the project's definitions were last taken, by
     /// path: one of them changing, or going, has them taken again.
-    defined_at: RwLock<std::collections::BTreeSet<crate::TreePath>>,
+    defined_at: RwLock<std::collections::BTreeSet<Arc<crate::TreePath>>>,
     project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
     /// The project's generators (`graph::DEFINED_GENERATOR`), taken with its definitions.
     generators: RwLock<Vec<Arc<index::Asset>>>,
@@ -1326,10 +1331,10 @@ impl Extensions {
     pub fn dependents(
         &self,
         index: &index::Index,
-        paths: &std::collections::BTreeSet<crate::TreePath>,
-    ) -> std::collections::BTreeSet<crate::TreePath> {
+        paths: &std::collections::BTreeSet<Arc<crate::TreePath>>,
+    ) -> std::collections::BTreeSet<Arc<crate::TreePath>> {
         let mut found = std::collections::BTreeSet::new();
-        let mut next: Vec<&crate::TreePath> = paths.iter().collect();
+        let mut next: Vec<&crate::TreePath> = paths.iter().map(|path| &**path).collect();
         while let Some(path) = next.pop() {
             let referrers = index.referenced_by.get(path).into_iter().flatten().map(|r| &r.from);
             for from in referrers {
@@ -1469,7 +1474,7 @@ impl Extensions {
     }
 
     /// The config what is made from now on is made for, with the assets left out of it.
-    pub fn set_config(&self, config: Option<pe2_ext::data::BuildConfig>, disabled: &[crate::TreePath]) {
+    pub fn set_config(&self, config: Option<pe2_ext::data::BuildConfig>, disabled: &[Arc<crate::TreePath>]) {
         *self.config.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config;
         *self.disabled.write().unwrap_or_else(std::sync::PoisonError::into_inner) = disabled.iter().cloned().collect();
     }
@@ -2077,7 +2082,7 @@ impl Extensions {
         let defining = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
             .into_iter()
             .flat_map(|defined| self.find(index, defined));
-        let defined_at: std::collections::BTreeSet<crate::TreePath> =
+        let defined_at: std::collections::BTreeSet<Arc<crate::TreePath>> =
             defining.map(|asset| asset.path.clone()).collect();
         *self.defined_at.write().unwrap_or_else(std::sync::PoisonError::into_inner) = defined_at;
         // Its generators, made again for whatever configuration is built next.
@@ -2126,7 +2131,7 @@ impl Extensions {
     pub fn definitions_among(
         &self,
         index: &index::Index,
-        changed: &std::collections::BTreeSet<crate::TreePath>,
+        changed: &std::collections::BTreeSet<Arc<crate::TreePath>>,
     ) -> bool {
         let defining: Vec<&str> = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
             .into_iter()
@@ -2455,7 +2460,7 @@ pub struct Exporter {
 }
 
 /// By (asset, family of its outputs), the member chosen: what is being looked at, never written.
-pub type Chosen = HashMap<(crate::TreePath, String), String>;
+pub type Chosen = HashMap<(Arc<crate::TreePath>, String), String>;
 
 /// The project as extensions ask about it: the index, through the registry, with what the user selected and the members
 /// chosen (the editor's; none for a tool).
@@ -2489,7 +2494,7 @@ impl Project for Lens<'_> {
 
     fn chosen(&self, path: &str, family: &str) -> Option<String> {
         // What an extension names that is no path has nothing chosen, as it has no asset.
-        self.chosen?.get(&(crate::TreePath::new(path).ok()?, family.to_string())).cloned()
+        self.chosen?.get(&(crate::TreePath::new(path).ok()?.to_owned(), family.to_string())).cloned()
     }
 
     fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>> {
@@ -2574,7 +2579,7 @@ impl graph::exec::World for Graph<'_> {
     fn entries(&self, folder: &str) -> Vec<String> {
         // A folder named as text: one that is no path holds nothing.
         let Ok(folder) = crate::TreePath::new(folder.trim_end_matches('/')) else { return Vec::new() };
-        let inside = self.index.entries.iter().filter(|(path, _)| **path != folder && path.starts_with(&folder));
+        let inside = self.index.entries.iter().filter(|(path, _)| **path != *folder && path.starts_with(folder));
         inside.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.to_string()).collect()
     }
 
@@ -2824,22 +2829,22 @@ impl Source for index::Asset {
     }
 
     fn has_file(&self, name: &str) -> bool {
-        self.files.iter().any(|f| f.name == name)
+        self.files.iter().any(|f| *f.name == *name)
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let file =
-            self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
+            self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
     fn size(&self, name: &str) -> Option<u64> {
-        Some(self.files.iter().find(|f| f.name == name)?.size)
+        Some(self.files.iter().find(|f| *f.name == *name)?.size)
     }
 
     fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         let file =
-            self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
+            self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read_range(&file.path, offset, len).with_context(|| file.path.display().to_string())
     }
 }

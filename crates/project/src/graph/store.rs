@@ -6,7 +6,8 @@
 //! of the cache, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
 //! a trace never names what is not there.
 
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -18,11 +19,11 @@ use super::{Content, File, Image, Pcm, Typed, Value};
 use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 
-const DIR: Name = Name::constant("store");
-const VALUES: Name = Name::constant("values");
-const BLOBS: Name = Name::constant("blobs");
-const TRACES: Name = Name::constant("traces");
-const TMP: Name = Name::constant("tmp");
+const DIR: &Name = Name::constant("store");
+const VALUES: &Name = Name::constant("values");
+const BLOBS: &Name = Name::constant("blobs");
+const TRACES: &Name = Name::constant("traces");
+const TMP: &Name = Name::constant("tmp");
 
 /// What the store writes, as CBOR.
 fn encode<T: Serialize>(what: &T) -> Result<Vec<u8>> {
@@ -164,7 +165,7 @@ pub struct Store {
 }
 
 /// The file whose time is when the store was last swept.
-const SWEPT: Name = Name::constant("swept");
+const SWEPT: &Name = Name::constant("swept");
 
 /// How long a file in `tmp/` goes unwritten before it is taken for a stopped process's and removed.
 const STALE: std::time::Duration = std::time::Duration::from_hours(24);
@@ -175,7 +176,7 @@ impl Store {
     /// # Errors
     /// Its folder cannot be made.
     pub fn open(cache: &Cache) -> Result<Store> {
-        Store::at(cache.path(&DIR))
+        Store::at(cache.path(DIR))
     }
 
     /// A store in a folder of its own.
@@ -522,7 +523,7 @@ impl Store {
         // Each live output's newest trace of each build, by when it was written.
         let mut newest: HashMap<(String, String), Builds> = HashMap::new();
         let mut gone = Vec::new();
-        for entry in entries(&TRACES) {
+        for entry in entries(TRACES) {
             let (Some(key), Some(trace)) = (stem(&entry), stem(&entry).and_then(|k| self.trace(&k))) else {
                 gone.push(entry.path());
                 continue;
@@ -576,7 +577,7 @@ impl Store {
             }
         }
         let mut blobs = HashSet::new();
-        for entry in entries(&VALUES) {
+        for entry in entries(VALUES) {
             let Some(hash) = stem(&entry) else { continue };
             if values.contains(&hash)
                 && let Some(kept) = self.describe(&hash)
@@ -586,7 +587,7 @@ impl Store {
                 swept.1 += 1;
             }
         }
-        for dir in entries(&BLOBS) {
+        for dir in entries(BLOBS) {
             for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten().filter(|e| !young(e)) {
                 let name = entry.file_name();
                 if !name.to_str().is_some_and(|n| blobs.contains(n)) && std::fs::remove_file(entry.path()).is_ok() {

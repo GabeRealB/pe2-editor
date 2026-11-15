@@ -78,7 +78,8 @@ fn needed(listing: &Path, platform: &str) -> Vec<(String, String)> {
     let text_of = |table: &toml::Table, key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_string);
     let mut needed = Vec::new();
     for entry in entries.iter().filter_map(toml::Value::as_table) {
-        if text_of(entry, "platform").is_some_and(|named| named != platform) {
+        // What is for no platform is the build's own (`prepared/common/`), put beside no program.
+        if text_of(entry, "platform").is_none_or(|named| named != platform) {
             continue;
         }
         let take = entry.get("take").and_then(toml::Value::as_table).expect("an entry says what it takes");

@@ -3,7 +3,8 @@
 //! `Writes`, a file put staged and applied when it is flushed, a folder made, a file or folder removed or moved. A server
 //! lasts as long as its `DavServer`; dropping it stops it.
 
-use pe2_path::HostPath;
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,9 +26,13 @@ struct Dav {
 }
 
 /// A path as the tree names it: its steps joined by `/`, the root empty.
-fn rel(path: &DavPath) -> FsResult<String> {
-    let steps: Option<Vec<&str>> = path.as_rel_ospath().components().map(|c| c.as_os_str().to_str()).collect();
-    Ok(steps.ok_or(FsError::NotFound)?.join("/"))
+/// A path a client names, within what is served: refused, as a server refuses a name it cannot hold, where one of its
+/// names is none every system takes.
+fn rel(path: &DavPath) -> FsResult<Arc<RelPath>> {
+    path.as_rel_ospath().components().try_fold(RelPath::root().to_owned(), |path, step| {
+        let name = step.as_os_str().to_str().and_then(|name| Name::new(name).ok()).ok_or(FsError::Forbidden)?;
+        Ok(path.join(name))
+    })
 }
 
 fn failed(e: &std::io::Error) -> FsError {
@@ -49,8 +54,7 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> std::io::Result<T> +
 /// A node's inode number by its path from the root.
 fn find(tree: &Tree, path: &DavPath) -> FsResult<u64> {
     let mut ino = ROOT;
-    for step in path.as_rel_ospath().components() {
-        let name = step.as_os_str().to_str().ok_or(FsError::NotFound)?;
+    for name in rel(path)?.parts() {
         ino = tree.lookup(ino, name).ok_or(FsError::NotFound)?;
     }
     Ok(ino)
@@ -88,13 +92,13 @@ impl DavMetaData for Meta {
 }
 
 struct Entry {
-    name: String,
+    name: Arc<Name>,
     meta: Meta,
 }
 
 impl DavDirEntry for Entry {
     fn name(&self) -> Vec<u8> {
-        self.name.as_bytes().to_vec()
+        self.name.as_str().as_bytes().to_vec()
     }
 
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
@@ -157,7 +161,7 @@ impl DavFile for Opened {
 /// go.
 struct Through {
     writes: Writes,
-    path: String,
+    path: Arc<RelPath>,
     handle: Option<u64>,
     at: u64,
     _open: crate::Open,
@@ -299,12 +303,11 @@ impl DavFileSystem for Dav {
                 if !writes.shown(&path).is_some_and(|s| s.folder) {
                     return Err(FsError::NotFound);
                 }
-                let join = |name: &str| if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
                 let entries: Vec<FsResult<Box<dyn DavDirEntry>>> = writes
                     .list(&path)
                     .into_keys()
                     .filter_map(|name| {
-                        let meta = Meta::shown(&writes.shown(&join(&name))?);
+                        let meta = Meta::shown(&writes.shown(&path.join(&name))?);
                         let entry: Box<dyn DavDirEntry> = Box::new(Entry { name, meta });
                         Some(Ok(entry))
                     })

@@ -1,5 +1,5 @@
 //! What a project is made of changing: it is read again with what it was still showing.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use project::ext::Status;
 
@@ -25,7 +25,7 @@ fn turning_an_extension_off_leaves_the_project_showing() {
     while editor.status("pe2.images") != Status::Disabled {
         editor.frame();
         assert_eq!(
-            editor.workspace().selected.as_ref().map(project::TreePath::as_str),
+            editor.workspace().selected.as_deref().map(project::TreePath::as_str),
             Some("rig/skeleton"),
             "what was showing still is"
         );
@@ -59,7 +59,7 @@ fn a_project_toml_that_cannot_be_read_leaves_the_project_as_it_was() {
     std::fs::write(&file, "[[layer\n").expect("written");
     editor.take_in_outside_changes();
     editor.until("it to say so", |editor| editor.says("the project could not be read again"));
-    assert_eq!(editor.workspace().selected.as_ref().map(project::TreePath::as_str), Some("rig/skeleton"));
+    assert_eq!(editor.workspace().selected.as_deref().map(project::TreePath::as_str), Some("rig/skeleton"));
     std::fs::write(&file, good).expect("written");
     editor.take_in_outside_changes();
     editor.until("it to read it", |editor| editor.says("the project was read again"));

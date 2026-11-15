@@ -146,6 +146,17 @@ on = ["windows"]
 texts = ["standard/LGPL-3.0.txt", "standard/GPL-3.0.txt"]
 
 [[bundled]]
+name = "Unicode Character Database: UnicodeData.txt and CaseFolding.txt"
+version = "18.0.0"
+what = """the table names are compared by, made from them as the editor is built (`crates/path/build.rs`): each \
+character's simple uppercase and full case folding"""
+license = "Unicode-3.0"
+copyright = "Unicode, Inc."
+from = "https://www.unicode.org/Public/18.0.0/ucd/"
+in = ["pe2-editor", "pe2-cli"]
+texts = ["texts/unicode-character-database/license.txt"]
+
+[[bundled]]
 name = "DirectX Shader Compiler, dxcompiler.dll"
 version = "1.9.2609"
 what = """Microsoft's release of it, beside the editor (`prepare.toml`): what Direct3D 12's shaders are compiled \

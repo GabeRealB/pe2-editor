@@ -4,71 +4,46 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{PathError, Why};
+use crate::fold;
 
 /// One part of a path: portable, so that a project made on one system opens on another. It is not empty, `.` or `..`;
 /// it holds no separator, none of `: * ? " < > |` and no control character; it is no name Windows keeps for a device
 /// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or without an extension, in any case); and it does
-/// not end in a dot or a space. A name the program itself holds is a constant, checked as it is compiled
-/// (`Name::constant`).
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Name(Text);
+/// not end in a dot or a space.
+///
+/// Unsized, as `str` is: held as `&Name`, a part of a path's text or a constant (`Name::constant`), and owned as
+/// `Arc<Name>` (`ToOwned`), whose clone shares its text.
+#[repr(transparent)]
+pub struct Name(str);
 
 /// Names joined by `/`, relative to what it is taken within; none at all is that itself (`RelPath::root`). Two are
 /// ordered and compared as their texts, as the names they were before they were paths.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct RelPath(Text);
+///
+/// Unsized, as `str` is: borrowed as `&RelPath` - what is in it (`parent`) and what is left of it (`strip_prefix`) are
+/// slices of its text - and owned as `Arc<RelPath>`.
+#[repr(transparent)]
+pub struct RelPath(str);
 
-/// A checked text: one the program holds from its start, or one made as it runs, shared by whatever holds it.
-#[derive(Clone)]
-enum Text {
-    Static(&'static str),
-    Shared(Arc<str>),
-}
-
-impl Text {
-    fn as_str(&self) -> &str {
-        match self {
-            Text::Static(text) => text,
-            Text::Shared(text) => text,
-        }
+impl Name {
+    /// A checked text as a name.
+    pub(crate) const fn of(text: &str) -> &Name {
+        // SAFETY: `Name` is `str` alone, as `repr(transparent)` lays it out.
+        unsafe { &*(std::ptr::from_ref::<str>(text) as *const Name) }
     }
 }
 
-impl From<&str> for Text {
-    fn from(text: &str) -> Text {
-        Text::Shared(text.into())
+impl RelPath {
+    /// A checked text as a path.
+    pub(crate) const fn of(text: &str) -> &RelPath {
+        // SAFETY: `RelPath` is `str` alone, as `repr(transparent)` lays it out.
+        unsafe { &*(std::ptr::from_ref::<str>(text) as *const RelPath) }
     }
-}
 
-impl Default for Text {
-    fn default() -> Text {
-        Text::Static("")
-    }
-}
-
-impl PartialEq for Text {
-    fn eq(&self, other: &Text) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl Eq for Text {}
-
-impl PartialOrd for Text {
-    fn partial_cmp(&self, other: &Text) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Text {
-    fn cmp(&self, other: &Text) -> std::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
-    }
-}
-
-impl std::hash::Hash for Text {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
+    /// A checked text as a shared path.
+    pub(crate) fn shared(text: &str) -> Arc<RelPath> {
+        let shared: Arc<str> = Arc::from(text);
+        // SAFETY: `RelPath` is `str` alone (`repr(transparent)`): the pointer is to what the `Arc<str>` held.
+        unsafe { Arc::from_raw(Arc::into_raw(shared) as *const RelPath) }
     }
 }
 
@@ -83,6 +58,9 @@ const fn refused_in(bytes: &[u8], start: usize, end: usize) -> Option<Why> {
     let len = end - start;
     if len == 0 {
         return Some(Why::Empty);
+    }
+    if len > 255 {
+        return Some(Why::Long);
     }
     if bytes[start] == b'.' && (len == 1 || (len == 2 && bytes[start + 1] == b'.')) {
         return Some(Why::Dot);
@@ -103,6 +81,9 @@ const fn refused_in(bytes: &[u8], start: usize, end: usize) -> Option<Why> {
                 None => '?',
             }));
         }
+        if let Some(c) = direction(bytes, at, end) {
+            return Some(Why::Direction(c));
+        }
         at += 1;
     }
     let last = bytes[end - 1];
@@ -112,7 +93,26 @@ const fn refused_in(bytes: &[u8], start: usize, end: usize) -> Option<Why> {
     if reserved(bytes, start, end) { Some(Why::Reserved) } else { None }
 }
 
-/// Whether Windows keeps a name for a device: its part before the first dot, without the spaces ending it.
+/// The character at `bytes[at..]` that turns which way text reads, if it is one: the marks and embeddings, overrides
+/// and isolates of bidirectional text (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
+const fn direction(bytes: &[u8], at: usize, end: usize) -> Option<char> {
+    let code = if bytes[at] == 0xd8 && at + 1 < end && bytes[at + 1] == 0x9c {
+        0x061c
+    } else if bytes[at] == 0xe2 && at + 2 < end && (bytes[at + 1] == 0x80 || bytes[at + 1] == 0x81) {
+        0x2000 | ((bytes[at + 1] as u32 & 0x3f) << 6) | (bytes[at + 2] as u32 & 0x3f)
+    } else {
+        return None;
+    };
+    if matches!(code, 0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069) {
+        char::from_u32(code)
+    } else {
+        None
+    }
+}
+
+/// Whether Windows keeps a name for a device: its part before the first dot, without the spaces ending it - `CON`,
+/// `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM` or `LPT` with a digit from 1 to 9 or a superscript one, two or
+/// three after it.
 const fn reserved(bytes: &[u8], start: usize, end: usize) -> bool {
     let mut stem_end = start;
     while stem_end < end && bytes[stem_end] != b'.' {
@@ -122,7 +122,14 @@ const fn reserved(bytes: &[u8], start: usize, end: usize) -> bool {
         stem_end -= 1;
     }
     let len = stem_end - start;
-    if len != 3 && len != 4 {
+    let stem = (bytes, start, len);
+    if is(stem, b"CON") || is(stem, b"PRN") || is(stem, b"AUX") || is(stem, b"NUL") {
+        return true;
+    }
+    if is(stem, b"CONIN$") || is(stem, b"CONOUT$") {
+        return true;
+    }
+    if len < 4 {
         return false;
     }
     let (a, b, c) = (
@@ -130,10 +137,28 @@ const fn reserved(bytes: &[u8], start: usize, end: usize) -> bool {
         bytes[start + 1].to_ascii_uppercase(),
         bytes[start + 2].to_ascii_uppercase(),
     );
-    if len == 3 {
-        return matches!((a, b, c), (b'C', b'O', b'N') | (b'P', b'R', b'N') | (b'A', b'U', b'X') | (b'N', b'U', b'L'));
+    if !matches!((a, b, c), (b'C', b'O', b'M') | (b'L', b'P', b'T')) {
+        return false;
     }
-    matches!((a, b, c), (b'C', b'O', b'M') | (b'L', b'P', b'T')) && bytes[start + 3] >= b'1' && bytes[start + 3] <= b'9'
+    let digit = bytes[start + 3];
+    // `¹`, `²` and `³`: 0xC2 and 0xB9, 0xB2 or 0xB3.
+    (len == 4 && digit >= b'1' && digit <= b'9')
+        || (len == 5 && digit == 0xc2 && matches!(bytes[start + 4], 0xb9 | 0xb2 | 0xb3))
+}
+
+/// Whether a name's stem (`bytes[start..start + len]`) is `word`, in any case.
+const fn is((bytes, start, len): (&[u8], usize, usize), word: &[u8]) -> bool {
+    if word.len() != len {
+        return false;
+    }
+    let mut at = 0;
+    while at < len {
+        if bytes[start + at].to_ascii_uppercase() != word[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
 }
 
 /// Why `text` is no relative path, if it is not one: none of its parts may be refused, the empty text being the root.
@@ -170,7 +195,19 @@ impl Names for Name {
 
 impl Names for RelPath {
     fn names(&self) -> impl Iterator<Item = &str> {
-        self.parts()
+        self.parts().map(Name::as_str)
+    }
+}
+
+impl<T: Names + ?Sized> Names for &T {
+    fn names(&self) -> impl Iterator<Item = &str> {
+        (**self).names()
+    }
+}
+
+impl<T: Names + ?Sized> Names for Arc<T> {
+    fn names(&self) -> impl Iterator<Item = &str> {
+        (**self).names()
     }
 }
 
@@ -179,58 +216,71 @@ impl Name {
     ///
     /// # Errors
     /// It is no portable name.
-    pub fn new(text: &str) -> Result<Name, PathError> {
+    pub fn new(text: &str) -> Result<&Name, PathError> {
         match refused(text) {
             Some(why) => Err(PathError::new(text, why)),
-            None => Ok(Name(text.into())),
+            None => Ok(Name::of(text)),
         }
     }
 
-    /// A name the program holds: checked as it is compiled, where it is a constant (`const X: Name = ...`), and
+    /// A name the program holds: checked as it is compiled, where it is a constant (`const X: &Name = ...`), and
     /// refused by failing to.
     ///
     /// # Panics
     /// `text` is no portable name.
     #[must_use]
-    pub const fn constant(text: &'static str) -> Name {
+    pub const fn constant(text: &'static str) -> &'static Name {
         assert!(refused(text).is_none(), "no portable name");
-        Name(Text::Static(text))
+        Name::of(text)
     }
 
     /// Its text.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
+    pub const fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// It as a path of one name.
+    #[must_use]
+    pub const fn as_rel(&self) -> &RelPath {
+        RelPath::of(&self.0)
+    }
+
+    /// A shared name as a shared path of one name.
+    #[must_use]
+    pub fn into_rel(name: Arc<Name>) -> Arc<RelPath> {
+        // SAFETY: `Name` and `RelPath` are both `str` alone (`repr(transparent)`), and a name is a path of one name.
+        unsafe { Arc::from_raw(Arc::into_raw(name) as *const RelPath) }
     }
 }
 
 impl RelPath {
     /// The path of nothing: what it is taken within itself.
     #[must_use]
-    pub fn root() -> RelPath {
-        RelPath::default()
+    pub const fn root() -> &'static RelPath {
+        RelPath::of("")
     }
 
     /// `text` as a path: names joined by `/`, none for the empty text.
     ///
     /// # Errors
     /// A part of it is no portable name, or empty (`a//b`, a leading or a trailing `/`).
-    pub fn new(text: &str) -> Result<RelPath, PathError> {
+    pub fn new(text: &str) -> Result<&RelPath, PathError> {
         match refused_path(text) {
             Some(why) => Err(PathError::new(text, why)),
-            None => Ok(RelPath(text.into())),
+            None => Ok(RelPath::of(text)),
         }
     }
 
-    /// A path the program holds: checked as it is compiled, where it is a constant (`const X: RelPath = ...`), and
+    /// A path the program holds: checked as it is compiled, where it is a constant (`const X: &RelPath = ...`), and
     /// refused by failing to.
     ///
     /// # Panics
     /// `text` is no relative path.
     #[must_use]
-    pub const fn constant(text: &'static str) -> RelPath {
+    pub const fn constant(text: &'static str) -> &'static RelPath {
         assert!(refused_path(text).is_none(), "no relative path of portable names");
-        RelPath(Text::Static(text))
+        RelPath::of(text)
     }
 
     /// Where a store keeps what it keeps by a key (a digest): in a folder of the key's first two characters, as
@@ -238,7 +288,7 @@ impl RelPath {
     ///
     /// # Errors
     /// The key with its suffix is no portable name.
-    pub fn sharded(key: &str, suffix: &str) -> Result<RelPath, PathError> {
+    pub fn sharded(key: &str, suffix: &str) -> Result<Arc<RelPath>, PathError> {
         let file = format!("{key}{suffix}");
         let shard = key.get(..2).unwrap_or(key);
         for name in [shard, file.as_str()] {
@@ -246,18 +296,18 @@ impl RelPath {
                 return Err(PathError::new(&file, why));
             }
         }
-        Ok(RelPath(format!("{shard}/{file}").as_str().into()))
+        Ok(RelPath::shared(&format!("{shard}/{file}")))
     }
 
     /// Whether it names nothing but what it is taken within.
     #[must_use]
-    pub fn is_root(&self) -> bool {
-        self.0.as_str().is_empty()
+    pub const fn is_root(&self) -> bool {
+        self.0.is_empty()
     }
 
-    /// Its names, in order; each one checked as [`Name`] checks one.
-    pub fn parts(&self) -> impl DoubleEndedIterator<Item = &str> {
-        self.0.as_str().split('/').filter(|part| !part.is_empty())
+    /// Its names, in order: slices of its text, each checked as [`Name`] checks one when it was.
+    pub fn parts(&self) -> impl DoubleEndedIterator<Item = &Name> {
+        self.0.split('/').filter(|part| !part.is_empty()).map(Name::of)
     }
 
     /// How many names it has.
@@ -266,48 +316,47 @@ impl RelPath {
         self.parts().count()
     }
 
-    /// Its last name, unless it is the root.
+    /// Its last name's text, unless it is the root: what it is shown as.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
+        self.last().map(Name::as_str)
+    }
+
+    /// Its last name, unless it is the root.
+    #[must_use]
+    pub fn last(&self) -> Option<&Name> {
         self.parts().next_back()
     }
 
-    /// Its last name as a name, unless it is the root: a part of a path is one already, checked as the path was.
+    /// What it is in, unless it is the root: the start of its text.
     #[must_use]
-    pub fn last(&self) -> Option<Name> {
-        self.name().map(|name| Name(Text::Shared(name.into())))
-    }
-
-    /// What it is in, unless it is the root.
-    #[must_use]
-    pub fn parent(&self) -> Option<RelPath> {
+    pub fn parent(&self) -> Option<&RelPath> {
         if self.is_root() {
             return None;
         }
-        let text = self.0.as_str();
-        Some(match text.rfind('/') {
-            Some(at) => RelPath(text[..at].into()),
+        Some(match self.0.rfind('/') {
+            Some(at) => RelPath::of(&self.0[..at]),
             None => RelPath::root(),
         })
     }
 
     /// A name within it.
     #[must_use]
-    pub fn join(&self, name: &Name) -> RelPath {
+    pub fn join(&self, name: &Name) -> Arc<RelPath> {
         self.join_text(name.as_str())
     }
 
     /// A path within it.
     #[must_use]
-    pub fn join_path(&self, path: &RelPath) -> RelPath {
+    pub fn join_path(&self, path: &RelPath) -> Arc<RelPath> {
         self.join_text(path.as_str())
     }
 
-    fn join_text(&self, text: &str) -> RelPath {
+    fn join_text(&self, text: &str) -> Arc<RelPath> {
         match (self.is_root(), text.is_empty()) {
-            (_, true) => self.clone(),
-            (true, false) => RelPath(text.into()),
-            (false, false) => RelPath(format!("{}/{text}", self.as_str()).as_str().into()),
+            (_, true) => self.to_owned(),
+            (true, false) => RelPath::shared(text),
+            (false, false) => RelPath::shared(&format!("{}/{text}", self.as_str())),
         }
     }
 
@@ -317,171 +366,334 @@ impl RelPath {
         self.strip_prefix(prefix).is_some()
     }
 
-    /// What of it is within `prefix`, if it is `prefix` or within it.
+    /// What of it is within `prefix`, if it is `prefix` or within it - name by name, each as names compare (`fold`):
+    /// the end of its text.
     #[must_use]
-    pub fn strip_prefix(&self, prefix: &RelPath) -> Option<RelPath> {
-        if prefix.is_root() {
-            return Some(self.clone());
+    pub fn strip_prefix(&self, prefix: &RelPath) -> Option<&RelPath> {
+        let mut rest = self.as_str();
+        for name in prefix.parts() {
+            let (first, after) = rest.split_once('/').unwrap_or((rest, ""));
+            if first.is_empty() || !fold::same(first, name.as_str()) {
+                return None;
+            }
+            rest = after;
         }
-        let rest = self.as_str().strip_prefix(prefix.as_str())?;
-        match rest.strip_prefix('/') {
-            _ if rest.is_empty() => Some(RelPath::root()),
-            Some(rest) => Some(RelPath(rest.into())),
-            None => None,
-        }
+        Some(RelPath::of(rest))
     }
 
     /// Its text, names joined by `/`: for writing it out where a path leaves the program as text.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
+    pub const fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl PartialEq<str> for Name {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+/// A name is a place within a folder as any system takes one: joined onto a path of the system's, it stays within it.
+impl AsRef<std::path::Path> for Name {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
     }
 }
 
-impl PartialEq<&str> for Name {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+impl ToOwned for Name {
+    type Owned = Arc<Name>;
+    fn to_owned(&self) -> Arc<Name> {
+        Arc::from(self)
     }
 }
 
-impl PartialEq<Name> for str {
-    fn eq(&self, other: &Name) -> bool {
-        self == other.as_str()
+impl ToOwned for RelPath {
+    type Owned = Arc<RelPath>;
+    fn to_owned(&self) -> Arc<RelPath> {
+        Arc::from(self)
     }
 }
 
-impl PartialEq<Name> for &str {
-    fn eq(&self, other: &Name) -> bool {
-        *self == other.as_str()
+impl From<&Name> for Arc<Name> {
+    fn from(name: &Name) -> Arc<Name> {
+        let shared = RelPath::shared(name.as_str());
+        // SAFETY: `Name` and `RelPath` are both `str` alone (`repr(transparent)`), and the text is a checked name.
+        unsafe { Arc::from_raw(Arc::into_raw(shared) as *const Name) }
     }
 }
 
-impl PartialEq<Name> for String {
-    fn eq(&self, other: &Name) -> bool {
-        self.as_str() == other.as_str()
+impl From<&RelPath> for Arc<RelPath> {
+    fn from(path: &RelPath) -> Arc<RelPath> {
+        RelPath::shared(path.as_str())
     }
 }
 
-impl PartialEq<Name> for &String {
-    fn eq(&self, other: &Name) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<String> for Name {
-    fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<str> for RelPath {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for RelPath {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+impl<'a> From<&'a Name> for &'a RelPath {
+    fn from(name: &'a Name) -> &'a RelPath {
+        name.as_rel()
     }
 }
 
 impl PartialEq<Name> for RelPath {
     fn eq(&self, other: &Name) -> bool {
-        self.as_str() == other.as_str()
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl PartialEq<&Name> for Arc<Name> {
+    fn eq(&self, other: &&Name) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<&RelPath> for Arc<RelPath> {
+    fn eq(&self, other: &&RelPath) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<&Name> for Arc<RelPath> {
+    fn eq(&self, other: &&Name) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Name> for Arc<Name> {
+    fn eq(&self, other: &Name) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<RelPath> for Arc<RelPath> {
+    fn eq(&self, other: &RelPath) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<Name> for Arc<RelPath> {
+    fn eq(&self, other: &Name) -> bool {
+        **self == *other
+    }
+}
+
+impl Default for &RelPath {
+    fn default() -> Self {
+        RelPath::root()
+    }
+}
+
+/// Two names are one where they fold alike (`fold`): what any system takes as one name.
+impl PartialEq for Name {
+    fn eq(&self, other: &Name) -> bool {
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl Eq for Name {}
+
+impl PartialOrd for Name {
+    fn partial_cmp(&self, other: &Name) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Names are ordered as their folds.
+impl Ord for Name {
+    fn cmp(&self, other: &Name) -> std::cmp::Ordering {
+        fold::order(self.as_str(), other.as_str())
+    }
+}
+
+impl std::hash::Hash for Name {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        fold::hash(self.as_str(), state);
+    }
+}
+
+/// Two paths are one where their names are, one by one: their texts fold alike, as a fold never makes or takes a `/`.
+impl PartialEq for RelPath {
+    fn eq(&self, other: &RelPath) -> bool {
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl Eq for RelPath {}
+
+impl PartialOrd for RelPath {
+    fn partial_cmp(&self, other: &RelPath) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Paths are ordered name by name, a path before what is within it: what is within a folder follows it, before
+/// anything else is.
+impl Ord for RelPath {
+    fn cmp(&self, other: &RelPath) -> std::cmp::Ordering {
+        self.parts().cmp(other.parts())
+    }
+}
+
+impl std::hash::Hash for RelPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        fold::hash(self.as_str(), state);
+    }
+}
+
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        fold::same(self.as_str(), other)
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        fold::same(self.as_str(), other)
+    }
+}
+
+impl PartialEq<Name> for str {
+    fn eq(&self, other: &Name) -> bool {
+        fold::same(self, other.as_str())
+    }
+}
+
+impl PartialEq<Name> for &str {
+    fn eq(&self, other: &Name) -> bool {
+        fold::same(self, other.as_str())
+    }
+}
+
+impl PartialEq<Name> for String {
+    fn eq(&self, other: &Name) -> bool {
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl PartialEq<Name> for &String {
+    fn eq(&self, other: &Name) -> bool {
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl PartialEq<String> for Name {
+    fn eq(&self, other: &String) -> bool {
+        fold::same(self.as_str(), other.as_str())
+    }
+}
+
+impl PartialEq<str> for RelPath {
+    fn eq(&self, other: &str) -> bool {
+        fold::same(self.as_str(), other)
+    }
+}
+
+impl PartialEq<&str> for RelPath {
+    fn eq(&self, other: &&str) -> bool {
+        fold::same(self.as_str(), other)
     }
 }
 
 impl PartialEq<Name> for &RelPath {
     fn eq(&self, other: &Name) -> bool {
-        self.as_str() == other.as_str()
+        fold::same(self.as_str(), other.as_str())
     }
 }
 
 impl PartialEq<std::ffi::OsStr> for Name {
     fn eq(&self, other: &std::ffi::OsStr) -> bool {
-        other == self.as_str()
+        other.to_str().is_some_and(|text| fold::same(self.as_str(), text))
     }
 }
 
 impl PartialEq<Name> for &std::ffi::OsStr {
     fn eq(&self, other: &Name) -> bool {
-        *self == other.as_str()
+        self.to_str().is_some_and(|text| fold::same(text, other.as_str()))
     }
 }
 
 impl PartialEq<Name> for std::ffi::OsString {
     fn eq(&self, other: &Name) -> bool {
-        self == other.as_str()
+        self.to_str().is_some_and(|text| fold::same(text, other.as_str()))
+    }
+}
+
+impl PartialEq<&Name> for std::ffi::OsStr {
+    fn eq(&self, other: &&Name) -> bool {
+        self.to_str().is_some_and(|text| fold::same(text, other.as_str()))
+    }
+}
+
+impl PartialEq<&Name> for std::ffi::OsString {
+    fn eq(&self, other: &&Name) -> bool {
+        self.to_str().is_some_and(|text| fold::same(text, other.as_str()))
     }
 }
 
 impl PartialEq<Name> for std::ffi::OsStr {
     fn eq(&self, other: &Name) -> bool {
-        self == other.as_str()
-    }
-}
-
-impl From<Name> for RelPath {
-    fn from(name: Name) -> RelPath {
-        RelPath(name.0)
+        self.to_str().is_some_and(|text| fold::same(text, other.as_str()))
     }
 }
 
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 impl fmt::Debug for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.0.as_str(), f)
+        fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
 impl fmt::Display for RelPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 impl fmt::Debug for RelPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.0.as_str(), f)
+        fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
-impl std::str::FromStr for Name {
-    type Err = PathError;
-    fn from_str(text: &str) -> Result<Name, PathError> {
-        Name::new(text)
+impl serde::Serialize for Name {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
-impl std::str::FromStr for RelPath {
-    type Err = PathError;
-    fn from_str(text: &str) -> Result<RelPath, PathError> {
-        RelPath::new(text)
+impl serde::Serialize for RelPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
-crate::serde_as_text!(Name);
-crate::serde_as_text!(RelPath);
+impl<'de> serde::Deserialize<'de> for Box<Name> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Box<Name>, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        let name = Name::new(&text).map_err(serde::de::Error::custom)?;
+        let boxed: Box<str> = name.as_str().into();
+        // SAFETY: `Name` is `str` alone (`repr(transparent)`), and the text is checked.
+        Ok(unsafe { Box::from_raw(Box::into_raw(boxed) as *mut Name) })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Box<RelPath> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Box<RelPath>, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        let path = RelPath::new(&text).map_err(serde::de::Error::custom)?;
+        let boxed: Box<str> = path.as_str().into();
+        // SAFETY: `RelPath` is `str` alone (`repr(transparent)`), and the text is checked.
+        Ok(unsafe { Box::from_raw(Box::into_raw(boxed) as *mut RelPath) })
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::{Name, RelPath};
     use crate::Why;
+    use std::sync::Arc;
 
-    const LAYERS: Name = Name::constant(".layers");
-    const NESTED: RelPath = RelPath::constant(".layers/top");
+    const LAYERS: &Name = Name::constant(".layers");
+    const NESTED: &RelPath = RelPath::constant(".layers/top");
 
     fn why(text: &str) -> Why {
         Name::new(text).expect_err(text).why
@@ -490,7 +702,7 @@ mod tests {
     #[test]
     fn a_name_is_refused_where_some_system_could_not_hold_it() {
         for ok in ["a", "native.bin", "node.toml", "COM0", "LPT", "console", "aux_", "my aux", ".hidden", "a b", "ä"] {
-            assert_eq!(Name::new(ok).map(|n| n.to_string()).as_deref(), Ok(ok));
+            assert_eq!(Name::new(ok).map(Name::as_str), Ok(ok));
         }
         assert_eq!(why(""), Why::Empty);
         assert_eq!(why("."), Why::Dot);
@@ -506,7 +718,7 @@ mod tests {
         assert_eq!(why("a "), Why::Trailing(' '));
         assert_eq!(why("a\u{85}b"), Why::Character('\u{85}'));
         assert_eq!(LAYERS, Name::new(".layers").unwrap());
-        assert_eq!(NESTED.parent().unwrap(), RelPath::from(LAYERS));
+        assert_eq!(NESTED.parent().unwrap(), LAYERS.as_rel());
         let error = Name::new("a:b").unwrap_err().to_string();
         assert!(error.contains("`:`"), "{error}");
     }
@@ -514,43 +726,82 @@ mod tests {
     #[test]
     fn a_path_is_its_names_and_goes_by_them() {
         let path = RelPath::new("packages/weapons/m93r").unwrap();
-        assert_eq!(path.parts().collect::<Vec<_>>(), ["packages", "weapons", "m93r"]);
+        assert_eq!(path.parts().map(Name::as_str).collect::<Vec<_>>(), ["packages", "weapons", "m93r"]);
         assert_eq!(path.name(), Some("m93r"));
+        assert_eq!(path.last(), Some(Name::new("m93r").unwrap()));
         assert_eq!(path.depth(), 3);
         assert_eq!(path.parent().unwrap().as_str(), "packages/weapons");
         assert_eq!(RelPath::new("a").unwrap().parent(), Some(RelPath::root()));
         assert_eq!(RelPath::root().parent(), None);
         assert!(RelPath::new("").unwrap().is_root());
         let weapons = RelPath::new("packages/weapons").unwrap();
-        assert!(path.starts_with(&weapons) && path.starts_with(&RelPath::root()) && path.starts_with(&path));
-        assert!(!RelPath::new("packages/weaponsx").unwrap().starts_with(&weapons));
-        assert_eq!(path.strip_prefix(&weapons).unwrap().as_str(), "m93r");
-        assert_eq!(path.strip_prefix(&path), Some(RelPath::root()));
-        assert_eq!(weapons.join(&Name::new("m93r").unwrap()), path);
-        assert_eq!(RelPath::root().join_path(&path), path);
-        assert_eq!(path.join_path(&RelPath::root()), path);
+        assert!(path.starts_with(weapons) && path.starts_with(RelPath::root()) && path.starts_with(path));
+        assert!(!RelPath::new("packages/weaponsx").unwrap().starts_with(weapons));
+        assert_eq!(path.strip_prefix(weapons).unwrap().as_str(), "m93r");
+        assert_eq!(path.strip_prefix(path), Some(RelPath::root()));
+        assert_eq!(&*weapons.join(Name::new("m93r").unwrap()), path);
+        assert_eq!(&*RelPath::root().join_path(path), path);
+        assert_eq!(&*path.join_path(RelPath::root()), path);
         for bad in ["/a", "a/", "a//b", "a/../b", "a/./b", "a\\b"] {
             assert!(RelPath::new(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn paths_order_as_their_texts() {
-        let texts = ["a", "a b", "a-b", "a/b", "a/b/c", "ab", "b"];
-        let mut paths: Vec<RelPath> = texts.iter().rev().map(|t| RelPath::new(t).unwrap()).collect();
+    fn owned_it_shares_its_text() {
+        let path: Arc<RelPath> = RelPath::new("a/b").unwrap().to_owned();
+        let again = Arc::clone(&path);
+        assert!(std::ptr::eq(path.as_str(), again.as_str()));
+        let name: Arc<Name> = Name::new("b").unwrap().to_owned();
+        assert_eq!(&*Name::into_rel(name), RelPath::new("b").unwrap());
+        // What is in it, and what is left of it, are slices of its text: nothing is made.
+        assert!(std::ptr::eq(path.parent().unwrap().as_str().as_ptr(), path.as_str().as_ptr()));
+    }
+
+    #[test]
+    fn paths_order_name_by_name_what_is_within_a_folder_after_it() {
+        let texts = ["a", "a/b", "a/b/c", "a b", "a-b", "ab", "b"];
+        let mut paths: Vec<&RelPath> = texts.iter().rev().map(|t| RelPath::new(t).unwrap()).collect();
         paths.sort();
-        let mut sorted = texts.to_vec();
-        sorted.sort_unstable();
-        assert_eq!(paths.iter().map(RelPath::as_str).collect::<Vec<_>>(), sorted);
+        assert_eq!(paths.iter().map(|p| p.as_str()).collect::<Vec<_>>(), texts);
+        // By their folds: a name of another case is no other name.
+        assert!(RelPath::new("B").unwrap() > RelPath::new("a/z").unwrap());
+        assert_eq!(RelPath::new("A/B").unwrap(), RelPath::new("a/b").unwrap());
+    }
+
+    #[test]
+    fn a_path_is_within_another_by_names_alike() {
+        let path = RelPath::new("Rooms/Cafe\u{301}/a.txt").unwrap();
+        let rest = path.strip_prefix(RelPath::new("rooms/CAFÉ").unwrap()).unwrap();
+        assert_eq!(rest.as_str(), "a.txt");
+        assert!(path.starts_with(RelPath::new("ROOMS").unwrap()));
+        assert!(!path.starts_with(RelPath::new("room").unwrap()));
+        assert_eq!(*Name::new("Notes").unwrap(), *"notes");
+    }
+
+    #[test]
+    fn what_windows_keeps_and_what_reads_otherwise_than_it_is_are_refused() {
+        for reserved in ["CONIN$", "conout$.txt", "COM\u{b9}", "lpt\u{b3}.log"] {
+            assert_eq!(why(reserved), Why::Reserved, "{reserved}");
+        }
+        for ok in ["COM\u{b9}x", "CONIN", "console$"] {
+            assert!(Name::new(ok).is_ok(), "{ok}");
+        }
+        for c in ['\u{202e}', '\u{200f}', '\u{2066}', '\u{61c}'] {
+            assert_eq!(why(&format!("a{c}gnp.exe")), Why::Direction(c));
+        }
+        assert_eq!(why(&"a".repeat(256)), Why::Long);
+        assert!(Name::new(&"\u{e9}".repeat(127)).is_ok());
     }
 
     #[test]
     fn as_text_it_is_checked_when_read() {
         let path = RelPath::new("a/b").unwrap();
-        assert_eq!(serde_json::to_string(&path).unwrap(), "\"a/b\"");
-        assert_eq!(serde_json::from_str::<RelPath>("\"a/b\"").unwrap(), path);
-        assert!(serde_json::from_str::<RelPath>("\"a/../b\"").is_err());
-        assert!(serde_json::from_str::<Name>("\"a/b\"").is_err());
+        assert_eq!(serde_json::to_string(path).unwrap(), "\"a/b\"");
+        assert_eq!(&*serde_json::from_str::<Box<RelPath>>("\"a/b\"").unwrap(), path);
+        assert_eq!(&*serde_json::from_str::<Arc<RelPath>>("\"a/b\"").unwrap(), path);
+        assert!(serde_json::from_str::<Box<RelPath>>("\"a/../b\"").is_err());
+        assert!(serde_json::from_str::<Box<Name>>("\"a/b\"").is_err());
         assert_eq!(RelPath::sharded("abcdef", ".cbor").unwrap().as_str(), "ab/abcdef.cbor");
         assert!(RelPath::sharded("../x", "").is_err());
     }

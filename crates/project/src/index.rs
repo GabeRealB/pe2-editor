@@ -20,7 +20,8 @@
 //! kept); elsewhere they are reported.
 
 use anyhow::{Context as _, Result};
-use pe2_path::{HostPath, Name, RelPath, Uid};
+use pe2_path::{Name, RelPath, Uid};
+use sfs::HostPath;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,10 +34,10 @@ use crate::model::{Declaration, Record};
 use crate::{FILE, Layer, LayerKind, Project, TreePath, uid};
 
 pub const BUNDLE_SUFFIX: &str = ".node";
-pub const NODE_FILE: Name = Name::constant("node.toml");
+pub const NODE_FILE: &Name = Name::constant("node.toml");
 /// A node's settings a generated layer holds for it, made by extraction: beneath what its `node.toml` sets
 /// (`graph::with_generated`), so that what the game holds stays out of the node and is still edited as its fields.
-pub const SETTINGS_FILE: Name = Name::constant("settings.toml");
+pub const SETTINGS_FILE: &Name = Name::constant("settings.toml");
 
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
@@ -81,7 +82,7 @@ struct Memo {
 /// A file of a bundle, from the layer whose version of the asset wins.
 #[derive(Clone, Debug)]
 pub struct BundleFile {
-    pub name: RelPath,
+    pub name: Arc<RelPath>,
     pub path: HostPath,
     pub size: u64,
     pub modified: Stamp,
@@ -96,7 +97,7 @@ pub struct BundleFile {
 /// Its fields are parsed from the `node.toml`'s text the first time they are asked for.
 #[derive(Clone, Debug)]
 pub struct Asset {
-    pub path: TreePath,
+    pub path: Arc<TreePath>,
     pub uid: Option<Uid>,
     /// The name the graph knows it by (`graph::exec::Node::uid`): its uid's text; for a version below an asset,
     /// `below:<uid>`, as many times over as it is below - it is no uid of its own.
@@ -130,7 +131,7 @@ pub struct Asset {
 /// disk, so that what reads the index - outputs, views, previews - follows the edit before it is saved.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Working {
-    pub files: BTreeMap<RelPath, Option<WorkingFile>>,
+    pub files: BTreeMap<Arc<RelPath>, Option<WorkingFile>>,
 }
 
 /// A file of a working copy: where its content is kept, and its hash.
@@ -262,14 +263,14 @@ pub enum OpStatus {
 pub struct OpView {
     pub uid: Uid,
     pub op: Op,
-    pub path: Option<TreePath>,
+    pub path: Option<Arc<TreePath>>,
     pub status: OpStatus,
 }
 
 /// An entry a layer creates: its uid, its path, and what the layer holds there (none: missing).
 pub struct CreateView {
     pub uid: Uid,
-    pub path: TreePath,
+    pub path: Arc<TreePath>,
     pub kind: Option<Kind>,
 }
 
@@ -277,7 +278,7 @@ pub struct CreateView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StalePart {
     /// The file of the bundle.
-    pub file: RelPath,
+    pub file: Arc<RelPath>,
     /// The field, as a dotted path; none for a file held or removed whole.
     pub field: Option<String>,
     /// What the layer has, what it was below when made, and what it is below now: none where absent.
@@ -292,14 +293,14 @@ pub struct Below {
     pub kind: Kind,
     pub uid: Uid,
     /// Its resolved path below the layer.
-    pub path: TreePath,
+    pub path: Arc<TreePath>,
     /// Its content's hash: what an override copying it whole records as its base. None for a folder.
     pub hash: Option<String>,
     /// Its files' hashes, by name: what an override records of a file it changes, as what it was made from
     /// (`changeset::Base::was`).
-    pub sha1s: BTreeMap<RelPath, String>,
+    pub sha1s: BTreeMap<Arc<RelPath>, String>,
     /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
-    pub files: Vec<(RelPath, HostPath)>,
+    pub files: Vec<(Arc<RelPath>, HostPath)>,
     /// The layer holding its content.
     pub layer: String,
 }
@@ -310,7 +311,7 @@ pub struct LayerInfo {
     pub name: String,
     pub kind: LayerKind,
     /// A mount's mount point; empty for a layer at the top.
-    pub at: TreePath,
+    pub at: Arc<TreePath>,
     /// Its content is its maker's alone.
     pub read_only: bool,
     /// Its changeset can be written.
@@ -358,7 +359,7 @@ fn plural_y(n: usize) -> &'static str {
 /// A reference from one asset to another: where it is (the slot's name, or the field holding it) and its target.
 #[derive(Clone, Debug)]
 pub struct Reference {
-    pub from: TreePath,
+    pub from: Arc<TreePath>,
     pub slot: String,
     pub uid: String,
     pub target: String,
@@ -586,14 +587,14 @@ impl<T> std::ops::Deref for Shared<T> {
 /// changed - the layers themselves may have, which a refresh does not follow: the project is read again.
 #[derive(Debug, Default)]
 pub struct Refreshed {
-    pub assets: BTreeSet<TreePath>,
+    pub assets: BTreeSet<Arc<TreePath>>,
     pub project_file: bool,
     /// The stack was applied again: what changed was more than contents.
     pub restacked: bool,
     /// The entries of the whole stack that changed or came to be, by their resolved paths, and those that are no
     /// more: what is served of them is all that changed of what is served (`Index::serve_changed`).
-    pub touched: BTreeSet<TreePath>,
-    pub gone: BTreeSet<TreePath>,
+    pub touched: BTreeSet<Arc<TreePath>>,
+    pub gone: BTreeSet<Arc<TreePath>>,
     /// What it changed of the project's model, where its processes share it (`model`): applied in the commit that
     /// says what is served after the refresh.
     pub model: crate::model::Delta,
@@ -641,9 +642,9 @@ fn records_differ(
 
 /// Whether an entry's content - where its layer holds it, or the layer filling that one does - or a file its
 /// overrides made lies in what was scanned again: the regions, by layer and path there, and where those are on disk.
-fn in_rescanned(node: &Node, regions: &[(usize, TreePath)], disks: &[HostPath], filled: &[Option<usize>]) -> bool {
+fn in_rescanned(node: &Node, regions: &[(usize, Arc<TreePath>)], disks: &[HostPath], filled: &[Option<usize>]) -> bool {
     let (layer, at) = (node.content.0, &node.content.1);
-    let of_content = |(scanned, region): &(usize, TreePath)| {
+    let of_content = |(scanned, region): &(usize, Arc<TreePath>)| {
         (*scanned == layer || filled.get(layer).copied().flatten() == Some(*scanned))
             && (at.starts_with(region) || region.starts_with(at))
     };
@@ -747,9 +748,9 @@ fn read_all(files: &[Pending]) -> Vec<Option<Record>> {
 /// entries.
 #[derive(Clone, Default)]
 struct Scan {
-    bundles: BTreeMap<TreePath, BTreeMap<RelPath, HostPath>>,
-    folders: BTreeSet<TreePath>,
-    files: BTreeMap<TreePath, HostPath>,
+    bundles: BTreeMap<Arc<TreePath>, BTreeMap<Arc<RelPath>, HostPath>>,
+    folders: BTreeSet<Arc<TreePath>>,
+    files: BTreeMap<Arc<TreePath>, HostPath>,
     /// What it holds by a name no path takes, at its path as shown, with why: a problem (`Problem::Refused`), and
     /// nothing of the project's - what is in a folder so named is not looked at.
     refused: BTreeMap<String, Box<str>>,
@@ -760,7 +761,7 @@ struct Scan {
 #[derive(Clone)]
 struct Place {
     root: HostPath,
-    at: TreePath,
+    at: Arc<TreePath>,
     ignore: Vec<String>,
     assets: bool,
 }
@@ -775,7 +776,7 @@ impl Place {
 
     /// A resolved path's place on disk: under the layer's folder, or a mount's tree.
     fn disk(&self, path: &TreePath) -> HostPath {
-        let within = path.strip_prefix(&self.at).unwrap_or_else(|| path.rel().clone());
+        let within = path.strip_prefix(&self.at).unwrap_or(path.rel());
         self.root.join(&within)
     }
 
@@ -783,34 +784,34 @@ impl Place {
     ///
     /// # Errors
     /// It is not in the layer, or it is by a name no path takes: two answers its callers tell apart.
-    fn resolved(&self, disk: &HostPath) -> Result<TreePath, pe2_path::NotWithin> {
+    fn resolved(&self, disk: &HostPath) -> Result<Arc<TreePath>, sfs::NotWithin> {
         Ok(self.at.join_path(&disk.within(&self.root)?))
     }
 
     /// Where to look again for what changed at a place on disk: its resolved path, or - where it is in the layer by a
     /// name no path takes - that of the nearest folder above it that has one, whose scan finds it refused and says so.
     /// None where it is not in the layer.
-    fn looked_at(&self, disk: &HostPath) -> Option<TreePath> {
+    fn looked_at(&self, disk: &HostPath) -> Option<Arc<TreePath>> {
         let mut at = disk.clone();
         loop {
             match self.resolved(&at) {
                 Ok(rel) => return Some(rel),
-                Err(pe2_path::NotWithin::Outside) => return None,
-                Err(pe2_path::NotWithin::Refused(_)) => at = at.parent()?,
+                Err(sfs::NotWithin::Outside) => return None,
+                Err(sfs::NotWithin::Refused(_)) => at = at.parent()?,
             }
         }
     }
 
     /// Whether a resolved path is left out: by its names within the layer.
     fn ignores(&self, path: &TreePath) -> bool {
-        let within = path.strip_prefix(&self.at).unwrap_or_else(|| path.rel().clone());
+        let within = path.strip_prefix(&self.at).unwrap_or(path.rel());
         changeset::ignored(&self.ignore, within.as_str()) || self.holds_extension(path)
     }
 
     /// Whether a path is in the folder of a layer holding its extensions (`extensions/`, `ext::folder`): code, which no
     /// asset is.
     fn holds_extension(&self, path: &TreePath) -> bool {
-        self.at.is_root() && path.parts().next() == Some(crate::ext::folder::HELD.as_str())
+        self.at.is_root() && path.parts().next() == Some(crate::ext::folder::HELD)
     }
 }
 
@@ -818,14 +819,14 @@ impl Scan {
     /// Scan what is at the resolved path `rel` within a layer (all of it at its root) and everything under it,
     /// replacing what was known there. A mount's tree is the folder at its mount point.
     fn rescan(&mut self, place: &Place, rel: &TreePath) {
-        let rel = if *rel == place.at { TreePath::root() } else { rel.clone() };
-        let below = |p: &TreePath| p.starts_with(&rel);
+        let rel: &TreePath = if place.at == *rel { TreePath::root() } else { rel };
+        let below = |p: &TreePath| p.starts_with(rel);
         self.bundles.retain(|p, _| !below(p));
         self.folders.retain(|p| !below(p));
         self.files.retain(|p, _| !below(p));
-        self.refused.retain(|p, _| !shown_within(p, &rel));
-        let start = if rel.is_root() { place.root.clone() } else { place.disk(&rel) };
-        let rel = if rel.is_root() { place.at.clone() } else { rel };
+        self.refused.retain(|p, _| !shown_within(p, rel));
+        let start = if rel.is_root() { place.root.clone() } else { place.disk(rel) };
+        let rel = if rel.is_root() { place.at.clone() } else { rel.to_owned() };
         if rel == place.at {
             if !place.at.is_root() {
                 self.folders.insert(place.at.clone());
@@ -878,8 +879,15 @@ impl Scan {
     }
 
     /// One folder's entries: its bundles and plain files kept, its folders kept and handed back to walk.
-    fn walk_one(&mut self, place: &Place, dir: &HostPath, dir_rel: &TreePath, folders: &mut Vec<(HostPath, TreePath)>) {
+    fn walk_one(
+        &mut self,
+        place: &Place,
+        dir: &HostPath,
+        dir_rel: &TreePath,
+        folders: &mut Vec<(HostPath, Arc<TreePath>)>,
+    ) {
         // On disk, or in a packed layer's listing.
+        let mut listing = Vec::new();
         for (name, path, is_dir) in crate::pack::read_dir(dir) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
@@ -895,10 +903,20 @@ impl Scan {
                     continue;
                 }
             };
-            let child = dir_rel.join(&name);
-            if place.ignores(&child) {
+            if place.ignores(&dir_rel.join(&name)) {
                 continue;
             }
+            // A large file is held as its manifest: listed as the file it stands for.
+            let (shown, path) = if is_dir { (name.clone(), path) } else { listed(&name, path) };
+            listing.push(Listed { shown, on_disk: name, held: (path, is_dir) });
+        }
+        let (listing, alike) = apart(listing);
+        for Refusal { text, why } in alike {
+            let child = if dir_rel.is_root() { text.into_string() } else { format!("{dir_rel}/{text}") };
+            self.refused.insert(child, why);
+        }
+        for Listed { shown: name, held: (path, is_dir), .. } in listing {
+            let child = dir_rel.join(&name);
             if is_dir {
                 if place.assets && name.as_str().ends_with(BUNDLE_SUFFIX) {
                     self.bundle(&child, &path);
@@ -907,8 +925,7 @@ impl Scan {
                     folders.push((path, child));
                 }
             } else {
-                let (name, path) = listed(&name, path);
-                self.files.insert(dir_rel.join(&name), path);
+                self.files.insert(child, path);
             }
         }
     }
@@ -921,10 +938,10 @@ impl Scan {
             return;
         }
         let (files, refused) = bundle_files(folder);
-        for why in refused {
-            self.refused.insert(format!("{at}/{}", why.text), why.to_string().into());
+        for refusal in refused {
+            self.refused.insert(format!("{at}/{}", refusal.text), refusal.why);
         }
-        self.bundles.insert(at.clone(), files);
+        self.bundles.insert(at.to_owned(), files);
     }
 
     /// What it holds, by path, as the project's model keeps it: its text.
@@ -953,9 +970,9 @@ impl Scan {
             };
             match (held, at) {
                 (Held::Refused(why), _) => drop(scan.refused.insert(path, why)),
-                (Held::Folder, Some(at)) => drop(scan.folders.insert(at)),
-                (Held::File(file), Some(at)) => drop(scan.files.insert(at, file)),
-                (Held::Bundle(files), Some(at)) => drop(scan.bundles.insert(at, files)),
+                (Held::Folder, Some(at)) => drop(scan.folders.insert(at.to_owned())),
+                (Held::File(file), Some(at)) => drop(scan.files.insert(at.to_owned(), file)),
+                (Held::Bundle(files), Some(at)) => drop(scan.bundles.insert(at.to_owned(), files)),
                 (_, None) => {}
             }
         }
@@ -999,20 +1016,20 @@ impl Scan {
     /// each there where it is a folder the layer does not leave out, and not where it is none - what scanning a
     /// path again leaves be, which the first thing put in a folder, and the last taken out of one that goes with
     /// it, change. Those that came or went, with whether they are there.
-    fn folders_above(&mut self, place: &Place, rel: &TreePath) -> Vec<(TreePath, bool)> {
+    fn folders_above(&mut self, place: &Place, rel: &TreePath) -> Vec<(Arc<TreePath>, bool)> {
         let mut changed = Vec::new();
         let mut above = rel.parent();
-        while let Some(folder) = above.filter(|folder| !folder.is_root() && *folder != place.at) {
+        while let Some(folder) = above.filter(|folder| !folder.is_root() && place.at != **folder) {
             let name = folder.name().unwrap_or_default();
-            let there = !name.starts_with('.') && !place.ignores(&folder) && crate::pack::is_dir(&place.disk(&folder));
-            let was = self.folders.contains(&folder);
+            let there = !name.starts_with('.') && !place.ignores(folder) && crate::pack::is_dir(&place.disk(folder));
+            let was = self.folders.contains(folder);
             if there && !was {
-                self.folders.insert(folder.clone());
+                self.folders.insert(folder.to_owned());
             } else if !there && was {
-                self.folders.remove(&folder);
+                self.folders.remove(folder);
             }
             if there != was {
-                changed.push((folder.clone(), there));
+                changed.push((folder.to_owned(), there));
             }
             above = folder.parent();
         }
@@ -1033,7 +1050,7 @@ impl Scan {
 
     /// Every path it holds.
     fn paths(&self) -> impl Iterator<Item = &TreePath> {
-        self.bundles.keys().chain(self.folders.iter()).chain(self.files.keys())
+        self.bundles.keys().chain(self.folders.iter()).chain(self.files.keys()).map(|path| &**path)
     }
 
     /// Every file it holds: bundles' and plain.
@@ -1096,41 +1113,100 @@ fn shown_within(shown: &str, at: &TreePath) -> bool {
 ///
 /// What in it is named so no path takes it is handed back apart, each refused with its path within the bundle as it
 /// shows: nothing of the bundle's, for whoever walks it to say so.
-pub(crate) fn bundle_files(dir: &HostPath) -> (BTreeMap<RelPath, HostPath>, Vec<pe2_path::PathError>) {
+pub(crate) fn bundle_files(dir: &HostPath) -> (BTreeMap<Arc<RelPath>, HostPath>, Vec<Refusal>) {
     let mut files = BTreeMap::new();
     let mut refused = Vec::new();
-    let mut pending = vec![(dir.clone(), RelPath::root())];
+    let mut pending = vec![(dir.clone(), RelPath::root().to_owned())];
     while let Some((folder, prefix)) = pending.pop() {
+        let within =
+            |text: &str| -> Box<str> { if prefix.is_root() { text.into() } else { format!("{prefix}/{text}").into() } };
         // On disk, or in a packed layer's listing.
+        let mut listing = Vec::new();
         for (name, path, is_dir) in crate::pack::read_dir(&folder) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
                 Err(why) if why.text.starts_with('.') => continue,
                 Err(why) => {
-                    let text = if prefix.is_root() { why.text.to_string() } else { format!("{prefix}/{}", why.text) };
-                    refused.push(pe2_path::PathError { text: text.into(), why: why.why });
+                    refused.push(Refusal { text: within(&why.text), why: why.to_string().into() });
                     continue;
                 }
             };
+            // A large file is held as its manifest: listed as the file it stands for.
+            let (shown, path) = if is_dir { (name.clone(), path) } else { listed(&name, path) };
+            listing.push(Listed { shown, on_disk: name, held: (path, is_dir) });
+        }
+        let (listing, alike) = apart(listing);
+        refused.extend(alike.into_iter().map(|refusal| Refusal { text: within(&refusal.text), why: refusal.why }));
+        for Listed { shown, held: (path, is_dir), .. } in listing {
             if is_dir {
-                pending.push((path, prefix.join(&name)));
+                pending.push((path, prefix.join(&shown)));
             } else {
-                // A large file is held as its manifest: listed as the file it stands for.
-                let (name, path) = listed(&name, path);
-                files.insert(prefix.join(&name), path);
+                files.insert(prefix.join(&shown), path);
             }
         }
     }
     (files, refused)
 }
 
+/// What a walk refused: its path as it shows, and why - the project's problem to say.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) text: Box<str>,
+    pub(crate) why: Box<str>,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+/// An entry of a folder as a walk lists it: by the name it shows as (a manifest as the file it stands for), the name it
+/// has on disk, and what of it the walk keeps.
+struct Listed<T> {
+    shown: Arc<Name>,
+    on_disk: Arc<Name>,
+    held: T,
+}
+
+/// A folder's listing apart from what in it is named alike: entries whose shown names are equal - `Notes` beside
+/// `notes`, a name beside the same in another normal form, a file beside its own manifest - are each refused, by its
+/// name on disk, whichever the system listed first: no system that does not tell them apart could hold them both.
+fn apart<T>(listing: Vec<Listed<T>>) -> (Vec<Listed<T>>, Vec<Refusal>) {
+    let mut alike: HashMap<&Name, Vec<usize>> = HashMap::new();
+    for (at, entry) in listing.iter().enumerate() {
+        alike.entry(&*entry.shown).or_default().push(at);
+    }
+    let mut refused = Vec::new();
+    let mut gone = vec![false; listing.len()];
+    for group in alike.values().filter(|group| group.len() > 1) {
+        for &at in group {
+            let others: Vec<String> = group
+                .iter()
+                .filter(|&&other| other != at)
+                .map(|&other| format!("{:?}", listing[other].on_disk.as_str()))
+                .collect();
+            let text = listing[at].on_disk.as_str();
+            let why = format!(
+                "{text:?} is one name with {} beside it to a system that does not tell case or form apart",
+                others.join(" and ")
+            );
+            refused.push(Refusal { text: text.into(), why: why.into() });
+            gone[at] = true;
+        }
+    }
+    refused.sort_by(|a, b| a.text.cmp(&b.text));
+    let kept = listing.into_iter().zip(gone).filter(|(_, gone)| !gone).map(|(entry, _)| entry).collect();
+    (kept, refused)
+}
+
 /// A file as the index lists it: a manifest (`<name>.chunks`) as the file it stands for, by that file's name and path.
-fn listed(name: &Name, path: HostPath) -> (Name, HostPath) {
+fn listed(name: &Name, path: HostPath) -> (Arc<Name>, HostPath) {
     let stands_for = name.as_str().strip_suffix(crate::chunks::SUFFIX.as_str()).and_then(|name| Name::new(name).ok());
     match (stands_for, crate::chunks::logical(&path)) {
-        (Some(name), Some(logical)) => (name, logical),
-        _ => (name.clone(), path),
+        (Some(name), Some(logical)) => (name.to_owned(), logical),
+        _ => (name.to_owned(), path),
     }
 }
 
@@ -1138,24 +1214,28 @@ fn listed(name: &Name, path: HostPath) -> (Name, HostPath) {
 ///
 /// # Errors
 /// That is no name (`CON.node`, whose asset would be `CON`).
-pub fn asset_named(bundle: &TreePath) -> Result<TreePath, pe2_path::PathError> {
-    let Some(name) = bundle.name().and_then(|name| name.strip_suffix(BUNDLE_SUFFIX)) else { return Ok(bundle.clone()) };
+pub fn asset_named(bundle: &TreePath) -> Result<Arc<TreePath>, pe2_path::PathError> {
+    let Some(name) = bundle.name().and_then(|name| name.strip_suffix(BUNDLE_SUFFIX)) else {
+        return Ok(bundle.to_owned());
+    };
     let parent = bundle.parent().unwrap_or_default();
-    Ok(parent.join(&Name::new(name)?))
+    Ok(parent.join(Name::new(name)?))
 }
 
 /// Move an entry and what is under it to another path, by a layer (`i`): each where it goes, but where something is there
 /// already, which stays where it was and is said back.
 fn move_subtree(
-    (resolved, where_is): (&mut BTreeMap<TreePath, Node>, &mut HashMap<Uid, TreePath>),
+    (resolved, where_is): (&mut Resolved, &mut HashMap<Uid, Arc<TreePath>>),
     from: &TreePath,
     to: &TreePath,
     i: usize,
-) -> Vec<TreePath> {
+) -> Vec<Arc<TreePath>> {
     let mut conflicts = Vec::new();
     for p in subtree(resolved, from) {
-        let target = to.join_path(&p.strip_prefix(from).expect("under it, as subtree lists"));
-        if resolved.contains_key(&target) {
+        let target = to.join_path(p.strip_prefix(from).expect("under it, as subtree lists"));
+        // What is there is another entry unless it is this one, spelled otherwise (`n` to `N`): then it takes the
+        // spelling it is moved to.
+        if *target != *p && resolved.contains_key(&target) {
             conflicts.push(target);
             continue;
         }
@@ -1169,16 +1249,28 @@ fn move_subtree(
     conflicts
 }
 
+/// Whether a map holds a path spelled as it is. Paths compare by their names' folds, so `n` finds `N`; where an entry is
+/// spelled anew (`n` renamed `N`), what was is gone and what is came, as a listing by text has them.
+fn spelled<V>(map: &BTreeMap<Arc<TreePath>, V>, path: &TreePath) -> bool {
+    map.get_key_value(path).is_some_and(|(key, _)| key.as_str() == path.as_str())
+}
+
+/// Whether a set of paths holds one spelled as it is (`spelled`).
+fn spelled_among(set: &HashSet<&TreePath>, path: &TreePath) -> bool {
+    set.get(path).is_some_and(|there| there.as_str() == path.as_str())
+}
+
 /// An asset's bundle: its path with `.node` after its last name. The root names no asset, and is itself.
 ///
 /// # Panics
 /// Never: a name with `.node` after it is a name.
 #[must_use]
-pub fn bundle_named(asset: &TreePath) -> TreePath {
-    let Some(name) = asset.name() else { return asset.clone() };
+pub fn bundle_named(asset: &TreePath) -> Arc<TreePath> {
+    let Some(name) = asset.name() else { return asset.to_owned() };
     // A name and `.node` after it is a name.
-    let bundle = Name::new(&format!("{name}{BUNDLE_SUFFIX}")).expect("a name with .node after it is a name");
-    asset.parent().unwrap_or_default().join(&bundle)
+    let text = format!("{name}{BUNDLE_SUFFIX}");
+    let bundle = Name::new(&text).expect("a name with .node after it is a name");
+    asset.parent().unwrap_or_default().join(bundle)
 }
 
 /// The asset an entry's path names: a bundle's without `.node`, any other its own. The index holds no bundle whose asset
@@ -1187,7 +1279,7 @@ pub fn bundle_named(asset: &TreePath) -> TreePath {
 /// # Panics
 /// The path is a bundle whose asset is no name: one the index holds none of.
 #[must_use]
-pub fn asset_of(path: &TreePath) -> TreePath {
+pub fn asset_of(path: &TreePath) -> Arc<TreePath> {
     asset_named(path).expect("the index holds no bundle whose asset is no name")
 }
 
@@ -1242,7 +1334,7 @@ impl LayerState {
             Some((made_by, scan)) if taken && made_by == place.made_by() => (scan, None),
             known => {
                 let mut scan = Scan::default();
-                scan.rescan(&place, &TreePath::root());
+                scan.rescan(&place, TreePath::root());
                 (scan, Some(known.map_or_default(|(_, was)| was)))
             }
         };
@@ -1313,24 +1405,24 @@ struct Node {
     kind: Kind,
     uid: Uid,
     home: usize,
-    content: (usize, TreePath),
+    content: (usize, Arc<TreePath>),
     overrides: Vec<usize>,
     moved: Option<usize>,
     /// Its files, where an override wins: those it changes - as held, or merged over the version below now - and those
     /// below it does not change; a plain file's own by an empty name.
-    files: Option<Arc<Vec<(RelPath, HostPath, usize)>>>,
+    files: Option<Arc<NodeFiles>>,
     /// The files its overrides' merges read (theirs below, and their own), for a change to any to merge again.
     inputs: Arc<Vec<HostPath>>,
 }
 
 impl Node {
     /// An entry as the layer creating it left it.
-    fn created(kind: Kind, uid: Uid, home: usize, path: &TreePath) -> Node {
+    fn created(kind: Kind, uid: Uid, home: usize, path: &Arc<TreePath>) -> Node {
         Node {
             kind,
             uid,
             home,
-            content: (home, path.clone()),
+            content: (home, Arc::clone(path)),
             overrides: vec![],
             moved: None,
             files: None,
@@ -1384,13 +1476,13 @@ impl Node {
         let kind = [Kind::Asset, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
         let uid = Uid::new(&read.text()?).ok()?;
         let home = layer(&mut read)?;
-        let content = (layer(&mut read)?, TreePath::new(&read.text()?).ok()?);
+        let content = (layer(&mut read)?, TreePath::new(&read.text()?).ok()?.to_owned());
         let overrides = (0..layer(&mut read)?).map(|_| layer(&mut read)).collect::<Option<Vec<usize>>>()?;
         let moved = layer(&mut read)?.checked_sub(1);
         let has_files = read.u8()? != 0;
         let mut files = Vec::new();
         while read.u8()? != 0 {
-            files.push((RelPath::new(&read.text()?).ok()?, named(root, &read.text()?)?, layer(&mut read)?));
+            files.push((RelPath::new(&read.text()?).ok()?.to_owned(), named(root, &read.text()?)?, layer(&mut read)?));
         }
         let inputs = (0..layer(&mut read)?).map(|_| named(root, &read.text()?)).collect::<Option<Vec<HostPath>>>()?;
         let files = has_files.then(|| Arc::new(files));
@@ -1451,9 +1543,9 @@ fn stack_made_of(project: &Project) -> String {
 /// The stack applied: the resolved entries, what is wrong, and each layer's operations with their status and the path
 /// their entry had.
 struct Resolution {
-    resolved: BTreeMap<TreePath, Node>,
+    resolved: Resolved,
     problems: Vec<Problem>,
-    ops: Vec<BTreeMap<Uid, (OpStatus, Option<TreePath>)>>,
+    ops: Vec<OpStatuses>,
 }
 
 /// What the layers below a layer resolve (`Index::under`).
@@ -1479,28 +1571,28 @@ impl Under {
 /// The entries a layer let go of and made, by uid and path, those made each with its kind: what the stack is applied
 /// for alone (`Index::restack_entries`).
 struct Restacked {
-    gone: Vec<(Uid, TreePath)>,
-    came: Vec<(Uid, TreePath)>,
+    gone: Vec<(Uid, Arc<TreePath>)>,
+    came: Vec<(Uid, Arc<TreePath>)>,
     kinds: Vec<Kind>,
 }
 
 /// What the layers below one resolve, with where each uid is.
 struct Beneath {
     resolution: Resolution,
-    by_uid: HashMap<Uid, TreePath>,
+    by_uid: HashMap<Uid, Arc<TreePath>>,
 }
 
 /// The bundle a path is in or is: the nearest of it and the folders above whose name ends in `.node`.
-fn bundle_at(rel: &TreePath) -> Option<TreePath> {
-    let mut at = Some(rel.clone());
+fn bundle_at(rel: &TreePath) -> Option<Arc<TreePath>> {
+    let mut at = Some(rel);
     let mut found = None;
     while let Some(path) = at {
         if path.name().is_some_and(|name| name.ends_with(BUNDLE_SUFFIX)) {
-            found = Some(path.clone());
+            found = Some(path);
         }
         at = path.parent().filter(|parent| !parent.is_root());
     }
-    found
+    found.map(ToOwned::to_owned)
 }
 
 /// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
@@ -1563,45 +1655,57 @@ fn named_uids<'a>(references: impl IntoIterator<Item = &'a Reference>) -> Vec<Ui
 }
 
 /// A path without what it ends in, where it ends in it and something is before it: `a/b/c` without `b/c` is `a`.
-fn without_tail(path: &TreePath, tail: &RelPath) -> Option<TreePath> {
-    let (parts, tail_parts): (Vec<&str>, Vec<&str>) = (path.parts().collect(), tail.parts().collect());
+fn without_tail(path: &TreePath, tail: &RelPath) -> Option<Arc<TreePath>> {
+    let (parts, tail_parts): (Vec<&Name>, Vec<&Name>) = (path.parts().collect(), tail.parts().collect());
     let keep = parts.len().checked_sub(tail_parts.len()).filter(|keep| *keep > 0)?;
     if parts[keep..] != tail_parts[..] {
         return None;
     }
-    let mut at = path.clone();
+    let mut at = path;
     for _ in 0..tail_parts.len() {
         at = at.parent()?;
     }
-    Some(at)
+    Some(at.to_owned())
 }
 
-fn subtree<V>(map: &BTreeMap<TreePath, V>, path: &TreePath) -> Vec<TreePath> {
-    // In the order of their text, what is under a path follows it, among those its text begins with.
-    let after = map.range(path.clone()..).map(|(p, _)| p);
-    after.take_while(|p| p.as_str().starts_with(path.as_str())).filter(|p| p.starts_with(path)).cloned().collect()
+fn subtree<V>(map: &BTreeMap<Arc<TreePath>, V>, path: &TreePath) -> Vec<Arc<TreePath>> {
+    // Paths order name by name: what is under a path follows it, before anything that is not.
+    let after = map.range::<TreePath, _>(pe2_path::from(path)).map(|(p, _)| p);
+    after.take_while(|p| p.starts_with(path)).cloned().collect()
 }
 
 /// How far a long piece of work is: its stage, and how many of how many it has done (both 0 where it cannot say).
 pub type Report<'a> = dyn Fn(&str, usize, usize) + 'a;
 
+/// The entries a stack resolves, by their real paths.
+type Resolved = BTreeMap<Arc<TreePath>, Node>;
+
+/// A node's files: each by its name in the node, where it is on disk, and the layer it comes from.
+type NodeFiles = Vec<(Arc<RelPath>, HostPath, usize)>;
+
+/// A layer's operations, by uid: how each went, and the path its entry had where it applied.
+type OpStatuses = BTreeMap<Uid, (OpStatus, Option<Arc<TreePath>>)>;
+
+/// Which entry's content wins, by the layer and path holding it.
+type Winning = HashMap<(usize, Arc<TreePath>), Arc<TreePath>>;
+
 #[derive(Clone)]
 pub struct Index {
     /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
     /// Shared with the snapshots made of the index, copied where one is changed while they hold it.
-    pub assets: Shared<BTreeMap<TreePath, Arc<Asset>>>,
+    pub assets: Shared<BTreeMap<Arc<TreePath>, Arc<Asset>>>,
     /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
     /// nodes of their own, read through the graph's `below` operation - made when first asked for (`version`),
     /// of the stack as it is then, and let go of whenever an asset is assembled again.
     versions: Arc<OnceLock<HashMap<String, Arc<Asset>>>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
-    pub entries: Shared<BTreeMap<TreePath, Entry>>,
+    pub entries: Shared<BTreeMap<Arc<TreePath>, Entry>>,
     /// How many files the last opening or refresh read, rather than took from what it knew.
     pub read: usize,
-    pub by_uid: Shared<HashMap<Uid, TreePath>>,
+    pub by_uid: Shared<HashMap<Uid, Arc<TreePath>>>,
     /// For each asset, the references naming it.
-    pub referenced_by: Shared<HashMap<TreePath, Vec<Reference>>>,
+    pub referenced_by: Shared<HashMap<Arc<TreePath>, Vec<Reference>>>,
     /// References whose uid or path names no asset of the project.
     pub dangling: Vec<Reference>,
     pub problems: Vec<Problem>,
@@ -1624,26 +1728,26 @@ pub struct Index {
     stack_said: Arc<[Vec<u8>; 3]>,
     /// Whether its opening took the stack as the model had it, where it applied none.
     stack_taken: bool,
-    resolved: Shared<BTreeMap<TreePath, Node>>,
+    resolved: Shared<Resolved>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
-    full: Shared<BTreeMap<TreePath, Node>>,
+    full: Shared<Resolved>,
     /// The layers left out of the view (the editor's eyes); problems and statuses are the full stack's.
     hidden: HashSet<usize>,
-    ops: Vec<BTreeMap<Uid, (OpStatus, Option<TreePath>)>>,
+    ops: Vec<OpStatuses>,
     dependencies: Vec<BTreeMap<usize, (usize, usize)>>,
     /// The content hash of each entry a writable layer holds, as of the last pass: what tells a move made outside
     /// the editor from a deletion and a new entry.
-    hashes: Shared<Vec<HashMap<TreePath, String>>>,
+    hashes: Shared<Vec<HashMap<Arc<TreePath>, String>>>,
     /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
     /// of a layer's content touches.
-    winning: Shared<HashMap<(usize, TreePath), TreePath>>,
+    winning: Shared<Winning>,
     /// The files the overrides' merges read (every node's `inputs`), as the stack was last applied: a change to
     /// one merges again. An entry a layer makes by itself reads none, so applying the stack for such alone
     /// (`restack_entries`) leaves it as it is.
     merge_inputs: Shared<HashSet<HostPath>>,
     /// Where each entry is, by its uid: its real path.
-    placed: Shared<HashMap<Uid, TreePath>>,
+    placed: Shared<HashMap<Uid, Arc<TreePath>>>,
     /// How many references name each uid, whatever they resolve to: a uid none names can come or go without any
     /// other asset's links changing.
     named: Shared<HashMap<Uid, usize>>,
@@ -1871,7 +1975,7 @@ impl Index {
                     let _span = tracing::info_span!("index: the layers held to what was known of them").entered();
                     let differing = layers.iter().flat_map(|(place, known)| {
                         let mut now = Scan::default();
-                        now.rescan(place, &TreePath::root());
+                        now.rescan(place, TreePath::root());
                         now.differing(known, place)
                     });
                     differing.collect::<Vec<HostPath>>()
@@ -2061,7 +2165,7 @@ impl Index {
             index.opened = differs;
         }
         report("Assembling the assets", 0, 0);
-        let paths: Vec<TreePath> = index.resolved.keys().cloned().collect();
+        let paths: Vec<Arc<TreePath>> = index.resolved.keys().cloned().collect();
         {
             let _span = tracing::info_span!("index assemble").entered();
             index.assemble(&paths);
@@ -2094,8 +2198,8 @@ impl Index {
     /// differ, for what is served (`served_differences`). Where no asset changed, the links stand as they were.
     fn after_restack(
         &mut self,
-        regions: &[(usize, TreePath)],
-        (before, whole_before): (&BTreeMap<TreePath, Node>, &BTreeMap<TreePath, Node>),
+        regions: &[(usize, Arc<TreePath>)],
+        (before, whole_before): (&Resolved, &Resolved),
         unreadable: Vec<Problem>,
         refreshed: &mut Refreshed,
     ) {
@@ -2115,7 +2219,7 @@ impl Index {
         }
         refreshed.assets.extend(self.assets.keys().filter(|a| !self.resolved.contains_key(&bundle_named(a))).cloned());
         drop(scanning);
-        let paths: Vec<TreePath> = refreshed.assets.iter().map(bundle_named).collect();
+        let paths: Vec<Arc<TreePath>> = refreshed.assets.iter().map(|asset| bundle_named(asset)).collect();
         tracing::info_span!("after: entries and assets assembled").in_scope(|| self.assemble(&paths));
         if refreshed.assets.is_empty() {
             self.problems.extend(unreadable);
@@ -2127,27 +2231,22 @@ impl Index {
     /// Which entries of the whole stack differ after the stack was applied again - changed, new, or with content in
     /// what was rescanned - and which are no more: what is served may differ of those alone. A node an entry came
     /// or went in is among them: its files show where no entry of the same name holds the place.
-    fn served_differences(
-        &self,
-        before: &BTreeMap<TreePath, Node>,
-        touched: &impl Fn(&Node) -> bool,
-        refreshed: &mut Refreshed,
-    ) {
+    fn served_differences(&self, before: &Resolved, touched: &impl Fn(&Node) -> bool, refreshed: &mut Refreshed) {
         let _span = tracing::info_span!("refresh: what is served differs").entered();
         for (path, node) in self.full.iter() {
             if before.get(path) != Some(node) || touched(node) {
                 refreshed.touched.insert(path.clone());
             }
         }
-        refreshed.gone.extend(before.keys().filter(|path| !self.full.contains_key(*path)).cloned());
+        refreshed.gone.extend(before.keys().filter(|path| !spelled(&self.full, path)).cloned());
         refreshed.touched.retain(|path| self.full.contains_key(path));
         // The node an entry came or went in.
-        let around: Vec<TreePath> = refreshed
+        let around: Vec<Arc<TreePath>> = refreshed
             .touched
             .iter()
             .chain(&refreshed.gone)
-            .filter(|path| before.contains_key(*path) != self.full.contains_key(*path))
-            .filter_map(|path| asset_of(path).parent().filter(|parent| !parent.is_root()))
+            .filter(|path| spelled(before, path) != spelled(&self.full, path))
+            .filter_map(|path| asset_of(path).parent().filter(|parent| !parent.is_root()).map(TreePath::to_owned))
             .map(|parent| bundle_named(&parent))
             .filter(|parent| self.full.contains_key(parent))
             .collect();
@@ -2158,19 +2257,20 @@ impl Index {
     /// that are gone - and say what of it differs now: what it costs follows what changed, not what the project
     /// holds.
     pub fn serve_changed(&self, listing: &mut crate::server::Listing, refreshed: &Refreshed) -> crate::server::Delta {
-        use crate::server::Shown;
+        use crate::server::{Listing, Shown};
         let mut delta = crate::server::Delta::default();
         // The files a node has in a listing: those in its folder that are its own, not those of a node inside it.
-        let files_of = |listing: &crate::server::Listing, name: &str| -> Vec<String> {
-            let prefix = format!("{name}/");
-            let inside = listing.range(prefix.clone()..).take_while(|(path, _)| path.starts_with(&prefix));
-            let own = |path: &str| {
-                let mut at = path;
-                while let Some((above, _)) = at.rsplit_once('/') {
+        // Paths order name by name: what is in its folder follows it.
+        let files_of = |listing: &Listing, name: &TreePath| -> Vec<Arc<TreePath>> {
+            let inside =
+                listing.range::<TreePath, _>(pe2_path::from(name)).take_while(|(path, _)| path.starts_with(name));
+            let own = |path: &TreePath| {
+                let mut at = path.parent();
+                while let Some(above) = at.filter(|above| !above.is_root()) {
                     if matches!(listing.get(above), Some(Shown::Node)) {
                         return above == name;
                     }
-                    at = above;
+                    at = above.parent();
                 }
                 false
             };
@@ -2178,39 +2278,40 @@ impl Index {
             files.map(|(path, _)| path.clone()).collect()
         };
         for path in &refreshed.gone {
-            let name = asset_of(path).to_string();
+            let name = asset_of(path);
             let mut going = files_of(listing, &name);
             going.push(name);
             for path in going {
-                if listing.remove(&path).is_some() {
+                if let Some((path, _)) = listing.remove_entry(&*path) {
                     delta.gone.insert(path);
                 }
             }
         }
         for path in &refreshed.touched {
             let Some(node) = self.full.get(path) else { continue };
-            let name = asset_of(path).to_string();
-            // What it had, to tell what of it differs: its own entry, and a node's files.
-            let mut had: BTreeMap<String, Shown> = BTreeMap::new();
+            let name = asset_of(path);
+            // What it had, to tell what of it differs: its own entry, and a node's files - each as it was written.
+            let mut had = Listing::new();
             let mut held = if node.kind == Kind::Asset { files_of(listing, &name) } else { Vec::new() };
             held.push(name);
             for path in held {
-                if let Some(it) = listing.remove(&path) {
+                if let Some((path, it)) = listing.remove_entry(&*path) {
                     had.insert(path, it);
                 }
             }
-            let mut put = |path: String, it: Shown| {
-                if had.remove(&path).as_ref() != Some(&it) {
-                    delta.gone.remove(&path);
-                    delta.shown.insert(path.clone(), it.clone());
+            let mut put = |path: Arc<TreePath>, it: Shown| {
+                let was = had.remove_entry(&*path);
+                if was.is_none_or(|(was, then)| then != it || was.as_str() != path.as_str()) {
+                    delta.gone.remove(&*path);
+                    crate::server::put(&mut delta.shown, &path, &it);
                 }
-                listing.insert(path, it);
+                crate::server::put(listing, &path, &it);
             };
             self.serve_entry(path, node, &mut put);
             if node.kind == Kind::Asset {
                 self.serve_files(path, node, &mut put);
             }
-            delta.gone.extend(had.into_keys().filter(|path| !listing.contains_key(path)));
+            delta.gone.extend(had.into_keys().filter(|path| !listing.contains_key(&**path)));
         }
         delta
     }
@@ -2226,31 +2327,31 @@ impl Index {
     }
 
     /// An entry of the stack as it is served: a folder, a plain file, or a node - the folder of its name.
-    fn serve_entry(&self, path: &TreePath, node: &Node, list: &mut impl FnMut(String, crate::server::Shown)) {
+    fn serve_entry(&self, path: &TreePath, node: &Node, list: &mut impl FnMut(Arc<TreePath>, crate::server::Shown)) {
         use crate::server::Shown;
         match node.kind {
-            Kind::Folder => list(path.to_string(), Shown::Folder),
+            Kind::Folder => list(path.to_owned(), Shown::Folder),
             Kind::File => {
                 if let Some((_, disk, _)) = self.node_files(node).into_iter().next() {
-                    list(path.to_string(), self.serve_file(disk, false));
+                    list(path.to_owned(), self.serve_file(disk, false));
                 }
             }
-            Kind::Asset => list(asset_of(path).to_string(), Shown::Node),
+            Kind::Asset => list(asset_of(path), Shown::Node),
         }
     }
 
     /// A node's files as they are served, in its folder - but where an entry of the same name holds that place.
-    fn serve_files(&self, path: &TreePath, node: &Node, list: &mut impl FnMut(String, crate::server::Shown)) {
+    fn serve_files(&self, path: &TreePath, node: &Node, list: &mut impl FnMut(Arc<TreePath>, crate::server::Shown)) {
         let name = asset_of(path);
         for (file, disk, _) in self.node_files(node) {
             // Where an entry of the name of its first part holds that place, it is not shown.
-            if let Some(first) = file.parts().next().and_then(|first| Name::new(first).ok()) {
-                let child = name.join(&first);
+            if let Some(first) = file.parts().next() {
+                let child = name.join(first);
                 if self.full.contains_key(&child) || self.full.contains_key(&bundle_named(&child)) {
                     continue;
                 }
             }
-            list(name.join_path(&file).to_string(), self.serve_file(disk, true));
+            list(name.join_path(&file), self.serve_file(disk, true));
         }
     }
 
@@ -2294,7 +2395,7 @@ impl Index {
             let node = self.full.get(path).map(|node| node.written(&self.root));
             refreshed.model.node(path.as_str(), node.as_deref());
         }
-        for path in refreshed.gone.iter().filter(|path| !self.full.contains_key(*path)) {
+        for path in refreshed.gone.iter().filter(|path| !spelled(&self.full, path)) {
             refreshed.model.node(path.as_str(), None);
         }
         let says = self.stack_says();
@@ -2364,9 +2465,10 @@ impl Index {
             return false;
         }
         // Each path checked as it is read back: a stack naming one that is none is not taken, and is applied anew.
-        let node =
-            |(path, bytes): (&String, &Vec<u8>)| Some((TreePath::new(path).ok()?, Node::read(&self.root, bytes)?));
-        let nodes: Option<BTreeMap<TreePath, Node>> = stack.nodes.iter().map(node).collect();
+        let node = |(path, bytes): (&String, &Vec<u8>)| {
+            Some((TreePath::new(path).ok()?.to_owned(), Node::read(&self.root, bytes)?))
+        };
+        let nodes: Option<Resolved> = stack.nodes.iter().map(node).collect();
         let layers = self.layers.len();
         let within = |node: &Node| {
             let layers_of =
@@ -2378,11 +2480,9 @@ impl Index {
         let Some(nodes) = nodes.filter(|nodes| nodes.values().all(within)) else { return false };
         let says = [SAID_OPS, SAID_PROBLEMS, SAID_DEPENDENCIES].map(|name| stack.said.get(name));
         let [Some(ops), Some(problems), Some(dependencies)] = says else { return false };
-        let (Some(ops), Some(problems), Some(dependencies)) = (
-            said_of::<Vec<BTreeMap<Uid, (OpStatus, Option<TreePath>)>>>(ops),
-            said_of::<Vec<Problem>>(problems),
-            said_of(dependencies),
-        ) else {
+        let (Some(ops), Some(problems), Some(dependencies)) =
+            (said_of::<Vec<OpStatuses>>(ops), said_of::<Vec<Problem>>(problems), said_of(dependencies))
+        else {
             return false;
         };
         if ops.len() != layers {
@@ -2414,7 +2514,7 @@ impl Index {
         &mut self,
         project: &Project,
         changed: &[HostPath],
-        wanted: &mut Vec<(usize, TreePath)>,
+        wanted: &mut Vec<(usize, Arc<TreePath>)>,
         were: &mut Vec<(usize, Changeset)>,
         model: &mut crate::model::Delta,
     ) -> Result<bool> {
@@ -2452,10 +2552,10 @@ impl Index {
             }
         }
         if placed && let Some(lowest) = lowest_changed {
-            let paths: BTreeSet<&TreePath> = changed.iter().flat_map(|(_, paths)| paths).collect();
+            let paths: BTreeSet<&TreePath> = changed.iter().flat_map(|(_, paths)| paths).map(|path| &**path).collect();
             for (i, layer) in self.layers.iter().enumerate().skip(lowest + 1) {
                 if crate::records::is_records(&layer.place.root) {
-                    wanted.extend(paths.iter().map(|path| (i, (*path).clone())));
+                    wanted.extend(paths.iter().map(|path| (i, (*path).to_owned())));
                 }
             }
         }
@@ -2465,7 +2565,7 @@ impl Index {
     fn refresh_files(&mut self, project: &Project, changed: &[HostPath]) -> Result<Refreshed> {
         let mut refreshed = Refreshed::default();
         let mut changesets = false;
-        let mut wanted: Vec<(usize, TreePath)> = Vec::new();
+        let mut wanted: Vec<(usize, Arc<TreePath>)> = Vec::new();
         // The records layers whose changesets changed, with what each said before.
         let mut were: Vec<(usize, Changeset)> = Vec::new();
         if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
@@ -2488,14 +2588,14 @@ impl Index {
                 // a mount's point).
                 let bundle = if layer.place.assets { bundle_at(&rel) } else { None };
                 let at = bundle.unwrap_or(rel);
-                wanted.push((i, if at == layer.place.at { TreePath::root() } else { at }));
+                wanted.push((i, if at == layer.place.at { TreePath::root().to_owned() } else { at }));
             }
         }
         // Each region once: one within another of its layer is scanned with it.
         let within = |a: &TreePath, b: &TreePath| a.starts_with(b);
         wanted.sort();
         wanted.dedup();
-        let regions: Vec<(usize, TreePath)> = wanted
+        let regions: Vec<(usize, Arc<TreePath>)> = wanted
             .iter()
             .filter(|(i, a)| !wanted.iter().any(|(j, b)| j == i && b != a && within(a, b)))
             .cloned()
@@ -2590,8 +2690,8 @@ impl Index {
         &mut self,
         at: usize,
         was: &Changeset,
-        regions: &[(usize, TreePath)],
-        before_references: &HashMap<TreePath, Vec<Reference>>,
+        regions: &[(usize, Arc<TreePath>)],
+        before_references: &HashMap<Arc<TreePath>, Vec<Reference>>,
         refreshed: &mut Refreshed,
     ) -> bool {
         let Some(entries) = self.entries_alone(at, was) else { return false };
@@ -2618,14 +2718,14 @@ impl Index {
         {
             return None;
         }
-        let differs = |a: &Changeset, b: &Changeset| -> Vec<(Uid, TreePath)> {
+        let differs = |a: &Changeset, b: &Changeset| -> Vec<(Uid, Arc<TreePath>)> {
             let other = a.entries.iter().filter(|(uid, path)| b.entries.get(*uid) != Some(*path));
             other.map(|(uid, path)| (*uid, path.clone())).collect()
         };
         let (gone, came) = (differs(was, now), differs(now, was));
         let uids: HashSet<Uid> = gone.iter().chain(&came).map(|(uid, _)| *uid).collect();
         let paths: HashSet<&str> = gone.iter().chain(&came).map(|(_, path)| path.as_str()).collect();
-        let came_at: HashSet<&TreePath> = came.iter().map(|(_, path)| path).collect();
+        let came_at: HashSet<&TreePath> = came.iter().map(|(_, path)| &**path).collect();
         if uids.is_empty()
             || came_at.len() != came.len()
             || uids.iter().any(|uid| now.ops.contains_key(uid))
@@ -2643,16 +2743,16 @@ impl Index {
                     && node.moved.is_none()
                     && node.files.is_none()
             });
-            if !own || (!came_at.contains(path) && layer.scan.kind(path).is_some()) {
+            if !own || (!came_at.contains(&**path) && layer.scan.kind(path).is_some()) {
                 return None;
             }
         }
-        let gone_at: HashSet<&TreePath> = gone.iter().map(|(_, path)| path).collect();
+        let gone_at: HashSet<&TreePath> = gone.iter().map(|(_, path)| &**path).collect();
         let gone_uids: HashSet<Uid> = gone.iter().map(|(uid, _)| *uid).collect();
         let mut kinds = Vec::with_capacity(came.len());
         for (uid, path) in &came {
             let kind = layer.scan.kind(path)?;
-            let free = !self.full.contains_key(path) || gone_at.contains(path);
+            let free = !self.full.contains_key(path) || gone_at.contains(&**path);
             let listed = |l: &LayerState| l.changeset.entries.contains_key(uid);
             let elsewhere = self.layers.iter().enumerate().any(|(i, l)| i != at && listed(l));
             if !free || elsewhere || (was.entries.contains_key(uid) && !gone_uids.contains(uid)) {
@@ -2668,14 +2768,14 @@ impl Index {
         &mut self,
         at: usize,
         Restacked { gone, came, kinds }: &Restacked,
-        regions: &[(usize, TreePath)],
-        before_references: &HashMap<TreePath, Vec<Reference>>,
+        regions: &[(usize, Arc<TreePath>)],
+        before_references: &HashMap<Arc<TreePath>, Vec<Reference>>,
         refreshed: &mut Refreshed,
     ) {
         let uids: HashSet<Uid> = gone.iter().chain(came).map(|(uid, _)| *uid).collect();
-        let paths: HashSet<&TreePath> = gone.iter().chain(came).map(|(_, path)| path).collect();
-        let came_at: HashSet<&TreePath> = came.iter().map(|(_, path)| path).collect();
-        let gone_at: HashSet<&TreePath> = gone.iter().map(|(_, path)| path).collect();
+        let paths: HashSet<&TreePath> = gone.iter().chain(came).map(|(_, path)| &**path).collect();
+        let came_at: HashSet<&TreePath> = came.iter().map(|(_, path)| &**path).collect();
+        let gone_at: HashSet<&TreePath> = gone.iter().map(|(_, path)| &**path).collect();
         let layer = &self.layers[at];
         let (name, writable) = (layer.name.clone(), layer.writable);
         let disk = |path: &TreePath| self.layers[at].place.disk(path);
@@ -2726,12 +2826,12 @@ impl Index {
             }
         }
         // What is served differs of these, and of a node an entry came or went in.
-        refreshed.gone.extend(gone.iter().map(|(_, path)| path).filter(|path| !came_at.contains(path)).cloned());
+        refreshed.gone.extend(gone.iter().map(|(_, path)| path).filter(|path| !spelled_among(&came_at, path)).cloned());
         refreshed.touched.extend(came.iter().map(|(_, path)| path.clone()));
-        let around: Vec<TreePath> = paths
+        let around: Vec<Arc<TreePath>> = paths
             .iter()
-            .filter(|path| gone_at.contains(**path) != came_at.contains(**path))
-            .filter_map(|path| asset_of(path).parent().filter(|parent| !parent.is_root()))
+            .filter(|path| spelled_among(&gone_at, path) != spelled_among(&came_at, path))
+            .filter_map(|path| asset_of(path).parent().filter(|parent| !parent.is_root()).map(TreePath::to_owned))
             .map(|parent| bundle_named(&parent))
             .filter(|parent| self.full.contains_key(parent))
             .collect();
@@ -2740,9 +2840,9 @@ impl Index {
         // and nothing refers to one that goes, the other assets' links stand, and so does what the layers need of
         // each other but for these; else all are linked, and counted, again.
         let asset =
-            |(uid, path): &(Uid, TreePath)| path.as_str().ends_with(BUNDLE_SUFFIX).then(|| (*uid, asset_of(path)));
-        let went: Vec<(Uid, TreePath)> = gone.iter().filter_map(asset).collect();
-        let come: Vec<(Uid, TreePath)> = came.iter().filter_map(asset).collect();
+            |(uid, path): &(Uid, Arc<TreePath>)| path.as_str().ends_with(BUNDLE_SUFFIX).then(|| (*uid, asset_of(path)));
+        let went: Vec<(Uid, Arc<TreePath>)> = gone.iter().filter_map(asset).collect();
+        let come: Vec<(Uid, Arc<TreePath>)> = came.iter().filter_map(asset).collect();
         // References are what declarations say: text.
         let others_refer =
             |asset: &TreePath| self.referenced_by.get(asset).is_some_and(|refs| refs.iter().any(|r| r.from != *asset));
@@ -2759,10 +2859,10 @@ impl Index {
             }
             by_uid.extend(come.iter().cloned());
         }
-        let left: Vec<TreePath> =
-            gone.iter().map(|(_, path)| path).filter(|path| !came_at.contains(path)).cloned().collect();
+        let left: Vec<Arc<TreePath>> =
+            gone.iter().map(|(_, path)| path).filter(|path| !came_at.contains(&***path)).cloned().collect();
         self.assemble_assets(&left);
-        let left: Vec<TreePath> =
+        let left: Vec<Arc<TreePath>> =
             went.iter().map(|(_, asset)| asset.clone()).filter(|a| !self.assets.contains_key(a)).collect();
         if !whole {
             for asset in &left {
@@ -2806,8 +2906,8 @@ impl Index {
     /// where their references changed.
     fn refresh_contents(
         &mut self,
-        regions: &[(usize, TreePath)],
-        before: &HashMap<TreePath, Vec<Reference>>,
+        regions: &[(usize, Arc<TreePath>)],
+        before: &HashMap<Arc<TreePath>, Vec<Reference>>,
         refreshed: &mut Refreshed,
     ) {
         let mut paths = Vec::new();
@@ -2834,7 +2934,7 @@ impl Index {
         }
         refreshed.touched.extend(paths.iter().cloned());
         self.assemble_assets(&paths);
-        let assets: Vec<TreePath> = paths.iter().map(asset_of).collect();
+        let assets: Vec<Arc<TreePath>> = paths.iter().map(|path| asset_of(path)).collect();
         let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.output.clone());
         let references_changed = assets.iter().any(|a| {
             let now: Vec<_> = self.references_from(a).iter().map(referring).collect();
@@ -2931,10 +3031,9 @@ impl Index {
     /// A bundle's files in a layer, each with the layer holding it: its own, then what the generated layer filling the
     /// layer holds at its path - a node's declaration in one, its files in the other. None where the layer holds no
     /// bundle there.
-    fn bundle_files(&self, layer: usize, path: &TreePath) -> Option<Vec<(RelPath, HostPath, usize)>> {
+    fn bundle_files(&self, layer: usize, path: &TreePath) -> Option<NodeFiles> {
         let own = self.layers[layer].scan.bundles.get(path)?;
-        let mut files: Vec<(RelPath, HostPath, usize)> =
-            own.iter().map(|(n, f)| (n.clone(), f.clone(), layer)).collect();
+        let mut files: NodeFiles = own.iter().map(|(n, f)| (n.clone(), f.clone(), layer)).collect();
         if let Some(filler) = self.filled_by(layer)
             && let Some(filled) = self.layers[filler].scan.bundles.get(path)
         {
@@ -2971,13 +3070,13 @@ impl Index {
     }
 
     /// A resolved entry's files: as its overrides make them, else its content's - a plain file's own by an empty name.
-    fn node_files(&self, node: &Node) -> Vec<(RelPath, HostPath, usize)> {
+    fn node_files(&self, node: &Node) -> NodeFiles {
         match (&node.files, node.kind) {
             (Some(files), _) => files.as_ref().clone(),
             (None, Kind::Asset) => self.bundle_files(node.content.0, &node.content.1).unwrap_or_default(),
             (None, Kind::File) => {
                 let file = self.layers[node.content.0].scan.files.get(&node.content.1);
-                file.map_or_else(Vec::new, |f| vec![(RelPath::root(), f.clone(), node.content.0)])
+                file.map_or_else(Vec::new, |f| vec![(RelPath::root().to_owned(), f.clone(), node.content.0)])
             }
             (None, Kind::Folder) => vec![],
         }
@@ -3023,15 +3122,17 @@ impl Index {
         node: &mut Node,
         layer: usize,
         at: &TreePath,
-        changed: &BTreeMap<RelPath, Base>,
+        changed: &BTreeMap<Arc<RelPath>, Base>,
     ) -> Option<bool> {
         let below = self.node_files(node);
-        let own: Vec<(RelPath, HostPath, usize)> = match node.kind {
+        let own: NodeFiles = match node.kind {
             Kind::Asset => self.bundle_files(layer, at).unwrap_or_default(),
-            Kind::File => self.layers[layer].scan.files.get(at).map(|f| vec![(RelPath::root(), f.clone(), layer)])?,
+            Kind::File => {
+                self.layers[layer].scan.files.get(at).map(|f| vec![(RelPath::root().to_owned(), f.clone(), layer)])?
+            }
             Kind::Folder => return None,
         };
-        let mut files: BTreeMap<RelPath, (HostPath, usize)> =
+        let mut files: BTreeMap<Arc<RelPath>, (HostPath, usize)> =
             below.iter().map(|(name, file, held)| (name.clone(), (file.clone(), *held))).collect();
         let (mut inputs, mut stale) = (Vec::new(), false);
         for (name, base) in changed {
@@ -3083,7 +3184,7 @@ impl Index {
         node: &mut Node,
         layer: usize,
         at: &TreePath,
-        changed: &BTreeMap<RelPath, Base>,
+        changed: &BTreeMap<Arc<RelPath>, Base>,
     ) -> Option<bool> {
         let held = self.layers[layer].scan.kind(at);
         if held.is_some_and(|k| k != node.kind) {
@@ -3091,7 +3192,7 @@ impl Index {
         }
         let stale = self.override_with(node, layer, at, changed)?;
         if held.is_some() {
-            node.content = (layer, at.clone());
+            node.content = (layer, at.to_owned());
         }
         node.overrides.push(layer);
         Some(stale)
@@ -3176,7 +3277,7 @@ impl Index {
 
     /// Whether what changed in these regions is contents alone: every bundle and plain file of them is its entry's
     /// winning content, and no layer is hidden.
-    fn contents_only(&self, regions: &[(usize, TreePath)]) -> bool {
+    fn contents_only(&self, regions: &[(usize, Arc<TreePath>)]) -> bool {
         self.hidden.is_empty()
             && regions.iter().all(|(i, at)| {
                 let scan = self.layers[*i].scan.under(at);
@@ -3189,8 +3290,8 @@ impl Index {
 
     /// The stack applied without the layers in `skip`.
     fn resolve_stack(&self, skip: &HashSet<usize>) -> Resolution {
-        let mut resolved: BTreeMap<TreePath, Node> = BTreeMap::new();
-        let mut where_is: HashMap<Uid, TreePath> = HashMap::new();
+        let mut resolved: Resolved = BTreeMap::new();
+        let mut where_is: HashMap<Uid, Arc<TreePath>> = HashMap::new();
         let mut problems = Vec::new();
         let mut statuses = vec![BTreeMap::new(); self.layers.len()];
         for (i, layer) in self.layers.iter().enumerate() {
@@ -3204,7 +3305,7 @@ impl Index {
                 continue;
             }
             let status = &mut statuses[i];
-            let mut accounted: HashSet<TreePath> = HashSet::new();
+            let mut accounted: HashSet<Arc<TreePath>> = HashSet::new();
             for (uid, path) in &layer.changeset.entries {
                 let Some(kind) = layer.scan.kind(path) else {
                     let left_out = layer.place.ignores(path);
@@ -3296,8 +3397,8 @@ impl Index {
     fn check_held(
         &self,
         i: usize,
-        accounted: &HashSet<TreePath>,
-        resolved: &BTreeMap<TreePath, Node>,
+        accounted: &HashSet<Arc<TreePath>>,
+        resolved: &Resolved,
         problems: &mut Vec<Problem>,
     ) {
         let layer = &self.layers[i];
@@ -3315,7 +3416,7 @@ impl Index {
             layer.scan.paths().filter(|p| !accounted.contains(*p) && !resolved.contains_key(*p)).collect();
         for path in &unlisted {
             let parent = path.parent().filter(|parent| !parent.is_root());
-            if !parent.is_some_and(|parent| unlisted.contains(&&parent)) {
+            if !parent.is_some_and(|parent| unlisted.contains(&parent)) {
                 problems.push(Problem::Unlisted { layer: layer.name.clone(), path: path.to_string() });
             }
         }
@@ -3339,7 +3440,7 @@ impl Index {
             }
             for files in layer.scan.bundles.values() {
                 let declaration = files
-                    .get(&RelPath::from(NODE_FILE))
+                    .get(NODE_FILE.as_rel())
                     .and_then(|f| self.records.get(f))
                     .and_then(|r| r.declaration.as_ref());
                 // What a declaration names as it writes it: a text that is no uid names no layer's entry.
@@ -3392,19 +3493,19 @@ impl Index {
     /// that is no path names no asset.
     #[must_use]
     pub fn asset_at(&self, path: &str) -> Option<&Arc<Asset>> {
-        self.assets.get(&TreePath::new(path).ok()?)
+        self.assets.get(TreePath::new(path).ok()?)
     }
 
     /// An entry by its path as text, as `asset_at` takes an asset's.
     #[must_use]
     pub fn entry_at(&self, path: &str) -> Option<&Entry> {
-        self.entries.get(&TreePath::new(path).ok()?)
+        self.entries.get(TreePath::new(path).ok()?)
     }
 
     /// The real path an entry resolves at, by its uid.
     #[must_use]
     pub fn real_path(&self, uid: Uid) -> Option<&TreePath> {
-        self.placed.get(&uid)
+        self.placed.get(&uid).map(|path| &**path)
     }
 
     /// A layer's changeset as the index read it.
@@ -3435,7 +3536,7 @@ impl Index {
 
     /// What the layers below `layer` resolve, by path: each entry's uid and kind.
     #[must_use]
-    pub fn entries_below(&self, layer: &str) -> HashMap<TreePath, (Uid, Kind)> {
+    pub fn entries_below(&self, layer: &str) -> HashMap<Arc<TreePath>, (Uid, Kind)> {
         let Some(beneath) = self.below_layer(layer) else { return HashMap::new() };
         beneath.resolution.resolved.iter().map(|(path, node)| (path.clone(), (node.uid, node.kind))).collect()
     }
@@ -3446,7 +3547,7 @@ impl Index {
         let beneath = self.below_layer(layer)?;
         let (path, node) = beneath.resolution.resolved.get_key_value(beneath.by_uid.get(&uid)?)?;
         let source = &self.layers[node.content.0];
-        let files: Vec<(RelPath, HostPath)> =
+        let files: Vec<(Arc<RelPath>, HostPath)> =
             self.node_files(node).into_iter().map(|(name, file, _)| (name, file)).collect();
         Some(Below {
             kind: node.kind,
@@ -3461,7 +3562,7 @@ impl Index {
 
     /// The entries the layers below `layer` resolve inside a folder (its path), by uid.
     #[must_use]
-    pub fn below_inside(&self, layer: &str, folder: &TreePath) -> Vec<(Uid, TreePath)> {
+    pub fn below_inside(&self, layer: &str, folder: &TreePath) -> Vec<(Uid, Arc<TreePath>)> {
         let Some(beneath) = self.below_layer(layer) else { return vec![] };
         let resolved = &beneath.resolution.resolved;
         let inside = subtree(resolved, folder).into_iter().filter(|path| path != folder);
@@ -3528,7 +3629,7 @@ impl Index {
             _ => self.layers[i].scan.bundles.get(&at).and_then(|b| b.get(name)).cloned(),
         };
         let whole = |file: &RelPath, mine: &str, was: &Option<String>, now: Option<&String>| StalePart {
-            file: file.clone(),
+            file: file.to_owned(),
             field: None,
             mine: Some(mine.to_string()),
             was: Some(if was.is_some() { "a version" } else { "absent" }.to_string()),
@@ -3595,7 +3696,7 @@ impl Index {
         self.hidden = hidden;
         self.resolved = Shared::new(self.resolve_stack(&self.hidden).resolved);
         Shared::make_mut(&mut self.assets).clear();
-        let paths: Vec<TreePath> = self.resolved.keys().cloned().collect();
+        let paths: Vec<Arc<TreePath>> = self.resolved.keys().cloned().collect();
         self.assemble(&paths);
         self.link();
         true
@@ -3603,10 +3704,10 @@ impl Index {
 
     /// Show assets with their working copies' files in place of those on disk - these, by uid; the others as on
     /// disk. The assets whose working copy changed are assembled and linked again; returns their paths.
-    pub fn set_working(&mut self, working: HashMap<Uid, Working>) -> BTreeSet<TreePath> {
+    pub fn set_working(&mut self, working: HashMap<Uid, Working>) -> BTreeSet<Arc<TreePath>> {
         let mut uids: BTreeSet<&Uid> = working.keys().collect();
         uids.extend(self.working.keys());
-        let changed: Vec<TreePath> = uids
+        let changed: Vec<Arc<TreePath>> = uids
             .into_iter()
             .filter(|uid| working.get(*uid) != self.working.get(*uid))
             .filter_map(|uid| self.by_uid.get(uid).cloned())
@@ -3632,9 +3733,9 @@ impl Index {
         if changed.is_empty() {
             return BTreeSet::new();
         }
-        let before: HashMap<TreePath, Vec<Reference>> =
+        let before: HashMap<Arc<TreePath>, Vec<Reference>> =
             changed.iter().map(|a| (a.clone(), self.references_from(a))).collect();
-        let paths: Vec<TreePath> = changed.iter().map(bundle_named).collect();
+        let paths: Vec<Arc<TreePath>> = changed.iter().map(|asset| bundle_named(asset)).collect();
         self.assemble_assets(&paths);
         let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.output.clone());
         let references_changed = changed.iter().any(|a| {
@@ -3706,7 +3807,7 @@ impl Index {
                     }
                     let held = layer.scan.bundles.keys().map(|p| (p, Kind::Asset));
                     let held = held.chain(layer.scan.files.keys().map(|p| (p, Kind::File)));
-                    let mut hashes: HashMap<TreePath, String> =
+                    let mut hashes: HashMap<Arc<TreePath>, String> =
                         held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect();
                     let last = before.get(i);
                     for path in layer.changeset.entries.values().filter(|p| layer.scan.kind(p).is_none()) {
@@ -3760,43 +3861,44 @@ impl Index {
     ///
     /// # Errors
     /// A new uid cannot be made.
-    fn listing(&self, i: usize, only: Option<&[TreePath]>) -> Result<Vec<(Uid, TreePath)>> {
+    fn listing(&self, i: usize, only: Option<&[Arc<TreePath>]>) -> Result<Vec<(Uid, Arc<TreePath>)>> {
         let mut taken: HashSet<Uid> = HashSet::new();
         for layer in &self.layers {
             taken.extend(layer.changeset.entries.keys().copied());
         }
-        let below: HashSet<&TreePath> = self.layers[..i].iter().flat_map(|l| l.changeset.entries.values()).collect();
+        let below: HashSet<&TreePath> =
+            self.layers[..i].iter().flat_map(|l| l.changeset.entries.values()).map(|path| &**path).collect();
         let layer = &self.layers[i];
-        let listed: HashSet<&TreePath> = layer.changeset.entries.values().collect();
+        let listed: HashSet<&TreePath> = layer.changeset.entries.values().map(|path| &**path).collect();
         let copies = self.override_targets(i);
         let wanted = |p: &TreePath| only.is_none_or(|only| only.iter().any(|o| p.starts_with(o)));
-        let mut unlisted: BTreeSet<TreePath> = layer
+        let mut unlisted: BTreeSet<Arc<TreePath>> = layer
             .scan
             .paths()
             .filter(|p| !listed.contains(p) && !below.contains(p) && !copies.contains(*p) && wanted(p))
-            .cloned()
+            .map(ToOwned::to_owned)
             .collect();
         if unlisted.is_empty() {
             return Ok(vec![]);
         }
         // Moves: a gone entry's last hash found again at an unlisted path, once.
-        let gone: Vec<(Uid, TreePath)> = layer
+        let gone: Vec<(Uid, Arc<TreePath>)> = layer
             .changeset
             .entries
             .iter()
             .filter(|(_, p)| layer.scan.kind(p).is_none())
             .map(|(u, p)| (*u, p.clone()))
             .collect();
-        let mut by_hash: HashMap<String, Vec<TreePath>> = HashMap::new();
+        let mut by_hash: HashMap<String, Vec<Arc<TreePath>>> = HashMap::new();
         for path in &unlisted {
             if let Some(kind) = layer.scan.kind(path).filter(|k| *k != Kind::Folder)
                 && let Some(hash) = self.content_hash(i, path, kind)
             {
-                by_hash.entry(hash).or_default().push(path.clone());
+                by_hash.entry(hash).or_default().push(path.to_owned());
             }
         }
         let last = self.hashes.get(i).cloned().unwrap_or_default();
-        let mut moves: Vec<(Uid, TreePath, TreePath)> = Vec::new();
+        let mut moves: Vec<(Uid, Arc<TreePath>, Arc<TreePath>)> = Vec::new();
         for (id, old) in &gone {
             if let Some(new) = last.get(old).and_then(|h| by_hash.get(h)).filter(|c| c.len() == 1).map(|c| c[0].clone())
                 && unlisted.remove(&new)
@@ -3809,11 +3911,11 @@ impl Index {
             if layer.scan.kind(old).is_some() || moves.iter().any(|(u, _, _)| u == id) {
                 continue;
             }
-            let targets: BTreeSet<TreePath> = moves
+            let targets: BTreeSet<Arc<TreePath>> = moves
                 .iter()
                 .filter_map(|(_, from, to)| {
                     let rest = from.strip_prefix(old).filter(|rest| !rest.is_root())?;
-                    without_tail(to, &rest)
+                    without_tail(to, rest)
                 })
                 .collect();
             if targets.len() == 1
@@ -3823,14 +3925,14 @@ impl Index {
                 moves.push((*id, old.clone(), new));
             }
         }
-        let mut out: Vec<(Uid, TreePath)> = moves.into_iter().map(|(id, _, new)| (id, new)).collect();
+        let mut out: Vec<(Uid, Arc<TreePath>)> = moves.into_iter().map(|(id, _, new)| (id, new)).collect();
         for path in unlisted {
             // The uid its declaration names, where that is one and not taken: what a node written by hand keeps.
             let declared = layer
                 .scan
                 .bundles
                 .get(&path)
-                .and_then(|files| files.get(&RelPath::from(NODE_FILE)))
+                .and_then(|files| files.get(NODE_FILE.as_rel()))
                 .and_then(|f| self.records.get(f))
                 .and_then(|r| Uid::new(r.declaration.as_ref()?.uid.as_deref()?).ok())
                 .filter(|u| !taken.contains(u));
@@ -3849,26 +3951,26 @@ impl Index {
     ///
     /// # Errors
     /// There is no such layer, or a new uid cannot be made.
-    pub fn adoption(&self, layer: &str, path: &TreePath) -> Result<Vec<(Uid, TreePath)>> {
+    pub fn adoption(&self, layer: &str, path: &TreePath) -> Result<Vec<(Uid, Arc<TreePath>)>> {
         let i = anyhow::Context::with_context(self.layers.iter().position(|l| l.name == layer), || {
             format!("no layer {layer}")
         })?;
-        self.listing(i, Some(std::slice::from_ref(path)))
+        self.listing(i, Some(&[path.to_owned()]))
     }
 
     /// Where a layer's overrides put their copies: each override's move target, else its entry's path below the
     /// layer. Not unlisted content: the changeset accounts for them.
-    fn override_targets(&self, layer: usize) -> HashSet<TreePath> {
+    fn override_targets(&self, layer: usize) -> HashSet<Arc<TreePath>> {
         let ops = &self.layers[layer].changeset.ops;
         if !ops.values().any(|op| matches!(op, Op::Override { .. })) {
             return HashSet::new();
         }
         let below = self.resolve_stack(&(layer..self.layers.len()).collect());
-        let path_of: HashMap<Uid, &TreePath> = below.resolved.iter().map(|(p, n)| (n.uid, p)).collect();
+        let path_of: HashMap<Uid, &TreePath> = below.resolved.iter().map(|(p, n)| (n.uid, &**p)).collect();
         ops.iter()
             .filter_map(|(uid, op)| match op {
                 Op::Override { to: Some(to), .. } => Some(to.clone()),
-                Op::Override { to: None, .. } => path_of.get(uid).map(|p| (*p).clone()),
+                Op::Override { to: None, .. } => path_of.get(uid).map(|p| (*p).to_owned()),
                 _ => None,
             })
             .collect()
@@ -3877,7 +3979,7 @@ impl Index {
     /// Build the assets at these real paths from the resolved stack and the records: their uid, the winning layer's
     /// bundle, its `node.toml`. A path that no longer resolves to an asset loses its asset; `entries` follows the
     /// whole stack.
-    fn assemble(&mut self, paths: &[TreePath]) {
+    fn assemble(&mut self, paths: &[Arc<TreePath>]) {
         tracing::info_span!("assemble: entries").in_scope(|| self.assemble_entries());
         self.assemble_assets(paths);
     }
@@ -3908,7 +4010,7 @@ impl Index {
     /// The assets at these real paths, from the resolved stack and the records; a path that no longer resolves to an
     /// asset loses its asset. Many at once - a project opened, the stack applied again - are made on every core:
     /// each is made of its own entry and files alone.
-    fn assemble_assets(&mut self, paths: &[TreePath]) {
+    fn assemble_assets(&mut self, paths: &[Arc<TreePath>]) {
         // Enough of them to be worth helpers: what an edit changed is made here.
         const MANY: usize = 64;
         fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -3965,7 +4067,7 @@ impl Index {
     }
 
     /// The asset an entry of the resolved stack is, of its files as they were read: as it is on disk.
-    fn asset_made(&self, path: &TreePath, node: &Node, files: &[(RelPath, HostPath, usize)]) -> Asset {
+    fn asset_made(&self, path: &TreePath, node: &Node, files: &[(Arc<RelPath>, HostPath, usize)]) -> Asset {
         let layers = std::iter::once(node.home).chain(node.overrides.iter().copied());
         let mut asset = Asset {
             path: asset_of(path),
@@ -4088,7 +4190,7 @@ impl Index {
                 self.problems.push(Problem::Unreadable { asset: asset.path.to_string(), error: error.clone() });
             }
         }
-        let (mut referenced_by, mut dangling) = (HashMap::<TreePath, Vec<Reference>>::new(), Vec::new());
+        let (mut referenced_by, mut dangling) = (HashMap::<Arc<TreePath>, Vec<Reference>>::new(), Vec::new());
         let mut named = HashMap::<Uid, usize>::new();
         for asset in self.assets.values() {
             let declaration = asset
@@ -4117,16 +4219,16 @@ impl Index {
     /// Link again what these assets declare, which declared `before` (by asset): their unreadable declarations, and
     /// their references taken back and made again where a full link puts them (in asset order, then declaration
     /// order). The uids and the assets stand: other assets' references resolve as they did.
-    fn relink(&mut self, assets: &[TreePath], before: &HashMap<TreePath, Vec<Reference>>) {
-        let changed: HashSet<&TreePath> = assets.iter().collect();
-        let shown: HashSet<&str> = assets.iter().map(TreePath::as_str).collect();
+    fn relink(&mut self, assets: &[Arc<TreePath>], before: &HashMap<Arc<TreePath>, Vec<Reference>>) {
+        let changed: HashSet<&TreePath> = assets.iter().map(|asset| &**asset).collect();
+        let shown: HashSet<&str> = assets.iter().map(|asset| asset.as_str()).collect();
         self.problems.retain(|p| !matches!(p, Problem::Unreadable { asset, .. } if shown.contains(asset.as_str())));
         for path in assets {
             if let Some(error) = self.assets.get(path).and_then(|a| a.error.clone()) {
                 self.problems.push(Problem::Unreadable { asset: path.to_string(), error });
             }
         }
-        for (from, references) in before.iter().filter(|(a, _)| changed.contains(a)) {
+        for (from, references) in before.iter().filter(|(a, _)| changed.contains(&***a)) {
             let named = Shared::make_mut(&mut self.named);
             for uid in references.iter().filter_map(|r| Uid::new(&r.uid).ok()) {
                 if let Some(count) = named.get_mut(&uid) {
@@ -4136,7 +4238,7 @@ impl Index {
                     }
                 }
             }
-            let targets: Vec<TreePath> = references.iter().filter_map(|r| self.target_of(r)).collect();
+            let targets: Vec<Arc<TreePath>> = references.iter().filter_map(|r| self.target_of(r)).collect();
             for target in targets {
                 let referenced_by = Shared::make_mut(&mut self.referenced_by);
                 if let Some(list) = referenced_by.get_mut(&target) {
@@ -4147,12 +4249,12 @@ impl Index {
                 }
             }
         }
-        self.dangling.retain(|r| !changed.contains(&r.from));
-        let mut sorted: Vec<&TreePath> = assets.iter().collect();
+        self.dangling.retain(|r| !changed.contains(&*r.from));
+        let mut sorted: Vec<&TreePath> = assets.iter().map(|asset| &**asset).collect();
         sorted.sort();
         for from in sorted {
-            let mut placed: HashMap<TreePath, usize> = HashMap::new();
-            let mut dangling_at = self.dangling.partition_point(|r| r.from < *from);
+            let mut placed: HashMap<Arc<TreePath>, usize> = HashMap::new();
+            let mut dangling_at = self.dangling.partition_point(|r| *r.from < *from);
             for reference in self.references_from(from) {
                 if let Ok(uid) = Uid::new(&reference.uid) {
                     *Shared::make_mut(&mut self.named).entry(uid).or_default() += 1;
@@ -4160,7 +4262,7 @@ impl Index {
                 if let Some(target) = self.target_of(&reference) {
                     let list = Shared::make_mut(&mut self.referenced_by).entry(target.clone()).or_default();
                     // After the references of the assets before it, then each of its own after the last.
-                    let at = placed.entry(target).or_insert_with(|| list.partition_point(|r| r.from < *from));
+                    let at = placed.entry(target).or_insert_with(|| list.partition_point(|r| *r.from < *from));
                     list.insert(*at, reference);
                     *at += 1;
                 } else {
@@ -4184,7 +4286,7 @@ impl Index {
             .map_or(&[][..], |d| d.references.as_slice())
             .iter()
             .map(|(slot, uid, target, output)| Reference {
-                from: path.clone(),
+                from: path.to_owned(),
                 slot: slot.clone(),
                 uid: uid.clone(),
                 target: target.clone(),
@@ -4198,14 +4300,19 @@ impl Index {
     #[must_use]
     pub fn resolve(&self, uid: &str, target: &str) -> Option<&Asset> {
         let by_uid = Uid::new(uid).ok().and_then(|uid| self.by_uid.get(&uid)).and_then(|p| self.assets.get(p));
-        by_uid.or_else(|| TreePath::new(target).ok().and_then(|target| self.assets.get(&target))).map(|a| &**a)
+        by_uid.or_else(|| TreePath::new(target).ok().and_then(|target| self.assets.get(target))).map(|a| &**a)
     }
 
     /// The asset path a reference resolves to: the uid decides, the path is the fallback - each as the declaration
     /// writes it, checked as it is read; none where neither names an asset.
-    fn target_of(&self, reference: &Reference) -> Option<TreePath> {
+    fn target_of(&self, reference: &Reference) -> Option<Arc<TreePath>> {
         let by_uid = Uid::new(&reference.uid).ok().and_then(|uid| self.by_uid.get(&uid)).cloned();
-        by_uid.or_else(|| TreePath::new(&reference.target).ok().filter(|target| self.assets.contains_key(target)))
+        by_uid.or_else(|| {
+            TreePath::new(&reference.target)
+                .ok()
+                .filter(|target| self.assets.contains_key(*target))
+                .map(ToOwned::to_owned)
+        })
     }
 }
 
@@ -4217,7 +4324,7 @@ mod tests {
     use crate::changeset::{Base, Changeset, Op};
     use crate::testing::At as _;
     use crate::testing::{rel, tree, uid};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     /// The top layer's override of an entry, changing these files of it: each made from the version below now, kept.
     fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
@@ -4330,7 +4437,7 @@ mod tests {
         let root = project("ops");
         let (_, index) = open(&root);
         let base = changeset(&root, "base");
-        let uid_of = |path: &str| *base.entries.iter().find(|(_, p)| *p == path).unwrap().0;
+        let uid_of = |path: &str| *base.entries.iter().find(|(_, p)| ***p == *path).unwrap().0;
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml", "native.texels"]));
         top.ops.insert(uid_of("b.node"), Op::Move { to: tree("c.node") });
@@ -4339,7 +4446,7 @@ mod tests {
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         write(&root, ".layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
-        assert_eq!(index.assets.keys().collect::<Vec<_>>(), ["c", "g/a"]);
+        assert_eq!(index.assets.keys().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["c", "g/a"]);
         assert_eq!(index.assets[&tree("g/a")].layers, ["base", "top"]);
         assert!(index.assets[&tree("g/a")].files.iter().all(|f| f.layer == "top"));
         assert_eq!(index.assets[&tree("c")].uid, Some(uid_of("b.node")));
@@ -4403,6 +4510,36 @@ mod tests {
         crate::cache::remove_all(&root);
     }
 
+    /// Two of a folder named alike - one name in both its normal forms, as a system keeping either writes them - are
+    /// each a problem of the layer's, and neither is the project's: in a folder as in a bundle, scanned and opened again
+    /// from the model. (Not where the system itself takes them as one.)
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn names_alike_beside_each_other_are_each_a_problem() {
+        let root = project("alike");
+        let (composed, decomposed) = ("caf\u{e9}.txt", "cafe\u{301}.txt");
+        for folder in [".layers/base/g", ".layers/base/g/a.node"] {
+            for (name, text) in [(composed, "a"), (decomposed, "b")] {
+                std::fs::write(root.at(folder).entry(std::ffi::OsStr::new(name)), text).unwrap();
+            }
+        }
+        let paths = [composed, decomposed].map(|name| [format!("g/{name}"), format!("g/a.node/{name}")]);
+        for _ in 0..2 {
+            let (_, index) = open(&root);
+            let said = |path: &str| {
+                index.problems.iter().any(|p| {
+                    matches!(p, Problem::Refused { path: at, why, .. } if at == path && why.contains("one name with"))
+                })
+            };
+            for path in paths.iter().flatten() {
+                assert!(said(path), "{path}: {:?}", index.problems);
+            }
+            assert!(!index.entries.contains_key(&*tree(&format!("g/{composed}"))), "neither is taken");
+            assert!(!index.assets[&tree("g/a")].files.iter().any(|file| file.name.as_str().starts_with("caf")));
+        }
+        crate::cache::remove_all(&root);
+    }
+
     /// Why a path the tests make is refused, as the index says it.
     #[cfg(unix)]
     fn index_why(path: &str) -> String {
@@ -4433,11 +4570,11 @@ mod tests {
     fn follows_the_watcher() {
         let root = project("refresh");
         let (project, mut index) = open(&root);
-        let folder = *changeset(&root, "base").entries.iter().find(|(_, p)| *p == "g").unwrap().0;
+        let folder = *changeset(&root, "base").entries.iter().find(|(_, p)| ***p == *"g").unwrap().0;
         // A file of a bundle changed: that bundle, its file read again.
         let texels = write(&root, ".layers/base/g/a.node/native.texels", "repainted");
         let refreshed = index.refresh(&project, &[texels]).unwrap();
-        assert_eq!(refreshed.assets.into_iter().collect::<Vec<_>>(), ["g/a"]);
+        assert_eq!(refreshed.assets.iter().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["g/a"]);
         assert_eq!(index.read, 1);
         // A folder renamed in the layer's folder, by other means than the editor: no edit, a problem - what it holds now
         // is unlisted, what it listed missing - until it is adopted, which follows the move: the uids are kept.
@@ -4501,11 +4638,11 @@ mod tests {
         top.save(&root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let below = index.below("top", uid("uid://a")).unwrap();
-        assert!(below.files.iter().any(|(name, _)| name == "native.texels"), "{:?}", below.files);
+        assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
         write(&root, ".layers/base-files/g/a.node/native.texels", "extracted otherwise");
         let (_, after) = open(&root);
         assert!(!after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
-        let texels = after.assets[&tree("g/a")].files.iter().find(|f| f.name == "native.texels").unwrap();
+        let texels = after.assets[&tree("g/a")].files.iter().find(|f| *f.name == *"native.texels").unwrap();
         assert_eq!(std::fs::read_to_string(&texels.path).unwrap(), "extracted otherwise");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4572,7 +4709,7 @@ mod tests {
         let root = project("mount");
         // A tree outside the project, mounted at `code`: its own `.gitignore` leaves out `*.o`; `x.node` in it is a
         // plain folder, not a bundle.
-        let tree = root.with_suffix(&pe2_path::Name::constant(".tree"));
+        let tree = root.with_suffix(pe2_path::Name::constant(".tree"));
         let _ = std::fs::remove_dir_all(&tree);
         write(&tree, "main.c", "int main;");
         write(&tree, "main.o", "object");

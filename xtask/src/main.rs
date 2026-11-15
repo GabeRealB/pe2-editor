@@ -1,9 +1,10 @@
 //! The editor's own tasks, run as `cargo xtask <task>`:
 //!
-//! - `prepare [--target <triple>]`: what a build for a platform needs that is no crate (`prepare.toml`: on Windows,
-//!   the DirectX Shader Compiler), fetched and held to its hashes into `prepared/<platform>/` - the host's, or the one
-//!   the target triple names. A build for a platform needing something fails until it is prepared, and puts it
-//!   beside the programs it makes (`crates/editor/build.rs`); a release has it there too.
+//! - `prepare [--target <triple>]`: what a build needs that is no crate (`prepare.toml`), fetched and held to its
+//!   hashes: what a platform's programs need (on Windows, the DirectX Shader Compiler) into `prepared/<platform>/` -
+//!   the host's, or the one the target triple names - which a build for it puts beside the programs it makes
+//!   (`crates/editor/build.rs`), as a release has it; and what the build itself reads on every platform (the Unicode
+//!   Character Database) into `prepared/common/` (`crates/path/build.rs`). A build fails until it is prepared.
 //! - `dist [--tests] [--out <folder>]`: prepared, built and laid out as it ships, in
 //!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, what a user reads
 //!   of them in `docs/` (the workspace's `docs/`), what they are built with and under which license in
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
             Some("--write") => true,
             Some(other) => bail!("no option {other}\n{USAGE}"),
         };
-        return pe2_setup::hash_manifest(&pe2_path::HostPath::new(Path::new(&manifest))?, write);
+        return pe2_setup::hash_manifest(Path::new(&manifest), write);
     }
     if task == "prepare" {
         let platform = match (args.next().as_deref(), args.next()) {
@@ -136,9 +137,7 @@ fn pins(manifests: Vec<PathBuf>) -> Result<()> {
         }
         println!("== {}", manifest.display());
         gone.extend(
-            pe2_setup::check_pins(&pe2_path::HostPath::new(&manifest)?)?
-                .into_iter()
-                .map(|entry| format!("{}: {entry}", manifest.display())),
+            pe2_setup::check_pins(&manifest)?.into_iter().map(|entry| format!("{}: {entry}", manifest.display())),
         );
     }
     ensure!(gone.is_empty(), "no source answers for:\n  {}", gone.join("\n  "));
@@ -186,25 +185,32 @@ struct Prepare {
 /// The file listing what a build needs that is no crate.
 const PREPARE: &str = "prepare.toml";
 
-/// The folder it is fetched into, a folder each platform's (`prepared/<platform>/`).
+/// The folder it is fetched into: a folder each platform's (`prepared/<platform>/`), and one for every platform
+/// (`prepared/common/`).
 const PREPARED: &str = "prepared";
 
-/// `prepare`: what a build for a platform needs that is no crate, fetched into `prepared/<platform>/` and held to its
-/// hashes - where a build finds it (`crates/editor/build.rs`); what is there as pinned already is not fetched again.
-/// The names of the files there.
+/// Where what is prepared for no platform goes: what the build itself reads on every one.
+const COMMON: &str = "common";
+
+/// `prepare`: what a build needs that is no crate, fetched and held to its hashes - what a platform's programs need
+/// into `prepared/<platform>/`, where its build finds it (`crates/editor/build.rs`), and what the build itself reads on
+/// every platform into `prepared/common/` (`crates/path/build.rs`); what is there as pinned already is not fetched
+/// again. The names of the files the platform's programs need.
 fn prepare(workspace: &Path, platform: &str) -> Result<Vec<String>> {
     let manifest = workspace.join(PREPARE);
     let text = std::fs::read_to_string(&manifest).with_context(|| manifest.display().to_string())?;
     let listed: Prepare = toml::from_str(&text).with_context(|| manifest.display().to_string())?;
-    let into = workspace.join(PREPARED).join(platform);
-    std::fs::create_dir_all(&into).with_context(|| into.display().to_string())?;
-    let into = pe2_path::HostPath::new(&into)?;
     let mut names = Vec::new();
     let cancel = std::sync::atomic::AtomicBool::new(false);
     for setup in listed.setup.iter().filter(|setup| setup.platform.as_deref().is_none_or(|named| named == platform)) {
-        println!("{} ({platform})", setup.name);
+        let folder = setup.platform.as_deref().map_or(COMMON, |_| platform);
+        let into = workspace.join(PREPARED).join(folder);
+        std::fs::create_dir_all(&into).with_context(|| into.display().to_string())?;
+        println!("{} ({folder})", setup.name);
         pe2_setup::fetch_into(setup, &into, &mut |_, _| {}, &cancel).with_context(|| setup.name.clone())?;
-        names.extend(setup.take.places().into_iter().map(|(to, _)| to.to_string()));
+        if setup.platform.is_some() {
+            names.extend(setup.take.places().into_iter().map(|(to, _)| to.to_string()));
+        }
     }
     Ok(names)
 }

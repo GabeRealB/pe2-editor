@@ -9,8 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# What tests share (`testing`): for dev-dependencies alone.
+testing = []
+
 [dependencies]
 pe2-path.workspace = true
+serde.workspace = true
 memmap2 = "0.9"
 crc32fast = "1"
 
@@ -23,4 +28,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 libc = "0.2"
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }
+serde_json.workspace = true

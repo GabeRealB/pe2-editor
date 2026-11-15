@@ -128,6 +128,9 @@ crc32fast = "1"
 quick-xml = "0.41"
 sha1 = "0.10"
 sha2 = "0.10"
+# Unicode normalization (NFD), which names are compared through (`pe2-path`): its data baked in, of the version the
+# fold's table is made of (`prepare.toml`).
+icu_normalizer = { version = "2.4", default-features = false, features = ["compiled_data"] }
 # What an extension's setup fetches (crates/setup): HTTPS, and the archives it comes in.
 ureq = "2"
 flate2 = "1"

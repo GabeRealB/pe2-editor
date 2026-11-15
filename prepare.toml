@@ -1,7 +1,27 @@
-# What a build of the editor needs that is no crate: fetched by `cargo xtask prepare` into `prepared/<platform>/`, each
-# entry as an extension's `[[setup]]` is and held to its hashes (`cargo xtask hash prepare.toml --write` finds them). A
-# build for a platform an entry is for fails until it is prepared, and puts it beside the programs it makes
-# (`crates/editor/build.rs`); `cargo xtask dist` prepares first, and ships it beside the programs.
+# What a build of the editor needs that is no crate, fetched by `cargo xtask prepare`, each entry as an extension's
+# `[[setup]]` is and held to its hashes (`cargo xtask hash prepare.toml --write` finds them). An entry for a platform goes
+# to `prepared/<platform>/`: a build for that platform fails until it is prepared, and puts it beside the programs it
+# makes (`crates/editor/build.rs`); `cargo xtask dist` prepares first, and ships it beside the programs. An entry for no
+# platform is what the build itself reads on every platform, in `prepared/common/`, and ships with none.
+
+# The Unicode Character Database, which the names of a project's files are compared by (`crates/path/build.rs`: what
+# case and normalization leave alike): each character's simple uppercase and full case folding. Of the version the
+# normalization `icu_normalizer` bakes in, so the two agree.
+[[setup]]
+name = "Unicode Character Database 18.0.0: UnicodeData.txt"
+license = "Unicode-3.0"
+copyright = "Unicode, Inc."
+url = "https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt"
+sha256 = "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950"
+take = { file = "ucd/UnicodeData.txt", sha256 = "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950" }
+
+[[setup]]
+name = "Unicode Character Database 18.0.0: CaseFolding.txt"
+license = "Unicode-3.0"
+copyright = "Unicode, Inc."
+url = "https://www.unicode.org/Public/18.0.0/ucd/CaseFolding.txt"
+sha256 = "a004797658a457bec4dc11683e39f69249ea3b595b752dbea6721c4c9f587b0d"
+take = { file = "ucd/CaseFolding.txt", sha256 = "a004797658a457bec4dc11683e39f69249ea3b595b752dbea6721c4c9f587b0d" }
 
 # The DirectX Shader Compiler: what Direct3D 12's shaders are compiled with, given to wgpu by its place beside the
 # editor - never one found on the system's PATH, which may make shaders Direct3D refuses. It signs what it compiles with

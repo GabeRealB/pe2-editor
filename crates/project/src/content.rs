@@ -8,7 +8,8 @@
 //! project's own files (`project.toml`, changesets), and temporary files. The history keeps what is on disk as it is - a
 //! manifest, not the chunks it names - so undo restores a large file by its manifest.
 
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::Name;
+use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -115,7 +116,7 @@ pub fn serve_whole(listing: &crate::server::Listing) {
 }
 
 /// Read these files as listed now, where they changed since what this process reads by was said.
-pub fn serve_changed(shown: &[(String, crate::server::Shown)]) {
+pub fn serve_changed(shown: &[(Arc<crate::TreePath>, crate::server::Shown)]) {
     let mut lives = SERVED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     let lives = lives.get_or_insert_default();
     for (_, shown) in shown {
@@ -138,9 +139,10 @@ const RECORDS_HELD: usize = 256;
 
 /// The text a record holds for one of its files, read from the record's own file.
 /// A file of a record, by the name what serves it was told: a path within the record's entry.
-fn record_file(record: &HostPath, name: &str) -> io::Result<pe2_path::RelPath> {
-    pe2_path::RelPath::new(name)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {e}", record.display())))
+fn record_file(record: &HostPath, name: &str) -> io::Result<Arc<pe2_path::RelPath>> {
+    (pe2_path::RelPath::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {e}", record.display()))))
+    .map(ToOwned::to_owned)
 }
 
 fn record_text(record: &HostPath, name: &str) -> io::Result<Vec<u8>> {
@@ -537,10 +539,14 @@ impl Folder {
 /// How what is served to a program will be used (`pe2_ext::Use`): what it is served by is chosen by it.
 pub use pe2_ext::Use;
 
+/// A path in a folder of files given to a program (`serve_folder`).
+pub type GivenPath = pe2_path::VfsPath<pe2_path::Given>;
+
 /// What serves folders to programs (a scoped filesystem, `vfs::scoped`): given the project they are of, where there is
 /// one, the files by their paths in the folder, and how they will be used. One that finds laying them out the better
 /// way for that use serves none, and they are laid out.
-type FolderServer = Arc<dyn Fn(Option<&HostPath>, &BTreeMap<String, Given>, &Use) -> io::Result<Folder> + Send + Sync>;
+type FolderServer =
+    Arc<dyn Fn(Option<&HostPath>, &BTreeMap<Arc<GivenPath>, Given>, &Use) -> io::Result<Folder> + Send + Sync>;
 
 static FOLDER_SERVERS: RwLock<Vec<(u64, FolderServer)>> = RwLock::new(Vec::new());
 
@@ -556,7 +562,7 @@ impl Drop for ServingFolders {
 /// Have `server` serve folders to programs (`serve_folder`) for as long as what this returns is held; the latest
 /// registered serves.
 pub fn serve_folders_with(
-    server: impl Fn(Option<&HostPath>, &BTreeMap<String, Given>, &Use) -> io::Result<Folder> + Send + Sync + 'static,
+    server: impl Fn(Option<&HostPath>, &BTreeMap<Arc<GivenPath>, Given>, &Use) -> io::Result<Folder> + Send + Sync + 'static,
 ) -> ServingFolders {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -572,7 +578,7 @@ pub fn serve_folders_with(
 /// Nothing serves it, and it cannot be laid out.
 pub fn serve_folder(
     project: Option<&HostPath>,
-    files: &BTreeMap<String, Given>,
+    files: &BTreeMap<Arc<GivenPath>, Given>,
     how: &Use,
     fallback: &HostPath,
 ) -> io::Result<Folder> {
@@ -588,7 +594,7 @@ pub fn serve_folder(
 /// file to link. What is linked costs nothing, so a tree of whole files is laid out for next to nothing whatever its
 /// size - which is what decides between laying files out and serving them where they are (`vfs::backend::choose`).
 #[must_use]
-pub fn written_to_lay_out(files: &BTreeMap<String, Given>) -> u64 {
+pub fn written_to_lay_out(files: &BTreeMap<Arc<GivenPath>, Given>) -> u64 {
     files
         .values()
         .map(|given| match given {
@@ -602,13 +608,13 @@ pub fn written_to_lay_out(files: &BTreeMap<String, Given>) -> u64 {
 }
 
 /// A folder of these files laid out on disk, removed whole once what this returns is dropped.
-fn laid_out(files: &BTreeMap<String, Given>, under: &HostPath) -> io::Result<Folder> {
+fn laid_out(files: &BTreeMap<Arc<GivenPath>, Given>, under: &HostPath) -> io::Result<Folder> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let at = under.join(&Name::new(&format!("served-{}-{n}", std::process::id())).map_err(io::Error::other)?);
     let removed = Removed(at.clone());
     for (name, given) in files {
-        let to = at.join(&RelPath::new(name).map_err(io::Error::other)?);
+        let to = at.join(name.rel());
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -667,7 +673,7 @@ pub fn for_program(path: &HostPath) -> io::Result<HostPath> {
 
 /// Where a project's cache keeps a content assembled for programs: by its hash, under the name of the file it is.
 fn materialized(project: &HostPath, sha1: &str, path: &HostPath) -> io::Result<HostPath> {
-    const MATERIALIZED: Name = Name::constant("materialized");
+    const MATERIALIZED: &Name = Name::constant("materialized");
     let hash = Name::new(sha1).map_err(io::Error::other)?;
     let folder = project.join(&crate::cache::DIR).join(&MATERIALIZED).join(&hash);
     Ok(folder.entry(path.file_name().ok_or_else(|| not_in_a_project(path))?))
@@ -791,8 +797,8 @@ mod serving {
         let whole = dir.at("whole.o");
         std::fs::write(&whole, b"object").unwrap();
         let files = std::collections::BTreeMap::from([
-            ("objects/a.o".to_string(), Given::Disk(whole.clone())),
-            ("units".to_string(), Given::Bytes(std::sync::Arc::from(&b"a.c"[..]))),
+            (super::GivenPath::new("objects/a.o").unwrap().to_owned(), Given::Disk(whole.clone())),
+            (super::GivenPath::new("units").unwrap().to_owned(), Given::Bytes(std::sync::Arc::from(&b"a.c"[..]))),
         ]);
         let folder = super::laid_out(&files, &dir.at("tmp")).unwrap();
         assert_eq!(std::fs::read(folder.at.at("objects/a.o")).unwrap(), b"object");

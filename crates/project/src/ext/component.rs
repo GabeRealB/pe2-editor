@@ -29,7 +29,7 @@
 use anyhow::{Context, Result, anyhow};
 use pe2_ext::{Asset, Field, Image, Name, Project, Registry, Source, Table, UiHost};
 use pe2_ext::{Value, View};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::path::Path;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2751,8 +2751,8 @@ fn file_from_wit(f: types::File) -> pe2_ext::File {
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.
 fn compiled_dir() -> Option<HostPath> {
-    const COMPILED: pe2_path::Name = pe2_path::Name::constant("compiled");
-    const EDITOR: pe2_path::Name = pe2_path::Name::constant("pe2-editor");
+    const COMPILED: &pe2_path::Name = pe2_path::Name::constant("compiled");
+    const EDITOR: &pe2_path::Name = pe2_path::Name::constant("pe2-editor");
     // A folder the environment names, as the system names it.
     let place = |var: &str| std::env::var_os(var).and_then(|dir| HostPath::new(std::path::Path::new(&dir)).ok());
     if let Some(dir) = place("PE2_CACHE") {
@@ -2996,7 +2996,7 @@ pub struct Unsandboxed {
     /// Its installation notes, where it has any: what a program it cannot start points to.
     pub install: Option<HostPath>,
     /// Where what its setup fetches is kept on this machine.
-    pub store: Option<HostPath>,
+    pub store: Option<std::path::PathBuf>,
     /// What its setup fetches for this platform.
     pub setup: Vec<super::setup::Setup>,
     /// Of what is optional, what the user turned off on this computer, by key.

@@ -1,12 +1,11 @@
 //! What a project takes from where extensions are kept: added, copied whole, and removed.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use super::{Fixture, Scenario, isolate};
-use pe2_path::HostPath;
 
 /// An extension in the user's own folder, as one is kept (`<id>.extension`): a built-in's component, as there is no
 /// other to hand, with the manifest it carries. Gone with it.
-struct Kept(HostPath);
+struct Kept(std::path::PathBuf);
 
 impl Kept {
     fn formats() -> Kept {

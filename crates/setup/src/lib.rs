@@ -20,11 +20,15 @@
 //! (`lazy`) when it asks for it (`set-up` of the contract) - unless the user turned that off on this computer, which is
 //! theirs to choose, kept with what they trust.
 
-use pe2_path::{HostPath, Name, RelPath};
+#![allow(
+    clippy::disallowed_methods,
+    reason = "it writes what it fetches into a folder it is given: a place on disk of any program's, no storage's"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -157,16 +161,16 @@ impl Setup {
 
     /// Where it is kept in a store, fetched.
     #[must_use]
-    pub fn place(&self, store: &HostPath) -> HostPath {
-        // A key is digits and an id's letters: a name a folder of the store can have.
-        Name::new(&self.key()).map_or_else(|_| store.join(&Name::constant("_")), |key| store.join(&key))
+    pub fn place(&self, store: &Path) -> PathBuf {
+        // A key is the hex digits of a hash: a name any folder can have.
+        store.join(self.key())
     }
 
     /// Whether it is fetched into a store, and still as it was: every file the fetch recorded the size and time it
     /// had then (`intact`) - looked at again an hour after it last was, or once it was fetched or removed; `verify`
     /// hashes it. Found intact, it is marked used now (`kept::sweep` removes what was not used for long).
     #[must_use]
-    pub fn fetched(&self, store: &HostPath) -> bool {
+    pub fn fetched(&self, store: &Path) -> bool {
         let place = self.place(store);
         if !place.is_dir() {
             return false;
@@ -196,51 +200,58 @@ impl Setup {
 
 /// What a fetch recorded in an entry's folder: what it is (`# <name>\t<url>`), then each file's size, time and path.
 /// Its own time is when the entry was last used.
-const RECORD: Name = Name::constant(".fetched");
+const RECORD: &str = ".fetched";
 
 /// Where downloads are kept while they are being unpacked, in the store.
-const DOWNLOADS_FOLDER: Name = Name::constant("downloads");
+const DOWNLOADS_FOLDER: &str = "downloads";
 
 /// A place within a folder of the store, as a record, a manifest or a listing names it.
-fn at(folder: &HostPath, within: &str) -> Result<HostPath> {
+fn at(folder: &Path, within: &str) -> Result<PathBuf> {
     let place =
         parts(within).as_deref().and_then(place_of).with_context(|| format!("{within}: not a place within it"))?;
     Ok(folder.join(&place))
 }
 
 /// A name of the store's own: an entry's key with what follows it.
-fn own_name(text: &str) -> Result<Name> {
-    Name::new(text).with_context(|| format!("{text}: no name a file can have"))
+fn own_name(text: &str) -> Result<&str> {
+    component(text).with_context(|| format!("{text}: no name a file can have"))
+}
+
+/// A name of a file or a folder within another, where it is one: not empty, `.` or `..`, and no separator, `:` or
+/// control character - what joined onto a folder stays within it, on every system.
+fn component(text: &str) -> Option<&str> {
+    let refused = |c: char| matches!(c, '/' | '\\' | ':') || c.is_control();
+    (!text.is_empty() && text != "." && text != ".." && !text.contains(refused)).then_some(text)
 }
 
 /// How long what was found of a place holds in a process before it is looked at again.
 const LOOKED_AT_FOR: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// The places in a store found intact or not in this process, and when: forgotten as an entry is fetched or removed.
-fn checked() -> std::sync::MutexGuard<'static, HashMap<HostPath, (bool, std::time::Instant)>> {
-    type Checked = std::sync::Mutex<HashMap<HostPath, (bool, std::time::Instant)>>;
+fn checked() -> std::sync::MutexGuard<'static, HashMap<PathBuf, (bool, std::time::Instant)>> {
+    type Checked = std::sync::Mutex<HashMap<PathBuf, (bool, std::time::Instant)>>;
     static CHECKED: std::sync::OnceLock<Checked> = std::sync::OnceLock::new();
     CHECKED.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A file's size and modification time, as a fetch records them.
-fn stamp(file: &HostPath) -> Option<(u64, u128)> {
+fn stamp(file: &Path) -> Option<(u64, u128)> {
     let meta = std::fs::metadata(file).ok()?;
     let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
     Some((meta.len(), time))
 }
 
 /// Every file in a folder, by its path within it (`/` between parts), sorted.
-fn files_in(folder: &HostPath) -> Result<Vec<String>> {
+fn files_in(folder: &Path) -> Result<Vec<String>> {
     let mut files = vec![];
-    let mut folders = vec![(folder.clone(), String::new())];
+    let mut folders = vec![(folder.to_path_buf(), String::new())];
     while let Some((at, within)) = folders.pop() {
         for entry in std::fs::read_dir(&at).with_context(|| at.display().to_string())? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = if within.is_empty() { name } else { format!("{within}/{name}") };
             if entry.file_type()?.is_dir() {
-                folders.push((at.entry(&entry.file_name()), path));
+                folders.push((at.join(entry.file_name()), path));
             } else {
                 files.push(path);
             }
@@ -251,20 +262,20 @@ fn files_in(folder: &HostPath) -> Result<Vec<String>> {
 }
 
 /// Record what a fetch made in its folder: what it is, and each file's size and time, against which it is found intact.
-fn record(setup: &Setup, place: &HostPath) -> Result<()> {
+fn record(setup: &Setup, place: &Path) -> Result<()> {
     let mut record = format!("# {}\t{}\n", setup.name.replace(['\t', '\n'], " "), setup.url);
     for file in files_in(place)? {
         let (size, time) = stamp(&at(place, &file)?).with_context(|| file.clone())?;
         let _ = writeln!(record, "{size} {time} {file}");
     }
-    let to = place.join(&RECORD);
+    let to = place.join(RECORD);
     std::fs::write(&to, record).with_context(|| to.display().to_string())
 }
 
 /// Whether an entry's folder is as its fetch left it: each place it takes there, and each file the fetch recorded of
 /// the size and time it had. Cheap - nothing is read - so its hashes are `verify`'s.
-fn intact(setup: &Setup, place: &HostPath) -> bool {
-    let Ok(record) = std::fs::read_to_string(place.join(&RECORD)) else { return false };
+fn intact(setup: &Setup, place: &Path) -> bool {
+    let Ok(record) = std::fs::read_to_string(place.join(RECORD)) else { return false };
     let taken = setup.take.places().into_iter().all(|(taken, _)| at(place, taken).is_ok_and(|taken| taken.exists()));
     taken
         && record.lines().filter(|line| !line.starts_with('#')).all(|line| {
@@ -285,8 +296,8 @@ fn intact(setup: &Setup, place: &HostPath) -> bool {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn hash(place: &HostPath) -> Result<String> {
-    let of_file = |file: &HostPath| -> Result<String> {
+pub fn hash(place: &Path) -> Result<String> {
+    let of_file = |file: &Path| -> Result<String> {
         let mut hasher = Sha256::new();
         std::io::copy(&mut std::fs::File::open(file).with_context(|| file.display().to_string())?, &mut hasher)?;
         Ok(hex(&hasher.finalize()))
@@ -302,7 +313,7 @@ pub fn hash(place: &HostPath) -> Result<String> {
 }
 
 /// Each place an entry's folder (or a folder it is being made in) takes, held to its hash; and nothing there besides.
-fn held(setup: &Setup, folder: &HostPath) -> Result<()> {
+fn held(setup: &Setup, folder: &Path) -> Result<()> {
     let places = setup.take.places();
     for (place, declared) in &places {
         let at =
@@ -326,7 +337,7 @@ fn held(setup: &Setup, folder: &HostPath) -> Result<()> {
 ///
 /// # Errors
 /// It is not fetched, or not what it declares (and is removed), or cannot be read.
-pub fn verify(setup: &Setup, store: &HostPath) -> Result<()> {
+pub fn verify(setup: &Setup, store: &Path) -> Result<()> {
     let place = setup.place(store);
     ensure!(place.is_dir(), "{}: not fetched", setup.name);
     let found = held(setup, &place);
@@ -339,7 +350,7 @@ pub fn verify(setup: &Setup, store: &HostPath) -> Result<()> {
 
 /// Lay out what an entry takes, empty, as though fetched: what tests hold, which download nothing.
 #[doc(hidden)]
-pub fn as_fetched(setup: &Setup, store: &HostPath) {
+pub fn as_fetched(setup: &Setup, store: &Path) {
     // One at a time, and once: tests that lay out the same entry at once would each record the other's files.
     static LAYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = LAYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -350,7 +361,7 @@ pub fn as_fetched(setup: &Setup, store: &HostPath) {
     for (taken, _) in setup.take.places() {
         let Ok(taken) = at(&place, taken) else { continue };
         if let Some(parent) = taken.parent() {
-            let _ = std::fs::create_dir_all(&parent);
+            let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(taken, "");
     }
@@ -370,7 +381,7 @@ pub fn forbid_downloads() {
 ///
 /// # Errors
 /// It cannot be removed.
-pub fn remove(setup: &Setup, store: &HostPath) -> Result<()> {
+pub fn remove(setup: &Setup, store: &Path) -> Result<()> {
     let place = setup.place(store);
     checked().remove(&place);
     match std::fs::remove_dir_all(&place) {
@@ -409,8 +420,8 @@ pub type Progress<'a> = &'a mut dyn FnMut(u64, Option<u64>);
 /// what it declares, or the store cannot be written; or it was cancelled.
 pub fn fetch(
     setup: &Setup,
-    store: &HostPath,
-    folder: Option<&HostPath>,
+    store: &Path,
+    folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
 ) -> Result<()> {
@@ -425,7 +436,7 @@ pub fn fetch(
     ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     // What another process makes at the same time is its own until it is whole.
     let own = std::process::id();
-    let partial = store.join(&own_name(&format!("{key}.{own}.part"))?);
+    let partial = store.join(own_name(&format!("{key}.{own}.part"))?);
     made(setup, store, &partial, folder, progress, cancel)?;
     let done = held(setup, &partial).and_then(|()| record(setup, &partial));
     if let Err(e) = done {
@@ -454,9 +465,9 @@ pub fn fetch(
 /// # Errors
 /// It declares no hashes, cannot be downloaded or is not what it declares, downloads are off, or the folder cannot be
 /// written.
-pub fn fetch_into(setup: &Setup, into: &HostPath, progress: Progress, cancel: &AtomicBool) -> Result<()> {
+pub fn fetch_into(setup: &Setup, into: &Path, progress: Progress, cancel: &AtomicBool) -> Result<()> {
     setup.declared()?;
-    let places: Vec<(RelPath, &str)> = setup
+    let places: Vec<(PathBuf, &str)> = setup
         .take
         .places()
         .into_iter()
@@ -465,15 +476,15 @@ pub fn fetch_into(setup: &Setup, into: &HostPath, progress: Progress, cancel: &A
             Ok((at.with_context(|| format!("{place}: not a place within it"))?, sha256))
         })
         .collect::<Result<_>>()?;
-    let there = |(at, sha256): &(RelPath, &str)| hash(&into.join(at)).is_ok_and(|got| got.eq_ignore_ascii_case(sha256));
+    let there = |(at, sha256): &(PathBuf, &str)| hash(&into.join(at)).is_ok_and(|got| got.eq_ignore_ascii_case(sha256));
     if places.iter().all(there) {
         return Ok(());
     }
     ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     std::fs::create_dir_all(into).with_context(|| into.display().to_string())?;
     // Made apart, in a folder of this process's own beside them, and checked whole before any of it moves in.
-    let scratch = into.join(&own_name(&format!(".{}.{}.part", setup.key(), std::process::id()))?);
-    let partial = scratch.join(&Name::constant("taken"));
+    let scratch = into.join(own_name(&format!(".{}.{}.part", setup.key(), std::process::id()))?);
+    let partial = scratch.join("taken");
     let moved =
         made(setup, &scratch, &partial, None, progress, cancel).and_then(|_| held(setup, &partial)).and_then(|()| {
             for (at, _) in &places {
@@ -484,7 +495,7 @@ pub fn fetch_into(setup: &Setup, into: &HostPath, progress: Progress, cancel: &A
                     std::fs::remove_file(&to).with_context(|| to.display().to_string())?;
                 }
                 if let Some(folder) = to.parent() {
-                    std::fs::create_dir_all(&folder).with_context(|| folder.display().to_string())?;
+                    std::fs::create_dir_all(folder).with_context(|| folder.display().to_string())?;
                 }
                 std::fs::rename(partial.join(at), &to).with_context(|| to.display().to_string())?;
             }
@@ -498,17 +509,17 @@ pub fn fetch_into(setup: &Setup, into: &HostPath, progress: Progress, cancel: &A
 /// download is held to its hash where it declares one.
 fn made(
     setup: &Setup,
-    store: &HostPath,
-    into: &HostPath,
-    folder: Option<&HostPath>,
+    store: &Path,
+    into: &Path,
+    folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
 ) -> Result<String> {
     let own = std::process::id();
-    let downloads = store.join(&DOWNLOADS_FOLDER);
+    let downloads = store.join(DOWNLOADS_FOLDER);
     std::fs::create_dir_all(&downloads).with_context(|| downloads.display().to_string())?;
     let n = DOWNLOADS.fetch_add(1, Ordering::Relaxed);
-    let file = downloads.join(&own_name(&format!("{}.{own}.{n}", setup.key()))?);
+    let file = downloads.join(own_name(&format!("{}.{own}.{n}", setup.key()))?);
     let sha256 = download(setup, &file, progress, cancel)?;
     let _ = std::fs::remove_dir_all(into);
     let unpacked = unpack(setup, &file, into, cancel).and_then(|()| patch_all(setup, folder, into));
@@ -532,14 +543,14 @@ static DOWNLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// what is declared or does not apply.
 pub fn hashes(
     setup: &Setup,
-    scratch: &HostPath,
-    folder: Option<&HostPath>,
+    scratch: &Path,
+    folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
 ) -> Result<(String, Vec<String>)> {
     ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     let into =
-        scratch.join(&own_name(&format!("hashing.{}.{}", std::process::id(), DOWNLOADS.load(Ordering::Relaxed)))?);
+        scratch.join(own_name(&format!("hashing.{}.{}", std::process::id(), DOWNLOADS.load(Ordering::Relaxed)))?);
     let sha256 = made(setup, scratch, &into, folder, progress, cancel)?;
     let found = setup.take.places().into_iter().map(|(place, _)| {
         let at =
@@ -548,7 +559,7 @@ pub fn hashes(
     });
     let found: Result<Vec<String>> = found.collect();
     let _ = std::fs::remove_dir_all(&into);
-    let _ = std::fs::remove_dir(scratch.join(&DOWNLOADS_FOLDER));
+    let _ = std::fs::remove_dir(scratch.join(DOWNLOADS_FOLDER));
     Ok((sha256, found?))
 }
 
@@ -570,7 +581,7 @@ fn hashed(value: &mut toml_edit::Value, key: &str, sha256: &str) {
 ///
 /// # Errors
 /// The manifest cannot be read.
-pub fn check_pins(manifest: &HostPath) -> Result<Vec<String>> {
+pub fn check_pins(manifest: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
     let doc: toml_edit::DocumentMut = text.parse().with_context(|| manifest.display().to_string())?;
     let setups: Setups = toml::from_str(&unhashed(&doc).to_string()).with_context(|| manifest.display().to_string())?;
@@ -646,13 +657,13 @@ fn unhashed(doc: &toml_edit::DocumentMut) -> toml_edit::DocumentMut {
 ///
 /// # Errors
 /// The manifest cannot be read or written, or an entry cannot be fetched.
-pub fn hash_manifest(manifest: &HostPath, write: bool) -> Result<()> {
+pub fn hash_manifest(manifest: &Path, write: bool) -> Result<()> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
     let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| manifest.display().to_string())?;
     let read = unhashed(&doc);
     let setups: Setups = toml::from_str(&read.to_string()).with_context(|| manifest.display().to_string())?;
     let folder = manifest.parent().context("a manifest in no folder")?;
-    let scratch = HostPath::new(&std::env::temp_dir())?.join(&own_name(&format!("pe2-hash-{}", std::process::id()))?);
+    let scratch = std::env::temp_dir().join(own_name(&format!("pe2-hash-{}", std::process::id()))?);
     std::fs::create_dir_all(&scratch)?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let mut differs = 0;
@@ -663,7 +674,7 @@ pub fn hash_manifest(manifest: &HostPath, write: bool) -> Result<()> {
             let of = total.map_or_default(|total| format!(" of {}", total >> 20));
             eprint!("\r  {}{of} MB   ", done >> 20);
         };
-        let found = hashes(setup, &scratch, Some(&folder), &mut shown, &cancel);
+        let found = hashes(setup, &scratch, Some(folder), &mut shown, &cancel);
         eprint!("\r{}\r", " ".repeat(40));
         let (download, places) = found.with_context(|| setup.name.clone())?;
         let mut said = |what: &str, was: &str, is: &str| {
@@ -711,7 +722,7 @@ pub fn hash_manifest(manifest: &HostPath, write: bool) -> Result<()> {
 /// Download an entry's package to a file, from its URL or else its mirrors in order, checked against its SHA-256 as it
 /// comes where it declares one: its SHA-256. A source that fails, or gives other bytes, gives way to the next; where all
 /// do, each says why.
-fn download(setup: &Setup, to: &HostPath, progress: Progress, cancel: &AtomicBool) -> Result<String> {
+fn download(setup: &Setup, to: &Path, progress: Progress, cancel: &AtomicBool) -> Result<String> {
     let mut failed = Vec::new();
     for url in setup.sources() {
         match download_from(setup, url, to, progress, cancel) {
@@ -727,7 +738,7 @@ fn download(setup: &Setup, to: &HostPath, progress: Progress, cancel: &AtomicBoo
 }
 
 /// Download from one of an entry's sources, as `download` does.
-fn download_from(setup: &Setup, url: &str, to: &HostPath, progress: Progress, cancel: &AtomicBool) -> Result<String> {
+fn download_from(setup: &Setup, url: &str, to: &Path, progress: Progress, cancel: &AtomicBool) -> Result<String> {
     ensure!(url.starts_with("https://"), "{url}: only HTTPS is fetched");
     let response = ureq::get(url).call().map_err(|e| anyhow!("{url}: {e}"))?;
     let total = response.header("Content-Length").and_then(|n| n.parse().ok());
@@ -775,19 +786,19 @@ fn download_from(setup: &Setup, url: &str, to: &HostPath, progress: Progress, ca
 static READER: std::sync::OnceLock<FolderReader> = std::sync::OnceLock::new();
 
 /// What reads a file of an extension's folder.
-pub type FolderReader = fn(&HostPath) -> std::io::Result<Vec<u8>>;
+pub type FolderReader = fn(&Path) -> std::io::Result<Vec<u8>>;
 
 /// Read the files of extensions' folders with this, from now on: what holds extensions where no disk does.
 pub fn read_folder_files_with(reader: FolderReader) {
     let _ = READER.set(reader);
 }
 
-fn read_folder_file(path: &HostPath) -> std::io::Result<Vec<u8>> {
+fn read_folder_file(path: &Path) -> std::io::Result<Vec<u8>> {
     READER.get().map_or_else(|| std::fs::read(path), |read| read(path))
 }
 
 /// An entry's patches applied to what it took, each checked against its hash first.
-fn patch_all(setup: &Setup, folder: Option<&HostPath>, into: &HostPath) -> Result<()> {
+fn patch_all(setup: &Setup, folder: Option<&Path>, into: &Path) -> Result<()> {
     for patch in &setup.patches {
         let folder = folder.with_context(|| {
             format!("{}: its patches are in the extension's folder, which it has none of", setup.name)
@@ -813,7 +824,7 @@ fn patch_all(setup: &Setup, folder: Option<&HostPath>, into: &HostPath) -> Resul
 ///
 /// # Errors
 /// It is not a unified diff, names a place outside the tree or a file not there, or a hunk is found nowhere.
-pub fn apply(diff: &str, tree: &HostPath) -> Result<()> {
+pub fn apply(diff: &str, tree: &Path) -> Result<()> {
     let lines: Vec<&str> = diff.lines().collect();
     let mut at = 0;
     let mut files = 0;
@@ -901,7 +912,7 @@ enum Kind {
 }
 
 /// An archive's tar, read through what compresses it.
-fn tar_of(file: &HostPath, kind: Kind) -> Result<tar::Archive<Box<dyn Read>>> {
+fn tar_of(file: &Path, kind: Kind) -> Result<tar::Archive<Box<dyn Read>>> {
     let file = std::fs::File::open(file)?;
     let read: Box<dyn Read> = match kind {
         Kind::TarXz => Box::new(lzma_rust2::XzReader::new(std::io::BufReader::new(file), true)),
@@ -910,7 +921,7 @@ fn tar_of(file: &HostPath, kind: Kind) -> Result<tar::Archive<Box<dyn Read>>> {
     Ok(tar::Archive::new(read))
 }
 
-fn kind_of(file: &HostPath) -> Result<Kind> {
+fn kind_of(file: &Path) -> Result<Kind> {
     let mut head = [0u8; 6];
     let read = std::fs::File::open(file)?.read(&mut head)?;
     let head = &head[..read];
@@ -946,7 +957,7 @@ fn parts(path: &str) -> Option<Vec<String>> {
 }
 
 /// Where an archive's entry goes, where it is taken: below the folder, by the place its member goes to.
-fn taken(members: &BTreeMap<String, String>, entry: &[String]) -> Option<(String, RelPath)> {
+fn taken(members: &BTreeMap<String, String>, entry: &[String]) -> Option<(String, PathBuf)> {
     members.iter().find_map(|(from, to)| {
         let from_parts = parts(from)?;
         let rest = entry.strip_prefix(from_parts.as_slice())?;
@@ -956,13 +967,14 @@ fn taken(members: &BTreeMap<String, String>, entry: &[String]) -> Option<(String
     })
 }
 
-/// Names within a folder as a place there: none where one is no name every system takes.
-fn place_of(names: &[String]) -> Option<RelPath> {
-    RelPath::new(&names.join("/")).ok()
+/// Names within a folder as a place there, joined in the system's own separators: none where one is no name a file
+/// can have (`component`).
+fn place_of(names: &[String]) -> Option<PathBuf> {
+    names.iter().map(|name| component(name)).collect()
 }
 
 /// Unpack what an entry takes of its download into a folder.
-fn unpack(setup: &Setup, file: &HostPath, into: &HostPath, cancel: &AtomicBool) -> Result<()> {
+fn unpack(setup: &Setup, file: &Path, into: &Path, cancel: &AtomicBool) -> Result<()> {
     let kind = kind_of(file)?;
     match (&setup.take, kind) {
         (Take::File(One { file: place, .. }), Kind::File) => {
@@ -988,9 +1000,9 @@ fn goes(members: &BTreeMap<String, Taken>) -> BTreeMap<String, String> {
 }
 
 /// A file written, its folder made first, with its mode where it says one.
-fn write(to: &HostPath, from: &mut dyn Read, mode: Option<u32>) -> Result<()> {
+fn write(to: &Path, from: &mut dyn Read, mode: Option<u32>) -> Result<()> {
     if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(&parent).with_context(|| parent.display().to_string())?;
+        std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
     }
     let mut out = std::fs::File::create(to).with_context(|| to.display().to_string())?;
     std::io::copy(from, &mut out).with_context(|| to.display().to_string())?;
@@ -1018,16 +1030,16 @@ fn all_found(
 fn unpack_tar(
     setup: &Setup,
     members: &BTreeMap<String, String>,
-    file: &HostPath,
+    file: &Path,
     kind: Kind,
-    into: &HostPath,
+    into: &Path,
     cancel: &AtomicBool,
 ) -> Result<()> {
     let open = || tar_of(file, kind);
     let mut found = std::collections::HashSet::new();
     // Where each archive path taken went; links taken, by the archive path they name.
-    let mut written: HashMap<Vec<String>, HostPath> = HashMap::new();
-    let mut links: Vec<(Vec<String>, HostPath)> = Vec::new();
+    let mut written: HashMap<Vec<String>, PathBuf> = HashMap::new();
+    let mut links: Vec<(Vec<String>, PathBuf)> = Vec::new();
     let mut archive = open()?;
     for entry in archive.entries().with_context(|| setup.url.clone())? {
         ensure!(!cancel.load(Ordering::Relaxed), "cancelled");
@@ -1070,7 +1082,7 @@ fn unpack_tar(
     }
     all_found(setup, members, &found)?;
     // A link is the file it names: copied where that was taken, read from the archive again where not.
-    let mut waiting: HashMap<Vec<String>, Vec<HostPath>> = HashMap::new();
+    let mut waiting: HashMap<Vec<String>, Vec<PathBuf>> = HashMap::new();
     for (named, to) in links {
         match written.get(&named) {
             Some(from) => {
@@ -1103,7 +1115,7 @@ fn unpack_tar(
     Ok(())
 }
 
-fn unpack_zip(setup: &Setup, members: &BTreeMap<String, String>, file: &HostPath, into: &HostPath) -> Result<()> {
+fn unpack_zip(setup: &Setup, members: &BTreeMap<String, String>, file: &Path, into: &Path) -> Result<()> {
     let bytes = std::fs::read(file)?;
     let archive = codecs::zip::Archive::new(&bytes).map_err(|e| anyhow!("{}: {e}", setup.url))?;
     let mut found = std::collections::HashSet::new();
@@ -1125,8 +1137,7 @@ fn unpack_zip(setup: &Setup, members: &BTreeMap<String, String>, file: &HostPath
 #[cfg(test)]
 mod tests {
     use super::{One, Setup, Take, Taken, fetch, unpack};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -1157,8 +1168,8 @@ mod tests {
     }
 
     /// A gzip of a tar: a program, a library and a link to it, and what is not taken.
-    fn tarball(dir: &HostPath) -> HostPath {
-        let file = dir.at("tool.tar.gz");
+    fn tarball(dir: &Path) -> PathBuf {
+        let file = dir.join("tool.tar.gz");
         let gz = flate2::write::GzEncoder::new(std::fs::File::create(&file).unwrap(), flate2::Compression::fast());
         let mut tar = tar::Builder::new(gz);
         let mut add = |path: &str, data: &[u8], mode: u32| {
@@ -1196,8 +1207,8 @@ mod tests {
         )
     }
 
-    fn scratch(name: &str) -> HostPath {
-        let dir = pe2_path::testing::scratch(&format!("setup-{name}"));
+    fn scratch(name: &str) -> PathBuf {
+        let dir = sfs::testing::scratch(&format!("setup-{name}")).into_path_buf();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1211,12 +1222,12 @@ mod tests {
             ("pkg/libexec/gcc/x86_64/14/cc1", "cpp/libexec/gcc/host/14/cc1"),
             ("pkg/libexec/libz.so.1", "cpp/libexec/libz.so.1"),
         ]);
-        let into = dir.at("out");
+        let into = dir.join("out");
         unpack(&setup(taken), &file, &into, &AtomicBool::new(false)).unwrap();
-        let cc1 = into.at("cpp/libexec/gcc/host/14/cc1");
+        let cc1 = into.join("cpp/libexec/gcc/host/14/cc1");
         assert_eq!(std::fs::read(&cc1).unwrap(), b"a compiler");
-        assert_eq!(std::fs::read(into.at("cpp/libexec/libz.so.1")).unwrap(), b"a library");
-        assert!(!into.at("share").exists() && !into.at("pkg").exists(), "only what is taken");
+        assert_eq!(std::fs::read(into.join("cpp/libexec/libz.so.1")).unwrap(), b"a library");
+        assert!(!into.join("share").exists() && !into.join("pkg").exists(), "only what is taken");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1224,9 +1235,9 @@ mod tests {
         }
         // What it does not have, and a file named as an archive.
         let missing = members(&[("pkg/bin/as", "as")]);
-        let why = unpack(&setup(missing), &file, &dir.at("no"), &AtomicBool::new(false));
+        let why = unpack(&setup(missing), &file, &dir.join("no"), &AtomicBool::new(false));
         assert!(format!("{:#}", why.unwrap_err()).contains("it has no pkg/bin/as"));
-        let why = unpack(&setup(one("cc1", "")), &file, &dir.at("no"), &AtomicBool::new(false));
+        let why = unpack(&setup(one("cc1", "")), &file, &dir.join("no"), &AtomicBool::new(false));
         assert!(format!("{:#}", why.unwrap_err()).contains("an archive, which `take` names as a single file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1248,11 +1259,11 @@ mod tests {
         tar.append_link(&mut link, "tools/bin/mipsel-ld", "tools/bin/mipsel-ld.bfd").unwrap();
         let mut xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
         std::io::Write::write_all(&mut xz, &tar.into_inner().unwrap()).unwrap();
-        let file = dir.at("tools.tar.xz");
+        let file = dir.join("tools.tar.xz");
         std::fs::write(&file, xz.finish().unwrap()).unwrap();
-        let into = dir.at("out");
+        let into = dir.join("out");
         unpack(&setup(members(&[("tools/bin/mipsel-ld", "mips-ld")])), &file, &into, &AtomicBool::new(false)).unwrap();
-        assert_eq!(std::fs::read(into.at("mips-ld")).unwrap(), b"a linker..");
+        assert_eq!(std::fs::read(into.join("mips-ld")).unwrap(), b"a linker..");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1282,19 +1293,19 @@ mod tests {
         assert_eq!(entry.sources().collect::<Vec<_>>().len(), 3);
         let why = format!(
             "{:#}",
-            super::download(&entry, &dir.at("got"), &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err()
+            super::download(&entry, &dir.join("got"), &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err()
         );
         assert!(why.contains("none of its sources gave it"), "{why}");
         let said: Vec<&str> = ["first", "second", "only HTTPS"].into_iter().filter(|s| why.contains(s)).collect();
         assert_eq!(said.len(), 3, "{why}");
-        assert!(!dir.at("got").exists());
+        assert!(!dir.join("got").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_zip_is_taken_as_a_tar_is_its_programs_renamed() {
         let dir = scratch("zip");
-        let file = dir.at("tools.zip");
+        let file = dir.join("tools.zip");
         let entries = [
             codecs::zip::Entry { name: "bin/mipsel-as.exe", data: b"an assembler", deflate: true, mode: 0o755 },
             codecs::zip::Entry { name: "bin/libzstd.dll", data: b"a library", deflate: true, mode: 0o644 },
@@ -1302,25 +1313,25 @@ mod tests {
         ];
         std::fs::write(&file, codecs::zip::write(&entries)).unwrap();
         let taken = members(&[("bin/mipsel-as.exe", "mips-as.exe"), ("bin/libzstd.dll", "libzstd.dll")]);
-        let into = dir.at("out");
+        let into = dir.join("out");
         unpack(&setup(taken), &file, &into, &AtomicBool::new(false)).unwrap();
-        assert_eq!(std::fs::read(into.at("mips-as.exe")).unwrap(), b"an assembler");
-        assert_eq!(std::fs::read(into.at("libzstd.dll")).unwrap(), b"a library");
-        assert!(!into.at("share").exists() && !into.at("bin").exists(), "only what is taken, where it goes");
+        assert_eq!(std::fs::read(into.join("mips-as.exe")).unwrap(), b"an assembler");
+        assert_eq!(std::fs::read(into.join("libzstd.dll")).unwrap(), b"a library");
+        assert!(!into.join("share").exists() && !into.join("bin").exists(), "only what is taken, where it goes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_patch_changes_what_was_taken_where_it_says_or_nothing() {
         let dir = scratch("patch");
-        std::fs::create_dir_all(dir.at("tool/lib")).unwrap();
-        std::fs::write(dir.at("tool/lib/a.py"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::create_dir_all(dir.join("tool/lib")).unwrap();
+        std::fs::write(dir.join("tool/lib/a.py"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
         // Its line is off by one: found nearby, as `patch` finds it.
         let diff =
             "--- a/tool/lib/a.py\n+++ b/tool/lib/a.py\n@@ -3,3 +3,4 @@\n two\n three\n+three and a half\n four\n";
         super::apply(diff, &dir).unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.at("tool/lib/a.py")).unwrap(),
+            std::fs::read_to_string(dir.join("tool/lib/a.py")).unwrap(),
             "one\ntwo\nthree\nthree and a half\nfour\nfive\n"
         );
         // What it removes is not there: refused, the file as it was.
@@ -1329,7 +1340,7 @@ mod tests {
         assert!(format!("{why:#}").contains("found nowhere"), "{why:#}");
         let outside = "--- a/../escaped\n+++ b/../escaped\n@@ -0,0 +1,1 @@\n+x\n";
         assert!(super::apply(outside, &dir).is_err());
-        assert!(!dir.parent().unwrap().at("escaped").exists());
+        assert!(!dir.parent().unwrap().join("escaped").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1366,8 +1377,8 @@ mod tests {
         let into = scratch("into");
         std::fs::create_dir_all(&into).unwrap();
         let sha = |bytes: &[u8]| super::hex(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
-        std::fs::write(into.at("dxcompiler.dll"), "a compiler").unwrap();
-        std::fs::write(into.at("other.dll"), "another entry's").unwrap();
+        std::fs::write(into.join("dxcompiler.dll"), "a compiler").unwrap();
+        std::fs::write(into.join("other.dll"), "another entry's").unwrap();
         // There as pinned: nothing is downloaded.
         let mut entry = setup(members(&[(r"bin\x64\dxcompiler.dll", "dxcompiler.dll")]));
         let Take::Members(places) = &mut entry.take else { unreachable!() };
@@ -1376,28 +1387,28 @@ mod tests {
         }
         super::fetch_into(&entry, &into, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false)).unwrap();
         // Changed: fetched again - here, where downloads are off, it says so, and what is beside it is as it was.
-        std::fs::write(into.at("dxcompiler.dll"), "changed").unwrap();
+        std::fs::write(into.join("dxcompiler.dll"), "changed").unwrap();
         super::forbid_downloads();
         let why = super::fetch_into(&entry, &into, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err();
         assert!(format!("{why:#}").contains("downloads are off"), "{why:#}");
-        assert_eq!(std::fs::read_to_string(into.at("other.dll")).unwrap(), "another entry's");
+        assert_eq!(std::fs::read_to_string(into.join("other.dll")).unwrap(), "another entry's");
         let _ = std::fs::remove_dir_all(&into);
     }
 
     #[test]
     fn what_was_fetched_is_held_to_its_hashes_and_found_changed() {
         let dir = scratch("held");
-        let made = dir.at("made");
-        std::fs::create_dir_all(made.at("python/lib/sub")).unwrap();
-        std::fs::write(made.at("python/lib/a.py"), "a").unwrap();
-        std::fs::write(made.at("python/lib/sub/b.py"), "b").unwrap();
-        std::fs::write(made.at("cc1"), "a compiler").unwrap();
+        let made = dir.join("made");
+        std::fs::create_dir_all(made.join("python/lib/sub")).unwrap();
+        std::fs::write(made.join("python/lib/a.py"), "a").unwrap();
+        std::fs::write(made.join("python/lib/sub/b.py"), "b").unwrap();
+        std::fs::write(made.join("cc1"), "a compiler").unwrap();
         // A folder's hash is its list of files and theirs.
         let sha = |bytes: &[u8]| super::hex(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
         let list = format!("a.py\t{}\nsub/b.py\t{}\n", sha(b"a"), sha(b"b"));
-        let lib = super::hash(&made.at("python/lib")).unwrap();
+        let lib = super::hash(&made.join("python/lib")).unwrap();
         assert_eq!(lib, sha(list.as_bytes()));
-        assert_eq!(super::hash(&made.at("cc1")).unwrap(), sha(b"a compiler"));
+        assert_eq!(super::hash(&made.join("cc1")).unwrap(), sha(b"a compiler"));
         let mut taken = members(&[("pkg/lib", "python/lib"), ("pkg/cc1", "cc1")]);
         let Take::Members(places) = &mut taken else { unreachable!() };
         places.get_mut("pkg/lib").unwrap().sha256.clone_from(&lib);
@@ -1405,23 +1416,23 @@ mod tests {
         let entry = setup(taken);
         super::held(&entry, &made).unwrap();
         // A file changed, and one that is nothing taken: each refused by name.
-        std::fs::write(made.at("python/lib/a.py"), "changed").unwrap();
+        std::fs::write(made.join("python/lib/a.py"), "changed").unwrap();
         let why = format!("{:#}", super::held(&entry, &made).unwrap_err());
         assert!(why.contains("python/lib: its SHA-256 is"), "{why}");
-        std::fs::write(made.at("python/lib/a.py"), "a").unwrap();
-        std::fs::write(made.at("stray"), "x").unwrap();
+        std::fs::write(made.join("python/lib/a.py"), "a").unwrap();
+        std::fs::write(made.join("stray"), "x").unwrap();
         let why = format!("{:#}", super::held(&entry, &made).unwrap_err());
         assert!(why.contains("what it does not take: stray"), "{why}");
-        std::fs::remove_file(made.at("stray")).unwrap();
+        std::fs::remove_file(made.join("stray")).unwrap();
         // In the store, recorded: intact until a file is removed or changed, which verify hashes.
-        let store = dir.at("store");
+        let store = dir.join("store");
         std::fs::create_dir_all(&store).unwrap();
         super::record(&entry, &made).unwrap();
         std::fs::rename(&made, entry.place(&store)).unwrap();
         assert!(entry.fetched(&store));
         super::verify(&entry, &store).unwrap();
         let place = entry.place(&store);
-        std::fs::remove_file(place.at("python/lib/sub/b.py")).unwrap();
+        std::fs::remove_file(place.join("python/lib/sub/b.py")).unwrap();
         assert!(!super::intact(&entry, &place), "a file gone");
         assert!(super::verify(&entry, &store).is_err());
         assert!(!place.exists(), "removed, to be fetched again");

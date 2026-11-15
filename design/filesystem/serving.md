@@ -27,6 +27,18 @@ Files worker - only what changed.
 Each served file says where its content lives (a layer's file, a record's text, the store by hash), so the server
 reads content without understanding records or layers.
 
+## Names
+
+The folder is the same on every system, whatever the system's own rules: its names are the project's (`Name`), and
+compare by their fold ([Names](../project/index-and-model.md)) - a name is found however it is written, in any case
+or normal form, as Windows and macOS find it, on Linux too; a folder holds one of each; renaming a file to another way
+of writing its name changes how it is written. Each backend checks the names the system hands it as they come in -
+FUSE's, WebDAV's URLs, Dokany's, the Cloud Files and Projected File System callbacks' - and answers one that is no
+name every system takes as the system answers an invalid name (`EINVAL`, `STATUS_OBJECT_NAME_INVALID`, `403`).
+Inside, a path of what is served is a `RelPath`; one of the project's edits a `TreePath`; one of a folder given to a
+program a `GivenPath`. What a served folder held before it was served by a name no path takes (`strays`) is neither
+set aside nor taken in: serving refuses until it is moved out.
+
 ## Backends
 
 A backend is a module implementing `Backend` plus one line in `backend::all`; nothing else names one. A backend

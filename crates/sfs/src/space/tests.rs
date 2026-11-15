@@ -2,8 +2,8 @@
 //! across everything a process can stop at: a writer at each step of a transaction (`Space::fault`), a reader
 //! before and after its pin, a reader killed while pinned, a page that is not the one pointed to, and a disk that
 //! kept any part of what was last written.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use crate::HostPath;
+use crate::testing::At as _;
 use std::path::Path;
 
 use super::*;
@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicUsize;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn folder(name: &str) -> HostPath {
-    let dir = pe2_path::testing::scratch(&format!("sfs-space-{name}"));
+    let dir = crate::testing::scratch(&format!("sfs-space-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }

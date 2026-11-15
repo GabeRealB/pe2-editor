@@ -20,7 +20,8 @@
 //! changes anything else waits for all that is behind to be written, and is written as it is said.
 
 use anyhow::{Context, Result};
-use pe2_path::{HostPath, Name, NotWithin, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::{HostPath, NotWithin};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -36,7 +37,7 @@ const HELD_LONG: Duration = Duration::from_secs(600);
 
 /// The log's folder, in the project's.
 fn log_dir(root: &HostPath) -> HostPath {
-    const LOG: Name = Name::constant("sfs");
+    const LOG: &Name = Name::constant("sfs");
     root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&LOG)
 }
 
@@ -400,7 +401,7 @@ impl Shared {
             return;
         }
         if now != file.before {
-            const CONFLICTS: Name = Name::constant("conflicts");
+            const CONFLICTS: &Name = Name::constant("conflicts");
             // Kept aside by its path within the project, which every file written behind has (`defers`).
             let conflicts = self.root.join(&crate::cache::DIR).join(&CONFLICTS);
             let kept = file.after.as_ref().map(|bytes| -> std::io::Result<HostPath> {

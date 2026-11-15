@@ -85,7 +85,7 @@ on Linux and on Windows. Three kinds of test matter most:
 - **The edit harness** (the tests of `project::edit`). Every edit a test makes is checked against the truth: the
   served tree updated by delta against the whole, the shared filesystem against a follower of its commits, the model
   against the index, and the index changed in place against one opened afresh. Every new kind of edit goes through
-  it. A test makes its folders as the program does, as `HostPath`s (`pe2_path::testing`).
+  it. A test makes its folders as the program does, as `HostPath`s (`sfs::testing`).
 - **Editor scenarios** (`crates/editor/src/scenario`). The real editor, driven headlessly through its accessibility
   tree with real pointer and keys, asserting on what is written, the problems and the labels - never on pixels. Each
   scenario runs in a project and data folder of its own, with no network.

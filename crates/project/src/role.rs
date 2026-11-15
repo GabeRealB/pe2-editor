@@ -5,9 +5,9 @@
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
-use pe2_path::HostPath;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sfs::HostPath;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,13 +21,13 @@ pub struct Role {
     /// The command it runs as (`pe2-cli project <command>`), and what it is called where one is said.
     pub command: &'static str,
     /// Its socket, in the cache (Unix).
-    pub socket: pe2_path::Name,
+    pub socket: &'static pe2_path::Name,
     /// What its pipe's name starts with (Windows), and its socket's where the cache's path is too long for one.
     pub pipe: &'static str,
     /// The file it locks for as long as it runs: one a project.
-    pub lock: pe2_path::Name,
+    pub lock: &'static pe2_path::Name,
     /// What one started by another process writes of itself.
-    pub log: pe2_path::Name,
+    pub log: &'static pe2_path::Name,
 }
 
 /// How long one started is waited for to listen, while it runs (one that ends says why at once): long enough for it
@@ -40,7 +40,7 @@ impl Role {
     /// # Errors
     /// The name cannot be made.
     pub fn name(&self, root: &HostPath) -> std::io::Result<Name<'static>> {
-        crate::host::local_name(root, &self.socket, self.pipe)
+        crate::host::local_name(root, self.socket, self.pipe)
     }
 
     /// Whether one runs for the project in `root`: one has its lock.
@@ -95,7 +95,7 @@ impl Role {
     ///
     /// # Errors
     /// It could not be started, or did not listen in time.
-    pub fn start(&self, root: &HostPath, program: &HostPath, args: &[String]) -> Result<Link> {
+    pub fn start(&self, root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<Link> {
         crate::cache::make(root)?;
         let log = std::fs::File::create(root.join(&DIR).join(&self.log))?;
         let mut command = std::process::Command::new(program.as_os_str());

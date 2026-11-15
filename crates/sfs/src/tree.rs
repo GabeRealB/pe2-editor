@@ -201,7 +201,8 @@ pub(crate) fn reached(pages: &impl Pages, tree: usize, into: &mut Vec<u64>) -> R
                 while left > 0 {
                     into.push(first & 0xFFFF_FFFF);
                     let more = pages.page(first, MORE)?;
-                    left = left.saturating_sub(usize::try_from(u32_at(more, PAGE_HEAD + 8)).unwrap_or(usize::MAX).max(1));
+                    left =
+                        left.saturating_sub(usize::try_from(u32_at(more, PAGE_HEAD + 8)).unwrap_or(usize::MAX).max(1));
                     first = u64_at(more, PAGE_HEAD);
                 }
             }
@@ -264,12 +265,23 @@ pub fn scan(pages: &impl Pages, tree: usize, from: &[u8], each: &mut dyn FnMut(&
 ///
 /// # Errors
 /// The space is damaged.
-pub fn scan_prefix(pages: &impl Pages, tree: usize, prefix: &[u8], each: &mut dyn FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
+pub fn scan_prefix(
+    pages: &impl Pages,
+    tree: usize,
+    prefix: &[u8],
+    each: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> Result<()> {
     scan(pages, tree, prefix, &mut |key, value| key.starts_with(prefix) && each(key, value))
 }
 
 /// Scan a page and what is under it: whether to go on.
-fn scan_page(pages: &impl Pages, at: u64, from: &[u8], each: &mut dyn FnMut(&[u8], &[u8]) -> bool, depth: usize) -> Result<bool> {
+fn scan_page(
+    pages: &impl Pages,
+    at: u64,
+    from: &[u8],
+    each: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    depth: usize,
+) -> Result<bool> {
     let page = pages.page_either(at, LEAF, BRANCH)?;
     let torn = || torn(pages, page);
     if page[0] == LEAF {
@@ -488,8 +500,12 @@ fn put_under(txn: &mut Txn<'_>, at: u64, key: &[u8], value: &[u8], depth: usize)
         };
         let key_len = u16::try_from(key.len()).unwrap_or(0).to_le_bytes();
         let fit = match &new {
-            Held::Here(bytes) => insert(page, i, &[&key_len, &u32::try_from(bytes.len()).unwrap_or(0).to_le_bytes(), key, bytes]),
-            Held::Long { len, first } => insert(page, i, &[&key_len, &(*len | LONG).to_le_bytes(), key, &first.to_le_bytes()]),
+            Held::Here(bytes) => {
+                insert(page, i, &[&key_len, &u32::try_from(bytes.len()).unwrap_or(0).to_le_bytes(), key, bytes])
+            }
+            Held::Long { len, first } => {
+                insert(page, i, &[&key_len, &(*len | LONG).to_le_bytes(), key, &first.to_le_bytes()])
+            }
         };
         if fit {
             return Ok((mine, None));

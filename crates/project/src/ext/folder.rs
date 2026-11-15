@@ -16,8 +16,8 @@
 //! and the built-ins, nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them from,
 //! kept as a tree when added - or from an archive of a folder (`<id>-<version>.extension.zip`), unpacked.
 
-use pe2_path::HostPath;
 use pe2_path::Name;
+use sfs::HostPath;
 
 use anyhow::{Context, Result, bail};
 
@@ -32,10 +32,10 @@ pub const ARCHIVE_SUFFIX: &str = ".extension.zip";
 
 /// The folder of a project's layer its extensions' files are read at (`records::held_folder`): where they were folders
 /// before they were records (`records::hold_extensions`).
-pub const HELD: Name = Name::constant("extensions");
+pub const HELD: &Name = Name::constant("extensions");
 
 /// An extension's manifest, in its folder.
-pub const MANIFEST: Name = Name::constant(MANIFEST_NAME);
+pub const MANIFEST: &Name = Name::constant(MANIFEST_NAME);
 const MANIFEST_NAME: &str = "extension.toml";
 
 /// What of an extension's folder is only read, beside its icon: none of it counts toward trusting it.
@@ -44,7 +44,7 @@ const READ_ONLY: &[&str] = &[MANIFEST_NAME, "docs", "licenses", "CHANGELOG.md", 
 /// Whether a path within an extension's folder is only read.
 #[must_use]
 pub fn read_only(name: &pe2_path::RelPath, about: &About) -> bool {
-    let top = name.parts().next().unwrap_or_default();
+    let top = name.parts().next().map_or("", pe2_path::Name::as_str);
     READ_ONLY.contains(&top)
         || top.starts_with("LICENSE")
         || about.described.icon.as_deref().is_some_and(|icon| name.as_str() == icon)
@@ -143,10 +143,10 @@ mod tests {
         let about: About = toml::from_str("id = \"a\"\nversion = \"0.1.0\"\nicon = \"art/icon.png\"\n").unwrap();
         for read in ["extension.toml", "docs/install.md", "licenses/gcc.txt", "LICENSE", "LICENSE-MIT", "art/icon.png"]
         {
-            assert!(read_only(&pe2_path::RelPath::new(read).unwrap(), &about), "{read}");
+            assert!(read_only(pe2_path::RelPath::new(read).unwrap(), &about), "{read}");
         }
         for run in ["extension.wasm", "linux-x86_64/cc1", "art/other.png", "docs.wasm"] {
-            assert!(!read_only(&pe2_path::RelPath::new(run).unwrap(), &about), "{run}");
+            assert!(!read_only(pe2_path::RelPath::new(run).unwrap(), &about), "{run}");
         }
     }
 

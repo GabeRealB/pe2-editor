@@ -9,12 +9,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-# What tests share (`testing`): for dev-dependencies alone.
-testing = []
-
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
+icu_normalizer.workspace = true
+
+[build-dependencies]
+# The fold's table, made of what `prepare.toml` pins (`build.rs`), held to its hashes.
+toml.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -2,9 +2,11 @@
 //! that moment and, where it can be written, what programs wrote over it (`writes::Writes`). A mount lasts as long as
 //! its `Mounted`; dropping it unmounts.
 
-use pe2_path::HostPath;
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -49,21 +51,21 @@ fn errno(e: &std::io::Error) -> Errno {
     }
 }
 
-fn join(parent: &str, name: &str) -> String {
-    if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") }
-}
-
 impl Fuse {
-    fn path(&self, ino: INodeNo) -> Option<String> {
+    fn path(&self, ino: INodeNo) -> Option<Arc<RelPath>> {
         self.served.path(u64::from(ino))
     }
 
-    fn child(&self, parent: INodeNo, name: &OsStr) -> Option<String> {
-        Some(join(&self.path(parent)?, name.to_str()?))
+    /// The path of a name in a folder, as the kernel asks for it: none where the folder is (`ENOENT`), and refused as
+    /// a system refuses an invalid name where it is none every system takes (`EINVAL`).
+    fn child(&self, parent: INodeNo, name: &OsStr) -> Result<Arc<RelPath>, Errno> {
+        let folder = self.path(parent).ok_or(Errno::ENOENT)?;
+        let name = name.to_str().and_then(|name| Name::new(name).ok()).ok_or(Errno::EINVAL)?;
+        Ok(folder.join(name))
     }
 
     /// What a path is: written over the tree where it can be written, else the tree's.
-    fn shown(&self, path: &str) -> Option<Shown> {
+    fn shown(&self, path: &RelPath) -> Option<Shown> {
         if let Some(writes) = &self.writes {
             return writes.shown(path);
         }
@@ -72,7 +74,7 @@ impl Fuse {
         Some(Shown { folder: matches!(node.what, What::Folder(_)), size: node.size, modified: node.modified })
     }
 
-    fn attr(&self, path: &str, shown: &Shown) -> FileAttr {
+    fn attr(&self, path: &RelPath, shown: &Shown) -> FileAttr {
         let writable = self.writes.is_some();
         let (kind, perm, nlink) = match (shown.folder, writable) {
             (true, false) => (FileType::Directory, 0o555, 2),
@@ -121,7 +123,7 @@ impl Fuse {
         }
     }
 
-    fn entry(&self, path: &str, reply: ReplyEntry) {
+    fn entry(&self, path: &RelPath, reply: ReplyEntry) {
         match self.shown(path) {
             Some(shown) => reply.entry(&self.lifetime(path), &self.attr(path, &shown), Generation(0)),
             None => reply.error(Errno::ENOENT),
@@ -134,11 +136,11 @@ impl Fuse {
 
     /// Whether a path is the tree's alone, nothing staged over it: what the kernel may keep, of its attributes and of
     /// its content, until the tree changes.
-    fn settled(&self, path: &str) -> bool {
+    fn settled(&self, path: &RelPath) -> bool {
         self.writes.as_ref().is_none_or(|writes| writes.settled(path))
     }
 
-    fn lifetime(&self, path: &str) -> Duration {
+    fn lifetime(&self, path: &RelPath) -> Duration {
         if self.settled(path) { KEPT } else { STAGED }
     }
 
@@ -168,7 +170,10 @@ impl Filesystem for Fuse {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let Some(path) = self.child(parent, name) else { return reply.error(Errno::ENOENT) };
+        let path = match self.child(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(e),
+        };
         match self.shown(&path) {
             Some(shown) => reply.entry(&self.lifetime(&path), &self.attr(&path, &shown), Generation(0)),
             // Not there - which the kernel keeps too, as an entry of no node: a compiler looking for a header along
@@ -231,7 +236,10 @@ impl Filesystem for Fuse {
     }
 
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        let Some(path) = self.child(parent, name) else { return reply.error(Errno::ENOENT) };
+        let path = match self.child(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(e),
+        };
         match self.writes().map(|w| w.make_folder(&path)) {
             Ok(Ok(())) => self.entry(&path, reply),
             Ok(Err(e)) => reply.error(errno(&e)),
@@ -240,7 +248,10 @@ impl Filesystem for Fuse {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let Some(path) = self.child(parent, name) else { return reply.error(Errno::ENOENT) };
+        let path = match self.child(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(e),
+        };
         match self.writes().map(|w| w.remove(&path)) {
             Ok(Ok(())) => reply.ok(),
             Ok(Err(e)) => reply.error(errno(&e)),
@@ -249,7 +260,7 @@ impl Filesystem for Fuse {
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Some(path) = self.child(parent, name)
+        if let Ok(path) = self.child(parent, name)
             && self.writes.as_ref().is_some_and(|w| !w.list(&path).is_empty())
         {
             return reply.error(Errno::ENOTEMPTY);
@@ -267,8 +278,9 @@ impl Filesystem for Fuse {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let (Some(from), Some(to)) = (self.child(parent, name), self.child(newparent, newname)) else {
-            return reply.error(Errno::ENOENT);
+        let (from, to) = match (self.child(parent, name), self.child(newparent, newname)) {
+            (Ok(from), Ok(to)) => (from, to),
+            (Err(e), _) | (_, Err(e)) => return reply.error(e),
         };
         match self.writes().map(|w| w.rename(&from, &to)) {
             Ok(Ok(())) => reply.ok(),
@@ -322,7 +334,10 @@ impl Filesystem for Fuse {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let Some(path) = self.child(parent, name) else { return reply.error(Errno::ENOENT) };
+        let path = match self.child(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(e),
+        };
         let made = self.writes().map(|w| w.create(&path));
         match made {
             Ok(Ok(handle)) => match self.shown(&path) {
@@ -454,7 +469,7 @@ impl Filesystem for Fuse {
             listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX))
         {
             let kind = if folder { FileType::Directory } else { FileType::RegularFile };
-            if reply.add(INodeNo(child), (at + 1) as u64, kind, &name) {
+            if reply.add(INodeNo(child), (at + 1) as u64, kind, name.shown()) {
                 break;
             }
         }
@@ -476,15 +491,15 @@ impl Filesystem for Fuse {
         for (at, (child, _, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX))
         {
             // The folder itself and the one it is in are no entries of it to look up: told by their numbers alone.
-            let of = match name.as_str() {
-                "." => path.clone(),
-                ".." => path.rsplit_once('/').map_or_else(String::new, |(parent, _)| parent.to_string()),
-                name => join(&path, name),
+            let of = match &name {
+                Listed::Itself => path.clone(),
+                Listed::Above => path.parent().unwrap_or(RelPath::root()).to_owned(),
+                Listed::Child(name) => path.join(name),
             };
             let Some(shown) = self.shown(&of) else { continue };
             let mut attr = self.attr(&of, &shown);
             attr.ino = INodeNo(child);
-            if reply.add(INodeNo(child), (at + 1) as u64, &name, &self.lifetime(&of), &attr, Generation(0)) {
+            if reply.add(INodeNo(child), (at + 1) as u64, name.shown(), &self.lifetime(&of), &attr, Generation(0)) {
                 break;
             }
         }
@@ -495,20 +510,37 @@ impl Filesystem for Fuse {
 impl Fuse {
     /// What a folder lists - itself, the folder it is in, then its entries as shown - each by its inode number and
     /// whether it is a folder; none where it is no folder.
-    fn listed(&self, ino: INodeNo, path: &str) -> Option<Vec<(u64, bool, String)>> {
-        let children: Vec<(String, bool)> = if let Some(writes) = &self.writes {
+    fn listed(&self, ino: INodeNo, path: &RelPath) -> Option<Vec<(u64, bool, Listed)>> {
+        let children: Vec<(Arc<Name>, bool)> = if let Some(writes) = &self.writes {
             writes.list(path).into_iter().collect()
         } else {
             self.served.tree().children(path)?.into_iter().collect()
         };
         let parent =
-            if u64::from(ino) == ROOT { ROOT } else { self.served.ino(path.rsplit_once('/').map_or("", |(p, _)| p)) };
-        let own = [(u64::from(ino), true, ".".to_string()), (parent, true, "..".to_string())];
-        Some(
-            own.into_iter()
-                .chain(children.into_iter().map(|(name, folder)| (self.served.ino(&join(path, &name)), folder, name)))
-                .collect(),
-        )
+            if u64::from(ino) == ROOT { ROOT } else { self.served.ino(path.parent().unwrap_or(RelPath::root())) };
+        let own = [(u64::from(ino), true, Listed::Itself), (parent, true, Listed::Above)];
+        let children = children
+            .into_iter()
+            .map(|(name, folder)| (self.served.ino(&path.join(&name)), folder, Listed::Child(name)));
+        Some(own.into_iter().chain(children).collect())
+    }
+}
+
+/// What a folder lists: itself (`.`), the folder it is in (`..`), and its entries by name.
+enum Listed {
+    Itself,
+    Above,
+    Child(Arc<Name>),
+}
+
+impl Listed {
+    /// What the kernel is told it is named.
+    fn shown(&self) -> &OsStr {
+        match self {
+            Listed::Itself => OsStr::new("."),
+            Listed::Above => OsStr::new(".."),
+            Listed::Child(name) => OsStr::new(name.as_str()),
+        }
     }
 }
 
@@ -538,15 +570,14 @@ fn tell_kernel(
     stale: &std::sync::mpsc::Receiver<u64>,
     stop: &std::sync::atomic::AtomicBool,
 ) {
-    let touch = |path: &str, time: SystemTime| {
-        let Ok(path) = pe2_path::RelPath::new(path) else { return };
-        if let Ok(file) = std::fs::File::open(at.join(&path)) {
+    let touch = |path: &RelPath, time: SystemTime| {
+        if let Ok(file) = std::fs::File::open(at.join(path)) {
             let _ = file.set_modified(time);
         }
     };
     let mut from = served.changes_from_now();
-    let parent_of = |path: &str| path.rsplit_once('/').map_or("", |(parent, _)| parent).to_string();
-    let name_of = |path: &str| path.rsplit_once('/').map_or(path, |(_, name)| name).to_string();
+    let parent_of = |path: &RelPath| path.parent().unwrap_or(RelPath::root()).to_owned();
+    let name_of = |path: &RelPath| OsStr::new(path.name().unwrap_or_default()).to_owned();
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         // What is written through the mount, the kernel lets go of what it kept of at once; what changed in the tree
         // is looked for as often as before.
@@ -581,16 +612,15 @@ fn tell_kernel(
             let mut gone = path.clone();
             loop {
                 let above = parent_of(&gone);
-                let number = |path: &str| changes.numbers.get(path).copied().or_else(|| served.known(path));
+                let number = |path: &RelPath| changes.numbers.get(path).copied().or_else(|| served.known(path));
                 if let Some(parent) = number(&above) {
-                    let told = number(&gone)
-                        .map(|ino| notifier.delete(INodeNo(parent), INodeNo(ino), OsStr::new(&name_of(&gone))));
+                    let told = number(&gone).map(|ino| notifier.delete(INodeNo(parent), INodeNo(ino), &name_of(&gone)));
                     if told.is_none_or(|told| told.is_err()) {
-                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name_of(&gone)));
+                        let _ = notifier.inval_entry(INodeNo(parent), &name_of(&gone));
                     }
                     folders.insert(above.clone());
                 }
-                if above.is_empty() || tree.at(&above).is_some() {
+                if above.is_root() || tree.at(&above).is_some() {
                     break;
                 }
                 gone = above;
@@ -600,11 +630,11 @@ fn tell_kernel(
             // The name the kernel may have asked for and not found: this one, or that of the first folder above it
             // that it does not know - made with it.
             let mut new = path.clone();
-            while !new.is_empty() && served.known(&parent_of(&new)).is_none() {
+            while !new.is_root() && served.known(&parent_of(&new)).is_none() {
                 new = parent_of(&new);
             }
-            if let Some(parent) = served.known(&parent_of(&new)).filter(|_| !new.is_empty()) {
-                let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name_of(&new)));
+            if let Some(parent) = served.known(&parent_of(&new)).filter(|_| !new.is_root()) {
+                let _ = notifier.inval_entry(INodeNo(parent), &name_of(&new));
                 folders.insert(parent_of(&new));
             }
         }

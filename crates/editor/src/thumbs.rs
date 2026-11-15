@@ -21,12 +21,12 @@ enum Thumb {
 }
 
 struct Job {
-    path: project::TreePath,
+    path: Arc<project::TreePath>,
     asset: Asset,
 }
 
 struct Done {
-    path: project::TreePath,
+    path: Arc<project::TreePath>,
     image: Option<egui::ColorImage>,
 }
 
@@ -35,7 +35,7 @@ pub struct Thumbs {
     done: mpsc::Receiver<Done>,
     /// The window to wake when a thumbnail is ready, once there is one.
     ctx: Arc<OnceLock<egui::Context>>,
-    shown: RefCell<HashMap<project::TreePath, Thumb>>,
+    shown: RefCell<HashMap<Arc<project::TreePath>, Thumb>>,
 }
 
 impl Thumbs {

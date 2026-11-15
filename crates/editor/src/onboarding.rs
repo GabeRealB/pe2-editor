@@ -4,7 +4,7 @@
 //! nothing to settle, and again only of what is new, or while the project is not whole. The answers are the user's: an agent
 //! driving the editor cannot give them.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::BTreeMap;
 
 use eframe::egui::{self, RichText};
@@ -52,7 +52,7 @@ pub enum Answer {
 /// The place an extension is in: the layer or mount holding it, else its own folder.
 pub fn place_of(ws: &Workspace, file: &HostPath) -> (HostPath, String) {
     // One the project holds is read where its folder was in its layer, on no disk.
-    let real = HostPath::new(file).unwrap_or_else(|_| file.clone());
+    let real = file;
     let holding = ws.project.layers.iter().find(|layer| real.starts_with(&layer.path));
     if let Some(layer) = holding {
         return (layer.path.clone(), format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));

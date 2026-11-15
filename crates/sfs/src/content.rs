@@ -321,11 +321,11 @@ fn place(extents: &mut BTreeMap<u64, Extent>, offset: u64, new: Extent) {
 #[cfg(test)]
 mod tests {
     use super::Content;
+    use crate::HostPath;
     use crate::log::{Config, Log};
-    use pe2_path::HostPath;
 
     fn log(name: &str) -> (HostPath, Log) {
-        let dir = pe2_path::testing::scratch(&format!("sfs-content-{name}"));
+        let dir = crate::testing::scratch(&format!("sfs-content-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
         (dir, log)

@@ -45,4 +45,4 @@ nt-time = "0.15"
 windows-core = "0.62"
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

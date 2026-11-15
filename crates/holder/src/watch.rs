@@ -5,7 +5,7 @@
 //! what its builds write, the folder it is served at, its unmanaged mounts (the discs), the temporary files of
 //! atomic writes, and what else sits in its own folder besides its `project*.toml`.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -138,8 +138,8 @@ fn debounce(
 #[cfg(test)]
 mod tests {
     use super::{Change, watch};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use sfs::HostPath;
+    use sfs::testing::At as _;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn batches_changes_and_leaves_out_bookkeeping() {
-        let root = pe2_path::testing::scratch("watch");
+        let root = sfs::testing::scratch("watch");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.at("a.node")).unwrap();
         std::fs::create_dir_all(root.at(".cache")).unwrap();

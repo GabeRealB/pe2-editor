@@ -5,7 +5,7 @@
 
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,7 @@ use crate::{Reply, Request};
 const PATIENCE: Duration = Duration::from_secs(20);
 
 fn name(root: &HostPath) -> std::io::Result<Name<'static>> {
-    project::host::local_name(root, &project::cache::SOCKET, "pe2-editor")
+    project::host::local_name(root, project::cache::SOCKET, "pe2-editor")
 }
 
 /// Whether anything listens on the holder's link of the project in `root`: an editor or a host that answers.

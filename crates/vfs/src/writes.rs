@@ -30,7 +30,9 @@
 //! - A move the project refuses is put back where it was; a removal it refuses (a node's `node.toml` alone)
 //!   shows the file again; a folder it refuses goes, where nothing was put in it.
 
-use pe2_path::HostPath;
+use pe2_path::{Name, RelPath};
+use project::TreePath;
+use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
@@ -45,7 +47,7 @@ use crate::write::{Owner, Refusal, Written, is_junk};
 use crate::{Changes, Served};
 
 /// The folder of the log, in the writes' own.
-pub const LOG: pe2_path::Name = pe2_path::Name::constant("sfs");
+pub const LOG: &pe2_path::Name = pe2_path::Name::constant("sfs");
 
 /// When a new file is the project's: once nothing has it open and its burst of changes has ended - the pause since
 /// its last change is several times the time between its changes, within these bounds. A file written under a
@@ -111,8 +113,8 @@ enum Asked {
     /// A path moved, already so in what is served: where from, where to, and what the move is known by there.
     Rename {
         number: u64,
-        from: String,
-        to: String,
+        from: Arc<RelPath>,
+        to: Arc<RelPath>,
         said: Option<u64>,
         moved: u64,
     },
@@ -271,16 +273,19 @@ struct Inner {
 /// No record is being done again: what is done is appended to the log.
 const NOT: u64 = u64::MAX;
 
-fn parent(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(p, _)| p)
+/// The folder a path is in; the root's is itself.
+fn parent(path: &RelPath) -> &RelPath {
+    path.parent().unwrap_or(RelPath::root())
 }
 
-fn name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// The name a path has in its folder: the root, which has none, is no place to put anything.
+fn name(path: &RelPath) -> io::Result<&Name> {
+    path.last().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-fn joined(folder: &str, name: &str) -> String {
-    if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") }
+/// A path of what is served as the project's tree names it.
+fn tree(path: &RelPath) -> Arc<TreePath> {
+    TreePath::within(path).to_owned()
 }
 
 fn nanos_now() -> u64 {
@@ -289,14 +294,19 @@ fn nanos_now() -> u64 {
 }
 
 /// What is at a path of what is served, shown or not: its number and its node.
-fn found(pages: &impl Pages, path: &str) -> Option<(u64, fs::Node)> {
-    let number = fs::at(pages, SERVED, path.trim_matches('/')).ok()??;
+fn found(pages: &impl Pages, path: &RelPath) -> Option<(u64, fs::Node)> {
+    let number = fs::at(pages, SERVED, path).ok()??;
     Some((number, fs::node(pages, SERVED, number).ok()??))
 }
 
 /// What is shown at a path: there, and not removed.
-fn there(pages: &impl Pages, path: &str) -> Option<(u64, fs::Node)> {
+fn there(pages: &impl Pages, path: &RelPath) -> Option<(u64, fs::Node)> {
     found(pages, path).filter(|(_, node)| node.flags & GONE == 0)
+}
+
+/// A path as a message says it: what was at a number that is gone since is said so.
+fn shown(path: Option<Arc<RelPath>>) -> String {
+    path.map_or_else(|| "(gone since)".to_string(), |path| path.to_string())
 }
 
 fn not_found() -> io::Error {
@@ -460,7 +470,7 @@ impl Writes {
     }
 
     /// The path of what has a number in what is served.
-    fn path_of(&self, number: u64) -> Option<String> {
+    fn path_of(&self, number: u64) -> Option<Arc<RelPath>> {
         fs::path(&self.pages().ok()?, SERVED, number).ok().flatten()
     }
 
@@ -477,7 +487,7 @@ impl Writes {
     }
 
     /// Make a node of what is served that is not the project's, at a path whose folder is there: its number.
-    fn make(&self, path: &str, folder: bool, flags: u32) -> io::Result<u64> {
+    fn make(&self, path: &RelPath, folder: bool, flags: u32) -> io::Result<u64> {
         let mut txn = self.0.space.write()?;
         let number = Self::make_in(&mut txn, path, folder, flags)?;
         txn.commit()?;
@@ -485,12 +495,16 @@ impl Writes {
     }
 
     /// The folders above a path that are not there, made here and not the project's.
-    fn make_above(&self, path: &str) -> io::Result<()> {
+    fn make_above(&self, path: &RelPath) -> io::Result<()> {
         let mut txn = self.0.space.write()?;
         let mut made = false;
-        for (at, _) in path.match_indices('/') {
-            if found(&txn, &path[..at]).is_none() {
-                Self::make_in(&mut txn, &path[..at], true, 0)?;
+        // Each folder above it, from the top down.
+        let mut above: Vec<&RelPath> =
+            std::iter::successors(path.parent(), |folder| folder.parent()).filter(|f| !f.is_root()).collect();
+        above.reverse();
+        for folder in above {
+            if found(&txn, folder).is_none() {
+                Self::make_in(&mut txn, folder, true, 0)?;
                 made = true;
             }
         }
@@ -500,7 +514,7 @@ impl Writes {
         Ok(())
     }
 
-    fn make_in(txn: &mut sfs::space::Txn<'_>, path: &str, folder: bool, flags: u32) -> io::Result<u64> {
+    fn make_in(txn: &mut sfs::space::Txn<'_>, path: &RelPath, folder: bool, flags: u32) -> io::Result<u64> {
         let above = there(txn, parent(path)).filter(|(_, node)| node.folder).map(|(number, _)| number);
         let above = above.ok_or_else(not_found)?;
         let node = fs::Node {
@@ -508,7 +522,7 @@ impl Writes {
             flags: NEW | flags,
             modified: nanos_now(),
             parent: above,
-            name: name(path).to_string(),
+            name: Some(name(path)?.to_owned()),
             ..fs::Node::default()
         };
         Ok(fs::make(txn, SERVED, &node, SERVER)?)
@@ -516,13 +530,13 @@ impl Writes {
 
     /// A content with nothing in it yet, begun at a path: in the log, where it is said to begin - `emptied`, as a
     /// change of its own - or in memory where it will never be the project's.
-    fn begin(&self, path: &str, emptied: bool) -> io::Result<Arc<RwLock<sfs::Content>>> {
+    fn begin(&self, path: &RelPath, emptied: bool) -> io::Result<Arc<RwLock<sfs::Content>>> {
         let content = if is_junk(path) {
             let mut state = self.lock();
             state.next += 1;
             sfs::Content::in_memory(state.next)
         } else {
-            sfs::Content::logged(self.record(&sfs::Op::Began { path: path.to_string(), emptied })?)
+            sfs::Content::logged(self.record(&sfs::Op::Began { path: path.to_owned(), emptied })?)
         };
         let content = Arc::new(RwLock::new(content));
         self.0.contents.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(&content));
@@ -556,7 +570,7 @@ impl Writes {
                 }
             }
             let Ok((from, given)) = self.given(&content) else { continue };
-            if matches!(crate::due::replace(&self.0.space, due, &Op::Write { path, from }), Ok(true)) {
+            if matches!(crate::due::replace(&self.0.space, due, &Op::Write { path: tree(&path), from }), Ok(true)) {
                 let mut state = self.lock();
                 if let Some(staged) =
                     state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content))
@@ -659,9 +673,10 @@ impl Writes {
         let mut txn = self.0.space.write()?;
         let mut changed = false;
         for (moved, from, to) in project::shared::moves_said(&txn)?.into_iter().rev() {
-            let back = found(&txn, parent(&from)).filter(|_| found(&txn, &from).is_none());
-            if let (Some((number, _)), Some((above, _))) = (found(&txn, &to), back) {
-                fs::rename(&mut txn, SERVED, number, above, name(&from), SERVER)?;
+            let (from, to) = (from.rel(), to.rel());
+            let back = found(&txn, parent(from)).filter(|_| found(&txn, from).is_none());
+            if let (Some((number, _)), Some((above, _))) = (found(&txn, to), back) {
+                fs::rename(&mut txn, SERVED, number, above, name(from)?, SERVER)?;
             }
             project::shared::unmoved(&mut txn, moved)?;
             changed = true;
@@ -697,7 +712,7 @@ impl Writes {
 
     /// What a path is: as what is served has it, with what was written to it and is not the project's yet.
     #[must_use]
-    pub fn shown(&self, path: &str) -> Option<Shown> {
+    pub fn shown(&self, path: &RelPath) -> Option<Shown> {
         let (number, node) = there(&self.pages().ok()?, path)?;
         if !node.folder
             && let Some(staged) = self.lock().staged.get(&number)
@@ -713,7 +728,7 @@ impl Writes {
     /// removed here. What it is then changes only as whoever holds the project says, which is told to whatever
     /// caches it.
     #[must_use]
-    pub fn settled(&self, path: &str) -> bool {
+    pub fn settled(&self, path: &RelPath) -> bool {
         let Some((number, node)) = self.pages().ok().and_then(|pages| found(&pages, path)) else { return true };
         let state = self.lock();
         node.flags & (NEW | GONE) == 0 && !state.staged.contains_key(&number) && !state.new.contains_key(&number)
@@ -721,12 +736,12 @@ impl Writes {
 
     /// A folder's children as shown: each name, with whether it is a folder.
     #[must_use]
-    pub fn list(&self, path: &str) -> BTreeMap<String, bool> {
+    pub fn list(&self, path: &RelPath) -> BTreeMap<Arc<Name>, bool> {
         let Ok(pages) = self.pages() else { return BTreeMap::new() };
         let Some((number, _)) = there(&pages, path).filter(|(_, node)| node.folder) else { return BTreeMap::new() };
         let mut inside = Vec::new();
         let _ = fs::list(&pages, SERVED, number, None, &mut |name, number| {
-            inside.push((name.to_string(), number));
+            inside.push((name.to_owned(), number));
             true
         });
         let shown = |number: u64| fs::node(&pages, SERVED, number).ok().flatten().filter(|node| node.flags & GONE == 0);
@@ -735,12 +750,12 @@ impl Writes {
 
     /// The names made in a folder that are not the project's yet: few, whatever the folder holds.
     #[must_use]
-    pub fn staged_in(&self, folder: &str) -> Vec<String> {
+    pub fn staged_in(&self, folder: &RelPath) -> Vec<Arc<Name>> {
         let Ok(pages) = self.pages() else { return Vec::new() };
         let Some((number, _)) = there(&pages, folder) else { return Vec::new() };
         let mut inside = Vec::new();
         let _ = fs::list(&pages, SERVED, number, None, &mut |name, number| {
-            inside.push((name.to_string(), number));
+            inside.push((name.to_owned(), number));
             true
         });
         let new = |number: u64| {
@@ -753,7 +768,7 @@ impl Writes {
     ///
     /// # Errors
     /// It is not there, or cannot be read.
-    pub fn read(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    pub fn read(&self, path: &RelPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut out = vec![0u8; len];
         let read = self.read_into(path, offset, &mut out)?;
         out.truncate(read);
@@ -765,7 +780,7 @@ impl Writes {
     ///
     /// # Errors
     /// It is not there, or cannot be read.
-    pub fn read_into(&self, path: &str, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+    pub fn read_into(&self, path: &RelPath, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         let (number, node) = there(&self.pages()?, path).ok_or_else(not_found)?;
         let staged = self.lock().staged.get(&number).map(|s| s.content.clone());
         if let Some(content) = staged {
@@ -783,7 +798,13 @@ impl Writes {
     /// A file staged: its content now - the project's, unless `empty` - brought into the log where it is not
     /// staged yet, so that what is written to it next is written over the file as it was then. What will never be
     /// the project's is kept in memory instead.
-    fn stage(&self, number: u64, node: &fs::Node, path: &str, empty: bool) -> io::Result<Arc<RwLock<sfs::Content>>> {
+    fn stage(
+        &self,
+        number: u64,
+        node: &fs::Node,
+        path: &RelPath,
+        empty: bool,
+    ) -> io::Result<Arc<RwLock<sfs::Content>>> {
         let staged = self.lock().staged.get(&number).map(|s| s.content.clone());
         if let Some(content) = staged {
             if empty {
@@ -827,7 +848,7 @@ impl Writes {
 
     /// Something is to be where something removed here still is, in what is served, or where something the
     /// project has is replaced: its removal is said due now, in its turn, and it is out of what is served.
-    fn vacate(&self, number: u64, path: &str) -> io::Result<()> {
+    fn vacate(&self, number: u64, path: &RelPath) -> io::Result<()> {
         let mut state = self.lock();
         state.removed.remove(&number);
         state.staged.remove(&number);
@@ -841,7 +862,7 @@ impl Writes {
         let due = if asked || !project {
             None
         } else {
-            Some(crate::due::put_in(&mut txn, &Op::Remove { path: path.to_string() }, None)?)
+            Some(crate::due::put_in(&mut txn, &Op::Remove { path: tree(path) }, None)?)
         };
         fs::remove(&mut txn, SERVED, number, SERVER)?;
         txn.commit()?;
@@ -856,7 +877,7 @@ impl Writes {
     ///
     /// # Errors
     /// It is not there, or cannot be staged.
-    pub fn open(&self, path: &str, truncate: bool) -> io::Result<u64> {
+    pub fn open(&self, path: &RelPath, truncate: bool) -> io::Result<u64> {
         let _ordered = self.ordered();
         let at = there(&self.pages()?, path);
         let (number, node) = match at {
@@ -868,7 +889,7 @@ impl Writes {
         self.opened(number, &node, path, truncate)
     }
 
-    fn opened(&self, number: u64, node: &fs::Node, path: &str, truncate: bool) -> io::Result<u64> {
+    fn opened(&self, number: u64, node: &fs::Node, path: &RelPath, truncate: bool) -> io::Result<u64> {
         self.stage(number, node, path, truncate)?;
         let mut state = self.lock();
         if truncate && let Some(staged) = state.staged.get_mut(&number) {
@@ -884,7 +905,7 @@ impl Writes {
     ///
     /// # Errors
     /// Its name is refused, its folder is not there, or it cannot be staged.
-    pub fn create(&self, path: &str) -> io::Result<u64> {
+    pub fn create(&self, path: &RelPath) -> io::Result<u64> {
         if crate::write::refused(path) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
@@ -913,7 +934,7 @@ impl Writes {
         Ok(handle)
     }
 
-    fn made_file(&self, path: &str) -> io::Result<(u64, fs::Node)> {
+    fn made_file(&self, path: &RelPath) -> io::Result<(u64, fs::Node)> {
         let flags = if is_junk(path) { JUNK } else { 0 };
         let number = self.make(path, false, flags)?;
         Ok((number, fs::Node { flags: NEW | flags, ..fs::Node::default() }))
@@ -945,7 +966,7 @@ impl Writes {
     ///
     /// # Errors
     /// It is not there, or cannot be staged.
-    pub fn truncate(&self, path: &str, len: u64) -> io::Result<()> {
+    pub fn truncate(&self, path: &RelPath, len: u64) -> io::Result<()> {
         let _ordered = self.ordered();
         let (number, node) = there(&self.pages()?, path).ok_or_else(not_found)?;
         let content = self.stage(number, &node, path, false)?;
@@ -962,7 +983,7 @@ impl Writes {
 
     /// Whether a program has the file at a path open to write.
     #[must_use]
-    pub fn is_open(&self, path: &str) -> bool {
+    pub fn is_open(&self, path: &RelPath) -> bool {
         let Some((number, _)) = self.pages().ok().and_then(|pages| found(&pages, path)) else { return false };
         self.lock().open(number)
     }
@@ -1035,11 +1056,11 @@ impl Writes {
     ///
     /// # Errors
     /// It is not there.
-    pub fn remove(&self, path: &str) -> io::Result<()> {
+    pub fn remove(&self, path: &RelPath) -> io::Result<()> {
         let _ordered = self.ordered();
         let (number, node) = there(&self.pages()?, path).ok_or_else(not_found)?;
         let junk = node.flags & JUNK != 0 || is_junk(path);
-        let said = if junk { None } else { Some(self.record(&sfs::Op::Removed { path: path.to_string() })?) };
+        let said = if junk { None } else { Some(self.record(&sfs::Op::Removed { path: path.to_owned() })?) };
         let mut state = self.lock();
         state.staged.remove(&number);
         state.new.remove(&number);
@@ -1067,13 +1088,13 @@ impl Writes {
     ///
     /// # Errors
     /// Its name is refused, something is there, or its folder is not.
-    pub fn make_folder(&self, path: &str) -> io::Result<()> {
+    pub fn make_folder(&self, path: &RelPath) -> io::Result<()> {
         if crate::write::refused(path) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let _ordered = self.ordered();
         let junk = is_junk(path);
-        let said = if junk { None } else { Some(self.record(&sfs::Op::MadeFolder { path: path.to_string() })?) };
+        let said = if junk { None } else { Some(self.record(&sfs::Op::MadeFolder { path: path.to_owned() })?) };
         match found(&self.pages()?, path) {
             Some((number, node)) if node.flags & GONE != 0 => {
                 // Made where one was removed a moment ago, its removal not said yet: it is not removed after all.
@@ -1095,7 +1116,7 @@ impl Writes {
         }
         let mut txn = self.0.space.write()?;
         let number = Self::make_in(&mut txn, path, true, 0)?;
-        let due = crate::due::put_in(&mut txn, &Op::Folder { path: path.to_string() }, None)?;
+        let due = crate::due::put_in(&mut txn, &Op::Folder { path: tree(path) }, None)?;
         txn.commit()?;
         self.lock().ask(due, Asked::Folder { number, said });
         self.wake_now();
@@ -1104,10 +1125,10 @@ impl Writes {
 
     /// Whether a new path is inside a node: its nearest folder there is a node, one of a node's files, or one made
     /// in a node and waiting.
-    fn in_node(&self, path: &str) -> bool {
+    fn in_node(&self, path: &RelPath) -> bool {
         let Ok(pages) = self.pages() else { return false };
         let mut at = path;
-        while let Some((above, _)) = at.rsplit_once('/') {
+        while let Some(above) = at.parent() {
             if let Some((_, node)) = found(&pages, above) {
                 return node.flags & (WAITS | JUNK | NODE | OF_FILES) != 0;
             }
@@ -1130,20 +1151,21 @@ impl Writes {
     ///
     /// # Errors
     /// Its new name is refused, or nothing is there.
-    pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+    pub fn rename(&self, from: &RelPath, to: &RelPath) -> io::Result<()> {
         if crate::write::refused(to) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let _ordered = self.ordered();
         let replaying = self.replaying();
         let (number, node) = there(&self.pages()?, from).ok_or_else(not_found)?;
-        if from == to {
+        // Paths compare by their names' folds: to another way of writing its name is a rename, as it is is none.
+        if from.as_str() == to.as_str() {
             return Ok(());
         }
         let (junk_from, junk_to) = (is_junk(from), is_junk(to));
-        // What is where it goes. Removed a moment ago: a file moved onto a file saves it, anything else is in the
-        // way no more.
-        let mut onto = found(&self.pages()?, to);
+        // What is where it goes - but itself, renamed to another way of writing its name. Removed a moment ago: a
+        // file moved onto a file saves it, anything else is in the way no more.
+        let mut onto = found(&self.pages()?, to).filter(|(there, _)| *there != number);
         if let Some((there, old)) = onto.take() {
             if old.flags & GONE == 0 {
                 onto = Some((there, old));
@@ -1165,7 +1187,7 @@ impl Writes {
         let said = if junk_from {
             None
         } else {
-            Some(self.record(&sfs::Op::Renamed { from: from.to_string(), to: to.to_string() })?)
+            Some(self.record(&sfs::Op::Renamed { from: from.to_owned(), to: to.to_owned() })?)
         };
         let staged = self.lock().staged.contains_key(&number);
         if let Some((there, old)) = onto.as_ref().filter(|_| onto_file && staged && !junk_to) {
@@ -1180,7 +1202,7 @@ impl Writes {
             let mut txn = self.0.space.write()?;
             let mut inside = Vec::new();
             fs::list(&txn, SERVED, number, None, &mut |name, number| {
-                inside.push((name.to_string(), number));
+                inside.push((name.to_owned(), number));
                 true
             })?;
             for (name, inner) in inside {
@@ -1200,7 +1222,7 @@ impl Writes {
             // Only here - a file written and not the project's yet, a folder waiting in a node: moved here.
             let mut txn = self.0.space.write()?;
             let above = there(&txn, parent(to)).filter(|(_, node)| node.folder).ok_or_else(not_found)?.0;
-            fs::rename(&mut txn, SERVED, number, above, name(to), SERVER)?;
+            fs::rename(&mut txn, SERVED, number, above, name(to)?, SERVER)?;
             if junk_from && !junk_to && node.flags & JUNK != 0 {
                 let moved = fs::node(&txn, SERVED, number)?.ok_or_else(not_found)?;
                 fs::set(&mut txn, SERVED, number, &fs::Node { flags: moved.flags & !JUNK, ..moved }, SERVER)?;
@@ -1217,14 +1239,14 @@ impl Writes {
         let moved = said.unwrap_or_else(|| self.unique());
         let mut txn = self.0.space.write()?;
         let above = there(&txn, parent(to)).filter(|(_, node)| node.folder).ok_or_else(not_found)?.0;
-        fs::rename(&mut txn, SERVED, number, above, name(to), SERVER)?;
-        project::shared::moved(&mut txn, moved, from, to)?;
-        let op = Op::Rename { from: from.to_string(), to: to.to_string() };
+        fs::rename(&mut txn, SERVED, number, above, name(to)?, SERVER)?;
+        project::shared::moved(&mut txn, moved, TreePath::within(from), TreePath::within(to))?;
+        let op = Op::Rename { from: tree(from), to: tree(to) };
         let due = crate::due::put_in(&mut txn, &op, Some(moved))?;
         txn.commit()?;
         self.0.served.moved_there(from, to, node.folder, replaced);
         let mut state = self.lock();
-        state.ask(due, Asked::Rename { number, from: from.to_string(), to: to.to_string(), said, moved });
+        state.ask(due, Asked::Rename { number, from: from.to_owned(), to: to.to_owned(), said, moved });
         // What was written to it and is not the project's yet goes on to its new name.
         if state.staged.get(&number).is_some_and(|staged| staged.dirty) && !state.open(number) {
             state.new.insert(number, Instant::now());
@@ -1238,8 +1260,8 @@ impl Writes {
     /// this one goes, removed from the project where the project has it.
     fn saved_over(
         &self,
-        (number, project, from): (u64, bool, &str),
-        (there, old, to): (u64, &fs::Node, &str),
+        (number, project, from): (u64, bool, &RelPath),
+        (there, old, to): (u64, &fs::Node, &RelPath),
         said: Option<u64>,
     ) -> io::Result<()> {
         let moved = {
@@ -1252,7 +1274,7 @@ impl Writes {
         let Some(moved) = moved else { return Ok(()) };
         // What comes to be the project's is in the log - begun there, where it was kept in memory.
         if !reading(&moved.content).is_logged() {
-            let begun = self.record(&sfs::Op::Began { path: to.to_string(), emptied: true })?;
+            let begun = self.record(&sfs::Op::Began { path: to.to_owned(), emptied: true })?;
             writing(&moved.content).held_in_log(&self.0.log, Some(begun))?;
         }
         let mut state = self.lock();
@@ -1290,9 +1312,9 @@ impl Writes {
     /// file's return - a file made there meanwhile saves it.
     fn put_aside(
         &self,
-        (number, node, project, from): (u64, &fs::Node, bool, &str),
+        (number, node, project, from): (u64, &fs::Node, bool, &RelPath),
         onto: Option<&(u64, fs::Node)>,
-        to: &str,
+        to: &RelPath,
     ) -> io::Result<()> {
         if onto.is_some_and(|(_, old)| old.folder) {
             return Err(io::Error::from(io::ErrorKind::IsADirectory));
@@ -1303,7 +1325,7 @@ impl Writes {
             }
             let mut txn = self.0.space.write()?;
             let above = there(&txn, parent(to)).filter(|(_, node)| node.folder).ok_or_else(not_found)?.0;
-            fs::rename(&mut txn, SERVED, number, above, name(to), SERVER)?;
+            fs::rename(&mut txn, SERVED, number, above, name(to)?, SERVER)?;
             let moved = fs::node(&txn, SERVED, number)?.ok_or_else(not_found)?;
             fs::set(&mut txn, SERVED, number, &fs::Node { flags: moved.flags | JUNK, ..moved }, SERVER)?;
             txn.commit()?;
@@ -1346,14 +1368,14 @@ impl Writes {
 
     /// A file only here, under a name it may come to be the project's by: in the log from here on - begun there,
     /// where it was kept in memory - and its burst goes on from where it was.
-    fn named_at_last(&self, number: u64, to: &str) -> io::Result<()> {
+    fn named_at_last(&self, number: u64, to: &RelPath) -> io::Result<()> {
         let content = self.lock().staged.get(&number).map(|staged| staged.content.clone());
         let Some(content) = content else { return Ok(()) };
         if is_junk(to) {
             return Ok(());
         }
         if !reading(&content).is_logged() {
-            let begun = self.record(&sfs::Op::Began { path: to.to_string(), emptied: true })?;
+            let begun = self.record(&sfs::Op::Began { path: to.to_owned(), emptied: true })?;
             writing(&content).held_in_log(&self.0.log, Some(begun))?;
         }
         let mut state = self.lock();
@@ -1365,12 +1387,12 @@ impl Writes {
     }
 
     /// Whether a new file waits for the `node.toml` beside it to make its folder a node.
-    fn waits_for_its_node(&self, pages: &impl Pages, path: &str) -> bool {
-        let Some((folder, name)) = path.rsplit_once('/') else { return false };
+    fn waits_for_its_node(&self, pages: &impl Pages, path: &RelPath) -> bool {
+        let (Some(folder), Some(name)) = (path.parent(), path.last()) else { return false };
         if name == project::index::NODE_FILE {
             return false;
         }
-        let declared = found(pages, &joined(folder, project::index::NODE_FILE.as_str()));
+        let declared = found(pages, &folder.join(project::index::NODE_FILE));
         let declared =
             declared.is_some_and(|(number, node)| node.flags & NEW != 0 && self.lock().staged.contains_key(&number));
         declared && found(pages, folder).is_none_or(|(_, node)| node.flags & NODE == 0)
@@ -1394,7 +1416,7 @@ impl Writes {
         }
         // Each file with its path, as it is now: declarations first - what is written beside one waits for its
         // folder to be a node.
-        let mut writes: Vec<(String, u64, Arc<RwLock<sfs::Content>>)> = Vec::new();
+        let mut writes: Vec<(Arc<RelPath>, u64, Arc<RwLock<sfs::Content>>)> = Vec::new();
         for number in files {
             let at =
                 fs::node(&pages, SERVED, number).ok().flatten().zip(fs::path(&pages, SERVED, number).ok().flatten());
@@ -1418,11 +1440,11 @@ impl Writes {
             }
             writes.push((path, number, content));
         }
-        writes.sort_by_key(|(path, ..)| (!path.ends_with(&format!("/{}", project::index::NODE_FILE)), path.clone()));
+        writes.sort_by_key(|(path, ..)| (path.last() != Some(project::index::NODE_FILE), path.clone()));
         // Each said by where it is; one that cannot be is not said, and stays as it is.
         let said = writes.into_iter().filter_map(|(path, number, content)| {
             let (from, given) = self.given(&content).ok()?;
-            Some((Op::Write { path, from }, number, content, given))
+            Some((Op::Write { path: tree(&path), from }, number, content, given))
         });
         let said: Vec<_> = said.collect();
         let (removed, gone) = self.removals_due(&pages, removals);
@@ -1494,7 +1516,7 @@ impl Writes {
                 state.removals.remove(&number);
                 gone.push(number);
             } else {
-                removed.push((Op::Remove { path }, number));
+                removed.push((Op::Remove { path: tree(&path) }, number));
             }
         }
         (removed, gone)
@@ -1554,8 +1576,7 @@ impl Writes {
             (Asked::Write { number, content, .. }, Err(why)) => {
                 // It stays as written, shown in the folder and not the project's: said here, and to the program at
                 // its next sync or close of the file - its last one was answered before the project was asked.
-                let path = self.path_of(number).unwrap_or_default();
-                eprintln!("{path}: written, and not taken into the project: {why}");
+                eprintln!("{}: written, and not taken into the project: {why}", shown(self.path_of(number)));
                 let mut state = self.lock();
                 state.refused.insert(number, why);
                 if let Some(staged) =
@@ -1570,11 +1591,13 @@ impl Writes {
                 done(said, false);
             }
             (Asked::Folder { number, said }, Err(why)) => {
-                let path = self.path_of(number).unwrap_or_default();
-                eprintln!("{path}: made, which the project did not take: {why}");
+                let path = self.path_of(number);
+                eprintln!("{}: made, which the project did not take: {why}", shown(path.clone()));
                 done(said, true);
                 let _ordered = self.ordered();
-                if self.undo_folder(number).unwrap_or(false) {
+                if self.undo_folder(number).unwrap_or(false)
+                    && let Some(path) = path
+                {
                     self.0.served.told(Changes { gone: vec![(path, true)], ..Changes::default() });
                 }
             }
@@ -1600,8 +1623,8 @@ impl Writes {
             }
             (Asked::Remove { number, said }, Err(why)) => {
                 // Refused: it is shown again.
-                let path = self.path_of(number).unwrap_or_default();
-                eprintln!("{path}: removed, which the project did not take: {why}");
+                let path = self.path_of(number);
+                eprintln!("{}: removed, which the project did not take: {why}", shown(path.clone()));
                 done(said, true);
                 self.lock().removed.remove(&number);
                 let _ordered = self.ordered();
@@ -1610,7 +1633,7 @@ impl Writes {
                     .ok()
                     .and_then(|pages| fs::node(&pages, SERVED, number).ok().flatten())
                     .map(|node| node.folder);
-                if let (Ok(()), Some(folder)) = (self.flag(number, 0, GONE), folder) {
+                if let (Ok(()), Some(folder), Some(path)) = (self.flag(number, 0, GONE), folder, path) {
                     self.0.served.told(Changes { new: vec![(path, folder)], ..Changes::default() });
                 }
             }
@@ -1636,7 +1659,7 @@ impl Writes {
 
     /// A path moved here that the project did not move is put back where it was, and the project's paths are
     /// read through the move no more.
-    fn undo_rename(&self, number: u64, from: &str, moved: u64) -> io::Result<()> {
+    fn undo_rename(&self, number: u64, from: &RelPath, moved: u64) -> io::Result<()> {
         let mut txn = self.0.space.write()?;
         project::shared::unmoved(&mut txn, moved)?;
         let now = fs::path(&txn, SERVED, number)?;
@@ -1644,7 +1667,7 @@ impl Writes {
         let above = there(&txn, parent(from)).filter(|(_, node)| node.folder).filter(|_| found(&txn, from).is_none());
         let back = match (&now, &node, above) {
             (Some(_), Some(_), Some((above, _))) => {
-                fs::rename(&mut txn, SERVED, number, above, name(from), SERVER).is_ok()
+                name(from).is_ok_and(|name| fs::rename(&mut txn, SERVED, number, above, name, SERVER).is_ok())
             }
             _ => false,
         };
@@ -1741,7 +1764,7 @@ impl Writes {
             }
         }
         // What nobody took by now is its owner's to keep: the staging is emptied when the folder is next served.
-        let left: Vec<(String, Arc<RwLock<sfs::Content>>)> = {
+        let left: Vec<(Arc<RelPath>, Arc<RwLock<sfs::Content>>)> = {
             let pages = self.pages().ok();
             let state = self.lock();
             let untaken = state.staged.iter().filter_map(|(number, staged)| {
@@ -1755,7 +1778,7 @@ impl Writes {
         };
         for (path, content) in left {
             if let Ok(file) = self.written_out(&content) {
-                self.0.owner.left(&path, &file);
+                self.0.owner.left(TreePath::within(&path), &file);
                 let _ = std::fs::remove_file(file);
             }
         }
@@ -2006,9 +2029,10 @@ mod tests {
     use super::Writes;
     use crate::Served;
     use crate::write::{Change, Owner, Refusal};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use pe2_path::{Name, RelPath};
     use project::server::{Delta, Listing, Shown as Listed, Source};
+    use sfs::HostPath;
+    use sfs::testing::At as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
@@ -2043,16 +2067,32 @@ mod tests {
         made: AtomicU64,
     }
 
-    fn above(listing: &mut Listing, path: &str) {
-        for (at, _) in path.match_indices('/') {
-            listing.entry(path[..at].to_string()).or_insert(Listed::Folder);
+    /// A path of the project a test writes.
+    fn t(path: &str) -> Arc<project::TreePath> {
+        project::TreePath::new(path).unwrap().to_owned()
+    }
+
+    /// A path of what is served, as a test writes it.
+    fn p(path: &str) -> &RelPath {
+        RelPath::new(path).unwrap()
+    }
+
+    /// Names as they are written.
+    fn names(names: impl IntoIterator<Item = Arc<Name>>) -> Vec<String> {
+        names.into_iter().map(|name| name.to_string()).collect()
+    }
+
+    fn above(listing: &mut Listing, path: &project::TreePath) {
+        let folders = std::iter::successors(path.parent(), |folder| folder.parent()).filter(|f| !f.is_root());
+        for folder in folders {
+            listing.entry(folder.to_owned()).or_insert(Listed::Folder);
         }
     }
 
     impl Holder {
         /// A project of these files, each with its text, over the folder `dir` a test keeps its writes in.
         fn new(dir: &HostPath, files: &[(&str, &str)], takes: Takes) -> Arc<Holder> {
-            let at = dir.with_suffix(&pe2_path::Name::constant("-files"));
+            let at = dir.with_suffix(pe2_path::Name::constant("-files"));
             let _ = std::fs::remove_dir_all(&at);
             std::fs::create_dir_all(&at).unwrap();
             let space = Arc::new(sfs::Space::private().unwrap());
@@ -2070,8 +2110,8 @@ mod tests {
             {
                 let mut listing = holder.listing.lock().unwrap();
                 for (path, text) in files {
-                    above(&mut listing, path);
-                    listing.insert((*path).to_string(), holder.file(text.as_bytes()));
+                    above(&mut listing, &t(path));
+                    listing.insert(t(path), holder.file(text.as_bytes()));
                 }
                 project::shared::say_whole(&holder.space, &listing).unwrap();
             }
@@ -2105,49 +2145,50 @@ mod tests {
         }
 
         fn has(&self, path: &str) -> bool {
-            self.listing.lock().unwrap().contains_key(path)
+            self.listing.lock().unwrap().contains_key(&*t(path))
         }
 
         fn made_of(&self, listing: &mut Listing, change: &Change) -> Result<(), Refusal> {
-            let under = |listing: &Listing, path: &str| -> Vec<String> {
-                let inside = format!("{path}/");
-                listing.keys().filter(|at| *at == path || at.starts_with(&inside)).cloned().collect()
+            let under = |listing: &Listing, path: &project::TreePath| -> Vec<Arc<project::TreePath>> {
+                listing.keys().filter(|at| at.starts_with(path)).cloned().collect()
             };
-            let none = |path: &str| Refusal::Never(format!("{path}: nothing is there"));
+            let none = |path: &project::TreePath| Refusal::Never(format!("{path}: nothing is there"));
             match change {
                 Change::Write { path, staged } => {
                     let bytes = staged.read().map_err(|e| Refusal::Never(e.to_string()))?;
                     above(listing, path);
-                    listing.insert(path.clone(), self.file(&bytes));
+                    let file = self.file(&bytes);
+                    project::server::put(listing, path, &file);
                 }
                 // What is so already is as asked, as with whoever holds a project.
                 Change::Folder { path } => {
-                    if matches!(listing.get(path), Some(Listed::File { .. })) {
+                    if matches!(listing.get(&**path), Some(Listed::File { .. })) {
                         return Err(Refusal::Never(format!("{path} is a file")));
                     }
                     above(listing, path);
-                    listing.insert(path.clone(), Listed::Folder);
+                    project::server::put(listing, path, &Listed::Folder);
                 }
                 Change::Remove { path } => {
                     for path in under(listing, path) {
-                        listing.remove(&path);
+                        listing.remove(&*path);
                     }
                 }
                 Change::Rename { from, to } => {
                     let moved = under(listing, from);
-                    if moved.is_empty() && listing.contains_key(to) {
+                    if moved.is_empty() && listing.contains_key(&**to) {
                         return Ok(());
                     }
                     if moved.is_empty() {
                         return Err(none(from));
                     }
-                    for path in under(listing, to) {
-                        listing.remove(&path);
+                    for path in under(listing, to).into_iter().filter(|path| !path.starts_with(from)) {
+                        listing.remove(&*path);
                     }
                     above(listing, to);
                     for path in moved {
-                        if let Some(it) = listing.remove(&path) {
-                            listing.insert(format!("{to}{}", &path[from.len()..]), it);
+                        if let Some(it) = listing.remove(&*path) {
+                            let within = path.strip_prefix(from).unwrap_or(pe2_path::RelPath::root());
+                            project::server::put(listing, &to.join_path(within), &it);
                         }
                     }
                 }
@@ -2214,7 +2255,7 @@ mod tests {
             self.taken()
         }
 
-        fn left(&self, path: &str, _staged: &HostPath) {
+        fn left(&self, path: &project::TreePath, _staged: &HostPath) {
             self.left.lock().unwrap().push(path.to_string());
         }
     }
@@ -2227,16 +2268,16 @@ mod tests {
 
     #[test]
     fn what_nobody_takes_yet_is_kept_and_given_once_someone_does() {
-        let dir = pe2_path::testing::scratch("writes-later");
+        let dir = sfs::testing::scratch("writes-later");
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        let handle = writes.create("kept.txt").unwrap();
+        let handle = writes.create(p("kept.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         // Tried, and not taken: it is shown as written, and nothing was given.
         std::thread::sleep(Duration::from_millis(2500));
-        assert!(writes.shown("kept.txt").is_some(), "shown as written while it waits");
+        assert!(writes.shown(p("kept.txt")).is_some(), "shown as written while it waits");
         assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
         // Someone takes changes again: it is given without being written again.
         owner.take(Takes::All);
@@ -2253,26 +2294,26 @@ mod tests {
 
     #[test]
     fn the_log_is_let_go_of_behind_what_is_written_whatever_waits() {
-        let dir = pe2_path::testing::scratch("writes-log");
+        let dir = sfs::testing::scratch("writes-log");
         // Nobody takes anything: what is written waits, for as long as this runs.
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let log = sfs::log::Config { segment: 64 << 10, budget: 1 << 20 };
         let writes = Writes::with(&served, owner, &dir, log, super::Pace::default()).unwrap();
-        let waits = writes.create("waits.txt").unwrap();
+        let waits = writes.create(p("waits.txt")).unwrap();
         writes.write(waits, 0, b"written first, and kept").unwrap();
         writes.close(waits, true).unwrap();
         // Four times what the log may hold, written over one file again and again.
         let mut last = Vec::new();
         for round in 0..40u8 {
-            let handle = writes.open("big.bin", true).unwrap();
+            let handle = writes.open(p("big.bin"), true).unwrap();
             last = vec![round; 100 << 10];
             writes.write(handle, 0, &last).unwrap();
             writes.close(handle, false).unwrap();
             writes.settle();
         }
-        assert_eq!(writes.read("waits.txt", 0, 100).unwrap(), b"written first, and kept");
-        assert_eq!(writes.read("big.bin", 0, 200 << 10).unwrap(), last);
+        assert_eq!(writes.read(p("waits.txt"), 0, 100).unwrap(), b"written first, and kept");
+        assert_eq!(writes.read(p("big.bin"), 0, 200 << 10).unwrap(), last);
         let segments = std::fs::read_dir(dir.at("sfs").at("log")).unwrap().count();
         assert!(segments <= 8, "the log keeps what is read from, not all that was written: {segments} segments");
         drop(writes);
@@ -2283,7 +2324,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement"]
     fn bench_writes() {
-        let dir = pe2_path::testing::scratch("writes-bench");
+        let dir = sfs::testing::scratch("writes-bench");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
@@ -2304,14 +2345,14 @@ mod tests {
         let block = [7u8; 4096];
         let new = timed(
             &mut |n| {
-                let handle = writes.create(&format!("new{n}.bin")).unwrap();
+                let handle = writes.create(p(&format!("new{n}.bin"))).unwrap();
                 writes.write(handle, 0, &block).unwrap();
                 writes.close(handle, true).unwrap();
             },
             2000,
         );
         said("a new file: create, write 4 KiB, close", new);
-        let handle = writes.create("writes.bin").unwrap();
+        let handle = writes.create(p("writes.bin")).unwrap();
         let wrote = timed(
             &mut |n| {
                 writes.write(handle, n as u64 * 4096, &block).unwrap();
@@ -2322,14 +2363,17 @@ mod tests {
         let mut buffer = [0u8; 4096];
         let read = timed(
             &mut |n| {
-                writes.read_into("writes.bin", (n * 37 % 20000) as u64 * 4096, &mut buffer).unwrap();
+                writes.read_into(p("writes.bin"), (n * 37 % 20000) as u64 * 4096, &mut buffer).unwrap();
             },
             20000,
         );
         said("a read of 4 KiB of what was written", read);
-        said("what a written file is (its length and time)", timed(&mut |_| drop(writes.shown("writes.bin")), 20000));
+        said(
+            "what a written file is (its length and time)",
+            timed(&mut |_| drop(writes.shown(p("writes.bin"))), 20000),
+        );
         writes.close(handle, true).unwrap();
-        said("a file removed", timed(&mut |n| writes.remove(&format!("new{n}.bin")).unwrap(), 2000));
+        said("a file removed", timed(&mut |n| writes.remove(p(&format!("new{n}.bin"))).unwrap(), 2000));
         drop(writes);
         done(&dir);
     }
@@ -2339,17 +2383,17 @@ mod tests {
 
     #[test]
     fn a_save_returns_at_once_and_is_the_projects_a_moment_later() {
-        let dir = pe2_path::testing::scratch("writes-save");
+        let dir = sfs::testing::scratch("writes-save");
         let (owner, starts, goes_on) = Holder::gated(&dir, &[("saved.txt", "before")]);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        let handle = writes.open("saved.txt", true).unwrap();
+        let handle = writes.open(p("saved.txt"), true).unwrap();
         writes.write(handle, 0, b"after").unwrap();
         // Let go of: it returns while the project has not taken it - which here waits to be told to go on.
         writes.close(handle, true).unwrap();
         starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file, off this thread");
         assert!(owner.given().is_empty(), "not the project's yet");
-        assert_eq!(writes.read("saved.txt", 0, 16).unwrap(), b"after", "read as written meanwhile");
+        assert_eq!(writes.read(p("saved.txt"), 0, 16).unwrap(), b"after", "read as written meanwhile");
         goes_on.send(()).unwrap();
         let asked = Instant::now();
         let saved = || owner.given().iter().any(|c| c == "Write saved.txt from outside");
@@ -2363,7 +2407,7 @@ mod tests {
 
     #[test]
     fn a_new_file_is_the_projects_once_its_burst_of_changes_has_ended() {
-        let dir = pe2_path::testing::scratch("writes-burst");
+        let dir = sfs::testing::scratch("writes-burst");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let pace = super::Pace { least: Duration::from_millis(400), most: Duration::from_secs(2) };
@@ -2371,7 +2415,8 @@ mod tests {
         let given = || owner.given().len();
         // Written again and again, let go of in between: one burst, for as long as it goes on.
         for round in 0..25u64 {
-            let handle = if round == 0 { writes.create("log.txt") } else { writes.open("log.txt", false) }.unwrap();
+            let handle =
+                if round == 0 { writes.create(p("log.txt")) } else { writes.open(p("log.txt"), false) }.unwrap();
             writes.write(handle, round, b"x").unwrap();
             writes.close(handle, true).unwrap();
             std::thread::sleep(Duration::from_millis(20));
@@ -2389,16 +2434,16 @@ mod tests {
 
     #[test]
     fn a_folder_is_made_at_once_whoever_takes_it_when() {
-        let dir = pe2_path::testing::scratch("writes-mkdir");
+        let dir = sfs::testing::scratch("writes-mkdir");
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let asked = Instant::now();
-        writes.make_folder("made").expect("made, whatever the project is doing");
-        writes.make_folder("made/inside").expect("and one in it");
+        writes.make_folder(p("made")).expect("made, whatever the project is doing");
+        writes.make_folder(p("made/inside")).expect("and one in it");
         assert!(asked.elapsed() < Duration::from_secs(1), "without waiting for the project");
-        assert!(writes.shown("made/inside").is_some_and(|shown| shown.folder), "shown at once");
+        assert!(writes.shown(p("made/inside")).is_some_and(|shown| shown.folder), "shown at once");
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
         // Someone takes changes again: given in the order they were made.
@@ -2415,19 +2460,19 @@ mod tests {
 
     #[test]
     fn what_is_written_in_a_folder_goes_with_it_when_it_is_renamed() {
-        let dir = pe2_path::testing::scratch("writes-moved");
+        let dir = sfs::testing::scratch("writes-moved");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
-        writes.make_folder("a").unwrap();
-        let handle = writes.create("a/x.txt").unwrap();
+        writes.make_folder(p("a")).unwrap();
+        let handle = writes.create(p("a/x.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         // Renamed before what was written in it is the project's.
-        writes.rename("a", "b").unwrap();
-        assert!(writes.shown("a/x.txt").is_none(), "no longer where it was");
-        assert_eq!(writes.read("b/x.txt", 0, 4).unwrap(), b"x", "read where its folder is now");
-        assert_eq!(writes.list("b").keys().collect::<Vec<_>>(), ["x.txt"]);
+        writes.rename(p("a"), p("b")).unwrap();
+        assert!(writes.shown(p("a/x.txt")).is_none(), "no longer where it was");
+        assert_eq!(writes.read(p("b/x.txt"), 0, 4).unwrap(), b"x", "read where its folder is now");
+        assert_eq!(names(writes.list(p("b")).into_keys()), ["x.txt"]);
         writes.finish();
         let given = owner.given();
         assert_eq!(given, ["New a from outside", "Rename a to b from outside", "Write x.txt from outside"]);
@@ -2437,12 +2482,12 @@ mod tests {
 
     #[test]
     fn what_the_project_refuses_late_is_said_at_the_next_sync_or_close() {
-        let dir = pe2_path::testing::scratch("writes-late");
+        let dir = sfs::testing::scratch("writes-late");
         let owner = Holder::new(&dir, &[], Takes::Never);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
         // Written and closed: answered at once, before the project is asked.
-        let handle = writes.create("a.txt").unwrap();
+        let handle = writes.create(p("a.txt")).unwrap();
         writes.write(handle, 0, b"one").unwrap();
         writes.flush(handle).expect("nothing was refused yet");
         writes.close(handle, true).expect("closed");
@@ -2451,7 +2496,7 @@ mod tests {
         let told_at = |sync: bool| {
             let waited = Instant::now();
             loop {
-                let handle = writes.open("a.txt", false).unwrap();
+                let handle = writes.open(p("a.txt"), false).unwrap();
                 let told = if sync { writes.close(handle, false) } else { writes.flush(handle) };
                 if let Err(told) = told {
                     break (handle, told);
@@ -2470,26 +2515,26 @@ mod tests {
         let (third, told) = told_at(true);
         assert!(told.to_string().contains("not here"), "{told}");
         writes.close(third, true).unwrap();
-        assert_eq!(writes.read("a.txt", 0, 16).unwrap(), b"one!", "as written, whatever the project took");
+        assert_eq!(writes.read(p("a.txt"), 0, 16).unwrap(), b"one!", "as written, whatever the project took");
         drop(writes);
         done(&dir);
     }
 
     #[test]
     fn a_rename_is_shown_at_once_and_the_project_told_in_its_turn() {
-        let dir = pe2_path::testing::scratch("writes-rename");
+        let dir = sfs::testing::scratch("writes-rename");
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[("old/in/a.txt", "a")], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        let number = served.ino("old/in/a.txt");
-        writes.rename("old", "new").expect("renamed, whatever the project is doing");
-        assert!(writes.shown("old").is_none(), "no longer where it was");
-        assert_eq!(writes.read("new/in/a.txt", 0, 4).unwrap(), b"a", "read where it is now");
-        assert_eq!(writes.list("new").keys().collect::<Vec<_>>(), ["in"]);
-        assert_eq!(served.ino("new/in/a.txt"), number, "each file keeps its number");
+        let number = served.ino(p("old/in/a.txt"));
+        writes.rename(p("old"), p("new")).expect("renamed, whatever the project is doing");
+        assert!(writes.shown(p("old")).is_none(), "no longer where it was");
+        assert_eq!(writes.read(p("new/in/a.txt"), 0, 4).unwrap(), b"a", "read where it is now");
+        assert_eq!(names(writes.list(p("new")).into_keys()), ["in"]);
+        assert_eq!(served.ino(p("new/in/a.txt")), number, "each file keeps its number");
         // What is asked after it waits for it: nothing overtakes what was asked in an order.
-        let handle = writes.open("new/in/a.txt", true).unwrap();
+        let handle = writes.open(p("new/in/a.txt"), true).unwrap();
         writes.write(handle, 0, b"after").unwrap();
         writes.close(handle, true).unwrap();
         std::thread::sleep(Duration::from_millis(300));
@@ -2507,8 +2552,35 @@ mod tests {
     }
 
     #[test]
+    fn a_name_is_found_however_written_and_renamed_to_another_writing_of_it() {
+        let dir = sfs::testing::scratch("writes-case");
+        let owner = Holder::new(&dir, &[("notes/a.txt", "a")], Takes::All);
+        let served = owner.served.clone();
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let number = served.ino(p("notes/a.txt"));
+        // However its names are written, as a system that does not tell them apart takes them: the same file.
+        assert_eq!(writes.read(p("NOTES/A.TXT"), 0, 4).unwrap(), b"a");
+        assert!(writes.make_folder(p("Notes")).is_err(), "there already");
+        // Renamed to another writing of its name: written so at once, the same file, and the project told.
+        writes.rename(p("notes"), p("Notes")).expect("renamed");
+        assert_eq!(names(writes.list(p("")).into_keys()), ["Notes"]);
+        assert_eq!(served.ino(p("Notes/a.txt")), number, "each file keeps its number");
+        let waited = Instant::now();
+        while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(owner.given(), ["Rename notes to Notes from outside"]);
+        let listing = owner.listing.lock().unwrap();
+        let written: Vec<&str> = listing.keys().map(|path| path.as_str()).collect();
+        assert_eq!(written, ["Notes", "Notes/a.txt"], "the project has it written so");
+        drop(listing);
+        drop(writes);
+        done(&dir);
+    }
+
+    #[test]
     fn a_file_moved_onto_one_that_is_there_gives_it_its_content_and_goes() {
-        let dir = pe2_path::testing::scratch("writes-onto");
+        let dir = sfs::testing::scratch("writes-onto");
         let owner = Holder::new(&dir, &[("a.txt", "one"), ("b.txt", "two"), ("d.txt", "four")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2523,16 +2595,16 @@ mod tests {
         };
         // Both the project's, nothing of either staged: no rename the project would refuse - the one there takes
         // the content, the one moved is removed.
-        writes.rename("a.txt", "b.txt").expect("moved onto it");
-        assert_eq!(writes.read("b.txt", 0, 8).unwrap(), b"one");
-        assert!(writes.shown("a.txt").is_none(), "no longer where it was");
+        writes.rename(p("a.txt"), p("b.txt")).expect("moved onto it");
+        assert_eq!(writes.read(p("b.txt"), 0, 8).unwrap(), b"one");
+        assert!(writes.shown(p("a.txt")).is_none(), "no longer where it was");
         assert_eq!(given(2), ["Remove a.txt from outside", "Write b.txt from outside"]);
         // Onto one written there that the project is yet to have: the same, and what was written there is not given.
-        let handle = writes.open("c.txt", true).unwrap();
+        let handle = writes.open(p("c.txt"), true).unwrap();
         writes.write(handle, 0, b"written, never the project's").unwrap();
-        writes.rename("d.txt", "c.txt").expect("moved onto it");
-        assert_eq!(writes.read("c.txt", 0, 8).unwrap(), b"four");
-        assert!(writes.shown("d.txt").is_none());
+        writes.rename(p("d.txt"), p("c.txt")).expect("moved onto it");
+        assert_eq!(writes.read(p("c.txt"), 0, 8).unwrap(), b"four");
+        assert!(writes.shown(p("d.txt")).is_none());
         writes.close(handle, true).unwrap();
         let given = given(2);
         assert_eq!(given, ["Remove d.txt from outside", "Write c.txt from outside"]);
@@ -2542,12 +2614,12 @@ mod tests {
 
     #[test]
     fn a_rename_the_project_refuses_is_put_back() {
-        let dir = pe2_path::testing::scratch("writes-back");
+        let dir = sfs::testing::scratch("writes-back");
         let owner = Holder::new(&dir, &[("old/a.txt", "a")], Takes::Never);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
-        writes.rename("old", "new").expect("shown renamed, until the project says otherwise");
-        let back = || writes.shown("old/a.txt").is_some() && writes.shown("new").is_none();
+        writes.rename(p("old"), p("new")).expect("shown renamed, until the project says otherwise");
+        let back = || writes.shown(p("old/a.txt")).is_some() && writes.shown(p("new")).is_none();
         let waited = Instant::now();
         while !back() && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
@@ -2559,7 +2631,7 @@ mod tests {
 
     #[test]
     fn what_was_in_transit_is_taken_up_by_a_serving_that_starts_again() {
-        let dir = pe2_path::testing::scratch("writes-again");
+        let dir = sfs::testing::scratch("writes-again");
         done(&dir);
         let project = [("kept.txt", "before"), ("gone.txt", "g"), ("old/x.txt", "x"), ("part.txt", "0123456789")];
         {
@@ -2567,22 +2639,22 @@ mod tests {
             let owner = Holder::new(&dir, &project, Takes::Nothing);
             let served = owner.served.clone();
             let writes = Writes::new(&served, owner, &dir).unwrap();
-            writes.make_folder("made").unwrap();
-            let handle = writes.create("made/a.txt").unwrap();
+            writes.make_folder(p("made")).unwrap();
+            let handle = writes.create(p("made/a.txt")).unwrap();
             writes.write(handle, 0, b"one").unwrap();
             writes.close(handle, true).unwrap();
-            let handle = writes.open("kept.txt", true).unwrap();
+            let handle = writes.open(p("kept.txt"), true).unwrap();
             writes.write(handle, 0, b"after").unwrap();
             writes.close(handle, true).unwrap();
             // Written in part over what it held, and made longer.
-            let handle = writes.open("part.txt", false).unwrap();
+            let handle = writes.open(p("part.txt"), false).unwrap();
             writes.write(handle, 3, b"xy").unwrap();
             writes.close(handle, true).unwrap();
-            writes.truncate("part.txt", 12).unwrap();
-            writes.remove("gone.txt").unwrap();
-            writes.rename("old", "new").unwrap();
+            writes.truncate(p("part.txt"), 12).unwrap();
+            writes.remove(p("gone.txt")).unwrap();
+            writes.rename(p("old"), p("new")).unwrap();
             // What an editor leaves beside a file is nobody's to find again.
-            let handle = writes.create("made/.a.txt.swp").unwrap();
+            let handle = writes.create(p("made/.a.txt.swp")).unwrap();
             writes.write(handle, 0, b"swap").unwrap();
             writes.close(handle, true).unwrap();
             // It ends with no word of it: its process gone.
@@ -2591,13 +2663,13 @@ mod tests {
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // Shown as it was left.
-        assert!(writes.shown("made").is_some_and(|shown| shown.folder));
-        assert_eq!(writes.read("made/a.txt", 0, 16).unwrap(), b"one");
-        assert_eq!(writes.read("kept.txt", 0, 16).unwrap(), b"after");
-        assert_eq!(writes.read("part.txt", 0, 16).unwrap(), b"012xy56789\0\0");
-        assert!(writes.shown("gone.txt").is_none() && writes.shown("old").is_none());
-        assert_eq!(writes.read("new/x.txt", 0, 4).unwrap(), b"x");
-        assert!(writes.shown("made/.a.txt.swp").is_none());
+        assert!(writes.shown(p("made")).is_some_and(|shown| shown.folder));
+        assert_eq!(writes.read(p("made/a.txt"), 0, 16).unwrap(), b"one");
+        assert_eq!(writes.read(p("kept.txt"), 0, 16).unwrap(), b"after");
+        assert_eq!(writes.read(p("part.txt"), 0, 16).unwrap(), b"012xy56789\0\0");
+        assert!(writes.shown(p("gone.txt")).is_none() && writes.shown(p("old")).is_none());
+        assert_eq!(writes.read(p("new/x.txt"), 0, 4).unwrap(), b"x");
+        assert!(writes.shown(p("made/.a.txt.swp")).is_none());
         // And given once someone takes it: what was asked in an order first, in that order.
         owner.take(Takes::All);
         let given = || owner.given();
@@ -2625,16 +2697,16 @@ mod tests {
 
     #[test]
     fn what_was_written_in_a_folder_the_project_has_renamed_is_taken_up_where_it_is() {
-        let dir = pe2_path::testing::scratch("writes-where");
+        let dir = sfs::testing::scratch("writes-where");
         done(&dir);
         {
             let owner = Holder::new(&dir, &[("old/x.txt", "x")], Takes::Ordered);
             let served = owner.served.clone();
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-            let handle = writes.create("old/written.txt").unwrap();
+            let handle = writes.create(p("old/written.txt")).unwrap();
             writes.write(handle, 0, b"w").unwrap();
             writes.close(handle, true).unwrap();
-            writes.rename("old", "new").unwrap();
+            writes.rename(p("old"), p("new")).unwrap();
             // The project has the rename, and not what was written: there it ends.
             let waited = Instant::now();
             while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
@@ -2646,8 +2718,8 @@ mod tests {
         let owner = Holder::new(&dir, &[("new/x.txt", "x")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        assert_eq!(writes.read("new/written.txt", 0, 4).unwrap(), b"w", "where its folder is now");
-        assert!(writes.shown("old").is_none() && writes.shown("old/written.txt").is_none());
+        assert_eq!(writes.read(p("new/written.txt"), 0, 4).unwrap(), b"w", "where its folder is now");
+        assert!(writes.shown(p("old")).is_none() && writes.shown(p("old/written.txt")).is_none());
         let given = || owner.given();
         let waited = Instant::now();
         while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
@@ -2660,17 +2732,17 @@ mod tests {
 
     #[test]
     fn what_the_project_took_is_not_given_again() {
-        let dir = pe2_path::testing::scratch("writes-took");
+        let dir = sfs::testing::scratch("writes-took");
         done(&dir);
         {
             let owner = Holder::new(&dir, &[], Takes::All);
             let served = owner.served.clone();
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-            writes.make_folder("made").unwrap();
-            let handle = writes.create("made/a.txt").unwrap();
+            writes.make_folder(p("made")).unwrap();
+            let handle = writes.create(p("made/a.txt")).unwrap();
             writes.write(handle, 0, b"one").unwrap();
             writes.close(handle, true).unwrap();
-            let handle = writes.create("late.txt").unwrap();
+            let handle = writes.create(p("late.txt")).unwrap();
             writes.write(handle, 0, b"first").unwrap();
             writes.close(handle, true).unwrap();
             let given = || owner.given().len();
@@ -2680,14 +2752,14 @@ mod tests {
             }
             assert_eq!(given(), 3, "the folder and the two files");
             // Written again after the project took it, and ended before it took that.
-            let handle = writes.open("late.txt", false).unwrap();
+            let handle = writes.open(p("late.txt"), false).unwrap();
             writes.write(handle, 5, b" and more").unwrap();
         }
         // The tree as whoever holds the project has it by now.
         let owner = Holder::new(&dir, &[("made/a.txt", "one"), ("late.txt", "first")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        assert_eq!(writes.read("late.txt", 0, 32).unwrap(), b"first and more");
+        assert_eq!(writes.read(p("late.txt"), 0, 32).unwrap(), b"first and more");
         let given = || owner.given();
         let waited = Instant::now();
         while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
@@ -2695,20 +2767,20 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(given(), ["Write late.txt from outside"], "only what the project had not taken");
-        assert!(writes.settled("made/a.txt"), "what it had is the tree's alone");
+        assert!(writes.settled(p("made/a.txt")), "what it had is the tree's alone");
         drop(writes);
         done(&dir);
     }
 
     #[test]
     fn a_serving_that_ended_leaves_nothing_to_take_up() {
-        let dir = pe2_path::testing::scratch("writes-ended");
+        let dir = sfs::testing::scratch("writes-ended");
         done(&dir);
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         {
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-            let handle = writes.create("left.txt").unwrap();
+            let handle = writes.create(p("left.txt")).unwrap();
             writes.write(handle, 0, b"x").unwrap();
             writes.close(handle, true).unwrap();
             writes.finish();
@@ -2716,7 +2788,7 @@ mod tests {
         }
         owner.take(Takes::All);
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        assert!(writes.shown("left.txt").is_none(), "not taken up again: it was set aside");
+        assert!(writes.shown(p("left.txt")).is_none(), "not taken up again: it was set aside");
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(owner.given().len(), 0, "and nothing is given");
         drop(writes);
@@ -2725,11 +2797,11 @@ mod tests {
 
     #[test]
     fn what_nobody_took_by_the_end_is_left_with_the_owner() {
-        let dir = pe2_path::testing::scratch("writes-left");
+        let dir = sfs::testing::scratch("writes-left");
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        let handle = writes.create("late.txt").unwrap();
+        let handle = writes.create(p("late.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         writes.finish();
@@ -2740,13 +2812,13 @@ mod tests {
 
     #[test]
     fn new_files_that_have_settled_are_given_to_the_project_together() {
-        let dir = pe2_path::testing::scratch("writes-many");
+        let dir = sfs::testing::scratch("writes-many");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         // Paced so that nothing is given before it is asked for here.
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
         for name in ["a.txt", "b.txt", "c.txt"] {
-            let handle = writes.create(name).unwrap();
+            let handle = writes.create(p(name)).unwrap();
             writes.write(handle, 0, b"x").unwrap();
             writes.close(handle, true).unwrap();
         }
@@ -2770,11 +2842,11 @@ mod tests {
 
     #[test]
     fn what_waits_to_settle_is_given_to_the_project_as_serving_ends() {
-        let dir = pe2_path::testing::scratch("writes-finish");
+        let dir = sfs::testing::scratch("writes-finish");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
-        let handle = writes.create("late.txt").unwrap();
+        let handle = writes.create(p("late.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         // At once, long before it would have settled.
@@ -2787,17 +2859,17 @@ mod tests {
 
     #[test]
     fn a_folder_the_project_was_given_is_shown_before_the_tree_follows() {
-        let dir = pe2_path::testing::scratch("writes-given");
+        let dir = sfs::testing::scratch("writes-given");
         // An owner that takes what it is given, the tree served following in its own time - as where another process
         // holds the project, and lists what is served a moment later.
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
-        writes.make_folder("made").expect("made");
-        assert!(writes.shown("made").is_some_and(|shown| shown.folder), "there at once");
-        assert_eq!(writes.list("").keys().collect::<Vec<_>>(), ["made"]);
+        writes.make_folder(p("made")).expect("made");
+        assert!(writes.shown(p("made")).is_some_and(|shown| shown.folder), "there at once");
+        assert_eq!(names(writes.list(p("")).into_keys()), ["made"]);
         // What is written in it next finds it, and is the project's with it.
-        let handle = writes.create("made/a.txt").unwrap();
+        let handle = writes.create(p("made/a.txt")).unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         writes.finish();
@@ -2806,24 +2878,24 @@ mod tests {
         // The tree shows it by then, and it is the tree's.
         assert!(owner.has("made/a.txt"));
         writes.settle();
-        assert!(writes.settled("made"), "nothing shown over the tree any more");
+        assert!(writes.settled(p("made")), "nothing shown over the tree any more");
         drop(writes);
         done(&dir);
     }
 
     #[test]
     fn a_folder_made_where_one_was_just_removed_is_kept() {
-        let dir = pe2_path::testing::scratch("writes-folder");
+        let dir = sfs::testing::scratch("writes-folder");
         let owner = Holder::new(&dir, &[("kept/a.txt", "a")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // Emptied and removed, then made again before the removal has settled: as a program replacing a folder does.
-        writes.remove("kept/a.txt").unwrap();
-        writes.remove("kept").unwrap();
-        assert!(writes.shown("kept").is_none(), "hidden at once");
-        writes.make_folder("kept").expect("made again");
-        assert!(writes.shown("kept").is_some_and(|shown| shown.folder), "shown again");
-        assert!(writes.list("kept").is_empty(), "without what was removed from it");
+        writes.remove(p("kept/a.txt")).unwrap();
+        writes.remove(p("kept")).unwrap();
+        assert!(writes.shown(p("kept")).is_none(), "hidden at once");
+        writes.make_folder(p("kept")).expect("made again");
+        assert!(writes.shown(p("kept")).is_some_and(|shown| shown.folder), "shown again");
+        assert!(writes.list(p("kept")).is_empty(), "without what was removed from it");
         // Once the removal has settled - however long that takes a machine doing other things - and then for as long
         // as the folder's own would have taken to follow it.
         let waited = std::time::Instant::now();
@@ -2839,12 +2911,12 @@ mod tests {
 
     #[test]
     fn a_file_removed_while_the_project_is_given_it_is_removed_from_the_project() {
-        let dir = pe2_path::testing::scratch("writes");
+        let dir = sfs::testing::scratch("writes");
         let (owner, starts, goes_on) = Holder::gated(&dir, &[]);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // A new file, written and let go of: given to the project once it has settled.
-        let handle = writes.create("a.txt").unwrap();
+        let handle = writes.create(p("a.txt")).unwrap();
         writes.write(handle, 0, b"written").unwrap();
         writes.close(handle, true).unwrap();
         starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file");
@@ -2852,9 +2924,9 @@ mod tests {
         // removal is said due after it, rather than the file taken for one only written here, which would leave
         // it in the project.
         let asked = Instant::now();
-        writes.remove("a.txt").expect("removed");
+        writes.remove(p("a.txt")).expect("removed");
         assert!(asked.elapsed() < Duration::from_millis(500), "without waiting for the project");
-        assert!(writes.shown("a.txt").is_none(), "hidden at once");
+        assert!(writes.shown(p("a.txt")).is_none(), "hidden at once");
         goes_on.send(()).unwrap();
         let asked = Instant::now();
         let removed = || owner.given().iter().any(|c| c == "Remove a.txt from outside");
@@ -2862,7 +2934,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(removed(), "removed from the project: {:?}", owner.given());
-        assert!(served.tree().at("a.txt").is_none() && writes.shown("a.txt").is_none(), "and gone");
+        assert!(served.tree().at(p("a.txt")).is_none() && writes.shown(p("a.txt")).is_none(), "and gone");
         drop(writes);
         done(&dir);
     }

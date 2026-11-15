@@ -81,7 +81,7 @@ pub struct ResourcePath {
     /// The asset.
     pub uid: Uid,
     /// What of it, after the `#`: an output, and a member of it.
-    pub suffix: Option<RelPath>,
+    pub suffix: Option<std::sync::Arc<RelPath>>,
 }
 
 impl ResourcePath {
@@ -93,8 +93,8 @@ impl ResourcePath {
 
     /// What of an asset `suffix` names.
     #[must_use]
-    pub fn within(uid: Uid, suffix: RelPath) -> ResourcePath {
-        ResourcePath { uid, suffix: (!suffix.is_root()).then_some(suffix) }
+    pub fn within(uid: Uid, suffix: &RelPath) -> ResourcePath {
+        ResourcePath { uid, suffix: (!suffix.is_root()).then(|| suffix.to_owned()) }
     }
 
     /// `text` as a resource path.
@@ -108,7 +108,8 @@ impl ResourcePath {
             None => (text, None),
         };
         let uid = Uid::parse(uid).ok_or_else(|| PathError::new(text, Why::NoUid))?;
-        let suffix = suffix.map(RelPath::new).transpose().map_err(|e| PathError::new(text, e.why))?;
+        let suffix =
+            suffix.map(RelPath::new).transpose().map_err(|e| PathError::new(text, e.why))?.map(RelPath::to_owned);
         Ok(ResourcePath { uid, suffix })
     }
 }
@@ -162,7 +163,7 @@ mod tests {
         assert_eq!(asset.suffix, None);
         let member = ResourcePath::new("uid://abc#cells/left").unwrap();
         assert_eq!(member.uid, asset.uid);
-        assert_eq!(member.suffix, Some(RelPath::new("cells/left").unwrap()));
+        assert_eq!(member.suffix.as_deref(), Some(RelPath::new("cells/left").unwrap()));
         assert_eq!(member.to_string(), "uid://abc#cells/left");
         assert_eq!(ResourcePath::within(asset.uid, RelPath::root()), asset);
         assert_eq!(ResourcePath::new("uid://abc#").unwrap_err().why, Why::EmptySuffix);

@@ -15,6 +15,7 @@ codecs.workspace = true
 anyhow.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+sfs.workspace = true
 pe2-dialogue.workspace = true
 pe2-flags.workspace = true
 pe2-formats.workspace = true
@@ -31,4 +32,4 @@ pe2-sounds.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

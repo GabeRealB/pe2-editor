@@ -1,5 +1,5 @@
 use crate::testing::At as _;
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;

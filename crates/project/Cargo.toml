@@ -47,4 +47,4 @@ blake3 = "1"
 tracy = ["dep:tracing-tracy"]
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

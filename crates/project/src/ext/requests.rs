@@ -22,7 +22,7 @@ pub const SAY_AFTER: Duration = Duration::from_millis(100);
 const KEPT: usize = 16;
 const THREADS: usize = 2;
 
-type Key = (crate::TreePath, String);
+type Key = (Arc<crate::TreePath>, String);
 type Wake = Box<dyn Fn(Duration) + Send>;
 type Maker = Arc<dyn Fn(&Index, &crate::index::Asset, &str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
@@ -200,7 +200,7 @@ impl Asking for Requests {
             Ok(path) => path,
             Err(why) => return Requested::Failed(format!("{path}: {why}")),
         };
-        let key = (path, address.to_string());
+        let key = (path.to_owned(), address.to_string());
         let mut state = self.shared.lock();
         if !state.slots.contains_key(&key) {
             state.asked += 1;
@@ -236,7 +236,7 @@ impl Asking for Requests {
     fn kept(&self, path: &str, address: &str) -> Option<Arc<Vec<u8>>> {
         // What is no path was never made: `request` refused it.
         let path = crate::TreePath::new(path).ok()?;
-        match self.shared.lock().slots.get(&(path, address.to_string())) {
+        match self.shared.lock().slots.get(&(path.to_owned(), address.to_string())) {
             Some(Slot::Made(bytes)) => Some(bytes.clone()),
             _ => None,
         }
@@ -253,7 +253,7 @@ mod tests {
     use crate::testing::At as _;
     use pe2_ext::ty::Registered as _;
     use pe2_ext::{Extension, File, Registry, Result, Typed, ty};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
     use std::sync::atomic::AtomicUsize;
 
     static MADE: AtomicUsize = AtomicUsize::new(0);

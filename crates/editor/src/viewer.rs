@@ -6,7 +6,7 @@
 
 use eframe::egui::{self, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::time::SystemTime;
 
 use crate::theme;
@@ -234,10 +234,10 @@ mod tests {
 
     #[test]
     fn tells_text_from_binary() {
-        let dir = pe2_path::testing::scratch("viewer");
+        let dir = sfs::testing::scratch("viewer");
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, bytes: &[u8]| {
-            let path = pe2_path::testing::At::at(&dir, name);
+            let path = sfs::testing::At::at(&dir, name);
             std::fs::write(&path, bytes).unwrap();
             Viewed::read(&path)
         };

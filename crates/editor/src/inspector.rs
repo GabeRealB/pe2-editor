@@ -82,7 +82,8 @@ pub fn inspector_ui(
     let target = edit_target(ws, &asset);
     // A tab of its own for each, the room going to the one read. Something selected inside shows on its tab.
     let id = ui.scope_id().with("inspector tab");
-    let (mut tab, seen): (Tab, Option<(project::TreePath, String)>) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let (mut tab, seen): (Tab, Option<(Arc<project::TreePath>, String)>) =
+        ui.data(|d| d.get_temp(id)).unwrap_or_default();
     if ws.inner != seen && ws.inner_of(&asset.path).is_some() {
         // Something in the stack shows there, and a part where it is, a tab of its own staying if one is up.
         tab = if ws.part_of(&asset.path).is_none() {
@@ -364,7 +365,7 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
                     let name = asset.path.name().unwrap_or_default();
                     *edit = Some(EditRequest::Write {
                         uid,
-                        file: RelPath::from(project::index::NODE_FILE),
+                        file: project::index::NODE_FILE.as_rel().to_owned(),
                         bytes: draft.clone().into_bytes(),
                         label: format!("Edit {name}'s declaration"),
                         merge: None,
@@ -516,7 +517,7 @@ fn property_sheet(
         }
         if let Some(axes) = three_numbers(value).filter(|_| editable) {
             let id = ui.scope_id().with(("axes", &asset.path, sheet.path(key)));
-            let shown = (&asset.path, key.as_str());
+            let shown = (&*asset.path, key.as_str());
             if let Some(new) = axes_editor(ui, id, shown, value, axes) {
                 *edit = set_field(asset, &sheet.within, key, inline(&new), &sheet.label(key));
             }
@@ -757,7 +758,7 @@ fn change_field(
     };
     Some(EditRequest::Write {
         uid,
-        file: RelPath::from(project::index::NODE_FILE),
+        file: project::index::NODE_FILE.as_rel().to_owned(),
         bytes: document.to_string().into_bytes(),
         label,
         merge: Some(format!("{}#{place}.{key}", asset.path)),
@@ -809,7 +810,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
         let uid = uid_to_edit(asset).map_err(|_| format!("{} has no uid to be edited by", asset.path))?;
         return Ok((!unchanged).then(|| EditRequest::Write {
             uid,
-            file,
+            file: file.to_owned(),
             bytes: bytes.clone(),
             label: outcome.label.clone(),
             merge: None,
@@ -819,7 +820,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
     let uid = uid_to_edit(asset).map_err(|_| format!("{} has no uid to be edited by", asset.path))?;
     Ok((text != asset.text()).then(|| EditRequest::Write {
         uid,
-        file: RelPath::from(project::index::NODE_FILE),
+        file: project::index::NODE_FILE.as_rel().to_owned(),
         bytes: text.into_bytes(),
         label: outcome.label.clone(),
         merge: None,
@@ -858,7 +859,7 @@ fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value
 
 /// What a reference field says of an asset dropped on it: it takes the type it names now.
 fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &project::TreePath) -> Result<(), String> {
-    if *path == holder.path {
+    if *path == *holder.path {
         return Err("It would name itself".to_string());
     }
     let held = reference_in(value).and_then(project::index::reference);
@@ -972,7 +973,7 @@ pub fn set_fields(asset: &Asset, sets: &crate::ext_ui::Sets) -> Option<EditReque
     };
     Some(EditRequest::Write {
         uid,
-        file: RelPath::from(project::index::NODE_FILE),
+        file: project::index::NODE_FILE.as_rel().to_owned(),
         bytes: document.to_string().into_bytes(),
         label: format!("Edit {} of {name}", keys.join(", ")),
         merge: (!sets.apart).then(|| format!("{}#{}", asset.path, keys.join(","))),
@@ -1083,8 +1084,12 @@ fn axes_editor(
     if active {
         let frame = ui.ctx().cumulative_frame_nr();
         let differs = held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9);
-        let moved =
-            differs.then(|| Edited { asset: asset.clone(), key: key.to_string(), value: vector(&held, whole), frame });
+        let moved = differs.then(|| Edited {
+            asset: asset.to_owned(),
+            key: key.to_string(),
+            value: vector(&held, whole),
+            frame,
+        });
         ui.data_mut(|data| {
             data.insert_temp(id, held);
             data.insert_temp(editing_id(), moved);
@@ -1112,7 +1117,7 @@ fn vector(held: &[f64; 3], whole: bool) -> toml::Value {
 /// A vector being dragged or typed in the sheet: the inspector draws after the views, so they read last frame's.
 #[derive(Clone)]
 struct Edited {
-    asset: project::TreePath,
+    asset: Arc<project::TreePath>,
     key: String,
     value: toml::Value,
     frame: u64,
@@ -1235,7 +1240,7 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
         Some(asset) => {
             let (icon, tint) = icons::for_type(sheet.extensions, sheet.extensions.type_name(asset));
             let mut parts = asset.path.parts().rev();
-            let name = parts.next().unwrap_or_default();
+            let name = parts.next().map_or("", |part| part.as_str());
             let short = match parts.next() {
                 Some(parent) => format!("{parent}/{name}"),
                 None => name.to_string(),
@@ -1514,7 +1519,7 @@ fn recognized_files(extensions: &project::ext::Extensions, asset: &Asset, layers
                 .get("file")
                 .and_then(toml::Value::as_str)
                 .filter(|_| layer.get("op").and_then(toml::Value::as_str) == Some(project::graph::FILE));
-            let file = name.and_then(|n| asset.files.iter().find(|f| f.name == n && f.made_by.is_none()));
+            let file = name.and_then(|n| asset.files.iter().find(|f| *f.name == *n && f.made_by.is_none()));
             file.map_or_default(|f| extensions.recognize(f).into_iter().map(|(ty, _)| ty.label.clone()).collect())
         })
         .collect()
@@ -1679,7 +1684,7 @@ fn layer_cell(
     (extensions, index, inner): (
         &project::ext::Extensions,
         &project::index::Index,
-        &mut Option<(project::TreePath, String)>,
+        &mut Option<(Arc<project::TreePath>, String)>,
     ),
     (asset, at, count): (&Asset, usize, usize),
     (selected, above): (Option<usize>, &[Option<pe2_ext::Type>]),
@@ -1893,7 +1898,7 @@ pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<Str
         Ok(uid) => uid,
         Err(refused) => return Some(refused),
     };
-    Some(EditRequest::Write { uid, file: RelPath::from(project::index::NODE_FILE), bytes, label, merge: None })
+    Some(EditRequest::Write { uid, file: project::index::NODE_FILE.as_rel().to_owned(), bytes, label, merge: None })
 }
 
 /// A layer's menu: moving it, removing it, and adding one over or under it.

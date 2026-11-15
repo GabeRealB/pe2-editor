@@ -13,7 +13,8 @@
 //! log ends is found, by the first process to open it, by checking records from that position on, never taken from
 //! the header: after a power loss it ends where the last whole record does.
 
-use pe2_path::{HostPath, Name};
+use crate::HostPath;
+use pe2_path::Name;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -22,9 +23,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use crate::Header;
 
 /// The folder of the segments, in the library's folder.
-pub const DIR: Name = Name::constant("log");
+pub const DIR: &Name = Name::constant("log");
 /// The file each process holds a shared lock on while it has the log open: who finds nobody has, checks the log.
-const ATTACHED: Name = Name::constant("attached");
+const ATTACHED: &Name = Name::constant("attached");
 
 /// A record's head: its body's length, its kind, its own position, a checksum of all three and the body.
 pub(crate) const HEAD: u64 = 24;
@@ -204,8 +205,8 @@ impl Log {
     ///
     /// # Errors
     /// As `open`.
-    pub fn shared(dir: &pe2_path::HostPath, config: Config) -> io::Result<Arc<Log>> {
-        static OPEN: Mutex<Vec<(pe2_path::HostPath, Weak<Log>)>> = Mutex::new(Vec::new());
+    pub fn shared(dir: &crate::HostPath, config: Config) -> io::Result<Arc<Log>> {
+        static OPEN: Mutex<Vec<(crate::HostPath, Weak<Log>)>> = Mutex::new(Vec::new());
         std::fs::create_dir_all(dir)?;
         let dir = dir.clone();
         let mut open = lock(&OPEN);
@@ -236,7 +237,8 @@ impl Log {
     }
 
     fn segment_path(&self, number: u64) -> HostPath {
-        let segment = Name::new(&format!("{number:016x}.seg")).expect("a number's digits and `.seg` are a name");
+        let text = format!("{number:016x}.seg");
+        let segment = Name::new(&text).expect("a number's digits and `.seg` are a name");
         self.dir.join(&DIR).join(&segment)
     }
 
@@ -499,13 +501,13 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::{Config, HEAD, Log};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use crate::HostPath;
+    use crate::testing::At as _;
 
     const SMALL: Config = Config { segment: 4096, budget: 1 << 20 };
 
     fn folder(name: &str) -> HostPath {
-        let dir = pe2_path::testing::scratch(&format!("sfs-{name}"));
+        let dir = crate::testing::scratch(&format!("sfs-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

@@ -26,8 +26,9 @@
 //! movies) is one, run after everything is written, its key that of what it comes `after`.
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
 use serde_json::{Value, json};
+use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use crate::discs::{self, Container, OpenDisc};
 use crate::extract::sha1_hex;
 
-pub const RECORD: Name = Name::constant("extraction.record.jsonl");
+pub const RECORD: &Name = Name::constant("extraction.record.jsonl");
 
 /// A release a plan reads: where its discs are looked for (`res://`), and each disc's image, by name, size and sha1 -
 /// the sha1 deciding, the name where it is looked for first.
@@ -735,14 +736,18 @@ impl Observing {
 /// # Errors
 /// The plan cannot be read, or what is read cannot be kept.
 pub fn observe(
-    plan_file: &HostPath,
-    look_in: &dyn Fn(&str) -> Result<HostPath>,
+    plan_file: &std::path::Path,
+    look_in: &dyn Fn(&str) -> Result<std::path::PathBuf>,
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
-    keep: Option<&HostPath>,
+    keep: Option<&std::path::Path>,
     kinds: &[String],
 ) -> Result<Vec<Observed>> {
-    let plan = Plan::read(plan_file)?;
+    let place = |path: &std::path::Path| HostPath::new(path).with_context(|| path.display().to_string());
+    let plan = Plan::read(&place(plan_file)?)?;
+    let look_in = |release: &str| place(&look_in(release)?);
+    let keep = keep.map(place).transpose()?;
+    let keep = keep.as_ref();
     let keys = plan.keys(&|id| extensions.version_of(id));
     let count = plan.ops.len();
     let mut waiting: Vec<usize> = vec![0; count];
@@ -1564,7 +1569,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layer);
         std::fs::create_dir_all(&layer).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
-        let plan_file = layer.with_suffix(&crate::PLAN_SUFFIX);
+        let plan_file = layer.with_suffix(crate::PLAN_SUFFIX);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::NoPlan);
         let plan = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[]}},"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
 {"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
@@ -1622,7 +1627,7 @@ mod tests {
         let layer = crate::testing::scratch("plan-partial");
         let _ = std::fs::remove_dir_all(&layer);
         std::fs::create_dir_all(layer.at("n.node")).unwrap();
-        let plan_file = layer.with_suffix(&crate::PLAN_SUFFIX);
+        let plan_file = layer.with_suffix(crate::PLAN_SUFFIX);
         std::fs::write(&plan_file, &text).unwrap();
         let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
         for name in ["native.bin", "inflated"] {

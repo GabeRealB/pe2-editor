@@ -8,8 +8,8 @@
 //!   (`uid://x#objects`, `uid://x#cells/left`).
 //! - [`VfsPath`]: a path within a scope of the project's filesystem, typed by the kind of scope ([`Tree`], [`Run`],
 //!   [`Given`]), so that one kind's path is not taken for another's.
-//! - [`HostPath`]: a place on disk, for the filesystem's implementations alone: absolute, its links resolved, in the
-//!   plain form the system names it by, so that two of the same place are equal on every system.
+//!
+//! A place on disk is no path of these: the filesystem's implementations keep it (`sfs::HostPath`).
 
 /// A type's serde as its text: written as `Display` writes it, read through its `FromStr`, which checks it.
 #[macro_export]
@@ -31,17 +31,20 @@ macro_rules! serde_as_text {
 }
 
 mod error;
-#[cfg(not(target_family = "wasm"))]
-mod host;
+mod fold;
 mod name;
 mod resource;
-#[cfg(all(feature = "testing", not(target_family = "wasm")))]
-pub mod testing;
 mod vfs;
 
-pub use error::{NotWithin, PathError, Why};
-#[cfg(not(target_family = "wasm"))]
-pub use host::HostPath;
+/// A key and everything after it, as a map of shared paths is ranged over by a borrowed one: `map.range(from(path))`.
+/// (`path..` asks for a sized key, which a path is not.)
+#[must_use]
+pub fn from<T: ?Sized>(start: &T) -> (std::ops::Bound<&T>, std::ops::Bound<&T>) {
+    (std::ops::Bound::Included(start), std::ops::Bound::Unbounded)
+}
+
+pub use error::{PathError, Why};
+pub use fold::{UNICODE_VERSION, folded};
 pub use name::{Name, Names, RelPath};
 pub use resource::{ResourcePath, Uid};
 pub use vfs::{Given, Run, Scope, Tree, VfsPath};

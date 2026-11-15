@@ -1,9 +1,9 @@
 //! Tests extensions carry, run by what they declare.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use super::suite::{self, Out, Suite};
 use super::{Fixture, Scenario};
-use pe2_path::HostPath;
+use sfs::HostPath;
 
 fn of(name: &str) -> Suite {
     suite::built().into_iter().find(|suite| suite.name == name).unwrap_or_else(|| panic!("no suite {name}"))
@@ -28,7 +28,7 @@ fn a_test_failing_says_why() {
     // What the doll's texture is made with is left off.
     let mut suite = of("render");
     suite.declared.disabled.push("pe2.images".to_string());
-    let artifacts = pe2_path::testing::scratch("scenario-failed");
+    let artifacts = sfs::testing::scratch("scenario-failed");
     let out = Out { artifacts: Some(artifacts.clone()), ..Out::default() };
     let report = suite::run(&[suite], &["a_prefab".to_string()], &out);
     assert!(!report.passed());
@@ -58,7 +58,7 @@ fn a_step_that_cannot_be_done_says_so() {
 #[test]
 fn a_folder_holds_a_suite_or_says_it_does_not() {
     let tests = extensions::built_suites().into_iter().next().expect("built with the others");
-    let extension = tests.parent().expect("its extension").clone();
+    let extension = tests.parent().expect("its extension").to_path_buf();
     assert_eq!(suite::in_folders(&[extension]).expect("its tests").len(), 1);
     assert!(suite::in_folders(&[tests.at("data")]).is_err());
 }

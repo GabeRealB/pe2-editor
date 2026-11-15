@@ -16,8 +16,8 @@
 use anyhow::{Context, Result};
 use interprocess::local_socket::Name;
 use interprocess::local_socket::prelude::*;
-use pe2_path::HostPath;
 use serde::{Deserialize, Serialize};
+use sfs::HostPath;
 use std::time::Duration;
 
 use crate::role::{Link, Role};
@@ -106,9 +106,9 @@ pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::
         let path = if path.as_os_str().len() < 100 {
             path
         } else {
-            let name =
-                pe2_path::Name::new(&format!("{prefix}-{}.sock", hashed(root))).map_err(std::io::Error::other)?;
-            HostPath::new(&std::env::temp_dir())?.join(&name)
+            let name = format!("{prefix}-{}.sock", hashed(root));
+            let name = pe2_path::Name::new(&name).map_err(std::io::Error::other)?;
+            HostPath::new(&std::env::temp_dir())?.join(name)
         };
         path.into_path_buf().to_fs_name::<GenericFilePath>()
     }
@@ -180,7 +180,7 @@ pub fn running(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// No host could be started.
-pub fn serving(root: &HostPath, program: &HostPath, args: &[String]) -> Result<(Connection, bool)> {
+pub fn serving(root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<(Connection, bool)> {
     if let Some(mut host) = Connection::connect(root) {
         match host.ask(&ToHost::Status) {
             Ok(FromHost::Status { serves: false, .. }) => {
@@ -195,10 +195,10 @@ pub fn serving(root: &HostPath, program: &HostPath, args: &[String]) -> Result<(
 }
 
 /// The program a host is started as, where this one starts hosts for what is asked of a project (`ensure`).
-static STARTER: std::sync::OnceLock<HostPath> = std::sync::OnceLock::new();
+static STARTER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 /// Start hosts as this program (`pe2-cli`) from now on, where something is asked of a project nothing holds.
-pub fn start_hosts_with(program: HostPath) {
+pub fn start_hosts_with(program: std::path::PathBuf) {
     let _ = STARTER.set(program);
 }
 
@@ -230,7 +230,7 @@ pub fn ensure(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// None runs, and none could be started.
-pub fn stand_by(root: &HostPath, program: &HostPath) -> Result<()> {
+pub fn stand_by(root: &HostPath, program: &std::path::Path) -> Result<()> {
     if Connection::connect(root).is_some() {
         return Ok(());
     }
@@ -275,18 +275,14 @@ pub fn answers(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.
-pub fn start(root: &HostPath, program: &HostPath, args: &[String]) -> Result<Connection> {
+pub fn start(root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<Connection> {
     ROLE.start(root, program, args).map(|link| Connection { link })
 }
 
 /// Where `pe2-cli` is for a program beside it (the editor): in the same folder.
 #[must_use]
-pub fn cli_beside(program: &HostPath) -> HostPath {
-    let cli = pe2_path::Name::new(&format!("pe2-cli{}", std::env::consts::EXE_SUFFIX));
-    match (program.parent(), cli) {
-        (Some(folder), Ok(cli)) => folder.join(&cli),
-        _ => program.clone(),
-    }
+pub fn cli_beside(program: &std::path::Path) -> std::path::PathBuf {
+    program.with_file_name(format!("pe2-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[cfg(test)]

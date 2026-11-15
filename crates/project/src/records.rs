@@ -29,16 +29,18 @@
 //! have them (`Set`), its entries placed through the layers below, read through `content` as a packed layer's are.
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, Name, RelPath, Uid};
+use pe2_path::{Name, RelPath, Uid};
+use sfs::HostPath;
+use std::sync::Arc;
 
 use crate::TreePath;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 /// The folder of a layer's records, in its folder: a name a scan of the layer leaves out.
-pub const DIR: Name = Name::constant(".records");
+pub const DIR: &Name = Name::constant(".records");
 /// The file marking a layer's folder as records: their format, and the layer's settings.
-pub const MARKER: Name = Name::constant("layer.toml");
+pub const MARKER: &Name = Name::constant("layer.toml");
 /// The format of the records this program reads and writes.
 pub const FORMAT: i64 = 1;
 
@@ -81,9 +83,9 @@ pub struct Record {
     pub kind: Kind,
     /// Where it is: its parent's uid (none at the top) and its name - for what the layer creates or moves.
     pub parent: Option<Uid>,
-    pub name: Option<Name>,
+    pub name: Option<Arc<Name>>,
     /// Its files by name; a plain file's own by the root.
-    pub files: BTreeMap<RelPath, File>,
+    pub files: BTreeMap<Arc<RelPath>, File>,
 }
 
 /// Where a layer keeps the extensions it holds - a records layer, or one stored as a tree, whose scan leaves `.records`
@@ -97,11 +99,11 @@ pub struct Record {
 /// kind = "extension"
 /// tree = "<the SHA-1 of its tree>"
 /// ```
-pub const EXTENSIONS: Name = Name::constant("extensions");
+pub const EXTENSIONS: &Name = Name::constant("extensions");
 
 /// An extension's id with what follows it in a file's name.
-fn id_name(id: &str, suffix: &str) -> Result<Name, pe2_path::PathError> {
-    Name::new(&format!("{id}{suffix}"))
+fn id_name(id: &str, suffix: &str) -> Result<Arc<Name>, pe2_path::PathError> {
+    (Name::new(&format!("{id}{suffix}"))).map(ToOwned::to_owned)
 }
 
 /// Where a layer's record of the extension of an id is.
@@ -474,7 +476,8 @@ impl Record {
         let string = |key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_string);
         // Where it is, checked as it is read: a parent that is no uid, a name that is none, is no record.
         let parent = string("parent").map(|text| Uid::new(&text)).transpose().context("its parent")?;
-        let name = string("name").map(|text| Name::new(&text)).transpose().context("its name")?;
+        let name =
+            string("name").map(|text| Name::new(&text).map(ToOwned::to_owned)).transpose().context("its name")?;
         let mut files = BTreeMap::new();
         for (name, file) in table.get("files").and_then(toml::Value::as_table).into_iter().flatten() {
             let file = file.as_table().with_context(|| format!("{name}: not a table"))?;
@@ -488,10 +491,12 @@ impl Record {
                 (None, None) if file.get("removed").and_then(toml::Value::as_bool) == Some(true) => None,
                 _ => bail!("{name}: neither text, a stored file nor removed"),
             };
-            files.insert(
-                RelPath::new(name).with_context(|| format!("its file {name}"))?,
-                File { content, was: field("was") },
-            );
+            let at = RelPath::new(name).with_context(|| format!("its file {name}"))?.to_owned();
+            // Names compare as a system that does not tell case or form apart takes them: two alike are one file.
+            if let Some((other, _)) = files.get_key_value(&*at) {
+                bail!("its files {other} and {name} are one name to a system that does not tell case or form apart");
+            }
+            files.insert(at, File { content, was: field("was") });
         }
         Ok(Record { op, kind, parent, name, files })
     }
@@ -540,15 +545,15 @@ struct View {
     settings: Settings,
     records: Read,
     /// Each file by its path in the layer: its entry's uid and its name in the entry (the root for a plain file).
-    files: BTreeMap<TreePath, (Uid, RelPath)>,
-    folders: std::collections::BTreeSet<TreePath>,
+    files: BTreeMap<Arc<TreePath>, (Uid, Arc<RelPath>)>,
+    folders: std::collections::BTreeSet<Arc<TreePath>>,
     /// Where each of its records' entries is.
-    placed: std::collections::HashMap<Uid, TreePath>,
+    placed: std::collections::HashMap<Uid, Arc<TreePath>>,
     /// Where the entries its records name are - those it makes and those it moves: what the layers above place
     /// theirs through. Shared with each reading that takes this view as it is.
-    named: std::sync::Arc<std::collections::HashMap<Uid, TreePath>>,
+    named: std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>>,
     /// What each folder holds, by its path (the root, the layer's top): each name, and whether it is a folder.
-    children: std::collections::HashMap<TreePath, Vec<(Name, bool)>>,
+    children: std::collections::HashMap<Arc<TreePath>, Vec<(Arc<Name>, bool)>>,
     /// What is wrong with its records: those with no place.
     problems: Vec<String>,
 }
@@ -573,12 +578,13 @@ impl View {
 impl View {
     /// What each folder holds, from the files and folders.
     fn list_children(&mut self) {
-        let mut children: std::collections::HashMap<TreePath, Vec<(Name, bool)>> = std::collections::HashMap::new();
+        let mut children: std::collections::HashMap<Arc<TreePath>, Vec<(Arc<Name>, bool)>> =
+            std::collections::HashMap::new();
         let entries =
             self.folders.iter().map(|folder| (folder, true)).chain(self.files.keys().map(|file| (file, false)));
         for (path, folder) in entries {
             if let (Some(parent), Some(name)) = (path.parent(), path.last()) {
-                children.entry(parent).or_default().push((name, folder));
+                children.entry(parent.to_owned()).or_default().push((name.to_owned(), folder));
             }
         }
         self.children = children;
@@ -598,7 +604,7 @@ pub struct Differences {
     /// and uid: what the project's model is told of.
     pub records: Vec<(HostPath, Uid)>,
     /// For each layer (by folder), where the entries whose records came, went or changed were, and are.
-    pub paths: Vec<(HostPath, BTreeSet<TreePath>)>,
+    pub paths: Vec<(HostPath, BTreeSet<Arc<TreePath>>)>,
     /// Any of them is placed otherwise.
     pub placed: bool,
     /// Any of them is (or was) an override: what it merges is merged again.
@@ -631,9 +637,41 @@ pub struct Set {
 
 static SETS: std::sync::RwLock<Vec<std::sync::Arc<Set>>> = std::sync::RwLock::new(Vec::new());
 
+/// The records placing entries at one name - alike but for case or form, which not every system tells apart - each
+/// said, in order, as a problem of the layer's: to be left out, all of them, whichever was written first.
+fn placed_alike(
+    records: &Read,
+    located: &std::collections::HashMap<Uid, Arc<TreePath>>,
+    layer: &str,
+    problems: &mut Vec<String>,
+) -> std::collections::HashSet<Uid> {
+    let mut placing: std::collections::HashMap<&TreePath, Vec<Uid>> = std::collections::HashMap::new();
+    for (uid, Held { record, .. }) in records {
+        if let (Some(_), Some(at)) = (&record.name, located.get(uid)) {
+            placing.entry(&**at).or_default().push(*uid);
+        }
+    }
+    let (mut alike, mut said) = (std::collections::HashSet::new(), Vec::new());
+    for group in placing.values().filter(|group| group.len() > 1) {
+        for uid in group {
+            let others: Vec<String> = group.iter().filter(|other| *other != uid).map(ToString::to_string).collect();
+            let at = &located[uid];
+            let others = others.join(" and ");
+            said.push(format!(
+                "{layer}: {uid} at {at} is placed at one name with {others} to a system that does not tell case or form \
+                 apart"
+            ));
+            alike.insert(*uid);
+        }
+    }
+    said.sort();
+    problems.extend(said);
+    alike
+}
+
 /// The path of an entry named so in a folder: a node's with `.node`.
-fn joined(parent: Option<&TreePath>, name: &Name, kind: Kind) -> TreePath {
-    let at = parent.cloned().unwrap_or_default().join(name);
+fn joined(parent: Option<&TreePath>, name: &Name, kind: Kind) -> Arc<TreePath> {
+    let at = parent.unwrap_or_default().join(name);
     if kind == Kind::Node { crate::index::bundle_named(&at) } else { at }
 }
 
@@ -641,19 +679,19 @@ fn joined(parent: Option<&TreePath>, name: &Name, kind: Kind) -> TreePath {
 /// the highest that names an entry says where it is. Nothing of them is copied to ask.
 #[derive(Default)]
 struct Below {
-    layers: Vec<std::sync::Arc<std::collections::HashMap<Uid, TreePath>>>,
+    layers: Vec<std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>>>,
 }
 
 impl Below {
     fn get(&self, uid: Uid) -> Option<&TreePath> {
-        self.layers.iter().rev().find_map(|layer| layer.get(&uid))
+        self.layers.iter().rev().find_map(|layer| layer.get(&uid)).map(|path| &**path)
     }
 }
 
 /// Where a tree layer's changeset places the entries it names, kept by its file's stamp: read again only when the
 /// file changed.
-fn tree_places(changeset: &HostPath) -> std::sync::Arc<std::collections::HashMap<Uid, TreePath>> {
-    type Kept = (Option<(std::time::SystemTime, u64)>, std::sync::Arc<std::collections::HashMap<Uid, TreePath>>);
+fn tree_places(changeset: &HostPath) -> std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>> {
+    type Kept = (Option<(std::time::SystemTime, u64)>, std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>>);
     static KEPT: std::sync::Mutex<Vec<(HostPath, Kept)>> = std::sync::Mutex::new(Vec::new());
     let stamp = std::fs::metadata(changeset).ok().and_then(|meta| Some((meta.modified().ok()?, meta.len())));
     let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -669,7 +707,7 @@ fn tree_places(changeset: &HostPath) -> std::sync::Arc<std::collections::HashMap
             places.insert(uid, to);
         }
     }
-    let places: std::sync::Arc<std::collections::HashMap<Uid, TreePath>> =
+    let places: std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>> =
         std::sync::Arc::new(places.into_iter().collect());
     kept.retain(|(path, _)| path != changeset);
     kept.push((changeset.clone(), (stamp, places.clone())));
@@ -682,9 +720,9 @@ fn place(
     uid: Uid,
     records: &Read,
     below: &Below,
-    placed: &mut std::collections::HashMap<Uid, TreePath>,
+    placed: &mut std::collections::HashMap<Uid, Arc<TreePath>>,
     depth: usize,
-) -> Option<TreePath> {
+) -> Option<Arc<TreePath>> {
     if let Some(at) = placed.get(&uid) {
         return Some(at.clone());
     }
@@ -694,9 +732,9 @@ fn place(
                 Some(parent) => Some(place(parent, records, below, placed, depth + 1)?),
                 None => None,
             };
-            joined(parent.as_ref(), record.name.as_ref()?, record.kind)
+            joined(parent.as_deref(), record.name.as_ref()?, record.kind)
         }
-        _ => below.get(uid)?.clone(),
+        _ => below.get(uid)?.to_owned(),
     };
     placed.insert(uid, at.clone());
     Some(at)
@@ -910,13 +948,14 @@ impl Set {
             let mut view = View { settings, ..View::new(layer.path.clone()) };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
-            let mut located: std::collections::HashMap<Uid, TreePath> = std::collections::HashMap::new();
+            let mut located: std::collections::HashMap<Uid, Arc<TreePath>> = std::collections::HashMap::new();
             for uid in records.keys() {
                 if place(*uid, &records, &places, &mut located, 0).is_none() {
                     view.problems.push(format!("{}: {uid} has no place: what it is in is nowhere below", layer.name));
                 }
             }
-            for (uid, Held { record, .. }) in &records {
+            let alike = placed_alike(&records, &located, &layer.name, &mut view.problems);
+            for (uid, Held { record, .. }) in records.iter().filter(|(uid, _)| !alike.contains(*uid)) {
                 let Some(at) = located.get(uid) else { continue };
                 // What it places (creates, moves) is there for the layers above.
                 if record.name.is_some() {
@@ -928,15 +967,15 @@ impl Set {
                 let mut folder = at.parent();
                 while let Some(f) = folder.filter(|f| !f.is_root()) {
                     folder = f.parent();
-                    view.folders.insert(f);
+                    view.folders.insert(f.to_owned());
                 }
                 match record.kind {
                     Kind::Folder => {
                         view.folders.insert(at.clone());
                     }
                     Kind::File => {
-                        if record.files.get(&RelPath::root()).is_some_and(|f| f.content.is_some()) {
-                            view.files.insert(at.clone(), (*uid, RelPath::root()));
+                        if record.files.get(RelPath::root()).is_some_and(|f| f.content.is_some()) {
+                            view.files.insert(at.clone(), (*uid, RelPath::root().to_owned()));
                         }
                     }
                     Kind::Node => {
@@ -946,7 +985,7 @@ impl Set {
                                 view.files.insert(at.join_path(name), (*uid, name.clone()));
                                 let mut folder = name.parent();
                                 while let Some(f) = folder.filter(|f| !f.is_root()) {
-                                    view.folders.insert(at.join_path(&f));
+                                    view.folders.insert(at.join_path(f));
                                     folder = f.parent();
                                 }
                             }
@@ -1097,15 +1136,15 @@ impl Set {
     }
 
     /// The records layer a path is in, and the path within it.
-    fn view_of(path: &HostPath) -> Option<(std::sync::Arc<Set>, usize, TreePath)> {
+    fn view_of(path: &HostPath) -> Option<(std::sync::Arc<Set>, usize, Arc<TreePath>)> {
         let sets = SETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         for set in sets.iter() {
             for (i, view) in set.views.iter().enumerate() {
                 match path.within(&view.dir) {
-                    Ok(rel) => return Some((set.clone(), i, TreePath::from(rel))),
-                    Err(pe2_path::NotWithin::Outside) => {}
+                    Ok(rel) => return Some((set.clone(), i, TreePath::shared(rel))),
+                    Err(sfs::NotWithin::Outside) => {}
                     // In the layer by a name no path takes: none of its records' files, as the index's scan says.
-                    Err(pe2_path::NotWithin::Refused(_)) => return None,
+                    Err(sfs::NotWithin::Refused(_)) => return None,
                 }
             }
         }
@@ -1149,7 +1188,7 @@ impl Set {
 
     /// What a folder of a records layer holds: each name, and whether it is a folder. None for a path in no records layer.
     #[must_use]
-    pub fn list(dir: &HostPath) -> Option<Vec<(Name, bool)>> {
+    pub fn list(dir: &HostPath) -> Option<Vec<(Arc<Name>, bool)>> {
         let (set, i, rel) = Set::view_of(dir)?;
         let view = &set.views[i];
         let out = view.children.get(&rel).cloned().unwrap_or_default();
@@ -1249,7 +1288,7 @@ fn records_of_tree(
     let store = crate::chunks::Store::at(&project.root);
     let below = index.entries_below(layer);
     // Who is where: what the layer places, then what is below it.
-    let mut uid_at: std::collections::HashMap<TreePath, Uid> =
+    let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> =
         below.iter().map(|(path, (uid, _))| (path.clone(), *uid)).collect();
     for (uid, path) in &changeset.entries {
         uid_at.insert(path.clone(), *uid);
@@ -1260,13 +1299,14 @@ fn records_of_tree(
         }
     }
     // Where a path is, as a record says it: its parent's uid (none at the top), and its name - a node's its asset's.
-    let place = |path: &TreePath| -> Result<(Option<Uid>, Name)> {
+    let place = |path: &TreePath| -> Result<(Option<Uid>, Arc<Name>)> {
         let parent = match path.parent().filter(|parent| !parent.is_root()) {
-            Some(parent) => Some(*uid_at.get(&parent).with_context(|| format!("{path}: nothing names {parent}"))?),
+            Some(parent) => Some(*uid_at.get(parent).with_context(|| format!("{path}: nothing names {parent}"))?),
             None => None,
         };
-        let name = crate::index::asset_named(path)?.last().with_context(|| format!("{path}: no name"))?;
-        Ok((parent, name))
+        let asset = crate::index::asset_named(path)?;
+        let name = asset.last().with_context(|| format!("{path}: no name"))?;
+        Ok((parent, name.to_owned()))
     };
     let kind_at = |path: &TreePath| -> Kind {
         if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
@@ -1282,7 +1322,7 @@ fn records_of_tree(
         Content::of(&bytes, &store)
     };
     // A bundle's files, by name, as its folder holds them.
-    let bundle = |path: &TreePath| -> Result<BTreeMap<RelPath, File>> {
+    let bundle = |path: &TreePath| -> Result<BTreeMap<Arc<RelPath>, File>> {
         let mut files = BTreeMap::new();
         let (held, refused) = crate::index::bundle_files(&disk(path));
         // Every file of it is the record's, or none is: one named so no path takes it is renamed first.
@@ -1299,7 +1339,9 @@ fn records_of_tree(
         let kind = kind_at(path);
         let files = match kind {
             Kind::Node => bundle(path)?,
-            Kind::File => BTreeMap::from([(RelPath::root(), File { content: Some(content(&disk(path))?), was: None })]),
+            Kind::File => {
+                BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content(&disk(path))?), was: None })])
+            }
             Kind::Folder => BTreeMap::new(),
         };
         let (parent, name) = place(path)?;
@@ -1347,12 +1389,18 @@ fn records_of_tree(
 ///
 /// # Errors
 /// The tree or its changeset cannot be read, or the records cannot be written.
-pub fn import(project: &crate::Project, cache: &crate::cache::Cache, name: &str, from: &HostPath) -> Result<usize> {
+pub fn import(
+    project: &crate::Project,
+    cache: &crate::cache::Cache,
+    name: &str,
+    from: &std::path::Path,
+) -> Result<usize> {
+    let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
     let layer = project.layer(name)?;
     if layer.mounted || layer.kind == crate::LayerKind::Generated {
         bail!("{name}: a mounted or generated layer is no records layer");
     }
-    let changeset = crate::changeset::Changeset::load(&from.with_suffix(&crate::CHANGESET_SUFFIX))?;
+    let changeset = crate::changeset::Changeset::load(&from.with_suffix(crate::CHANGESET_SUFFIX))?;
     let records = {
         let index = crate::index::Index::open(project, cache)?;
         let disk = |path: &TreePath| from.join(path);
@@ -1399,7 +1447,8 @@ pub fn import(project: &crate::Project, cache: &crate::cache::Cache, name: &str,
 ///
 /// # Errors
 /// The layer is no records layer read, or a file cannot be read or written.
-pub fn export(project: &crate::Project, name: &str, to: &HostPath) -> Result<usize> {
+pub fn export(project: &crate::Project, name: &str, to: &std::path::Path) -> Result<usize> {
+    let to = &HostPath::new(to).with_context(|| to.display().to_string())?;
     let layer = project.layer(name)?;
     Set::open(project)?;
     let mut changeset = Set::changeset(&layer.path).with_context(|| format!("{name} is no records layer"))?;
@@ -1429,7 +1478,7 @@ pub fn export(project: &crate::Project, name: &str, to: &HostPath) -> Result<usi
             std::fs::create_dir_all(&out)?;
         }
     }
-    changeset.save(&to.with_suffix(&crate::CHANGESET_SUFFIX))?;
+    changeset.save(&to.with_suffix(crate::CHANGESET_SUFFIX))?;
     Ok(changeset.entries.len())
 }
 
@@ -1460,13 +1509,13 @@ pub fn records_for(
     layer: &crate::Layer,
     changeset: &crate::changeset::Changeset,
     old: &BTreeMap<Uid, Record>,
-    written: &BTreeMap<TreePath, Option<Vec<u8>>>,
+    written: &BTreeMap<Arc<TreePath>, Option<Vec<u8>>>,
 ) -> Result<(BTreeMap<Uid, Record>, Vec<Uid>)> {
     use crate::changeset::Op as Did;
     let store = crate::chunks::Store::at(&project.root);
     // What the layers below resolve is asked, entry by entry: the layer's own are few beside it.
     let below = index.under(&layer.name);
-    let mut uid_at: std::collections::HashMap<TreePath, Uid> = std::collections::HashMap::new();
+    let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> = std::collections::HashMap::new();
     for (uid, path) in &changeset.entries {
         uid_at.insert(path.clone(), *uid);
     }
@@ -1475,23 +1524,26 @@ pub fn records_for(
             uid_at.insert(to.clone(), *uid);
         }
     }
-    let place = |path: &TreePath| -> Result<(Option<Uid>, Name)> {
+    let place = |path: &TreePath| -> Result<(Option<Uid>, Arc<Name>)> {
         let named = |p: &TreePath| uid_at.get(p).copied().or_else(|| below.at(p).map(|(uid, _)| uid));
         let parent = match path.parent().filter(|parent| !parent.is_root()) {
-            Some(p) => Some(named(&p).with_context(|| format!("{path}: nothing names {p}"))?),
+            Some(p) => Some(named(p).with_context(|| format!("{path}: nothing names {p}"))?),
             None => None,
         };
-        let name = crate::index::asset_named(path)?.last().with_context(|| format!("{path}: no name"))?;
-        Ok((parent, name))
+        let asset = crate::index::asset_named(path)?;
+        let name = asset.last().with_context(|| format!("{path}: no name"))?;
+        Ok((parent, name.to_owned()))
     };
     let mut claimed = std::collections::HashSet::new();
     // What was written of an entry at a path: its files by name, as a node's are inside its folder, a file's itself.
-    let mut written_at = |path: &TreePath, kind: Kind| -> Vec<(RelPath, Option<Vec<u8>>)> {
-        let found: Vec<(RelPath, Option<Vec<u8>>)> = written
+    let mut written_at = |path: &TreePath, kind: Kind| -> Vec<(Arc<RelPath>, Option<Vec<u8>>)> {
+        let found: Vec<(Arc<RelPath>, Option<Vec<u8>>)> = written
             .iter()
             .filter_map(|(at, bytes)| match kind {
-                Kind::Node => at.strip_prefix(path).filter(|name| !name.is_root()).map(|name| (name, bytes.clone())),
-                Kind::File => (at == path).then(|| (RelPath::root(), bytes.clone())),
+                Kind::Node => {
+                    at.strip_prefix(path).filter(|name| !name.is_root()).map(|name| (name.to_owned(), bytes.clone()))
+                }
+                Kind::File => (**at == *path).then(|| (RelPath::root().to_owned(), bytes.clone())),
                 Kind::Folder => None,
             })
             .collect();
@@ -1538,12 +1590,12 @@ pub fn records_for(
                 Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new() }
             }
             Did::Override { files: bases, to } => {
-                let at = to.clone().or_else(|| from.map(|(p, _)| p.clone())).context("an override of nothing")?;
+                let at = to.as_deref().or(from.map(|(p, _)| p)).context("an override of nothing")?.to_owned();
                 let (parent, name) = match to {
                     Some(to) => place(to).map(|(p, n)| (p, Some(n)))?,
                     None => (None, None),
                 };
-                let now: BTreeMap<RelPath, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
+                let now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
                 let held = old.get(uid).filter(|r| r.op == Op::Override).map(|r| &r.files);
                 Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, &store)? }
             }
@@ -1561,11 +1613,11 @@ pub fn records_for(
 /// An override's files in its record: each it holds as written now, else as it held it; each it removes, removed;
 /// each with what it was made from.
 fn override_files(
-    bases: &BTreeMap<RelPath, crate::changeset::Base>,
-    mut now: BTreeMap<RelPath, Option<Vec<u8>>>,
-    held: Option<&BTreeMap<RelPath, File>>,
+    bases: &BTreeMap<Arc<RelPath>, crate::changeset::Base>,
+    mut now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>>,
+    held: Option<&BTreeMap<Arc<RelPath>, File>>,
     store: &crate::chunks::Store,
-) -> Result<BTreeMap<RelPath, File>> {
+) -> Result<BTreeMap<Arc<RelPath>, File>> {
     let mut files = BTreeMap::new();
     for (file, base) in bases {
         let content = if base.removed {
@@ -1585,11 +1637,11 @@ fn override_files(
 /// nor the extensions it holds (`ext::folder::HELD`), which are no entries: held as records of their own
 /// (`hold_extensions`).
 fn of_the_tree(name: &std::ffi::OsStr) -> bool {
-    !name.to_string_lossy().starts_with('.') && *name != crate::ext::folder::HELD
+    !name.to_string_lossy().starts_with('.') && *name != *crate::ext::folder::HELD
 }
 
 /// What a project's index shows, for comparing: each entry by path - its kind, uid, and files by name and SHA-1.
-fn shown(index: &crate::index::Index) -> BTreeMap<TreePath, String> {
+fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
     let mut out = BTreeMap::new();
     for (path, entry) in index.entries.iter() {
         let mut said = format!("{:?} {}", entry.kind, entry.uid);
@@ -1736,6 +1788,21 @@ mod tests {
         let error = Record::parse("format = 2\nop = \"create\"\nkind = \"node\"\n").unwrap_err();
         assert!(error.to_string().contains("newer pe2"), "{error}");
         assert!(Record::parse("op = \"create\"\nkind = \"node\"\n").is_err());
+    }
+
+    #[test]
+    fn a_record_naming_two_files_alike_is_refused() {
+        let text = |a: &str, b: &str| {
+            format!(
+                "format = {}\nop = \"create\"\nkind = \"node\"\nname = \"n\"\n[files.{a:?}]\ntext = \"1\"\n\
+                 [files.{b:?}]\ntext = \"2\"\n",
+                super::FORMAT
+            )
+        };
+        let error = Record::parse(&text("Notes.txt", "notes.txt")).unwrap_err();
+        assert!(error.to_string().contains("one name"), "{error}");
+        assert!(Record::parse(&text("caf\u{e9}.txt", "cafe\u{301}.txt")).is_err());
+        assert_eq!(Record::parse(&text("a.txt", "b.txt")).unwrap().files.len(), 2);
     }
 
     #[test]

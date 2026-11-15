@@ -1,9 +1,9 @@
 //! What is edited from outside the window - through the served folder, the command line, an agent - as the editor
 //! takes it: a step of its history, in the layer edits go to, taken back by undo.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use super::{Fixture, Scenario};
-use pe2_path::HostPath;
+use sfs::HostPath;
 
 /// What a records layer holds: its records' files, by name.
 fn records(scenario: &mut Scenario) -> Vec<String> {
@@ -25,17 +25,22 @@ fn walk(dir: &HostPath) -> Vec<String> {
     out
 }
 
+/// A path of the project a scenario writes.
+fn tree(path: &str) -> std::sync::Arc<project::TreePath> {
+    project::TreePath::new(path).expect("a path").to_owned()
+}
+
 #[test]
 fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
     // A folder made: a record of the layer's, and an entry of the project's.
-    let op = vfs::ops::Op::Folder { path: "made".into() };
+    let op = vfs::ops::Op::Folder { path: tree("made") };
     let (label, _) = editor.workspace().apply_edit(&op, None).expect("made");
     assert!(label.contains("made"), "{label}");
     editor.until("the folder to be taken in", |e| e.workspace().index.entries.contains_key(&super::path("made")));
     assert_eq!(records(&mut editor).len(), 1);
     // The node below overridden: its record says what it was made from.
-    let op = vfs::ops::Op::Override { path: "notes".into() };
+    let op = vfs::ops::Op::Override { path: tree("notes") };
     editor.workspace().apply_edit(&op, None).expect("overridden");
     editor
         .until("the override to be taken in", |e| e.workspace().index.assets[&super::path("notes")].layers.len() == 2);
@@ -57,8 +62,8 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     let root = editor.workspace().project.root.clone();
     let space = project::shared::space(&root).expect("the shared space");
     // What a serving would say due: a folder, one in it, and a removal of what is not there - so already.
-    let folder = |path: &str| vfs::ops::Op::Folder { path: path.into() };
-    let ops = [folder("made"), folder("made/inside"), vfs::ops::Op::Remove { path: "never".into() }];
+    let folder = |path: &str| vfs::ops::Op::Folder { path: tree(path) };
+    let ops = [folder("made"), folder("made/inside"), vfs::ops::Op::Remove { path: tree("never") }];
     let numbers = vfs::due::put(&space, &ops).expect("said due");
     let (reply, answered) = std::sync::mpsc::channel();
     editor.workspace().take_due(&reply);
@@ -90,7 +95,7 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     let root = editor.workspace().project.root.clone();
     let space = project::shared::space(&root).expect("the shared space");
     let outside = editor.workspace().outside();
-    let folder = |path: &str| vfs::ops::Op::Folder { path: path.into() };
+    let folder = |path: &str| vfs::ops::Op::Folder { path: tree(path) };
     let edit =
         |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
     // An edit, and one over the project as the first left it: made by the worker, answered here - no frame is
@@ -131,7 +136,7 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
 #[test]
 fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
-    let kept = editor.workspace().cache_path(&pe2_path::RelPath::constant("editor/layers.toml"));
+    let kept = editor.workspace().cache_path(pe2_path::RelPath::constant("editor/layers.toml"));
     editor.workspace().toggle_lock("top").expect("locked");
     // Written by the worker's thread, aside: there a moment after, with no frame waited for.
     editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
@@ -143,8 +148,8 @@ fn what_the_editor_wrote_is_no_change_of_another_program() {
     let outside = editor.workspace().outside();
     let edit =
         |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
-    assert!(matches!(edit(vfs::ops::Op::Folder { path: "made".into() }), mcp::Reply::Edited { .. }));
-    assert!(matches!(edit(vfs::ops::Op::Override { path: "notes".into() }), mcp::Reply::Edited { .. }));
+    assert!(matches!(edit(vfs::ops::Op::Folder { path: tree("made") }), mcp::Reply::Edited { .. }));
+    assert!(matches!(edit(vfs::ops::Op::Override { path: tree("notes") }), mcp::Reply::Edited { .. }));
     // What watches the layers tells of the files those wrote, a moment after: they are the editor's own.
     let started = std::time::Instant::now();
     while started.elapsed() < std::time::Duration::from_millis(900) {

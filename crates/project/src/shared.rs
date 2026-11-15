@@ -9,10 +9,13 @@
 //! it; a file says where its content lives as the listing does (`Shown::File`), for the server to read it knowing
 //! nothing else of the project.
 
+use crate::TreePath;
 use crate::server::{Delta, Listing, Shown, Source};
-use pe2_path::HostPath;
+use pe2_path::Name;
+use sfs::HostPath;
 use sfs::fs::{self, Bytes, Node, ROOT, SERVED};
 use sfs::space::{Pages, Result, Txn};
+use std::sync::Arc;
 
 /// A folder that is a project node (an asset): its files in it beside what is inside it.
 pub const NODE: u32 = 1;
@@ -43,7 +46,7 @@ const NOT_YET: u32 = NEW | WAITS | JUNK;
 pub const MOVES: usize = 11;
 
 /// The shared space's folder, in the cache's folder of what serving keeps.
-pub const SPACE: pe2_path::Name = pe2_path::Name::constant("space");
+pub const SPACE: &pe2_path::Name = pe2_path::Name::constant("space");
 
 /// The space the processes of the project in `root` share, attached here.
 ///
@@ -160,10 +163,10 @@ pub fn say_each_with(
 ///
 /// # Errors
 /// The shared space cannot take it.
-pub fn moved(txn: &mut Txn<'_>, due: u64, from: &str, to: &str) -> Result<()> {
+pub fn moved(txn: &mut Txn<'_>, due: u64, from: &TreePath, to: &TreePath) -> Result<()> {
     let mut said = Vec::new();
-    text(&mut said, from);
-    text(&mut said, to);
+    text(&mut said, from.as_str());
+    text(&mut said, to.as_str());
     sfs::tree::put(txn, MOVES, &due.to_be_bytes(), &said)
 }
 
@@ -176,8 +179,14 @@ pub fn unmoved(txn: &mut Txn<'_>, due: u64) -> Result<bool> {
     sfs::tree::remove(txn, MOVES, &due.to_be_bytes())
 }
 
+/// A move the project is yet to take: where it was, where it is.
+type Move = (Arc<TreePath>, Arc<TreePath>);
+
+/// A move the project is yet to take as it is said: what it is known by, where it was, where it is.
+pub type Said = (u64, Arc<TreePath>, Arc<TreePath>);
+
 /// The moves the project is yet to take, in the order they were made.
-fn moves(pages: &impl Pages) -> Result<Vec<(String, String)>> {
+fn moves(pages: &impl Pages) -> Result<Vec<Move>> {
     Ok(moves_said(pages)?.into_iter().map(|(_, from, to)| (from, to)).collect())
 }
 
@@ -186,36 +195,41 @@ fn moves(pages: &impl Pages) -> Result<Vec<(String, String)>> {
 ///
 /// # Errors
 /// The shared space is damaged.
-pub fn moves_said(pages: &impl Pages) -> Result<Vec<(u64, String, String)>> {
+pub fn moves_said(pages: &impl Pages) -> Result<Vec<Said>> {
     let mut moves = Vec::new();
     if pages.root(MOVES) == 0 {
         return Ok(moves);
     }
+    let mut torn = false;
     sfs::tree::scan(pages, MOVES, &[], &mut |key, mut said| {
         let due = <[u8; 8]>::try_from(key).map_or(0, u64::from_be_bytes);
-        let mut text = || {
+        let mut path = || {
             let len = usize::try_from(u32::from_le_bytes(said.get(..4)?.try_into().ok()?)).ok()?;
-            let text = std::str::from_utf8(said.get(4..4 + len)?).ok()?.to_owned();
+            let path = TreePath::new(std::str::from_utf8(said.get(4..4 + len)?).ok()?).ok()?.to_owned();
             said = &said[4 + len..];
-            Some(text)
+            Some(path)
         };
-        if let (Some(from), Some(to)) = (text(), text()) {
-            moves.push((due, from, to));
+        match (path(), path()) {
+            (Some(from), Some(to)) => moves.push((due, from, to)),
+            _ => torn = true,
         }
-        true
+        !torn
     })?;
+    if torn {
+        return Err(pages.damaged("a move made through the folder is not whole".into()));
+    }
     Ok(moves)
 }
 
 /// A path as the project has it, where it is in what is served: through the moves the project is yet to take.
-fn through(moves: &[(String, String)], path: &str) -> String {
-    let mut path = std::borrow::Cow::Borrowed(path);
+fn through(moves: &[Move], path: &Arc<TreePath>) -> Arc<TreePath> {
+    let mut path = path.clone();
     for (from, to) in moves {
-        if let Some(rest) = path.strip_prefix(from.as_str()).filter(|rest| rest.is_empty() || rest.starts_with('/')) {
-            path = std::borrow::Cow::Owned(format!("{to}{rest}"));
+        if let Some(rest) = path.strip_prefix(from) {
+            path = to.join_path(rest);
         }
     }
-    path.into_owned()
+    path
 }
 
 fn nanos((secs, nanos): (u64, u32)) -> u64 {
@@ -273,18 +287,29 @@ pub fn placed(said: &[u8]) -> Option<(HostPath, Source)> {
     Some((disk, source))
 }
 
-fn above(path: &str) -> (&str, &str) {
-    path.rsplit_once('/').unwrap_or(("", path))
+/// The folder a path is in, and its name there; none of the root, which no listing holds.
+fn above(path: &TreePath) -> Option<(&TreePath, &Name)> {
+    Some((path.parent()?, path.last()?))
 }
 
 /// The folder the path before was in: paths are said in order, and the next is mostly in the same. None after
 /// anything was taken away.
-type Last = Option<(String, u64)>;
+type Last = Option<(Arc<TreePath>, u64)>;
+
+/// What a folder has under a name, written as the name is: renamed to it where it is written otherwise there (the
+/// project renamed it to another way of writing its name). None where it has nothing of that name.
+fn written_as(txn: &mut Txn<'_>, at: u64, name: &Name) -> Result<Option<u64>> {
+    let Some((written, number)) = fs::entry(txn, SERVED, at, name)? else { return Ok(None) };
+    if written.as_str() != name.as_str() {
+        fs::rename(txn, SERVED, number, at, name, HOLDER)?;
+    }
+    Ok(Some(number))
+}
 
 /// The folder a folder has under a name, made where there is none - of a node's files, where it is made for one.
 /// What a file holds the place of gives way.
-fn folder_in(txn: &mut Txn<'_>, at: u64, name: &str, of_files: bool, last: &mut Last) -> Result<u64> {
-    match (fs::lookup(txn, SERVED, at, name)?, of_files) {
+fn folder_in(txn: &mut Txn<'_>, at: u64, name: &Name, of_files: bool, last: &mut Last) -> Result<u64> {
+    match (written_as(txn, at, name)?, of_files) {
         (Some(there), _) if fs::node(txn, SERVED, there)?.is_some_and(|node| node.folder) => {
             // One made through the folder, in a node: what a file of the node's was written in it makes it.
             if of_files && let Some(node) = fs::node(txn, SERVED, there)?.filter(|node| node.flags & NOT_YET != 0) {
@@ -299,16 +324,17 @@ fn folder_in(txn: &mut Txn<'_>, at: u64, name: &str, of_files: bool, last: &mut 
         (None, _) => {}
     }
     let flags = if of_files { OF_FILES } else { 0 };
-    fs::make(txn, SERVED, &Node { folder: true, flags, parent: at, name: name.to_owned(), ..Node::default() }, HOLDER)
+    let folder = Node { folder: true, flags, parent: at, name: Some(name.to_owned()), ..Node::default() };
+    fs::make(txn, SERVED, &folder, HOLDER)
 }
 
 /// The folder at a path, made with those above it where there is none.
-fn folder(txn: &mut Txn<'_>, path: &str, of_files: bool, last: &mut Last) -> Result<u64> {
-    if let Some((_, number)) = last.as_ref().filter(|(at, _)| at == path) {
+fn folder(txn: &mut Txn<'_>, path: &TreePath, of_files: bool, last: &mut Last) -> Result<u64> {
+    if let Some((_, number)) = last.as_ref().filter(|(at, _)| at.as_str() == path.as_str()) {
         return Ok(*number);
     }
     let mut at = ROOT;
-    for name in path.split('/').filter(|name| !name.is_empty()) {
+    for name in path.parts() {
         at = folder_in(txn, at, name, of_files, last)?;
     }
     *last = Some((path.to_owned(), at));
@@ -339,11 +365,11 @@ fn prune(txn: &mut Txn<'_>, mut at: u64) -> Result<()> {
 
 /// A path is listed no more: a file goes; a folder goes where nothing is in it, and is otherwise what the files
 /// still in it made - each of which the listing says for itself, shown or gone.
-fn gone(txn: &mut Txn<'_>, path: &str, last: &mut Last) -> Result<()> {
-    let (folder_path, name) = above(path);
-    let parent = match last.as_ref().filter(|(at, _)| at == folder_path) {
+fn gone(txn: &mut Txn<'_>, path: &TreePath, last: &mut Last) -> Result<()> {
+    let Some((folder_path, name)) = above(path) else { return Ok(()) };
+    let parent = match last.as_ref().filter(|(at, _)| **at == *folder_path) {
         Some((_, number)) => Some(*number),
-        None => fs::at(txn, SERVED, folder_path)?,
+        None => fs::at(txn, SERVED, folder_path.rel())?,
     };
     let Some(parent) = parent else { return Ok(()) };
     let Some(number) = fs::lookup(txn, SERVED, parent, name)? else { return Ok(()) };
@@ -368,11 +394,11 @@ fn gone(txn: &mut Txn<'_>, path: &str, last: &mut Last) -> Result<()> {
     Ok(())
 }
 
-/// A path is listed, anew or otherwise than it was.
-fn shown(txn: &mut Txn<'_>, path: &str, shown: &Shown, now: u64, last: &mut Last) -> Result<()> {
+/// A path is listed, anew or otherwise than it was - or written otherwise.
+fn shown(txn: &mut Txn<'_>, path: &TreePath, shown: &Shown, now: u64, last: &mut Last) -> Result<()> {
+    let Some((folder_path, name)) = above(path) else { return Ok(()) };
     match shown {
         Shown::Folder | Shown::Node => {
-            let (folder_path, name) = above(path);
             let parent = folder(txn, folder_path, false, last)?;
             let number = folder_in(txn, parent, name, false, last)?;
             let flags = if matches!(shown, Shown::Node) { NODE } else { 0 };
@@ -384,7 +410,6 @@ fn shown(txn: &mut Txn<'_>, path: &str, shown: &Shown, now: u64, last: &mut Last
             }
         }
         Shown::File { disk, size, modified, of_files, source } => {
-            let (folder_path, name) = above(path);
             let parent = folder(txn, folder_path, *of_files, last)?;
             let bytes = Bytes::Derived(place(disk, source));
             let flags = if *of_files { OF_FILES } else { 0 };
@@ -393,11 +418,11 @@ fn shown(txn: &mut Txn<'_>, path: &str, shown: &Shown, now: u64, last: &mut Last
                 len: *size,
                 modified: nanos(*modified),
                 parent,
-                name: name.to_owned(),
+                name: Some(name.to_owned()),
                 bytes,
                 ..Node::default()
             };
-            match fs::lookup(txn, SERVED, parent, name)? {
+            match written_as(txn, parent, name)? {
                 Some(number) => match fs::node(txn, SERVED, number)? {
                     Some(was) if !was.folder => {
                         // A second on at least, where it changed and its time did not go on: what polls compares
@@ -440,10 +465,10 @@ pub fn show(txn: &mut Txn<'_>, delta: &Delta, now: u64) -> Result<()> {
     if moves.is_empty() {
         return show_there(txn, delta, now);
     }
-    let there = Delta {
-        shown: delta.shown.iter().map(|(path, it)| (through(&moves, path), it.clone())).collect(),
-        gone: delta.gone.iter().map(|path| through(&moves, path)).collect(),
-    };
+    let mut there = Delta { gone: delta.gone.iter().map(|path| through(&moves, path)).collect(), ..Delta::default() };
+    for (path, it) in &delta.shown {
+        crate::server::put(&mut there.shown, &through(&moves, path), it);
+    }
     show_there(txn, &there, now)
 }
 
@@ -474,7 +499,10 @@ pub fn show_whole(txn: &mut Txn<'_>, listing: &Listing, now: u64) -> Result<()> 
     if moves.is_empty() {
         return show_there(txn, &Delta::between(&held, listing), now);
     }
-    let there: Listing = listing.iter().map(|(path, it)| (through(&moves, path), it.clone())).collect();
+    let mut there = Listing::new();
+    for (path, it) in listing {
+        crate::server::put(&mut there, &through(&moves, path), it);
+    }
     show_there(txn, &Delta::between(&held, &there), now)
 }
 
@@ -504,12 +532,12 @@ fn entry(node: &Node) -> Option<Shown> {
 /// The shared space is damaged.
 pub fn listed(pages: &impl Pages) -> Result<Listing> {
     let mut listing = Listing::new();
-    under(pages, ROOT, "", &mut |path, shown| drop(listing.insert(path, shown)))?;
+    under(pages, ROOT, TreePath::root(), &mut |path, shown| drop(listing.insert(path, shown)))?;
     Ok(listing)
 }
 
 /// Each entry under a folder of the shared filesystem, by its path.
-fn under(pages: &impl Pages, folder: u64, path: &str, each: &mut dyn FnMut(String, Shown)) -> Result<()> {
+fn under(pages: &impl Pages, folder: u64, path: &TreePath, each: &mut dyn FnMut(Arc<TreePath>, Shown)) -> Result<()> {
     let mut folders = vec![(folder, path.to_owned())];
     while let Some((number, path)) = folders.pop() {
         let mut inside = Vec::new();
@@ -519,7 +547,7 @@ fn under(pages: &impl Pages, folder: u64, path: &str, each: &mut dyn FnMut(Strin
         })?;
         for (name, number) in inside {
             let Some(node) = fs::node(pages, SERVED, number)? else { continue };
-            let path = if path.is_empty() { name } else { format!("{path}/{name}") };
+            let path = path.join(&name);
             if let Some(shown) = entry(&node) {
                 each(path.clone(), shown);
             }
@@ -529,6 +557,11 @@ fn under(pages: &impl Pages, folder: u64, path: &str, each: &mut dyn FnMut(Strin
         }
     }
     Ok(())
+}
+
+/// The path of what has a number in what is served; none where nothing has it.
+fn served_path(pages: &impl Pages, number: u64) -> Result<Option<Arc<TreePath>>> {
+    Ok(fs::path(pages, SERVED, number)?.map(TreePath::shared))
 }
 
 /// What differs of what is served from a listing of it read at an earlier commit, by what the commits after that
@@ -546,14 +579,14 @@ pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Opti
         return Ok(None);
     }
     let mut delta = Delta::default();
-    let join = |folder: &str, name: &str| if folder.is_empty() { name.to_owned() } else { format!("{folder}/{name}") };
-    // A path is listed no more, with what the listing - and what was shown since - has under it.
-    let gone = |delta: &mut Delta, path: &str| {
-        let inside = format!("{path}/");
-        let listed = listing.range(inside.clone()..).take_while(|(under, _)| under.starts_with(&inside));
+    // A path is listed no more, with what the listing - and what was shown since - has under it: paths order name by
+    // name, so what is under one follows it.
+    let gone = |delta: &mut Delta, path: &Arc<TreePath>| {
+        let listed =
+            listing.range::<TreePath, _>(pe2_path::from(&**path)).take_while(|(under, _)| under.starts_with(path));
         delta.gone.extend(listed.map(|(under, _)| under.clone()));
-        delta.gone.insert(path.to_owned());
-        delta.shown.retain(|shown, _| shown != path && !shown.starts_with(&inside));
+        delta.gone.insert(path.clone());
+        delta.shown.retain(|shown, _| !shown.starts_with(path));
     };
     for change in since {
         let now = match change.what {
@@ -561,60 +594,78 @@ pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Opti
             fs::What::Made | fs::What::Changed | fs::What::Moved { .. } => fs::node(pages, SERVED, change.number)?,
         };
         if let fs::What::Moved { from, was } = &change.what
-            && let Some(folder) = fs::path(pages, SERVED, *from)?
+            && let Some(folder) = served_path(pages, *from)?
         {
-            gone(&mut delta, &join(&folder, was));
+            gone(&mut delta, &folder.join(was));
         }
         // Where it is now - or, gone, was: what is gone with the folder it was in is said by that folder's going.
-        let Some(folder) = fs::path(pages, SERVED, now.as_ref().map_or(change.parent, |node| node.parent))? else {
+        let Some(folder) = served_path(pages, now.as_ref().map_or(change.parent, |node| node.parent))? else {
             continue;
         };
         let Some(node) = now else {
-            gone(&mut delta, &join(&folder, &change.name));
+            if let Some(name) = &change.name {
+                gone(&mut delta, &folder.join(name));
+            }
             continue;
         };
-        let path = join(&folder, &node.name);
+        let Some(name) = &node.name else { continue };
+        let path = folder.join(name);
         match entry(&node) {
             Some(shown) => {
-                delta.gone.remove(&path);
+                delta.gone.remove(&*path);
                 if matches!(change.what, fs::What::Moved { .. }) && node.folder {
                     under(pages, change.number, &path, &mut |path, shown| {
-                        delta.gone.remove(&path);
-                        delta.shown.insert(path, shown);
+                        delta.gone.remove(&*path);
+                        crate::server::put(&mut delta.shown, &path, &shown);
                     })?;
                 }
-                delta.shown.insert(path, shown);
+                crate::server::put(&mut delta.shown, &path, &shown);
             }
             // An entry no more, but there for the files still in it: those are shown as they are, after it went.
-            None if listing.contains_key(&path) || delta.shown.contains_key(&path) => {
+            None if listing.contains_key(&*path) || delta.shown.contains_key(&*path) => {
                 gone(&mut delta, &path);
                 under(pages, change.number, &path, &mut |path, shown| {
-                    delta.gone.remove(&path);
-                    delta.shown.insert(path, shown);
+                    delta.gone.remove(&*path);
+                    crate::server::put(&mut delta.shown, &path, &shown);
                 })?;
             }
             None => {}
         }
     }
-    // What is as the listing has it already is no change - but where it, or a folder above it, went first.
-    let went = |path: &str| {
-        let mut at = Some(path);
-        std::iter::from_fn(|| {
-            let now = at?;
-            at = now.rsplit_once('/').map(|(above, _)| above);
-            Some(now)
-        })
-        .any(|path| delta.gone.contains(path))
+    // What is as the listing has it already - written alike - is no change; but where it, or a folder above it, went
+    // first.
+    let went = |path: &TreePath| {
+        std::iter::successors(Some(path), |path| path.parent().filter(|above| !above.is_root()))
+            .any(|path| delta.gone.contains(path))
     };
-    delta.shown.retain(|path, shown| went(path) || listing.get(path) != Some(&*shown));
+    delta.shown.retain(|path, shown| {
+        went(path)
+            || listing.get_key_value(&**path).is_none_or(|(was, it)| it != shown || was.as_str() != path.as_str())
+    });
     Ok(Some(delta))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pe2_path::HostPath;
+    use pe2_path::RelPath;
+    use sfs::HostPath;
     use sfs::Space;
+
+    /// A path of the project a test writes.
+    fn t(path: &str) -> Arc<TreePath> {
+        TreePath::new(path).unwrap().to_owned()
+    }
+
+    /// A path in what is served, as a test writes it.
+    fn r(path: &str) -> &RelPath {
+        RelPath::new(path).unwrap()
+    }
+
+    /// A name a test writes.
+    fn n(name: &str) -> &Name {
+        Name::new(name).unwrap()
+    }
 
     fn file(size: u64, at: u64, of_files: bool, source: Source) -> Shown {
         let disk = HostPath::new(&std::env::temp_dir()).unwrap().join(&pe2_path::RelPath::constant("layers/game/x"));
@@ -624,16 +675,16 @@ mod tests {
     /// A project of two folders, a file in each.
     fn small() -> Listing {
         Listing::from([
-            ("rooms".to_owned(), Shown::Folder),
-            ("rooms/a.txt".to_owned(), file(1, 10, false, Source::Disk)),
-            ("props".to_owned(), Shown::Folder),
-            ("props/b.txt".to_owned(), file(2, 10, false, Source::Disk)),
+            (t("rooms"), Shown::Folder),
+            (t("rooms/a.txt"), file(1, 10, false, Source::Disk)),
+            (t("props"), Shown::Folder),
+            (t("props/b.txt"), file(2, 10, false, Source::Disk)),
         ])
     }
 
     fn flags_at(space: &Space, path: &str) -> Option<u32> {
         let pages = space.read().unwrap();
-        let number = fs::at(&pages, SERVED, path).unwrap()?;
+        let number = fs::at(&pages, SERVED, r(path)).unwrap()?;
         fs::node(&pages, SERVED, number).unwrap().map(|node| node.flags)
     }
 
@@ -644,9 +695,14 @@ mod tests {
         say_whole(&space, &before).unwrap();
         // Whoever serves the folder makes a folder in it, and one in that, a program having asked.
         let mut txn = space.write().unwrap();
-        let rooms = fs::at(&txn, SERVED, "rooms").unwrap().unwrap();
-        let folder =
-            |parent: u64, name: &str| Node { folder: true, flags: NEW, parent, name: name.into(), ..Node::default() };
+        let rooms = fs::at(&txn, SERVED, r("rooms")).unwrap().unwrap();
+        let folder = |parent: u64, name: &str| Node {
+            folder: true,
+            flags: NEW,
+            parent,
+            name: Some(n(name).to_owned()),
+            ..Node::default()
+        };
         let made = fs::make(&mut txn, SERVED, &folder(rooms, "made"), SERVER).unwrap();
         fs::make(&mut txn, SERVED, &folder(made, "inside"), SERVER).unwrap();
         let seen = txn.generation();
@@ -660,15 +716,15 @@ mod tests {
         // Said whole again, or a path beside it said gone, it stays; said gone itself - which the project never had
         // - it stays too.
         say_whole(&space, &before).unwrap();
-        say(&space, &Delta { gone: ["rooms/made".to_owned()].into(), ..Delta::default() }).unwrap();
+        say(&space, &Delta { gone: [t("rooms/made")].into(), ..Delta::default() }).unwrap();
         assert_eq!(flags_at(&space, "rooms/made/inside"), Some(NEW));
         // The project has the first: listed from then on, as the node it was made as; the one in it not yet.
         let mut now = before.clone();
-        now.insert("rooms/made".to_owned(), Shown::Folder);
+        now.insert(t("rooms/made"), Shown::Folder);
         say(&space, &Delta::between(&before, &now)).unwrap();
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         assert_eq!(
-            fs::at(&space.read().unwrap(), SERVED, "rooms/made").unwrap(),
+            fs::at(&space.read().unwrap(), SERVED, r("rooms/made")).unwrap(),
             Some(made),
             "under the number it had"
         );
@@ -681,19 +737,19 @@ mod tests {
         let before = small();
         say_whole(&space, &before).unwrap();
         let mut txn = space.write().unwrap();
-        let number = fs::at(&txn, SERVED, "rooms/a.txt").unwrap().unwrap();
+        let number = fs::at(&txn, SERVED, r("rooms/a.txt")).unwrap().unwrap();
         let node = fs::node(&txn, SERVED, number).unwrap().unwrap();
         fs::set(&mut txn, SERVED, number, &Node { flags: node.flags | GONE, ..node }, SERVER).unwrap();
         txn.commit().unwrap();
         assert_eq!(listed(&space.read().unwrap()).unwrap(), before, "the project has it still");
         // The project changes it: removed through the folder all the same.
         let mut now = before.clone();
-        now.insert("rooms/a.txt".to_owned(), file(5, 20, false, Source::Disk));
+        now.insert(t("rooms/a.txt"), file(5, 20, false, Source::Disk));
         say(&space, &Delta::between(&before, &now)).unwrap();
         assert_eq!(flags_at(&space, "rooms/a.txt"), Some(GONE));
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         // The project takes the removal: gone.
-        say(&space, &Delta { gone: ["rooms/a.txt".to_owned()].into(), ..Delta::default() }).unwrap();
+        say(&space, &Delta { gone: [t("rooms/a.txt")].into(), ..Delta::default() }).unwrap();
         assert_eq!(flags_at(&space, "rooms/a.txt"), None);
     }
 
@@ -704,36 +760,39 @@ mod tests {
         say_whole(&space, &before).unwrap();
         // A program renames a folder; whoever serves it moves it at once, and says the project is yet to.
         let mut txn = space.write().unwrap();
-        let rooms = fs::at(&txn, SERVED, "rooms").unwrap().unwrap();
-        fs::rename(&mut txn, SERVED, rooms, fs::ROOT, "halls", SERVER).unwrap();
-        moved(&mut txn, 7, "rooms", "halls").unwrap();
+        let rooms = fs::at(&txn, SERVED, r("rooms")).unwrap().unwrap();
+        fs::rename(&mut txn, SERVED, rooms, fs::ROOT, n("halls"), SERVER).unwrap();
+        moved(&mut txn, 7, &t("rooms"), &t("halls")).unwrap();
         txn.commit().unwrap();
-        let there = |space: &Space| listed(&space.read().unwrap()).unwrap().into_keys().collect::<Vec<_>>();
+        let there = |space: &Space| {
+            listed(&space.read().unwrap()).unwrap().into_keys().map(|path| path.to_string()).collect::<Vec<_>>()
+        };
         assert_eq!(there(&space), ["halls", "halls/a.txt", "props", "props/b.txt"]);
         // The project, which has it where it was, says its file changed and another came beside it: said where
         // they are now. Said whole, nothing comes back where it was.
         let mut now = before.clone();
-        now.insert("rooms/a.txt".to_owned(), file(5, 20, false, Source::Disk));
-        now.insert("rooms/c.txt".to_owned(), file(3, 20, false, Source::Disk));
+        now.insert(t("rooms/a.txt"), file(5, 20, false, Source::Disk));
+        now.insert(t("rooms/c.txt"), file(3, 20, false, Source::Disk));
         say(&space, &Delta::between(&before, &now)).unwrap();
         say_whole(&space, &now).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         let pages = space.read().unwrap();
-        let a =
-            fs::at(&pages, SERVED, "halls/a.txt").unwrap().and_then(|number| fs::node(&pages, SERVED, number).unwrap());
+        let a = fs::at(&pages, SERVED, r("halls/a.txt"))
+            .unwrap()
+            .and_then(|number| fs::node(&pages, SERVED, number).unwrap());
         assert_eq!(a.map(|node| node.len), Some(5));
         drop(pages);
         // The project takes the move, and says so in the commit that says what it serves after it: where it was
         // gone, where it is shown - and nothing of what is there taken away for it.
         let moved_listing: Listing =
-            now.iter().map(|(path, it)| (path.replacen("rooms", "halls", 1), it.clone())).collect();
+            now.iter().map(|(path, it)| (t(&path.as_str().replacen("rooms", "halls", 1)), it.clone())).collect();
         say_with(&space, &Delta::between(&now, &moved_listing), &mut |txn| unmoved(txn, 7).map(drop)).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         assert_eq!(listed(&space.read().unwrap()).unwrap(), moved_listing);
-        assert_eq!(fs::at(&space.read().unwrap(), SERVED, "halls").unwrap(), Some(rooms), "the folder it was");
+        assert_eq!(fs::at(&space.read().unwrap(), SERVED, r("halls")).unwrap(), Some(rooms), "the folder it was");
         // From then on its paths are the project's own again.
         let mut last = moved_listing.clone();
-        last.insert("rooms".to_owned(), Shown::Folder);
+        last.insert(t("rooms"), Shown::Folder);
         say(&space, &Delta::between(&moved_listing, &last)).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt", "rooms"]);
     }
@@ -745,14 +804,14 @@ mod tests {
         let stored =
             Source::Stored { sha1: "da39a3ee".into(), store: layers.join(&pe2_path::Name::constant(".store")) };
         Listing::from([
-            ("rooms".to_owned(), Shown::Folder),
-            ("rooms/patio".to_owned(), Shown::Node),
-            ("rooms/patio/node.toml".to_owned(), file(12, 100, true, record)),
-            ("rooms/patio/glyphs/a.glif".to_owned(), file(30, 100, true, Source::Disk)),
-            ("rooms/patio/glyphs/b.glif".to_owned(), file(31, 100, true, stored)),
-            ("rooms/patio/props".to_owned(), Shown::Folder),
-            ("rooms/patio/props/lamp".to_owned(), Shown::Node),
-            ("readme.txt".to_owned(), file(5, 100, false, Source::Disk)),
+            (t("rooms"), Shown::Folder),
+            (t("rooms/patio"), Shown::Node),
+            (t("rooms/patio/node.toml"), file(12, 100, true, record)),
+            (t("rooms/patio/glyphs/a.glif"), file(30, 100, true, Source::Disk)),
+            (t("rooms/patio/glyphs/b.glif"), file(31, 100, true, stored)),
+            (t("rooms/patio/props"), Shown::Folder),
+            (t("rooms/patio/props/lamp"), Shown::Node),
+            (t("readme.txt"), file(5, 100, false, Source::Disk)),
         ])
     }
 
@@ -770,11 +829,32 @@ mod tests {
         let delta = changed(&read, seen, &follows).unwrap().expect("the changes are kept");
         // As the server's tree takes it: what is gone goes with what is under it, then what is shown is put.
         for path in &delta.gone {
-            let inside = format!("{path}/");
-            follows.retain(|under, _| under != path && !under.starts_with(&inside));
+            follows.retain(|under, _| !under.starts_with(path));
         }
-        follows.extend(delta.shown.clone());
-        assert_eq!(follows, listed(&read).unwrap(), "followed by change: {delta:?}");
+        for (path, shown) in &delta.shown {
+            crate::server::put(&mut follows, path, shown);
+        }
+        // Each path written as it is served, too: a listing compares paths by their names' folds.
+        let written =
+            |listing: &Listing| listing.iter().map(|(path, it)| (path.to_string(), it.clone())).collect::<Vec<_>>();
+        assert_eq!(written(&follows), written(&listed(&read).unwrap()), "followed by change: {delta:?}");
+    }
+
+    #[test]
+    fn an_entry_the_project_writes_otherwise_is_renamed_where_it_is() {
+        let space = Space::private().unwrap();
+        let before = small();
+        told(&space, &Listing::new(), &before, 0);
+        let rooms = fs::at(&space.read().unwrap(), SERVED, r("rooms")).unwrap();
+        // The project renames it to another way of writing its name: one key in the listing, written anew.
+        let mut now = before.clone();
+        crate::server::put(&mut now, &t("Rooms"), &Shown::Folder);
+        assert_eq!(Delta::between(&before, &now).shown.keys().map(|p| p.as_str()).collect::<Vec<_>>(), ["Rooms"]);
+        told(&space, &before, &now, 0);
+        let read = space.read().unwrap();
+        let written: Vec<String> = listed(&read).unwrap().into_keys().map(|path| path.to_string()).collect();
+        assert_eq!(written, ["props", "props/b.txt", "Rooms", "Rooms/a.txt"]);
+        assert_eq!(fs::at(&read, SERVED, r("ROOMS")).unwrap(), rooms, "the folder it was, found however written");
     }
 
     #[test]
@@ -786,7 +866,7 @@ mod tests {
         let read = space.read().unwrap();
         assert_eq!(listed(&read).unwrap(), listing());
         // The folder a node's files made is there, and no entry.
-        let glyphs = fs::at(&read, SERVED, "rooms/patio/glyphs").unwrap().unwrap();
+        let glyphs = fs::at(&read, SERVED, r("rooms/patio/glyphs")).unwrap().unwrap();
         assert_eq!(fs::node(&read, SERVED, glyphs).unwrap().unwrap().flags, OF_FILES);
         drop(read);
         // Said again where all of it is held: nothing changes.
@@ -797,8 +877,8 @@ mod tests {
         assert_eq!(space.usage().unwrap().generation, before);
         // Said whole where something else is held: brought to it.
         let mut other = listing();
-        other.remove("readme.txt");
-        other.insert("rooms/yard".into(), Shown::Node);
+        other.remove(&*t("readme.txt"));
+        other.insert(t("rooms/yard"), Shown::Node);
         let mut txn = space.write().unwrap();
         show_whole(&mut txn, &other, 0).unwrap();
         txn.commit().unwrap();
@@ -812,35 +892,35 @@ mod tests {
         told(&space, &Listing::new(), &now, 0);
         // An entry of the folder's name comes: an entry now, with the files still in it.
         let mut next = now.clone();
-        next.insert("rooms/patio/glyphs".into(), Shown::Folder);
+        next.insert(t("rooms/patio/glyphs"), Shown::Folder);
         told(&space, &now, &next, 0);
         now = next;
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         // And goes: the files' own again.
         let mut next = now.clone();
-        next.remove("rooms/patio/glyphs");
+        next.remove(&*t("rooms/patio/glyphs"));
         told(&space, &now, &next, 0);
         now = next;
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         // The files go, one and then the other: the folder with the last.
         for name in ["rooms/patio/glyphs/a.glif", "rooms/patio/glyphs/b.glif"] {
-            assert!(fs::at(&space.read().unwrap(), SERVED, "rooms/patio/glyphs").unwrap().is_some());
+            assert!(fs::at(&space.read().unwrap(), SERVED, r("rooms/patio/glyphs")).unwrap().is_some());
             let mut next = now.clone();
-            next.remove(name);
+            next.remove(&*t(name));
             told(&space, &now, &next, 0);
             now = next;
         }
         let read = space.read().unwrap();
-        assert_eq!(fs::at(&read, SERVED, "rooms/patio/glyphs").unwrap(), None);
+        assert_eq!(fs::at(&read, SERVED, r("rooms/patio/glyphs")).unwrap(), None);
         assert_eq!(listed(&read).unwrap(), now);
         drop(read);
         // A node gone with all in it; a file where a folder was, and a folder where a file was.
         let mut next = now.clone();
-        next.retain(|path, _| !path.starts_with("rooms/patio"));
-        next.insert("rooms/patio".into(), file(1, 100, false, Source::Disk));
-        next.remove("readme.txt");
-        next.insert("readme.txt".into(), Shown::Folder);
-        next.insert("readme.txt/inside".into(), file(2, 100, false, Source::Disk));
+        next.retain(|path, _| !path.starts_with(&t("rooms/patio")));
+        next.insert(t("rooms/patio"), file(1, 100, false, Source::Disk));
+        next.remove(&*t("readme.txt"));
+        next.insert(t("readme.txt"), Shown::Folder);
+        next.insert(t("readme.txt/inside"), file(2, 100, false, Source::Disk));
         told(&space, &now, &next, 0);
         assert_eq!(listed(&space.read().unwrap()).unwrap(), next);
     }
@@ -877,7 +957,7 @@ mod tests {
             let changed = changed.elapsed();
             let added = std::time::Instant::now();
             for n in 0..100 {
-                let new = format!("zz_bench/file-{n}.txt");
+                let new = t(&format!("zz_bench/file-{n}.txt"));
                 say(&space, &Delta { shown: [(new.clone(), shown.clone())].into(), gone: [].into() }).unwrap();
                 say(&space, &Delta { shown: [].into(), gone: [new].into() }).unwrap();
             }
@@ -902,25 +982,25 @@ mod tests {
     #[test]
     fn a_files_time_never_goes_back_and_its_version_goes_up_with_it() {
         let space = Space::private().unwrap();
-        let mut now = Listing::from([("a.txt".to_owned(), file(5, 100, false, Source::Disk))]);
+        let mut now = Listing::from([(t("a.txt"), file(5, 100, false, Source::Disk))]);
         told(&space, &Listing::new(), &now, 0);
         let node = |space: &Space| {
             let read = space.read().unwrap();
-            let number = fs::at(&read, SERVED, "a.txt").unwrap().unwrap();
+            let number = fs::at(&read, SERVED, r("a.txt")).unwrap().unwrap();
             (number, fs::node(&read, SERVED, number).unwrap().unwrap())
         };
         let (number, first) = node(&space);
         assert_eq!((first.modified, first.version, first.len), (100_000_000_000, 0, 5));
         // Changed, its time said the same: a second on at least - the time it is said at, where that is later.
         let mut next = now.clone();
-        next.insert("a.txt".into(), file(6, 100, false, Source::Disk));
+        next.insert(t("a.txt"), file(6, 100, false, Source::Disk));
         told(&space, &now, &next, 100_500_000_000);
         now = next;
         let (same, second) = node(&space);
         assert_eq!((same, second.modified, second.version, second.len), (number, 101_000_000_000, 1, 6));
         // Changed, its time said earlier: the time it is said at.
         let mut next = now.clone();
-        next.insert("a.txt".into(), file(7, 50, false, Source::Disk));
+        next.insert(t("a.txt"), file(7, 50, false, Source::Disk));
         told(&space, &now, &next, 300_000_000_000);
         assert_eq!(node(&space).1.modified, 300_000_000_000);
         // What each change was is said for who reads them after: made, then changed twice, by the holder.

@@ -1524,6 +1524,7 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "sfs",
  "sha2 0.10.9",
  "sysinfo",
  "toml 0.8.23",
@@ -1902,6 +1903,7 @@ dependencies = [
  "pe2-sounds",
  "pe2-str",
  "project",
+ "sfs",
  "toml 0.8.23",
 ]
 
@@ -2044,9 +2046,6 @@ dependencies = [
 [[package]]
 name = "formats"
 version = "0.1.0"
-dependencies = [
- "pe2-path",
-]
 
 [[package]]
 name = "fuser"
@@ -3191,6 +3190,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sfs",
  "sha1",
  "tokio",
  "toml 0.8.23",
@@ -4012,8 +4012,8 @@ dependencies = [
  "codecs",
  "formats",
  "pe2-ext",
- "pe2-path",
  "serde_json",
+ "sfs",
  "sha1",
  "toml 0.8.23",
  "typeface",
@@ -4072,9 +4072,9 @@ dependencies = [
  "codecs",
  "formats",
  "pe2-ext",
- "pe2-path",
  "png",
  "serde",
+ "sfs",
  "sha1",
  "toml 0.8.23",
  "typeface",
@@ -4163,8 +4163,11 @@ dependencies = [
 name = "pe2-path"
 version = "0.1.0"
 dependencies = [
+ "icu_normalizer",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -4200,8 +4203,8 @@ dependencies = [
  "codecs",
  "flate2",
  "lzma-rust2",
- "pe2-path",
  "serde",
+ "sfs",
  "sha2 0.10.9",
  "tar",
  "toml 0.8.23",
@@ -5111,6 +5114,9 @@ dependencies = [
  "libc",
  "memmap2",
  "pe2-path",
+ "serde",
+ "serde_json",
+ "sfs",
  "windows-sys 0.61.2",
 ]
 
@@ -7336,7 +7342,6 @@ dependencies = [
  "licenses",
  "lzma-rust2",
  "minisign-verify",
- "pe2-path",
  "pe2-setup",
  "serde",
  "sha2 0.10.9",

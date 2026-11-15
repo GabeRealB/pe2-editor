@@ -10,8 +10,8 @@
 //!         test.toml       what a project for them holds
 //!         data/           what they make their nodes from
 //! ```
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use sfs::HostPath;
+use sfs::testing::At as _;
 
 use serde::Deserialize;
 
@@ -51,7 +51,8 @@ impl Suite {
     ///
     /// # Errors
     /// Its `test.toml` cannot be read.
-    pub fn at(folder: &HostPath) -> Result<Suite, String> {
+    pub fn at(folder: &std::path::Path) -> Result<Suite, String> {
+        let folder = &HostPath::new(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         let name = folder
             .parent()
             .and_then(|extension| extension.file_name().map(|name| name.to_string_lossy().into_owned()))
@@ -221,15 +222,15 @@ pub fn built() -> Vec<Suite> {
 ///
 /// # Errors
 /// One holds no tests, or its `test.toml` cannot be read.
-pub fn in_folders(folders: &[HostPath]) -> Result<Vec<Suite>, String> {
-    let found = |folder: &HostPath| {
+pub fn in_folders(folders: &[impl AsRef<std::path::Path>]) -> Result<Vec<Suite>, String> {
+    let found = |folder: &std::path::Path| {
         let inside = folder.at("tests");
-        let folder = if inside.is_dir() { inside } else { folder.clone() };
+        let folder = if inside.is_dir() { inside } else { folder.to_path_buf() };
         if folder.at("tests.wasm").is_file() {
             Suite::at(&folder)
         } else {
             Err(format!("{}: no tests.wasm", folder.display()))
         }
     };
-    folders.iter().map(found).collect()
+    folders.iter().map(|folder| found(folder.as_ref())).collect()
 }

@@ -11,7 +11,7 @@
 //! A place is compared with where the file really is: what a layer above overrides is the file of that layer, and a link
 //! out of a place is not in it.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,8 +46,8 @@ pub struct Trusted {
 }
 
 /// The file holding what the user enabled and trusts.
-pub(crate) fn file() -> Option<HostPath> {
-    Some(data_folder()?.join(&pe2_path::Name::constant("unsandboxed.toml")))
+pub(crate) fn file() -> Option<std::path::PathBuf> {
+    Some(data_folder()?.join("unsandboxed.toml"))
 }
 
 /// What the file holds.
@@ -107,19 +107,26 @@ fn store(all: &[Trusted]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// One is not there, or what is trusted cannot be written.
-pub fn trust(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
-    if let Some(place) = places.iter().find(|place| !place.exists()) {
+pub fn trust(project: &HostPath, places: &[impl AsRef<Path>]) -> std::io::Result<()> {
+    if let Some(place) = places.iter().map(AsRef::as_ref).find(|place| !place.exists()) {
+        let place = place.display();
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{place}: nothing is there")));
     }
+    let places = held(places)?;
     let mut all = trusted();
     let at = entry(&mut all, project);
-    for place in places {
+    for place in &places {
         all[at].declined.retain(|declined| declined != place);
         if !all[at].places.contains(place) {
             all[at].places.push(place.clone());
         }
     }
     store(&all)
+}
+
+/// Places as trust keeps them, to be compared by where they are: what the user names is any spelling of one.
+fn held(places: &[impl AsRef<Path>]) -> std::io::Result<Vec<HostPath>> {
+    places.iter().map(|place| HostPath::new(place.as_ref())).collect()
 }
 
 /// A project's entry, made where it has none.
@@ -152,7 +159,8 @@ pub fn decline(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// What is trusted cannot be written.
-pub fn distrust(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
+pub fn distrust(project: &HostPath, places: &[impl AsRef<Path>]) -> std::io::Result<()> {
+    let places = held(places)?;
     let mut all = trusted();
     for known in all.iter_mut().filter(|known| known.project == *project) {
         known.places.retain(|place| !places.is_empty() && !places.contains(place));
@@ -250,12 +258,12 @@ pub fn allowed_by(origin: &Origin) -> Option<Allowed> {
 #[cfg(test)]
 mod tests {
     use super::{Allowed, Origin, Trusted, allowed};
-    use pe2_path::HostPath;
-    use pe2_path::testing::At as _;
+    use sfs::HostPath;
+    use sfs::testing::At as _;
 
     /// A project's layers in a folder, one holding an extension, with its real paths.
     fn places(name: &str) -> (HostPath, HostPath, HostPath) {
-        let root = pe2_path::testing::scratch(&format!("trust-{name}"));
+        let root = sfs::testing::scratch(&format!("trust-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         for layer in ["mine", "mine_too", "theirs"] {
             std::fs::create_dir_all(root.at(layer).at("extensions/x.extension")).unwrap();
@@ -288,7 +296,7 @@ mod tests {
 
     #[test]
     fn what_is_kept_apart_runs_nowhere_and_a_run_may_trust_everything() {
-        let folder = pe2_path::testing::scratch("nowhere").at("x.extension");
+        let folder = sfs::testing::scratch("nowhere").at("x.extension");
         assert_eq!(allowed(&Origin::User(folder.clone()), false, &[]), None);
         assert_eq!(allowed(&in_project(folder.clone()), false, &[]), None);
         assert_eq!(allowed(&in_project(folder), true, &[]), Some(Allowed::Everything));

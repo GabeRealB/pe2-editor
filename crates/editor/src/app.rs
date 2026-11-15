@@ -4,9 +4,10 @@
 
 use eframe::egui::{self, RichText};
 use egui_tiles::{Behavior as _, TileId};
-use pe2_path::{HostPath, Uid};
+use pe2_path::Uid;
 use project::TreePath;
 use serde::Deserialize;
+use sfs::HostPath;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -50,12 +51,12 @@ const STEADY_FRAMES: u32 = 2;
 #[derive(Default, Deserialize)]
 struct OldSettings {
     zoom: Option<f32>,
-    last_project: Option<HostPath>,
+    last_project: Option<std::path::PathBuf>,
 }
 
 /// A screenshot asked for on the command line: taken once the window has settled, then the editor exits.
 struct Capture {
-    path: HostPath,
+    path: std::path::PathBuf,
     frames: u32,
     requested: bool,
     /// Whether the image is still to be saved (1) or saved (0).
@@ -83,7 +84,7 @@ enum Closing {
     /// The window, closing.
     Quit,
     /// Another project, opening.
-    Open(HostPath),
+    Open(std::path::PathBuf),
     /// A build or a clean, by its event.
     Signal(&'static str),
     /// A document's last tab: where it is, and the document's uid.
@@ -100,7 +101,7 @@ struct Opening {
     /// they ask of the window as ever, what they ask of the project with how far it is - then the workspace's.
     agents: std::sync::mpsc::Receiver<crate::workspace::AgentRequest>,
     /// Shown once it is open: the selection kept across a reopen, or asked on the command line.
-    select: Option<TreePath>,
+    select: Option<Arc<TreePath>>,
 }
 
 #[expect(clippy::struct_excessive_bools, reason = "each answers for itself")]
@@ -144,14 +145,14 @@ pub struct Editor {
     /// Exports being made, off the window's thread: what each is, and what came of it once it has.
     exports: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// An entry being renamed: its uid, its real path, the new name being typed.
-    renaming: Option<(Uid, TreePath, String)>,
+    renaming: Option<(Uid, Arc<TreePath>, String)>,
     /// Code being overridden while an asset layer is active: which files layer takes it.
     choosing: Option<Choosing>,
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(HostPath, String)>,
     /// The selection last opened as a document.
-    opened: Option<TreePath>,
+    opened: Option<Arc<TreePath>>,
     /// Files being imported: their paths, a line each.
     import: Option<String>,
     /// Whether the assets are up in their drawer.
@@ -193,10 +194,10 @@ pub struct Editor {
 }
 
 pub struct Start {
-    pub project: Option<HostPath>,
-    pub select: Option<TreePath>,
+    pub project: Option<std::path::PathBuf>,
+    pub select: Option<Arc<TreePath>>,
     pub show: Option<String>,
-    pub screenshot: Option<HostPath>,
+    pub screenshot: Option<std::path::PathBuf>,
     pub max_surface: Option<u32>,
     /// Agents may act in the editor this session, whatever the settings say.
     pub agents_drive: bool,
@@ -242,7 +243,7 @@ fn epoch_status(ui: &mut egui::Ui, ws: &Workspace) {
 /// The config in use for a project: the one chosen, else its first.
 fn active_config(settings: &EditorSettings, project: &project::Project) -> Option<project::Config> {
     let chosen = settings.active_configs.get(&project.root.display().to_string());
-    let found = chosen.and_then(|name| project.configs.iter().find(|config| config.name == *name));
+    let found = chosen.and_then(|name| project.configs.iter().find(|config| *config.name == **name));
     found.or(project.configs.first()).cloned()
 }
 
@@ -362,16 +363,24 @@ impl Editor {
     }
 
     /// Open a project - the documents of the one open with unsaved changes saved or let go first, as the user says.
-    fn open(&mut self, dir: &HostPath) {
+    fn open(&mut self, dir: &std::path::Path) {
         if self.workspace.as_ref().is_some_and(|ws| !ws.unsaved_documents().is_empty()) {
-            self.closing = Some(Closing::Open(dir.clone()));
+            self.closing = Some(Closing::Open(dir.to_path_buf()));
             return;
         }
         self.open_now(dir);
     }
 
     /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
-    fn open_now(&mut self, dir: &HostPath) {
+    fn open_now(&mut self, dir: &std::path::Path) {
+        // Where the project is, as a place: what is said of it and compared with what other processes hold.
+        let dir = &match HostPath::new(dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.error = Some(format!("{}: {e}", dir.display()));
+                return;
+            }
+        };
         // The project open now lets go of its lock first: opening it again must find it free. It finishes what it is on to
         // do that, on the thread opening the next.
         let leaving = self.workspace.take().map(Workspace::leave);
@@ -436,7 +445,7 @@ impl Editor {
         let dir = opening.dir;
         match result {
             Ok(opened) => {
-                self.settings.last_project = Some(dir.clone());
+                self.settings.last_project = Some(dir.to_path_buf());
                 if let Some(label) = &opened.recovered {
                     self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
                 }
@@ -444,7 +453,8 @@ impl Editor {
                 // A layout outlives a project: tabs of what is not here close, and what is in front is what is selected.
                 self.layouts.close_documents(|path| !ws.exists(path));
                 self.opened = None;
-                let front = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).cloned();
+                let front =
+                    self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).map(ToOwned::to_owned);
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
@@ -530,7 +540,7 @@ impl Editor {
         if ws.reading_until().is_some() {
             return;
         }
-        let gone: Vec<TreePath> = self
+        let gone: Vec<Arc<TreePath>> = self
             .layouts
             .states
             .values()
@@ -564,7 +574,7 @@ impl Editor {
         ws.author = author;
         let verb = if redo { "Redo" } else { "Undo" };
         let asked = scope;
-        let said = move |editor: &mut Editor, made: Result<(String, Option<TreePath>), StepError>| match made {
+        let said = move |editor: &mut Editor, made: Result<(String, Option<Arc<TreePath>>), StepError>| match made {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
             Ok((label, selection)) => {
                 editor.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
@@ -737,7 +747,7 @@ impl Editor {
         let named = |typed: &str| {
             let typed = typed.trim();
             let stored = if bundle { format!("{typed}{}", project::index::BUNDLE_SUFFIX) } else { typed.to_string() };
-            pe2_path::Name::new(&stored).map_err(|why| format!("{typed}: {why}"))
+            pe2_path::Name::new(&stored).map(ToOwned::to_owned).map_err(|why| format!("{typed}: {why}"))
         };
         let checked = named(name);
         let valid = checked.is_ok() && !name.trim().starts_with('.');
@@ -1197,11 +1207,11 @@ impl Editor {
     }
 
     /// The asset of the document in use: its tab in front's, else the asset selected.
-    fn document_path(&self) -> Option<TreePath> {
+    fn document_path(&self) -> Option<Arc<TreePath>> {
         let ws = self.workspace.as_ref()?;
         let shown = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane));
-        let path = shown.or(ws.selected.as_ref())?;
-        ws.index.assets.contains_key(path).then(|| path.clone())
+        let path = shown.or(ws.selected.as_deref())?;
+        (ws.index.assets.contains_key(path).then_some(path)).map(ToOwned::to_owned)
     }
 
     /// The export of an asset to choose: its exporters, the first chosen, its file in the project's `exports` folder.
@@ -1210,7 +1220,7 @@ impl Editor {
         let asset = ws.index.assets.get(path)?;
         let exporters = ws.extensions.exporters(asset);
         let mut exporting = Exporting {
-            path: path.clone(),
+            path: path.to_owned(),
             exporters,
             chosen: 0,
             member: 0,
@@ -1490,7 +1500,7 @@ impl Editor {
             self.closing = None;
             return;
         };
-        let documents: Vec<(Uid, TreePath)> = match &closing {
+        let documents: Vec<(Uid, Arc<TreePath>)> = match &closing {
             Closing::Tab { uid, .. } => ws.unsaved_documents().into_iter().filter(|(u, _)| u == uid).collect(),
             _ => ws.unsaved_documents(),
         };
@@ -1610,7 +1620,7 @@ impl Editor {
 
     /// What the document tab in use shows is what is selected.
     fn select_in_use(&mut self) {
-        let path = self.layouts.focused.and_then(|pane| self.layouts.subject(pane)).cloned();
+        let path = self.layouts.focused.and_then(|pane| self.layouts.subject(pane)).map(ToOwned::to_owned);
         if let (Some(ws), Some(path)) = (self.workspace.as_mut(), path) {
             ws.navigate(path);
             self.opened.clone_from(&ws.selected);
@@ -2073,7 +2083,7 @@ impl Editor {
         if let Some(ws) = self.workspace.as_mut() {
             if let Some(pane) = outcome.focus {
                 self.layouts.focused = Some(pane);
-                if let Some(path) = self.layouts.subject(pane).cloned() {
+                if let Some(path) = self.layouts.subject(pane).map(ToOwned::to_owned) {
                     ws.navigate(path);
                     self.opened.clone_from(&ws.selected);
                 }
@@ -2110,7 +2120,7 @@ impl Editor {
             if closed
                 && let Some(pane) = self.layouts.focused
                 && let Some(ws) = self.workspace.as_mut()
-                && let Some(path) = self.layouts.subject(pane).cloned()
+                && let Some(path) = self.layouts.subject(pane).map(ToOwned::to_owned)
             {
                 ws.navigate(path);
                 self.opened.clone_from(&ws.selected);
@@ -2197,10 +2207,10 @@ impl Editor {
 
     /// Make a node of a template - of a file, where it takes one - beside the document in use, else in the folder the
     /// browser shows; it is then named, as it is made with the template's.
-    fn new_node(&mut self, template: &str, file: Option<&HostPath>) {
+    fn new_node(&mut self, template: &str, file: Option<&std::path::Path>) {
         let in_use = self.document_path();
         let Some(ws) = &mut self.workspace else { return };
-        let folder = ws.new_node_folder(in_use.as_ref());
+        let folder = ws.new_node_folder(in_use.as_deref());
         let place = if folder.is_root() { "the project".to_string() } else { folder.to_string() };
         let then = move |editor: &mut Editor, made: Result<crate::workspace::NewNode, String>| match made {
             Ok(made) => {
@@ -2328,7 +2338,7 @@ impl Editor {
             }
             ui.add_space(8.0);
             if let Some(path) = ws.selected.clone() {
-                let parts: Vec<&str> = path.parts().collect();
+                let parts: Vec<&str> = path.parts().map(pe2_path::Name::as_str).collect();
                 let first = theme::fitting_steps(ui, &parts, ui.available_width());
                 if first > 0 {
                     ui.label(RichText::new("…").color(theme::weak()));
@@ -2347,7 +2357,7 @@ impl Editor {
                             .clicked()
                         {
                             let above = parts.len() - 1 - i;
-                            folder = (0..above).try_fold(path.clone(), |up, _| up.parent());
+                            folder = (0..above).try_fold(&*path, |up, _| up.parent()).map(ToOwned::to_owned);
                         }
                         ui.label(RichText::new("/").color(theme::border().gamma_multiply(3.0)));
                     }
@@ -2360,7 +2370,7 @@ impl Editor {
         if let Some(folder) = folder
             && let Some(ws) = &mut self.workspace
         {
-            ws.open_folder(folder);
+            ws.open_folder(folder.clone());
             self.show_pane(Pane::first(PaneKind::Assets));
         }
     }
@@ -2728,9 +2738,9 @@ impl Editor {
         let Some(text) = &mut self.import else { return };
         let Some(ws) = &self.workspace else { return };
         let asset = ws.selected.as_ref().and_then(|path| ws.index.assets.get(path)).cloned();
-        let files: Vec<HostPath> = text.lines().filter_map(local_path).collect();
+        let files: Vec<std::path::PathBuf> = text.lines().filter_map(local_path).collect();
         let (mut replace, mut add, mut cancel) = (false, false, false);
-        let mut made: Option<(String, HostPath)> = None;
+        let mut made: Option<(String, std::path::PathBuf)> = None;
         egui::Window::new("Import")
             .collapsible(false)
             .resizable(false)
@@ -2759,7 +2769,7 @@ impl Editor {
                 let missing =
                     files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
                 let name_of =
-                    |file: &HostPath| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                    |file: &std::path::Path| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
                 let stack = match files.as_slice() {
                     [] => Err("No file yet".to_string()),
                     [file] => ws
@@ -2834,8 +2844,8 @@ impl Editor {
         if make {
             let dir = std::path::Path::new(text.trim()).to_path_buf();
             self.new_dialog = None;
-            match project::create(&dir).and_then(|()| Ok(HostPath::new(&dir)?)) {
-                Ok(dir) => self.open(&dir),
+            match project::create(&dir) {
+                Ok(()) => self.open(&dir),
                 Err(why) => self.message = Some(format!("No project was made: {why:#}")),
             }
         } else if cancel {
@@ -2933,7 +2943,7 @@ impl Editor {
 
     /// Open a project, as the menu does.
     #[cfg(test)]
-    pub fn open_project(&mut self, dir: &HostPath) {
+    pub fn open_project(&mut self, dir: &std::path::Path) {
         self.open(dir);
     }
 
@@ -2954,9 +2964,9 @@ impl Editor {
     }
 
     /// The asset the document in use shows.
-    pub fn document_in_use(&self) -> Option<TreePath> {
+    pub fn document_in_use(&self) -> Option<Arc<TreePath>> {
         let pane = self.layouts.active_document()?;
-        self.layouts.subject(pane).cloned()
+        self.layouts.subject(pane).map(ToOwned::to_owned)
     }
 
     /// Undo, as the command does: the last edit of the document in use, or the project's last change.
@@ -3133,7 +3143,7 @@ impl eframe::App for Editor {
 /// An export being chosen: the asset, its exporters, the one chosen and its member, and where its file goes - written
 /// by the user (`typed`), or following what is chosen.
 struct Exporting {
-    path: TreePath,
+    path: Arc<TreePath>,
     exporters: Vec<project::ext::Exporter>,
     chosen: usize,
     member: usize,
@@ -3181,14 +3191,14 @@ const VISITS: usize = 100;
 /// A document brought into focus: its path, its uid (which finds it where it moved), and how it was shown.
 #[derive(Clone, Debug)]
 struct Visit {
-    path: TreePath,
+    path: Arc<TreePath>,
     uid: Option<Uid>,
     editor: Option<EditorKind>,
 }
 
 impl Visit {
     /// Where it is now: by its uid, else its path; none where it is gone.
-    fn place(&self, ws: &Workspace) -> Option<TreePath> {
+    fn place(&self, ws: &Workspace) -> Option<Arc<TreePath>> {
         if let Some(path) = self.uid.as_ref().and_then(|uid| ws.index.by_uid.get(uid)) {
             return Some(path.clone());
         }
@@ -3202,11 +3212,11 @@ enum Unsaved {
     Save(Uid),
     Revert(Uid),
     /// Its path: shown.
-    Show(TreePath),
+    Show(Arc<TreePath>),
 }
 
 /// The unsaved documents' count in the status bar, opening their list: each shown, saved or reverted, or all saved.
-fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, TreePath)]) -> Option<Unsaved> {
+fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, Arc<TreePath>)]) -> Option<Unsaved> {
     let mut asked = None;
     let n = documents.len();
     let text = RichText::new(format!("{n} unsaved")).small().color(ui.visuals().warn_fg_color);
@@ -3243,7 +3253,7 @@ fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, TreePath)]
 /// Code being overridden: its uid, path and own layer, the files layers that can take it, a new one's name.
 struct Choosing {
     uid: Uid,
-    path: TreePath,
+    path: Arc<TreePath>,
     home: String,
     layers: Vec<String>,
     name: String,
@@ -3287,7 +3297,7 @@ impl Outcome {
 
 /// A line of pasted paths as a path here: without the quotes Windows' Copy as path puts round it, and under WSL a Windows
 /// path where Windows' disks are mounted.
-fn local_path(line: &str) -> Option<HostPath> {
+fn local_path(line: &str) -> Option<std::path::PathBuf> {
     let line = line.trim().trim_matches('"');
     if line.is_empty() {
         return None;
@@ -3298,12 +3308,12 @@ fn local_path(line: &str) -> Option<HostPath> {
     {
         let rest = line[3..].replace('\\', "/");
         let mounted = format!("/mnt/{}/{rest}", drive.to_ascii_lowercase() as char);
-        return HostPath::new(std::path::Path::new(&mounted)).ok();
+        return Some(mounted.into());
     }
-    HostPath::new(std::path::Path::new(line)).ok()
+    Some(line.into())
 }
 
-fn save_png(path: &HostPath, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
+fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
     let [width, height] = image.size;
     let mut encoder = png::Encoder::new(
         std::io::BufWriter::new(std::fs::File::create(path)?),
@@ -3320,12 +3330,10 @@ fn save_png(path: &HostPath, image: &egui::ColorImage) -> Result<(), Box<dyn std
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::local_path;
-    use pe2_path::HostPath;
-    use std::path::Path;
 
     #[test]
     fn a_pasted_path_is_read_as_a_path_here() {
-        let place = |text: &str| HostPath::new(Path::new(text)).ok();
+        let place = |text: &str| Some(std::path::PathBuf::from(text));
         assert_eq!(local_path("  \"/tmp/a b.mp4\" "), place("/tmp/a b.mp4"));
         assert_eq!(local_path(r#""C:\Users\me\a.mp4""#), place("/mnt/c/Users/me/a.mp4"));
         assert_eq!(local_path("   "), None);

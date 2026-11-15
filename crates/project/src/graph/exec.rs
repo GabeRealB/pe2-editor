@@ -3,7 +3,7 @@
 //! read of their node - its files, its declaration - is recorded as they read it: the outputs' trace, by which a kept
 //! output is known still to hold without making it again.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -89,7 +89,7 @@ impl Node for crate::index::Asset {
     }
 
     fn file_sha1(&self, name: &str) -> Option<String> {
-        self.files.iter().find(|f| f.name == name && f.made_by.is_none()).map(|f| f.sha1.clone())
+        self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.sha1.clone())
     }
 
     fn file_names(&self) -> Vec<String> {
@@ -97,13 +97,13 @@ impl Node for crate::index::Asset {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {
-        let file = self.files.iter().find(|f| f.name == name && f.made_by.is_none());
+        let file = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none());
         let file = file.with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
     fn file_size(&self, name: &str) -> Option<u64> {
-        self.files.iter().find(|f| f.name == name && f.made_by.is_none()).map(|f| f.size)
+        self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.size)
     }
 
     fn content_path(&self, sha1: &str) -> Option<HostPath> {
@@ -111,7 +111,7 @@ impl Node for crate::index::Asset {
     }
 
     fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
-        let Some(file) = self.files.iter().find(|f| f.name == name && f.made_by.is_none()) else { return Vec::new() };
+        let Some(file) = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()) else { return Vec::new() };
         crate::content::head(&file.path, len)
     }
 }
@@ -766,7 +766,10 @@ impl<'a> Call<'a> {
                     )),
                 },
             };
-            given.insert(file.name.clone(), content);
+            // Its name is a path in the folder: checked here, where it becomes one.
+            let name = crate::content::GivenPath::new(&file.name)
+                .with_context(|| format!("{}: no path in a folder", file.name))?;
+            given.insert(name.to_owned(), content);
         }
         let project = self.store.and_then(Store::project);
         let fallback = match self.store {

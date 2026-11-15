@@ -1,10 +1,11 @@
 # Words the docs use that are names, not code: kept as Clippy's defaults are, with these added.
 doc-valid-idents = ["WebDAV", ".."]
-# A place on disk is made and joined through pe2_path::HostPath alone (`crates/path`): resolved once, plain on every
-# system, and joined of checked names - never text joined onto a path.
+# A place where the filesystem is implemented is made and joined through sfs::HostPath alone (`crates/sfs`): resolved
+# once, plain on every system, and joined of checked names - never text joined onto a path. The crates working with
+# plain paths (what they are given, the program's own folders) allow these, each saying why.
 disallowed-methods = [
-    { path = "std::fs::canonicalize", reason = "a place is resolved by pe2_path::HostPath::new" },
-    { path = "std::path::Path::canonicalize", reason = "a place is resolved by pe2_path::HostPath::new" },
-    { path = "std::path::Path::join", reason = "a place within another is pe2_path::HostPath::join of a Name or a RelPath" },
-    { path = "std::path::PathBuf::push", reason = "a place within another is pe2_path::HostPath::join of a Name or a RelPath" },
+    { path = "std::fs::canonicalize", reason = "a place is resolved by sfs::HostPath::new" },
+    { path = "std::path::Path::canonicalize", reason = "a place is resolved by sfs::HostPath::new" },
+    { path = "std::path::Path::join", reason = "a place within another is sfs::HostPath::join of a Name or a RelPath" },
+    { path = "std::path::PathBuf::push", reason = "a place within another is sfs::HostPath::join of a Name or a RelPath" },
 ]

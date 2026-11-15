@@ -9,8 +9,10 @@
 //! folder worked in, what was read last time is still kept - while filling in the background slows what is read
 //! meanwhile.
 
-use pe2_path::HostPath;
+use pe2_path::RelPath;
+use sfs::HostPath;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,7 +35,7 @@ fn is_zero(bytes: &u64) -> bool {
 #[derive(Debug)]
 pub struct Access {
     file: Option<HostPath>,
-    read: Mutex<(BTreeMap<String, Read>, bool)>,
+    read: Mutex<(BTreeMap<Arc<RelPath>, Read>, bool)>,
 }
 
 fn now() -> u64 {
@@ -44,7 +46,7 @@ impl Access {
     /// What was read of a use of a project, by its name: as remembered from the last time, nothing where it is new.
     #[must_use]
     pub fn of(project: &HostPath, what: &str) -> Access {
-        const ACCESS: pe2_path::Name = pe2_path::Name::constant("access");
+        const ACCESS: &pe2_path::Name = pe2_path::Name::constant("access");
         let name = project::extract::sha1_hex(what.as_bytes());
         let file = pe2_path::Name::new(&format!("{name}.json"))
             .ok()
@@ -63,27 +65,27 @@ impl Access {
         Access { file: None, read: Mutex::default() }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, (BTreeMap<String, Read>, bool)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (BTreeMap<Arc<RelPath>, Read>, bool)> {
         self.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A file was read, now.
-    pub fn read(&self, path: &str) {
+    pub fn read(&self, path: &RelPath) {
         let mut state = self.lock();
-        state.0.entry(path.to_string()).or_default().last = now();
+        state.0.entry(path.to_owned()).or_default().last = now();
         state.1 = true;
     }
 
     /// A file's content is kept on disk, this much of it: read now, as far as letting go of it goes.
-    pub fn kept(&self, path: &str, bytes: u64) {
+    pub fn kept(&self, path: &RelPath, bytes: u64) {
         let mut state = self.lock();
-        let read = state.0.entry(path.to_string()).or_default();
+        let read = state.0.entry(path.to_owned()).or_default();
         (read.last, read.kept) = (now(), read.kept.max(bytes));
         state.1 = true;
     }
 
     /// A file's content is no longer kept on disk.
-    pub fn dropped(&self, path: &str) {
+    pub fn dropped(&self, path: &RelPath) {
         let mut state = self.lock();
         if let Some(read) = state.0.get_mut(path) {
             read.kept = 0;
@@ -109,9 +111,9 @@ impl Access {
     /// What is kept on disk, read longest ago first, each with how much of it is: what to let go of until what is kept
     /// fits a budget.
     #[must_use]
-    pub fn oldest(&self) -> Vec<(String, u64)> {
+    pub fn oldest(&self) -> Vec<(Arc<RelPath>, u64)> {
         let state = self.lock();
-        let mut kept: Vec<(&String, &Read)> = state.0.iter().filter(|(_, read)| read.kept > 0).collect();
+        let mut kept: Vec<(&Arc<RelPath>, &Read)> = state.0.iter().filter(|(_, read)| read.kept > 0).collect();
         kept.sort_by_key(|(path, read)| (read.last, *path));
         kept.into_iter().map(|(path, read)| (path.clone(), read.kept)).collect()
     }
@@ -163,18 +165,24 @@ mod tests {
 
     #[test]
     fn what_is_let_go_of_first_is_what_was_read_longest_ago_and_is_kept() {
+        fn p(path: &str) -> &pe2_path::RelPath {
+            pe2_path::RelPath::new(path).unwrap()
+        }
+        let oldest = |access: &Access| -> Vec<(String, u64)> {
+            access.oldest().into_iter().map(|(path, kept)| (path.to_string(), kept)).collect()
+        };
         let access = Access::unkept();
-        access.kept("old.bin", 100);
-        access.kept("new.bin", 50);
-        access.read("only-read.h");
+        access.kept(p("old.bin"), 100);
+        access.kept(p("new.bin"), 50);
+        access.read(p("only-read.h"));
         // Made older by hand: both were kept this second.
-        access.lock().0.get_mut("old.bin").unwrap().last -= 60;
-        assert_eq!(access.oldest(), [("old.bin".to_string(), 100), ("new.bin".to_string(), 50)]);
+        access.lock().0.get_mut(p("old.bin")).unwrap().last -= 60;
+        assert_eq!(oldest(&access), [("old.bin".to_string(), 100), ("new.bin".to_string(), 50)]);
         assert_eq!(access.kept_in_all(), 150);
-        access.dropped("old.bin");
-        assert_eq!(access.oldest(), [("new.bin".to_string(), 50)]);
+        access.dropped(p("old.bin"));
+        assert_eq!(oldest(&access), [("new.bin".to_string(), 50)]);
         access.nothing_kept();
-        assert_eq!((access.oldest(), access.kept_in_all()), (Vec::new(), 0));
+        assert_eq!((oldest(&access), access.kept_in_all()), (Vec::new(), 0));
     }
 
     #[test]

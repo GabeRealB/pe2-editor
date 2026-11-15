@@ -9,8 +9,9 @@
 //! nothing, and no read is cut off.
 
 use anyhow::{Context, Result, bail};
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::io::BufReader;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -69,7 +70,7 @@ struct Mounted {
 }
 
 /// `pe2-cli project server`.
-pub fn run(directory: &HostPath, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
+pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
     // It serves files, and runs nothing of a project's: no extension is loaded in this process, whatever comes.
     project::ext::forbid();
     let p = Project::load(directory)?;
@@ -580,10 +581,11 @@ impl vfs::write::Owner for Server {
 
     /// What was written and nobody took by the time serving ends: set aside beside the folder, by its path there,
     /// as what is not the project's is - the staging is emptied when the folder is next served.
-    fn left(&self, path: &str, staged: &HostPath) {
+    fn left(&self, path: &project::TreePath, staged: &HostPath) {
         let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let Ok(within) = pe2_path::RelPath::new(&format!("{seconds}/{path}")) else { return };
-        let aside = self.project.root.join(&project::SET_ASIDE).join(&within);
+        let seconds = seconds.to_string();
+        let Ok(when) = pe2_path::Name::new(&seconds) else { return };
+        let aside = self.project.root.join(&project::SET_ASIDE).join(when).join(path.rel());
         let kept = aside
             .parent()
             .map_or(Ok(()), |folder| std::fs::create_dir_all(&folder))
@@ -604,7 +606,23 @@ fn clear_strays(
     staging: &HostPath,
 ) -> Result<()> {
     let at = &p.filesystem.at;
-    let found = vfs::strays::strays(at, serving);
+    let vfs::strays::Found { strays: found, unnamed } = vfs::strays::strays(at, serving);
+    // Named so no path takes it: nothing here moves it by its path, nor serves over it.
+    if !unnamed.is_empty() {
+        let listed: Vec<&str> = unnamed.iter().take(8).map(String::as_str).collect();
+        let more = if unnamed.len() > listed.len() {
+            format!(", and {} more", unnamed.len() - listed.len())
+        } else {
+            String::new()
+        };
+        bail!(
+            "{at} holds {} named so no path of the project takes {} ({}{more}): it is not served over them. Move them \
+             out of it, or rename them",
+            files(unnamed.len()),
+            if unnamed.len() == 1 { "it" } else { "them" },
+            listed.join(", "),
+        );
+    }
     if found.is_empty() {
         return Ok(());
     }
@@ -613,7 +631,7 @@ fn clear_strays(
     let shown = at.to_string();
     match strays {
         Strays::Refuse => {
-            let listed: Vec<&str> = found.iter().take(8).map(String::as_str).collect();
+            let listed: Vec<&str> = found.iter().take(8).map(|path| path.as_str()).collect();
             let more = if found.len() > listed.len() {
                 format!(", and {} more", found.len() - listed.len())
             } else {

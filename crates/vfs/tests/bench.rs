@@ -8,15 +8,21 @@
 //!   and reading a file cost in this crate alone, to tell them from what a backend and the system add.
 //! - `folder`: a project's folder as something serves it now (`PE2_BENCH_FOLDER`): listed, its small files and its
 //!   largest read a first time and again, files written into it and removed.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use sfs::HostPath;
+use sfs::testing::At as _;
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use project::content::Given;
+use pe2_path::RelPath;
+use project::content::{Given, GivenPath};
+
+/// A path in a folder given to a program, as a measurement writes it.
+fn given(path: &str) -> Arc<GivenPath> {
+    GivenPath::new(path).unwrap().to_owned()
+}
 
 fn timed<T>(work: impl FnOnce() -> T) -> (Duration, T) {
     let started = Instant::now();
@@ -82,23 +88,23 @@ fn scopes() -> vfs::scoped::Scopes {
 #[test]
 #[ignore = "a benchmark, run by hand"]
 fn scope() {
-    let root = pe2_path::testing::scratch("bench-scope");
+    let root = sfs::testing::scratch("bench-scope");
     std::fs::create_dir_all(&root).unwrap();
     let small: Arc<[u8]> = Arc::from(vec![7u8; 8 << 10]);
     let large: Arc<[u8]> = Arc::from(vec![9u8; 8 << 20]);
     let mut files = BTreeMap::new();
     for dir in 0..40 {
         for file in 0..50 {
-            files.insert(format!("small/d{dir:02}/f{file:02}.h"), Given::Bytes(small.clone()));
+            files.insert(given(&format!("small/d{dir:02}/f{file:02}.h")), Given::Bytes(small.clone()));
         }
     }
     for file in 0..16 {
-        files.insert(format!("large/f{file:02}.bin"), Given::Bytes(large.clone()));
+        files.insert(given(&format!("large/f{file:02}.bin")), Given::Bytes(large.clone()));
     }
     // One folder of many headers, as an SDK's is: where a name looked for and not there costs the most.
     let tiny: Arc<[u8]> = Arc::from(vec![1u8; 64]);
     for file in 0..2000 {
-        files.insert(format!("wide/h{file:04}.h"), Given::Bytes(tiny.clone()));
+        files.insert(given(&format!("wide/h{file:04}.h")), Given::Bytes(tiny.clone()));
     }
     let serving = scopes();
     let (served, folder) =
@@ -164,8 +170,8 @@ fn scope() {
 #[test]
 #[ignore = "a benchmark, run by hand"]
 fn mounts() {
-    let base = pe2_path::testing::scratch("bench-mounts");
-    let files = BTreeMap::from([("a.h".to_string(), Given::Bytes(Arc::from(&b"#define A 1"[..])))]);
+    let base = sfs::testing::scratch("bench-mounts");
+    let files = BTreeMap::from([(given("a.h"), Given::Bytes(Arc::from(&b"#define A 1"[..])))]);
     let serving = scopes();
     let mut kept = Vec::new();
     for nth in 0..4 {
@@ -310,11 +316,11 @@ fn tree() {
 fn tree_of(kind: &str, indexed: Duration, of: &dyn Fn() -> vfs::Served) {
     let (made, served) = timed(of);
     let tree = served.tree();
-    let mut files: Vec<(String, u64)> = Vec::new();
-    let mut folders = vec![String::new()];
+    let mut files: Vec<(Arc<RelPath>, u64)> = Vec::new();
+    let mut folders = vec![RelPath::root().to_owned()];
     while let Some(folder) = folders.pop() {
         for (name, _, node) in tree.entries(&folder).unwrap_or_default() {
-            let path = if folder.is_empty() { name } else { format!("{folder}/{name}") };
+            let path = folder.join(&name);
             match &node.what {
                 vfs::What::Folder(_) => folders.push(path),
                 vfs::What::File(_) => files.push((path, node.size)),
@@ -323,8 +329,8 @@ fn tree_of(kind: &str, indexed: Duration, of: &dyn Fn() -> vfs::Served) {
     }
     files.sort();
     let (looked, found) = timed(|| files.iter().filter(|(path, _)| tree.at(path).is_some()).count());
-    let small: Vec<&(String, u64)> = files.iter().filter(|(_, size)| *size <= 64 << 10).take(3000).collect();
-    let read_all = |paths: &[&(String, u64)]| {
+    let small: Vec<&(Arc<RelPath>, u64)> = files.iter().filter(|(_, size)| *size <= 64 << 10).take(3000).collect();
+    let read_all = |paths: &[&(Arc<RelPath>, u64)]| {
         let mut bytes = 0u64;
         for (path, size) in paths {
             let (ino, _) = tree.at(path).expect("there");
@@ -342,7 +348,7 @@ fn tree_of(kind: &str, indexed: Duration, of: &dyn Fn() -> vfs::Served) {
     };
     let (small_first, small_bytes) = timed(|| read_all(&small));
     let (small_again, _) = timed(|| read_all(&small));
-    let largest: Vec<&(String, u64)> = files.iter().max_by_key(|(_, size)| *size).into_iter().collect();
+    let largest: Vec<&(Arc<RelPath>, u64)> = files.iter().max_by_key(|(_, size)| *size).into_iter().collect();
     let (large_first, large_bytes) = timed(|| read_all(&largest));
     let (large_again, _) = timed(|| read_all(&largest));
     #[expect(clippy::cast_precision_loss, reason = "a mean, as it is said")]

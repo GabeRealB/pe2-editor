@@ -566,12 +566,12 @@ fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<c
 /// A resolved path, a link where it is an entry of the view.
 fn path_link(ui: &mut egui::Ui, ws: &Workspace, real: &project::TreePath, nav: &mut Option<crate::workspace::Nav>) {
     // A bundle shows as its asset; one whose asset is no name is shown as it is.
-    let shown = project::index::asset_named(real).unwrap_or_else(|_| real.clone());
+    let shown = project::index::asset_named(real).unwrap_or_else(|_| real.to_owned());
     let known = ws.index.assets.contains_key(&shown) || ws.index.entries.contains_key(real);
     if known {
         let target = if ws.index.assets.contains_key(&shown) { &shown } else { real };
         if theme::short_link(ui, shown.as_str()).clicked() {
-            *nav = Some(crate::workspace::Nav::to(target.clone()));
+            *nav = Some(crate::workspace::Nav::to(target.to_owned()));
         }
     } else {
         theme::short(ui, RichText::new(shown.as_str()).color(theme::weak()));

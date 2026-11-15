@@ -1,5 +1,5 @@
 //! What extensions fetch, fetched beside the editor once they run: trusting them consents to it.
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 use super::isolate;
 use crate::fetcher::{Fetcher, State};
@@ -24,7 +24,7 @@ fn requiring() -> (Extensions, Setup, Setup) {
     let present = Present {
         id: "test.fetching".to_string(),
         version: "0.1.0".to_string(),
-        origin: Origin::Project(pe2_path::testing::scratch("fetching").at("extensions/test.fetching.extension")),
+        origin: Origin::Project(sfs::testing::scratch("fetching").at("extensions/test.fetching.extension")),
         requires: vec![],
         weak: vec![],
         optional: vec![],

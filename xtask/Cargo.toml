@@ -10,7 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pe2-path.workspace = true
 codecs.workspace = true
 anyhow.workspace = true
 sha2.workspace = true

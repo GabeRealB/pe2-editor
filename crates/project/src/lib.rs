@@ -55,18 +55,20 @@ pub fn give_back_memory() {
 }
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, Name};
+use pe2_path::Name;
 use serde::Deserialize;
+use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
-pub const FILE: Name = Name::constant("project.toml");
+pub const FILE: &Name = Name::constant("project.toml");
 /// Where a project's layers live, each a directory with its changeset beside it.
-pub const LAYERS: Name = Name::constant(".layers");
+pub const LAYERS: &Name = Name::constant(".layers");
 /// What follows a layer's folder's name in its changeset's.
-pub const CHANGESET_SUFFIX: Name = Name::constant(".toml");
+pub const CHANGESET_SUFFIX: &Name = Name::constant(".toml");
 /// What follows a generated layer's folder's name in its plan's.
-pub const PLAN_SUFFIX: Name = Name::constant(".plan.jsonl");
+pub const PLAN_SUFFIX: &Name = Name::constant(".plan.jsonl");
 
 #[derive(Deserialize)]
 struct ProjectFile {
@@ -91,12 +93,12 @@ struct ProjectFile {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Its name, which names its folder of what is built (`build/<name>`).
-    pub name: Name,
+    pub name: Arc<Name>,
     pub release: Option<String>,
     /// The target building it, what its `target.<name>` sections are for.
     pub target: Option<String>,
     /// The assets left out of it, by path: no event reaches them, and looking for a type's assets does not find them.
-    pub disabled: Box<[TreePath]>,
+    pub disabled: Box<[Arc<TreePath>]>,
     /// The properties it sets (`[config.<name>.properties]`), as written: `Project::properties_of` gives them over
     /// what the project declares.
     pub properties: toml::Table,
@@ -169,7 +171,7 @@ impl std::fmt::Display for PropertyKind {
 /// What is wrong with a config's property, or with a property's declaration (no config).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyProblem {
-    pub config: Option<Name>,
+    pub config: Option<Arc<Name>>,
     pub property: String,
     pub why: String,
 }
@@ -307,10 +309,10 @@ struct FilesystemFile {
 }
 
 /// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
-pub const SERVED: Name = Name::constant("assets");
+pub const SERVED: &Name = Name::constant("assets");
 /// Where what that folder held that was not the project's is set aside before it is served (`vfs::strays`), a folder a
 /// time: the only copy of it, so not in the cache.
-pub const SET_ASIDE: Name = Name::constant("assets.set-aside");
+pub const SET_ASIDE: &Name = Name::constant("assets.set-aside");
 
 /// How this machine serves a project as a filesystem, as far as the project says (`project.local.toml`): what serves
 /// is chosen where it is served (`vfs::backend`), which knows the backends - a name is not judged here.
@@ -370,7 +372,7 @@ fn read_local(root: &HostPath) -> Result<LocalFile> {
 }
 
 /// The file what of a project is this machine's is kept in.
-pub const LOCAL: Name = Name::constant("project.local.toml");
+pub const LOCAL: &Name = Name::constant("project.local.toml");
 
 /// What a layer may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,7 +395,7 @@ pub struct Layer {
     /// Its content's directory: in `.layers/`, or a mounted tree.
     pub path: HostPath,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
-    pub at: TreePath,
+    pub at: Arc<TreePath>,
     /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
     pub changeset: HostPath,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
@@ -410,7 +412,7 @@ pub struct Layer {
 
 #[derive(Clone)]
 pub struct Mount {
-    pub at: TreePath,
+    pub at: Arc<TreePath>,
     pub path: HostPath,
     pub read_only: bool,
 }
@@ -420,14 +422,14 @@ impl Layer {
     /// the layer travels with the project while what it made does not.
     #[must_use]
     pub fn plan(&self) -> HostPath {
-        self.path.with_suffix(&PLAN_SUFFIX)
+        self.path.with_suffix(PLAN_SUFFIX)
     }
 
     /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree; joined part
     /// by part, so that it is in the system's own separators.
     #[must_use]
     pub fn disk(&self, path: &TreePath) -> HostPath {
-        let within = path.strip_prefix(&self.at).unwrap_or_else(|| path.rel().clone());
+        let within = path.strip_prefix(&self.at).unwrap_or(path.rel());
         self.path.join(&within)
     }
 }
@@ -469,13 +471,19 @@ fn configs_of(
         .into_iter()
         .map(|(name, c)| {
             Ok(Config {
-                name: Name::new(&name).with_context(|| format!("the config {name}, which names its build's folder"))?,
+                name: (Name::new(&name)
+                    .with_context(|| format!("the config {name}, which names its build's folder"))?)
+                .to_owned(),
                 release: c.release,
                 target: c.target,
                 disabled: c
                     .disabled
                     .iter()
-                    .map(|path| TreePath::new(path).with_context(|| format!("the config {name} leaves out {path}")))
+                    .map(|path| {
+                        let path =
+                            TreePath::new(path).with_context(|| format!("the config {name} leaves out {path}"))?;
+                        Ok(path.to_owned())
+                    })
                     .collect::<Result<_>>()?,
                 properties: c.properties,
             })
@@ -536,8 +544,8 @@ pub(crate) fn resolve_path(directory: &HostPath, value: &str) -> Result<HostPath
 }
 
 /// A layer's or a mount point's name, as the name of its folder or changeset.
-fn layer_name(name: &str) -> Result<Name> {
-    Name::new(name).with_context(|| format!("the layer {name}"))
+fn layer_name(name: &str) -> Result<Arc<Name>> {
+    (Name::new(name).with_context(|| format!("the layer {name}"))).map(ToOwned::to_owned)
 }
 
 /// That each generated layer fills an asset layer of the project.
@@ -562,8 +570,8 @@ const EMPTY: &str = "# A project. `res://` paths are absolute from this director
 /// # Errors
 /// A project is there already, or the folder cannot be written.
 pub fn create(directory: &Path) -> Result<()> {
-    const OWN: Name = Name::constant("project");
-    const IGNORE: Name = Name::constant(".gitignore");
+    const OWN: &Name = Name::constant("project");
+    const IGNORE: &Name = Name::constant(".gitignore");
     let directory = HostPath::new(directory).with_context(|| directory.display().to_string())?;
     let file = directory.join(&FILE);
     anyhow::ensure!(!file.as_path().exists(), "{directory} holds a project already");
@@ -620,7 +628,7 @@ fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Re
             (true, None, None) => root.join(&at),
             (false, _, None) => bail!("{}: the mount {at} says no path", root.join(&FILE)),
         };
-        let mount = Mount { at, path, read_only: m.read_only || m.unmanaged };
+        let mount = Mount { at: at.to_owned(), path, read_only: m.read_only || m.unmanaged };
         if m.unmanaged { unmanaged.push(mount) } else { mounts.push(mount) }
     }
     Ok((mounts, unmanaged))
@@ -647,7 +655,7 @@ impl Project {
                     kind: LayerKind::Files,
                     path: m.path.clone(),
                     at: m.at.clone(),
-                    changeset: root.join(&LAYERS).join(&layer_name(m.at.as_str())?).with_suffix(&CHANGESET_SUFFIX),
+                    changeset: root.join(&LAYERS).join(&layer_name(m.at.as_str())?).with_suffix(CHANGESET_SUFFIX),
                     read_only: m.read_only,
                     changeset_writable: true,
                     mounted: true,
@@ -661,7 +669,7 @@ impl Project {
                 Some(path) => resolve_path(&root, path)?,
                 None => root.join(&LAYERS).join(&layer_name(&l.name)?),
             };
-            let changeset = path.with_suffix(&CHANGESET_SUFFIX);
+            let changeset = path.with_suffix(CHANGESET_SUFFIX);
             if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at.as_str() == l.name) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
             }
@@ -683,7 +691,7 @@ impl Project {
                 name: l.name,
                 kind,
                 path,
-                at: TreePath::root(),
+                at: TreePath::root().to_owned(),
                 changeset,
                 read_only,
                 changeset_writable: !read_only,
@@ -821,8 +829,9 @@ impl Project {
 /// What tests of a project share.
 #[cfg(test)]
 pub(crate) mod testing {
-    use pe2_path::HostPath;
-    pub use pe2_path::testing::{At, scratch};
+    use sfs::HostPath;
+    pub use sfs::testing::{At, scratch};
+    use std::sync::Arc;
 
     /// A uid a test writes, checked.
     pub fn uid(text: &str) -> pe2_path::Uid {
@@ -830,18 +839,18 @@ pub(crate) mod testing {
     }
 
     /// A path of the project's tree a test writes, checked.
-    pub fn tree(text: &str) -> crate::TreePath {
-        crate::TreePath::new(text).expect("a test writes a path")
+    pub fn tree(text: &str) -> Arc<crate::TreePath> {
+        crate::TreePath::new(text).expect("a test writes a path").to_owned()
     }
 
     /// A path within something a test writes, checked.
-    pub fn rel(text: &str) -> pe2_path::RelPath {
-        pe2_path::RelPath::new(text).expect("a test writes a path")
+    pub fn rel(text: &str) -> Arc<pe2_path::RelPath> {
+        pe2_path::RelPath::new(text).expect("a test writes a path").to_owned()
     }
 
     /// A name a test writes, checked.
-    pub fn name(text: &str) -> pe2_path::Name {
-        pe2_path::Name::new(text).expect("a test writes a name")
+    pub fn name(text: &str) -> Arc<pe2_path::Name> {
+        pe2_path::Name::new(text).expect("a test writes a name").to_owned()
     }
 
     /// Have a file or a folder say it was last changed then.
@@ -915,7 +924,7 @@ properties = { language = "de", flags = [1], nothing = true }
         let project = super::Project::load(&dir).unwrap();
         let names: Vec<&str> = project.properties.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["language", "flags", "level"], "in order, the one declared wrongly left out");
-        let config = |name: &str| project.configs.iter().find(|c| c.name == name).unwrap();
+        let config = |name: &str| project.configs.iter().find(|c| *c.name == *name).unwrap();
         let of = |name: &str| project.properties_of(config(name));
         assert_eq!(of("usa").get("language").and_then(toml::Value::as_str), Some("en"), "by default");
         assert_eq!(of("usa_fr").get("language").and_then(toml::Value::as_str), Some("fr"));
@@ -924,7 +933,7 @@ properties = { language = "de", flags = [1], nothing = true }
         let mut said: Vec<String> = project
             .property_problems
             .iter()
-            .map(|p| format!("{} {}", p.config.as_ref().map_or("-", pe2_path::Name::as_str), p.property))
+            .map(|p| format!("{} {}", p.config.as_ref().map_or("-", |config| config.as_str()), p.property))
             .collect();
         said.sort();
         assert_eq!(said, ["- odd", "wrong flags", "wrong language", "wrong level", "wrong nothing"]);

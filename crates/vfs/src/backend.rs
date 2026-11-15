@@ -14,7 +14,7 @@
 //! backend needs telling (`placed`, `released`), and what a process that ended left of one is the backend's to clear
 //! (`clear`).
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -164,11 +164,11 @@ impl Mount for Finishing {
         self.mount().note()
     }
 
-    fn placed(&self, served: &Served, path: &str) {
+    fn placed(&self, served: &Served, path: &pe2_path::RelPath) {
         self.mount().placed(served, path);
     }
 
-    fn released(&self, path: &str) {
+    fn released(&self, path: &pe2_path::RelPath) {
         self.mount().released(path);
     }
 }
@@ -192,10 +192,10 @@ pub trait Mount: Send {
     }
 
     /// What is now served under a path is about to be opened by it.
-    fn placed(&self, _served: &Served, _path: &str) {}
+    fn placed(&self, _served: &Served, _path: &pe2_path::RelPath) {}
 
     /// What was served under a path no longer is; called while the tree still holds it.
-    fn released(&self, _path: &str) {}
+    fn released(&self, _path: &pe2_path::RelPath) {}
 }
 
 /// What a setting says serves.
@@ -342,11 +342,12 @@ fn choose_among<'a>(
 }
 
 /// What says where this machine keeps apart what a backend keeps of a folder elsewhere than in it (`keep_apart_by`).
-static APART: std::sync::OnceLock<Box<dyn Fn() -> Option<HostPath> + Send + Sync>> = std::sync::OnceLock::new();
+static APART: std::sync::OnceLock<Box<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 /// Ask this, from now on, where the machine keeps such things apart (its settings' `[filesystem] cache`): given by
 /// the program, which is what reads the machine's settings, once.
-pub fn keep_apart_by(machine: impl Fn() -> Option<HostPath> + Send + Sync + 'static) {
+pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + Sync + 'static) {
     let _ = APART.set(Box::new(machine));
 }
 
@@ -359,7 +360,7 @@ pub fn apart_for(at: &HostPath) -> Option<HostPath> {
     // Places a setting or the environment names, as the system names them.
     let place = |text: &std::ffi::OsStr| HostPath::new(std::path::Path::new(text)).ok();
     let project = at.parent().and_then(|root| project::local_filesystem(&root).cache);
-    let machine = || APART.get().and_then(|machine| machine());
+    let machine = || APART.get().and_then(|machine| machine()).and_then(|cache| place(cache.as_os_str()));
     let default = || {
         let local = place(&std::env::var_os("LOCALAPPDATA")?)?;
         Some(local.join(&pe2_path::RelPath::constant("pe2-editor/served")))
@@ -505,7 +506,7 @@ pub fn unmount_all() {
 #[cfg(test)]
 mod tests {
     use super::{Backend, Can, Job, Mount, Setting, Use, choose_among, setting};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     /// A backend that only says what it is.
     struct Said {
@@ -553,7 +554,7 @@ mod tests {
         let full = said("full", BOTH, true);
         let wire = said("wire", Can::WRITTEN, true);
         let all: [&dyn Backend; 4] = [&light, &off, &full, &wire];
-        let at = &pe2_path::testing::scratch("backend-choice");
+        let at = &sfs::testing::scratch("backend-choice");
         // Read once, and much to write to lay it out: a backend suits better than copies.
         let how = Use::once();
         let chosen = |setting: &Setting, needs: Can| {
@@ -584,8 +585,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_folder_leads_to_another_and_is_one_of_its_own_again() {
-        use pe2_path::testing::At as _;
-        let root = pe2_path::testing::scratch("junction");
+        use sfs::testing::At as _;
+        let root = sfs::testing::scratch("junction");
         let (at, to) = (root.at("at"), root.at("to"));
         std::fs::create_dir_all(&to).unwrap();
         std::fs::write(to.at("there.txt"), "there").unwrap();
@@ -611,7 +612,7 @@ mod tests {
         let keeper = Said { keeps: true, ..said("keeper", Can::BY_PATH, true) };
         let eager = Said { keeps: true, prepares: true, ..said("eager", BOTH, true) };
         let all: [&dyn Backend; 3] = [&plain, &keeper, &eager];
-        let at = &pe2_path::testing::scratch("backend-choice");
+        let at = &sfs::testing::scratch("backend-choice");
         let chosen = |needs: Can, how: &Use, light: bool| {
             choose_among(&all, &Setting::Auto, needs, at, how, light).unwrap().map_or("copies", Backend::name)
         };

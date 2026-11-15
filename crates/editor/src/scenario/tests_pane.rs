@@ -27,7 +27,7 @@ fn with_runner() -> Scenario {
     let runner =
         editor.file_elsewhere("runner.sh", RUNNER.replace("PICTURE", &picture.display().to_string()).as_bytes());
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).expect("a program");
-    editor.workspace().tests.use_runner(runner);
+    editor.workspace().tests.use_runner(runner.into_path_buf());
     editor.settle();
     editor.settle();
     editor

@@ -2,17 +2,18 @@
 //! go says what it would do before the drop, by the pointer, as a wire of the graph is refused with its reason.
 
 use eframe::egui::{self, DragAndDrop, RichText};
+use std::sync::Arc;
 
 use crate::theme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dragged {
     /// An asset, by its path.
-    Asset(project::TreePath),
+    Asset(Arc<project::TreePath>),
     /// A layer of an asset's stack: the asset's path and its place.
-    Layer(project::TreePath, usize),
+    Layer(Arc<project::TreePath>, usize),
     /// A row of the contents: its asset's path, its id, its label and what its type says it is when dragged.
-    Row { asset: project::TreePath, id: String, label: String, what: String },
+    Row { asset: Arc<project::TreePath>, id: String, label: String, what: String },
 }
 
 impl Dragged {

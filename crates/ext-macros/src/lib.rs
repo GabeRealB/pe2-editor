@@ -1,7 +1,12 @@
 //! The extension SDK's macros. `pe2_ext` re-exports them: an extension uses `pe2_ext::extension!`.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "it reads the crate being built where cargo has it: a place on disk, no storage's"
+)]
+
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use proc_macro::TokenStream;
 
@@ -81,10 +86,9 @@ pub fn extension(input: TokenStream) -> TokenStream {
 }
 
 /// The manifest of the crate being built: its path, and what it says.
-fn manifest() -> Result<(pe2_path::HostPath, toml::Table), String> {
+fn manifest() -> Result<(PathBuf, toml::Table), String> {
     let folder = std::env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is not set: build it with cargo")?;
-    let folder = pe2_path::HostPath::new(Path::new(&folder)).map_err(|e| e.to_string())?;
-    let path = folder.join(&pe2_path::Name::constant(MANIFEST));
+    let path = Path::new(&folder).join(MANIFEST);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let table = text.parse::<toml::Table>().map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((path, table))
@@ -92,17 +96,19 @@ fn manifest() -> Result<(pe2_path::HostPath, toml::Table), String> {
 
 /// A manifest's keys checked, each as what it is, the files it names beside it, and that only what runs unsandboxed
 /// fetches or offers programs (`pe2_manifest::check`).
-fn check(path: &pe2_path::HostPath, table: &toml::Table) -> Result<(), String> {
+fn check(path: &Path, table: &toml::Table) -> Result<(), String> {
     let folder = path.parent().ok_or("a manifest in no folder")?;
+    // What it names beside it is a path of the extension's tree: checked as one, then read where cargo has the crate.
     let read = |name: &str| {
         let within = pe2_path::RelPath::new(name).map_err(|e| e.to_string())?;
-        std::fs::read(folder.join(&within)).map_err(|e| e.to_string())
+        let place = within.parts().fold(folder.to_path_buf(), |at, part| at.join(part.as_str()));
+        std::fs::read(place).map_err(|e| e.to_string())
     };
     pe2_manifest::check(table, &read).map_err(|why| format!("{}: {why}", path.display()))
 }
 
 /// The manifest checked, and the code it declares.
-fn expand(path: &pe2_path::HostPath, table: &toml::Table, register: &str) -> Result<String, String> {
+fn expand(path: &Path, table: &toml::Table, register: &str) -> Result<String, String> {
     check(path, table)?;
     let said = |why: String| format!("{}: {why}", path.display());
     let text = |key: &str| table.get(key).and_then(toml::Value::as_str);

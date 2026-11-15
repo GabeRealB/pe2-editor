@@ -21,6 +21,10 @@
 //! Panes moved into windows of their own open as native windows; `PE2_EDITOR_EMBED_WINDOWS=1` draws those windows
 //! inside the main one instead (and so in its screenshots).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "what it is given and the program's own files are plain paths; a project's places are HostPaths, joined only of checked names"
+)]
 // wgpu's handles are Send through a deep chain of types: proving it for the player's renderer needs a higher limit.
 #![recursion_limit = "256"]
 
@@ -36,7 +40,6 @@ mod extensions_pane;
 mod external;
 mod fetcher;
 use holder::files;
-use pe2_path::HostPath;
 mod fill;
 mod gpu_stats;
 mod gpu_view;
@@ -79,30 +82,26 @@ use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 /// Direct3D refuses, which wgpu says as a device lost - nor wgpu's own choice (`Auto`, which looks there). Where there is
 /// none, Direct3D 12 is left out, said once, and another backend serves.
 pub(crate) fn shader_compiler(setup: &mut eframe::egui_wgpu::WgpuSetupCreateNew) {
-    const DXC: pe2_path::Name = pe2_path::Name::constant("dxcompiler.dll");
+    const DXC: &str = "dxcompiler.dll";
     static SAID: std::sync::Once = std::sync::Once::new();
     if !cfg!(windows) {
         return;
     }
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|program| pe2_path::HostPath::new(&program).ok())
-        .and_then(|program| program.parent());
+    let beside = std::env::current_exe().ok().map(|program| program.with_file_name(DXC));
     // Only a test build reads where it was prepared: no program anyone runs carries the path of the machine it was
     // built on.
     #[cfg(test)]
-    let prepared =
-        option_env!("PE2_PREPARED").and_then(|folder| pe2_path::HostPath::new(std::path::Path::new(folder)).ok());
+    let prepared = option_env!("PE2_PREPARED").map(|folder| std::path::Path::new(folder).join(DXC));
     #[cfg(not(test))]
     let prepared = None;
-    let places: Vec<pe2_path::HostPath> = beside.into_iter().chain(prepared).map(|folder| folder.join(&DXC)).collect();
+    let places: Vec<std::path::PathBuf> = beside.into_iter().chain(prepared).collect();
     if let Some(dxc) = places.iter().find(|dxc| dxc.is_file()) {
         setup.instance_descriptor.backend_options.dx12.shader_compiler =
-            wgpu::Dx12Compiler::DynamicDxc { dxc_path: dxc.to_string() };
+            wgpu::Dx12Compiler::DynamicDxc { dxc_path: dxc.to_string_lossy().into_owned() };
         return;
     }
     SAID.call_once(|| {
-        let looked: Vec<String> = places.iter().map(ToString::to_string).collect();
+        let looked: Vec<String> = places.iter().map(|place| place.display().to_string()).collect();
         eprintln!("no DirectX Shader Compiler at {}: Direct3D 12 is left out", looked.join(" or "));
     });
     setup.instance_descriptor.backends.remove(wgpu::Backends::DX12);
@@ -233,9 +232,7 @@ pub fn run() -> Result {
         let machine = extensions::filesystem_defaults();
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
-    vfs::backend::keep_apart_by(|| {
-        extensions::filesystem_defaults().cache.and_then(|cache| HostPath::new(std::path::Path::new(&cache)).ok())
-    });
+    vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(std::path::PathBuf::from));
     // Ended by a signal, the editor drops nothing: what it mounted would be left with no one serving it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = ctrlc::set_handler(|| {
@@ -251,28 +248,28 @@ pub fn run() -> Result {
         eprintln!("pe2-editor: {}: {why}", arg.to_string_lossy());
         std::process::exit(2)
     };
-    let place = |arg: &std::ffi::OsStr| HostPath::new(std::path::Path::new(arg)).unwrap_or_else(|e| refused(arg, &e));
+    let place = std::path::PathBuf::from;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--select") => {
                 let Some(asset) = args.next() else { refused(&arg, &"names no asset") };
                 let text = asset.to_str().unwrap_or_else(|| refused(&asset, &"is no text"));
-                select = Some(project::TreePath::new(text).unwrap_or_else(|e| refused(&asset, &e)));
+                select = Some(project::TreePath::new(text).unwrap_or_else(|e| refused(&asset, &e)).to_owned());
             }
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--screenshot") => {
                 let Some(to) = args.next() else { refused(&arg, &"names no file") };
-                screenshot = Some(place(&to));
+                screenshot = Some(place(to));
             }
             Some("--agents-drive") => agents_drive = true,
             Some("--wait-for-agent") => workspace::wait_for_agent(),
             Some("--trust-everything") => extensions::trust::trust_everything(),
-            _ => project = Some(place(&arg)),
+            _ => project = Some(place(arg)),
         }
     }
     let project = project.or_else(|| {
-        let cwd = HostPath::new(&std::env::current_dir().ok()?).ok()?;
-        cwd.join(&project::FILE).is_file().then_some(cwd)
+        let cwd = std::env::current_dir().ok()?;
+        cwd.join(project::FILE.as_str()).is_file().then_some(cwd)
     });
     // Kept here rather than by eframe: under WSLg it would read back a place a decoration off, and a window closed filling the
     // screen would come back that size.

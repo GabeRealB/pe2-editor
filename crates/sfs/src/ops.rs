@@ -4,7 +4,9 @@
 //! (`Began`), which no other record has; its bytes are the data records that say that number.
 
 use crate::Log;
+use pe2_path::RelPath;
 use std::io;
+use std::sync::Arc;
 
 /// The kinds of records, after the two of a file's bytes (`content::DATA`, `content::FILL`).
 mod kind {
@@ -25,15 +27,15 @@ pub enum Op {
     /// A file in transit begins at a path: the record's position is the file's number. `emptied`, it begins as a
     /// change of its own - a file made, or one written anew; otherwise it begins as the file there is, whose bytes
     /// follow as a fill, and changes by what is written to it after.
-    Began { path: String, emptied: bool },
+    Began { path: Arc<RelPath>, emptied: bool },
     /// A file in transit was made this long.
     Truncated { file: u64, len: u64 },
     /// A path was removed.
-    Removed { path: String },
+    Removed { path: Arc<RelPath> },
     /// A folder was made.
-    MadeFolder { path: String },
+    MadeFolder { path: Arc<RelPath> },
     /// A path was renamed.
-    Renamed { from: String, to: String },
+    Renamed { from: Arc<RelPath>, to: Arc<RelPath> },
     /// The project has a file in transit as it was when the log ended at `upto`: what was written to it after is
     /// not the project's yet.
     Taken { file: u64, upto: u64 },
@@ -65,12 +67,13 @@ impl Reader<'_> {
         Some(*flag != 0)
     }
 
-    fn text(&mut self) -> Option<String> {
+    /// A path, as written: none where it is not whole, or is no path.
+    fn path(&mut self) -> Option<Arc<RelPath>> {
         let (len, rest) = self.0.split_first_chunk::<4>()?;
         let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
         let (text, rest) = rest.split_at_checked(len)?;
         self.0 = rest;
-        String::from_utf8(text.to_vec()).ok()
+        Some(RelPath::new(std::str::from_utf8(text).ok()?).ok()?.to_owned())
     }
 }
 
@@ -84,7 +87,7 @@ impl Op {
         let kind = match self {
             Op::Began { path, emptied } => {
                 body.push(u8::from(*emptied));
-                text(&mut body, path);
+                text(&mut body, path.as_str());
                 kind::BEGAN
             }
             Op::Truncated { file, len } => {
@@ -93,16 +96,16 @@ impl Op {
                 kind::TRUNCATED
             }
             Op::Removed { path } => {
-                text(&mut body, path);
+                text(&mut body, path.as_str());
                 kind::REMOVED
             }
             Op::MadeFolder { path } => {
-                text(&mut body, path);
+                text(&mut body, path.as_str());
                 kind::MADE_FOLDER
             }
             Op::Renamed { from, to } => {
-                text(&mut body, from);
-                text(&mut body, to);
+                text(&mut body, from.as_str());
+                text(&mut body, to.as_str());
                 kind::RENAMED
             }
             Op::Taken { file, upto } => {
@@ -123,16 +126,17 @@ impl Op {
         log.append(kind, &[&body])
     }
 
-    /// The operation a record is; none where it is of another kind - a file's bytes - or not whole.
+    /// The operation a record is; none where it is of another kind - a file's bytes - or not whole: a path it says
+    /// is one, as it was when it was written.
     #[must_use]
     pub fn of(kind: u8, body: &[u8]) -> Option<Op> {
         let mut body = Reader(body);
         Some(match kind {
-            kind::BEGAN => Op::Began { emptied: body.flag()?, path: body.text()? },
+            kind::BEGAN => Op::Began { emptied: body.flag()?, path: body.path()? },
             kind::TRUNCATED => Op::Truncated { file: body.number()?, len: body.number()? },
-            kind::REMOVED => Op::Removed { path: body.text()? },
-            kind::MADE_FOLDER => Op::MadeFolder { path: body.text()? },
-            kind::RENAMED => Op::Renamed { from: body.text()?, to: body.text()? },
+            kind::REMOVED => Op::Removed { path: body.path()? },
+            kind::MADE_FOLDER => Op::MadeFolder { path: body.path()? },
+            kind::RENAMED => Op::Renamed { from: body.path()?, to: body.path()? },
             kind::TAKEN => Op::Taken { file: body.number()?, upto: body.number()? },
             kind::DONE => Op::Done { of: body.number()? },
             kind::REFUSED => Op::Refused { of: body.number()? },
@@ -146,19 +150,25 @@ impl Op {
 mod tests {
     use super::Op;
     use crate::log::{Config, Log};
+    use pe2_path::RelPath;
+    use std::sync::Arc;
+
+    fn p(path: &str) -> Arc<RelPath> {
+        RelPath::new(path).unwrap().to_owned()
+    }
 
     #[test]
     fn what_is_appended_is_read_as_it_was() {
-        let dir = pe2_path::testing::scratch("sfs-ops");
+        let dir = crate::testing::scratch("sfs-ops");
         let _ = std::fs::remove_dir_all(&dir);
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 20 }).unwrap();
         let ops = [
-            Op::Began { path: "a/b.txt".into(), emptied: true },
-            Op::Began { path: "c".into(), emptied: false },
+            Op::Began { path: p("a/b.txt"), emptied: true },
+            Op::Began { path: p("c"), emptied: false },
             Op::Truncated { file: 7, len: 12 },
-            Op::Removed { path: "gone".into() },
-            Op::MadeFolder { path: "made/here".into() },
-            Op::Renamed { from: "old name".into(), to: "näme".into() },
+            Op::Removed { path: p("gone") },
+            Op::MadeFolder { path: p("made/here") },
+            Op::Renamed { from: p("old name"), to: p("näme") },
             Op::Taken { file: 7, upto: 99 },
             Op::Done { of: 3 },
             Op::Refused { of: 4 },

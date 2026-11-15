@@ -28,7 +28,8 @@
 //! are text in which the folder it took is written as `tree`, so that what it makes is the same wherever it ran - a
 //! preprocessor's line markers - and so is what is made of it.
 
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -70,7 +71,7 @@ struct Laid {
     folder: Option<HostPath>,
     input: HostPath,
     output: HostPath,
-    files: Vec<RelPath>,
+    files: Vec<Arc<RelPath>>,
 }
 
 impl Drop for Laid {
@@ -95,12 +96,14 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
     }
     let laid = lay_out(call, &given)?;
     let config = config_of(call, &settings);
-    let first = laid.files.first().map(RelPath::as_str);
-    let outputs: Vec<RelPath> = texts(&settings, "outputs")
+    let first = laid.files.first().map(|path| path.as_str());
+    let outputs: Vec<Arc<RelPath>> = texts(&settings, "outputs")
         .iter()
         .map(|name| {
             let name = named(name, first, &told);
-            RelPath::new(&name).with_context(|| format!("its output {name}, which is no path within a folder"))
+            let path =
+                RelPath::new(&name).with_context(|| format!("its output {name}, which is no path within a folder"))?;
+            Ok(path.to_owned())
         })
         .collect::<Result<_>>()?;
     let stdout = settings.get("stdout").and_then(Toml::as_str).map(|name| named(name, first, &told));
@@ -185,9 +188,10 @@ fn files_of(value: &Value) -> Vec<File> {
 fn lay_out(call: &exec::Call<'_>, given: &[File]) -> Result<Laid> {
     use std::sync::atomic::AtomicU64;
     static RUNS: AtomicU64 = AtomicU64::new(0);
-    const IN: Name = Name::constant("in");
-    const OUT: Name = Name::constant("out");
-    let run = Name::new(&format!("pe2-run-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed)))?;
+    const IN: &Name = Name::constant("in");
+    const OUT: &Name = Name::constant("out");
+    let run = format!("pe2-run-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
+    let run = Name::new(&run)?;
     let folder = HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?.join(&run);
     let _ = std::fs::remove_dir_all(&folder);
     let laid = Laid { input: folder.join(&IN), output: folder.join(&OUT), folder: Some(folder), files: Vec::new() };
@@ -202,7 +206,7 @@ fn lay_out(call: &exec::Call<'_>, given: &[File]) -> Result<Laid> {
             std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
         }
         std::fs::write(&path, call.read(&file.content)?).with_context(|| path.to_string())?;
-        laid.files.push(name);
+        laid.files.push(name.to_owned());
     }
     Ok(laid)
 }
@@ -269,7 +273,7 @@ fn forms(folder: &HostPath) -> Vec<String> {
 /// What placeholders come to in one run.
 struct Places<'a> {
     laid: &'a Laid,
-    outputs: &'a [RelPath],
+    outputs: &'a [Arc<RelPath>],
     config: &'a Table,
     values: &'a Table,
     told: &'a Table,
@@ -325,7 +329,7 @@ impl Places<'_> {
             "tree" => Filled::One(self.laid.input.to_string()),
             "in" => Filled::One(self.laid.input.argument(first.context("{in}: it is given no file")?)),
             "in.path" => Filled::One(first.map_or_else(String::new, ToString::to_string)),
-            "in.stem" => Filled::One(named("{in.stem}", first.map(RelPath::as_str), &Table::new())),
+            "in.stem" => Filled::One(named("{in.stem}", first.map(|path| path.as_str()), &Table::new())),
             "inputs" => Filled::Many(self.laid.files.iter().map(|f| self.laid.input.argument(f)).collect()),
             "out" => Filled::One(self.laid.output.argument(self.outputs.first().context("{out}: it names no output")?)),
             _ => {
@@ -391,9 +395,12 @@ mod tests {
             folder: None,
             input: run.at("in"),
             output: run.at("out"),
-            files: vec![RelPath::new("self/src/a.c").unwrap(), RelPath::new("self/src/b.h").unwrap()],
+            files: vec![
+                RelPath::new("self/src/a.c").unwrap().to_owned(),
+                RelPath::new("self/src/b.h").unwrap().to_owned(),
+            ],
         };
-        let outputs = [RelPath::new("self/src/a.c.s").unwrap()];
+        let outputs = [RelPath::new("self/src/a.c.s").unwrap().to_owned()];
         let config: toml::Table = toml::from_str("release = \"USA\"\n[properties]\nlanguage = \"en\"").unwrap();
         let values: toml::Table =
             toml::from_str("flags = [\"-O2\", \"-G0\"]\nincludes = [\"self\", \"dep\"]\nmode = \"x\"").unwrap();
@@ -401,7 +408,7 @@ mod tests {
         let places = Places { laid: &laid, outputs: &outputs, config: &config, values: &values, told: &told };
         let one = |arg: &str| places.expand(arg).unwrap();
         // A file of what it took, or one it makes: the folder as this platform writes it, the path within with `/`.
-        let at = |folder: &str, file: &str| run.at(folder).argument(&RelPath::new(file).unwrap());
+        let at = |folder: &str, file: &str| run.at(folder).argument(RelPath::new(file).unwrap());
         assert_eq!(one("-DVER_{config.release}"), ["-DVER_USA"]);
         assert_eq!(one("{config.properties.language}"), ["en"]);
         assert_eq!(one("{values.flags}"), ["-O2", "-G0"]);

@@ -7,24 +7,24 @@
 //! folder (`server.rs`), each its socket, lock and log, and what is written through what is served.
 
 use anyhow::{Context, Result};
-use pe2_path::HostPath;
 use pe2_path::Name;
+use sfs::HostPath;
 
 use crate::Project;
 use crate::lock::Lock;
 
-pub const DIR: Name = Name::constant(".cache");
+pub const DIR: &Name = Name::constant(".cache");
 /// The socket agents reach the editor holding the project by (`mcp::link`): listening from the moment it holds the
 /// project's lock, before it opens the cache.
-pub const SOCKET: Name = Name::constant("editor.sock");
+pub const SOCKET: &Name = Name::constant("editor.sock");
 /// Where what programs write through the filesystem served is staged until it is applied (`vfs::writes`).
-pub const STAGING: Name = Name::constant("filesystem");
+pub const STAGING: &Name = Name::constant("filesystem");
 /// Raised whenever what the cache holds changes shape.
 pub(crate) const SCHEMA: u32 = 2;
 /// The schema and the tools that wrote the cache.
-const VERSION: Name = Name::constant("version");
+const VERSION: &Name = Name::constant("version");
 /// What has git ignore the folder it is in.
-pub const GITIGNORE: Name = Name::constant(".gitignore");
+pub const GITIGNORE: &Name = Name::constant(".gitignore");
 
 #[derive(Clone)]
 pub struct Cache {
@@ -136,8 +136,8 @@ mod tests {
         }
         // No version, as a cache another wrote: wiped, but for the lock and the socket.
         let cache = super::Cache::open(&project, &lock).unwrap();
-        assert!(cache.path(&super::SOCKET).exists());
-        assert!(!cache.path(&left).exists());
+        assert!(cache.path(super::SOCKET).exists());
+        assert!(!cache.path(left).exists());
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);
     }

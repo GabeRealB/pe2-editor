@@ -12,14 +12,15 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Write as _};
 
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::chunks::{Manifest, Store};
 
 /// The listing's name in a packed layer's folder.
-pub const FILE: pe2_path::Name = pe2_path::Name::constant(".pack");
+pub const FILE: &pe2_path::Name = pe2_path::Name::constant(".pack");
 
 const HEADER: &str = "pe2 pack 1";
 
@@ -301,7 +302,7 @@ pub fn reread_changed(paths: &[HostPath]) {
 }
 
 /// An entry's name as a folder lists it: a name, or what it was refused as (`PathError::text` shows it) and why.
-pub type Listed = Result<Name, pe2_path::PathError>;
+pub type Listed = Result<Arc<Name>, pe2_path::PathError>;
 
 /// The text an entry is listed by: its name, or how the one refused shows.
 #[must_use]
@@ -325,7 +326,7 @@ pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
         if kind.is_dir() || kind.is_file() {
             let raw = entry.file_name();
             let name = match raw.to_str() {
-                Some(text) => Name::new(text),
+                Some(text) => Name::new(text).map(ToOwned::to_owned),
                 None => Err(pe2_path::PathError { text: raw.to_string_lossy().into(), why: pe2_path::Why::NotText }),
             };
             seen.insert(shown(&name).to_owned());
@@ -334,7 +335,7 @@ pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
     }
     // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
     let held = crate::records::held_at(dir).map(|(held, within)| held.list(&within));
-    let held = held.into_iter().flatten().map(|(name, folder)| (Name::new(&name), folder));
+    let held = held.into_iter().flatten().map(|(name, folder)| (Name::new(&name).map(ToOwned::to_owned), folder));
     let recorded = crate::records::Set::list(dir).into_iter().flatten().map(|(name, folder)| (Ok(name), folder));
     for (name, folder) in held.chain(recorded) {
         let text = shown(&name).to_owned();
@@ -348,7 +349,7 @@ pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
         let listed = dir.within(&pack.root).map_or_default(|rel| pack.list(rel.as_str()));
         for (name, folder) in listed {
             if seen.insert(name.clone()) {
-                out.push((Name::new(&name), dir.entry(std::ffi::OsStr::new(&name)), folder));
+                out.push((Name::new(&name).map(ToOwned::to_owned), dir.entry(std::ffi::OsStr::new(&name)), folder));
             }
         }
     }

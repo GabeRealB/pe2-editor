@@ -33,9 +33,18 @@ after the edit has been answered (see [The editor](../processes/editor.md)).
 Paths of the project are `TreePath`s (`pe2_path::VfsPath<Tree>`), files within an asset `RelPath`s, uids `Uid`s:
 checked where they come in - a changeset or record read, an edit asked, a file a walk finds - and never text after.
 What a layer holds by a name no path takes is a problem of the project's (`Problem::Refused`), it and what is
-inside it left out; nothing is renamed or passed over unsaid. An edit making or moving an entry beside one named
-alike but for its case is refused (`edit::alone_but_for_case`), comparing a node by its asset's name; a project
-already holding such siblings is not yet said to.
+inside it left out; nothing is renamed or passed over unsaid.
+
+Names compare as the served folder must hold them on every system: by their fold (`pe2_path::folded`), each
+character's full case folding of its simple uppercase, in canonical decomposition - what full case folding takes as
+alike, and what NTFS takes as alike (`ı` and `i`), are one name, and so is a name in either normal form. Equality,
+hashing and order all go by it, with a path ordered name by name, so what is in a folder follows it; the spelling
+written is what is kept and shown. The table is made as the crate is built from the Unicode Character Database
+`cargo xtask prepare` fetches, and the model names its version (`UNICODE_VERSION`): one made with another is filled
+again. An edit making or moving an entry where one is shown already is refused as there already
+(`edit::shown_free`), a node compared by its asset's name, and renaming an entry to another spelling of its name
+changes its spelling. Two a walk finds in one folder, two files of a record, two records placed at one name are each
+refused and said - whichever the system listed first (`index::apart`, `records::placed_alike`).
 
 ## The model
 

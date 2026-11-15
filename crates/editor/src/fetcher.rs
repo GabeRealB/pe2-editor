@@ -6,7 +6,7 @@
 //! shown in the status bar and the pane. What failed waits to be tried again, from the pane. Between fetches, the store
 //! is swept where a sweep is due (`setup::kept`), keeping what the project's extensions name.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};

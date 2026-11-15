@@ -34,9 +34,11 @@
 //! Only the holder of the project lock writes (`lock.rs`).
 
 use anyhow::{Context, Result, bail};
-use pe2_path::{HostPath, Name, RelPath, Uid};
+use pe2_path::{Name, RelPath, Uid};
 use serde::{Deserialize, Serialize};
+use sfs::HostPath;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::TreePath;
@@ -44,12 +46,12 @@ use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 use crate::index::{Index, Working, WorkingFile};
 
-pub(crate) const DIR: Name = Name::constant("history");
-const SESSION: Name = Name::constant("session.jsonl");
+pub(crate) const DIR: &Name = Name::constant("history");
+const SESSION: &Name = Name::constant("session.jsonl");
 /// Where it keeps the contents it may put back, by their hashes.
-const BLOBS: Name = Name::constant("blobs");
+const BLOBS: &Name = Name::constant("blobs");
 /// Where it keeps what it removed, a folder or a file a step, by their numbers.
-const TRASH: Name = Name::constant("trash");
+const TRASH: &Name = Name::constant("trash");
 /// How long the session's file may grow by what is appended before it is written whole again.
 const SESSION_LONG: u64 = 4 << 20;
 /// How many steps a session keeps.
@@ -96,8 +98,8 @@ impl Change {
 pub struct Edit {
     pub uid: Uid,
     /// Where the asset was when it was edited.
-    pub path: TreePath,
-    pub file: RelPath,
+    pub path: Arc<TreePath>,
+    pub file: Arc<RelPath>,
     pub before: Option<String>,
     pub after: Option<String>,
 }
@@ -120,6 +122,9 @@ pub enum Kind {
     Checkpoint,
 }
 
+/// What saving a document writes: each file it changed by name, its bytes, or none where it is removed.
+pub type ToSave = Vec<(Arc<RelPath>, Option<Vec<u8>>)>;
+
 /// A step of the log: what it was, who made it and when, what it changed, and what was selected when it was made.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Step {
@@ -133,7 +138,7 @@ pub struct Step {
     pub changes: Vec<Change>,
     #[serde(default)]
     pub edits: Vec<Edit>,
-    pub selection: Option<TreePath>,
+    pub selection: Option<Arc<TreePath>>,
     #[serde(skip)]
     merge: Option<(String, Instant)>,
 }
@@ -184,10 +189,10 @@ impl Step {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     /// Where the asset is.
-    pub path: TreePath,
-    pub base: BTreeMap<RelPath, Option<String>>,
-    pub working: BTreeMap<RelPath, Option<String>>,
-    pub stale: Option<BTreeMap<RelPath, Option<String>>>,
+    pub path: Arc<TreePath>,
+    pub base: BTreeMap<Arc<RelPath>, Option<String>>,
+    pub working: BTreeMap<Arc<RelPath>, Option<String>>,
+    pub stale: Option<BTreeMap<Arc<RelPath>, Option<String>>>,
 }
 
 /// What a session a crash ended left: its steps, and its documents with unsaved changes.
@@ -346,7 +351,7 @@ impl View {
     /// since edited them: each by uid and name, by hash (none: absent). Of one document, or all. What steps did to
     /// files otherwise (a move, a new asset) is not taken back: a point is of the documents.
     #[must_use]
-    pub fn states_at(&self, point: usize, scope: Option<Uid>) -> BTreeMap<(Uid, RelPath), Option<String>> {
+    pub fn states_at(&self, point: usize, scope: Option<Uid>) -> BTreeMap<(Uid, Arc<RelPath>), Option<String>> {
         let mut states = BTreeMap::new();
         for step in self.done[point.min(self.done.len())..].iter().rev() {
             for edit in step.edits.iter().rev().filter(|e| scope.is_none_or(|uid| e.uid == uid)) {
@@ -400,7 +405,7 @@ impl History {
     /// # Errors
     /// The history's folder cannot be read, cleared or made.
     pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
-        let dir = cache.path(&DIR);
+        let dir = cache.path(DIR);
         let mut history = History {
             view: View::new(dir.clone()),
             merge_within: MERGE_WITHIN,
@@ -505,7 +510,7 @@ impl History {
     }
 
     /// Note what was selected when the last step was made: undoing it shows that again.
-    pub fn note_selection(&mut self, selection: Option<TreePath>) {
+    pub fn note_selection(&mut self, selection: Option<Arc<TreePath>>) {
         if let Some(step) = self.view.done.last_mut() {
             step.selection = selection;
         }
@@ -546,7 +551,7 @@ impl History {
         if before == after {
             return Ok(false);
         }
-        let edit = Edit { uid, path: path.clone(), file: file.clone(), before, after };
+        let edit = Edit { uid, path: path.to_owned(), file: file.to_owned(), before, after };
         self.set_working(index, &edit);
         let mut step = Step::new(label, self.author.clone());
         step.edits.push(edit);
@@ -592,7 +597,7 @@ impl History {
     ///
     /// # Errors
     /// A content is not kept.
-    pub fn to_save(&self, uid: Uid) -> Result<Vec<(RelPath, Option<Vec<u8>>)>> {
+    pub fn to_save(&self, uid: Uid) -> Result<ToSave> {
         let Some(document) = self.view.documents.get(&uid) else { return Ok(vec![]) };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let changed = document.working.iter().filter(|(name, sha1)| disk.get(*name) != Some(*sha1));
@@ -649,7 +654,7 @@ impl History {
                 document.path.clone_from(path);
                 changed = true;
             }
-            let now: BTreeMap<RelPath, Option<String>> =
+            let now: BTreeMap<Arc<RelPath>, Option<String>> =
                 document.base.keys().map(|file| (file.clone(), on_disk(index, *uid, file))).collect();
             let stale = if now == document.base { None } else { Some(now.clone()) };
             // What the disk has now is kept: taken, it is the working copy.
@@ -750,7 +755,7 @@ impl History {
     }
 
     /// Where an asset is, for an edit of it: as the index has it, else as its document last had it.
-    fn edit_path(&self, index: &Index, uid: Uid) -> Option<TreePath> {
+    fn edit_path(&self, index: &Index, uid: Uid) -> Option<Arc<TreePath>> {
         index
             .by_uid
             .get(&uid)
@@ -869,7 +874,7 @@ impl History {
         let mut state: HashMap<(Uid, &RelPath), Option<String>> = HashMap::new();
         let mut differing = vec![];
         for edit in edits {
-            let key = (edit.uid, &edit.file);
+            let key = (edit.uid, &*edit.file);
             let now = state.get(&key).cloned().unwrap_or_else(|| self.current(index, edit.uid, &edit.file));
             if now != edit.before {
                 let path = index.by_uid.get(&edit.uid).unwrap_or(&edit.path);
@@ -1239,7 +1244,7 @@ impl Transaction<'_> {
 
     /// What was selected, which undoing it shows again.
     #[must_use]
-    pub fn selecting(mut self, selection: Option<TreePath>) -> Self {
+    pub fn selecting(mut self, selection: Option<Arc<TreePath>>) -> Self {
         self.step.selection = selection;
         self
     }
@@ -1565,7 +1570,7 @@ mod tests {
     use crate::lock::Lock;
     use crate::testing::At as _;
     use crate::testing::{rel, tree, uid};
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     fn project(name: &str) -> HostPath {
         let root = crate::testing::scratch(&format!("history-{name}"));

@@ -2,8 +2,8 @@
 //! holds is answered by a host started for it - one, which the next command finds, with the history the last one
 //! left; its folder is served by a server of its own, which whoever holds the project feeds, and which serves on
 //! as the project changes hands.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use sfs::HostPath;
+use sfs::testing::At as _;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ struct Tried {
 
 impl Tried {
     fn new(name: &str) -> Tried {
-        let root = pe2_path::testing::scratch(&format!("roles-{name}"));
+        let root = sfs::testing::scratch(&format!("roles-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.at("data")).unwrap();
         let tried = Tried { root };
@@ -356,12 +356,18 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     let shared = project::shared::space(&tried.project()).expect("the shared space");
     let said = project::shared::listed(&shared.read().expect("read")).expect("listed");
     assert!(
-        matches!(said.get("notes/a.txt"), Some(project::server::Shown::File { size: 3, .. })),
+        matches!(
+            said.get(project::TreePath::new("notes/a.txt").unwrap()),
+            Some(project::server::Shown::File { size: 3, .. })
+        ),
         "{:?}\n{:?}",
         said.keys(),
         tried.said()
     );
-    assert!(matches!(said.get("notes"), Some(project::server::Shown::Folder)) && !said.contains_key("b.txt"));
+    assert!(
+        matches!(said.get(project::TreePath::new("notes").unwrap()), Some(project::server::Shown::Folder))
+            && !said.contains_key(project::TreePath::new("b.txt").unwrap())
+    );
     drop(shared);
     // One feeder at a time: what another process lists while the host feeds it is not taken.
     let mut other = project::server::ROLE.connect(&tried.project()).expect("the server listens");

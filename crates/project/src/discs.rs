@@ -6,7 +6,8 @@
 use anyhow::{Context, Result, bail};
 use formats::cdf::{self, Source};
 use formats::iso::{self, Image};
-use pe2_path::{HostPath, Name};
+use pe2_path::Name;
+use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 

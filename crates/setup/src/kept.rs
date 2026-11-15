@@ -8,9 +8,9 @@
 //! Everything in a store can be fetched again, and is held to its hashes when it is: a sweep that removes too much
 //! costs a download.
 
-use pe2_path::{HostPath, Name};
 use std::collections::HashSet;
 use std::hash::BuildHasher;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -25,7 +25,7 @@ const GRACE: Duration = Duration::from_hours(24);
 
 /// How often a store is swept, by any process: the time of `SWEPT`, its stamp, says when it last was.
 const EVERY: Duration = Duration::from_mins(30);
-const SWEPT: Name = Name::constant(".swept");
+const SWEPT: &str = ".swept";
 
 /// What a store holds: an entry's folder, or what a fetch left unfinished.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,30 +81,30 @@ pub fn ago(when: SystemTime) -> String {
 }
 
 /// Mark an entry's folder used now.
-pub(crate) fn used(place: &HostPath) {
-    let record = place.join(&RECORD);
+pub(crate) fn used(place: &Path) {
+    let record = place.join(RECORD);
     if let Ok(file) = std::fs::File::options().append(true).open(&record) {
         let _ = file.set_modified(SystemTime::now());
     }
 }
 
 /// When a file or folder was last changed.
-fn changed(path: &HostPath) -> SystemTime {
+fn changed(path: &Path) -> SystemTime {
     std::fs::symlink_metadata(path).and_then(|meta| meta.modified()).unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// How many bytes a folder holds, every file in it.
-fn bytes_in(path: &HostPath) -> u64 {
+fn bytes_in(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
     if !meta.is_dir() {
         return meta.len();
     }
-    path.entries().map(|entry| bytes_in(&entry)).sum()
+    entries(path).map(|entry| bytes_in(&entry)).sum()
 }
 
 /// One thing in a store, as it is.
-fn read(path: &HostPath, key: String) -> Kept {
-    let record = path.join(&RECORD);
+fn read(path: &Path, key: String) -> Kept {
+    let record = path.join(RECORD);
     let Ok(text) = std::fs::read_to_string(&record) else {
         return Kept { key, name: None, bytes: bytes_in(path), used: changed(path), whole: false };
     };
@@ -117,13 +117,18 @@ fn read(path: &HostPath, key: String) -> Kept {
 }
 
 /// What a store holds, most recently used first: each entry's folder, and what fetches left unfinished.
+/// What a folder holds, as places: what the system lists, nothing where it lists nothing.
+fn entries(folder: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
+}
+
 #[must_use]
-pub fn list(store: &HostPath) -> Vec<Kept> {
+pub fn list(store: &Path) -> Vec<Kept> {
     let mut kept = vec![];
-    for path in store.entries() {
+    for path in entries(store) {
         let name = path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
         if name == "downloads" {
-            for file in path.entries() {
+            for file in entries(&path) {
                 let name = format!("downloads/{}", file.file_name().unwrap_or_default().to_string_lossy());
                 kept.push(Kept { key: name, name: None, bytes: bytes_in(&file), used: changed(&file), whole: false });
             }
@@ -139,11 +144,10 @@ pub fn list(store: &HostPath) -> Vec<Kept> {
 ///
 /// # Errors
 /// It names nothing a store holds, or cannot be removed.
-pub fn remove(store: &HostPath, key: &str) -> Result<()> {
-    let within =
-        pe2_path::RelPath::new(key).ok().filter(|within| !within.is_root() && within.as_str() != SWEPT.as_str());
+pub fn remove(store: &Path, key: &str) -> Result<()> {
+    let within = super::parts(key).as_deref().and_then(super::place_of).filter(|within| *within != Path::new(SWEPT));
     let within = within.with_context(|| format!("{key}: nothing a store holds"))?;
-    let path = store.join(&within);
+    let path = store.join(within);
     super::checked().remove(&path);
     let removed = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
     removed.with_context(|| path.display().to_string())
@@ -165,7 +169,7 @@ pub type Swept = (Vec<Kept>, Vec<(Kept, String)>);
 /// Sweep a store now: what is to go, as `due` says, removed - keeping every entry the project sweeping names
 /// (`keep`, by key). What was removed, and what could not be, with why.
 #[must_use]
-pub fn sweep<S: BuildHasher>(store: &HostPath, keep: &HashSet<String, S>) -> Swept {
+pub fn sweep<S: BuildHasher>(store: &Path, keep: &HashSet<String, S>) -> Swept {
     let now = SystemTime::now();
     let (mut removed, mut failed) = (vec![], vec![]);
     for kept in list(store).into_iter().filter(|kept| due(kept, keep, now)) {
@@ -180,8 +184,8 @@ pub fn sweep<S: BuildHasher>(store: &HostPath, keep: &HashSet<String, S>) -> Swe
 /// Sweep a store where a sweep is due - none for `EVERY`, by any process - as `sweep` does: what was removed and what
 /// could not be, or None where it was not due.
 #[must_use]
-pub fn sweep_if_due<S: BuildHasher>(store: &HostPath, keep: &HashSet<String, S>) -> Option<Swept> {
-    let stamp: HostPath = store.join(&SWEPT);
+pub fn sweep_if_due<S: BuildHasher>(store: &Path, keep: &HashSet<String, S>) -> Option<Swept> {
+    let stamp: PathBuf = store.join(SWEPT);
     let last = std::fs::metadata(&stamp).and_then(|meta| meta.modified()).ok();
     if last.is_some_and(|last| SystemTime::now().duration_since(last).unwrap_or_default() < EVERY) || !store.is_dir() {
         return None;
@@ -195,7 +199,6 @@ pub fn sweep_if_due<S: BuildHasher>(store: &HostPath, keep: &HashSet<String, S>)
 mod tests {
     use super::{GRACE, UNUSED_FOR, list, sweep, sweep_if_due};
     use crate::{One, Setup, Take};
-    use pe2_path::testing::At as _;
     use std::collections::HashSet;
     use std::time::SystemTime;
 
@@ -232,7 +235,7 @@ mod tests {
 
     #[test]
     fn what_was_not_used_for_long_goes_unless_the_project_names_it() {
-        let store = pe2_path::testing::scratch("kept");
+        let store = sfs::testing::scratch("kept").into_path_buf();
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(&store).unwrap();
         let (fresh, old, named) = (entry("fresh"), entry("old-one"), entry("named-one"));
@@ -241,19 +244,19 @@ mod tests {
             assert!(setup.fetched(&store), "marked used as it is found");
         }
         let long = UNUSED_FOR + GRACE;
-        aged(&old.place(&store).at(".fetched"), long);
-        aged(&named.place(&store).at(".fetched"), long);
+        aged(&old.place(&store).join(".fetched"), long);
+        aged(&named.place(&store).join(".fetched"), long);
         // What fetches left: a folder being made and a download, a day old and just now; an older editor's folder.
         for (name, ago) in
             [("x.1.part", GRACE * 2), ("y.2.part", GRACE / 2), ("f6f6e883942d4d32-9872f330edb1", GRACE * 2)]
         {
-            std::fs::create_dir_all(store.at(name)).unwrap();
-            std::fs::write(store.at(name).at("cc1"), "x").unwrap();
-            aged(&store.at(name), ago);
+            std::fs::create_dir_all(store.join(name)).unwrap();
+            std::fs::write(store.join(name).join("cc1"), "x").unwrap();
+            aged(&store.join(name), ago);
         }
-        std::fs::create_dir_all(store.at("downloads")).unwrap();
-        std::fs::write(store.at("downloads/abc.1.0"), "partial").unwrap();
-        aged(&store.at("downloads/abc.1.0"), GRACE * 2);
+        std::fs::create_dir_all(store.join("downloads")).unwrap();
+        std::fs::write(store.join("downloads/abc.1.0"), "partial").unwrap();
+        aged(&store.join("downloads/abc.1.0"), GRACE * 2);
         let listed = list(&store);
         assert_eq!(listed.len(), 7);
         let fresh_kept = listed.iter().find(|k| k.key == fresh.key()).unwrap();
@@ -268,7 +271,7 @@ mod tests {
             vec![old.key(), "x.1.part".into(), "f6f6e883942d4d32-9872f330edb1".into(), "downloads/abc.1.0".into()];
         expected.sort();
         assert_eq!(gone, expected);
-        assert!(fresh.fetched(&store) && named.fetched(&store) && store.at("y.2.part").exists());
+        assert!(fresh.fetched(&store) && named.fetched(&store) && store.join("y.2.part").exists());
         assert!(!old.fetched(&store));
         // Swept: not again for a while, whatever process asks.
         assert!(sweep_if_due(&store, &keep).is_some());

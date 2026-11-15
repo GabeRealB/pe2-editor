@@ -6,6 +6,7 @@
 use eframe::egui;
 use egui_tiles::{Container, Tile, TileId, Tree};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use std::collections::BTreeMap;
 
@@ -345,7 +346,7 @@ impl Layouts {
 
     /// What a document tab shows.
     pub fn subject(&self, pane: Pane) -> Option<&project::TreePath> {
-        self.states.get(&pane)?.pinned.as_ref()
+        self.states.get(&pane)?.pinned.as_deref()
     }
 
     /// Whether a document tab is the one the next asset opened replaces.
@@ -501,10 +502,10 @@ impl Layouts {
             pane
         });
         // Another entry in the tab starts over; the same keeps how it was shown.
-        let same = self.states.get(&tab).filter(|s| s.pinned.as_ref() == Some(path));
+        let same = self.states.get(&tab).filter(|s| s.pinned.as_deref() == Some(path));
         let previewed = same.is_none_or(|s| s.preview);
         let (editor, uid) = same.map_or((None, None), |s| (s.editor, s.uid));
-        self.states.insert(tab, PaneState { pinned: Some(path.clone()), preview: previewed && !keep, editor, uid });
+        self.states.insert(tab, PaneState { pinned: Some(path.to_owned()), preview: previewed && !keep, editor, uid });
         self.focused = Some(tab);
         self.reveal = Some(tab);
         if let Some((window, tile)) = self.find(tab)
@@ -524,7 +525,7 @@ impl Layouts {
 
     /// An entry's document tab is kept: it was edited.
     pub fn keep(&mut self, path: &project::TreePath) {
-        for state in self.states.values_mut().filter(|s| s.pinned.as_ref() == Some(path)) {
+        for state in self.states.values_mut().filter(|s| s.pinned.as_deref() == Some(path)) {
             state.preview = false;
         }
     }
@@ -577,7 +578,7 @@ impl Layouts {
     }
 
     /// The asset a document tab shows, where it is the last tab showing it: closing it closes the document.
-    pub fn last_tab_of(&self, window: Option<u64>, tile: TileId) -> Option<project::TreePath> {
+    pub fn last_tab_of(&self, window: Option<u64>, tile: TileId) -> Option<Arc<project::TreePath>> {
         let tree = match window {
             None => &self.main,
             Some(id) => &self.windows.iter().find(|w| w.id == id)?.tree,
@@ -585,7 +586,7 @@ impl Layouts {
         let Some(Tile::Pane(pane)) = tree.tiles.get(tile) else { return None };
         let path = self.subject(*pane).filter(|_| pane.kind == PaneKind::Document)?;
         let elsewhere = self.documents().into_iter().any(|other| other != *pane && self.subject(other) == Some(path));
-        (!elsewhere).then(|| path.clone())
+        ((!elsewhere).then_some(path)).map(ToOwned::to_owned)
     }
 
     /// Do what a tab asked: in the layout of `window` (none: the main one), for the pane in `tile`.
@@ -764,8 +765,8 @@ pub fn activate(tree: &mut Tree<Pane>, tile: TileId) {
 #[cfg(test)]
 mod tests {
     /// A path of the tree a test names.
-    fn t(text: &str) -> project::TreePath {
-        project::TreePath::new(text).unwrap()
+    fn t(text: &str) -> std::sync::Arc<project::TreePath> {
+        project::TreePath::new(text).unwrap().to_owned()
     }
 
     use super::{Layouts, Place, SETTLING, STEADY, Tracker, Window, panes_of, put, take, tile_of};
@@ -897,7 +898,7 @@ mod tests {
         layouts.switch_mode(1);
         assert_eq!(layouts.documents(), documents);
         assert!(layouts.find(Pane::first(PaneKind::Contents)).is_none());
-        assert_eq!(layouts.subject(documents[1]), Some(&t("g/b")));
+        assert_eq!(layouts.subject(documents[1]), (Some(&t("g/b"))).map(|path| &**path));
         // What is changed in it stays with it.
         layouts.hide(Pane::first(PaneKind::Inspector));
         layouts.switch_mode(0);
@@ -930,8 +931,8 @@ mod tests {
         assert_eq!(layouts.main.tiles.parent_of(tile(&layouts, second).1), group);
         let (window, at) = tile(&layouts, second);
         let pinned = project::TreePath::new("g/a").unwrap();
-        layouts.act(window, at, PaneAction::Pin(pinned.clone()));
-        assert_eq!(layouts.states[&second].pinned, Some(pinned));
+        layouts.act(window, at, PaneAction::Pin(pinned.to_owned()));
+        assert_eq!(layouts.states[&second].pinned, Some(ToOwned::to_owned(pinned)));
         // Into a window of its own; the second joins it; the first goes home.
         let (window, at) = tile(&layouts, inspector);
         layouts.act(window, at, PaneAction::ToNewWindow);
@@ -971,11 +972,11 @@ mod tests {
         // The preview tab is replaced; a double click keeps it; the next opens beside it.
         layouts.open(&t("g/a"), false);
         layouts.open(&t("g/b"), false);
-        assert_eq!(layouts.subject(first), Some(&t("g/b")));
+        assert_eq!(layouts.subject(first), (Some(&t("g/b"))).map(|path| &**path));
         assert!(layouts.find(second).is_none());
         layouts.open(&t("g/b"), true);
         layouts.open(&t("g/c"), false);
-        assert_eq!((layouts.subject(first), layouts.subject(second)), (Some(&t("g/b")), Some(&t("g/c"))));
+        assert_eq!((layouts.subject(first), layouts.subject(second)), (Some(&*t("g/b")), Some(&*t("g/c"))));
         let group = layouts.main.tiles.parent_of(layouts.find(first).unwrap().1);
         assert_eq!(layouts.main.tiles.parent_of(layouts.find(second).unwrap().1), group);
         assert_eq!(front(&layouts).as_deref(), Some("g/c"));
@@ -1006,7 +1007,7 @@ mod tests {
         };
         let order = |pane| tabs.children.iter().position(|t| *t == layouts.find(pane).unwrap().1).unwrap();
         assert_eq!(order(copy), order(second) + 1);
-        assert_eq!((layouts.states[&copy].editor, layouts.subject(copy)), (Some(EditorKind::Graph), Some(&t("g/c"))));
+        assert_eq!((layouts.states[&copy].editor, layouts.subject(copy)), (Some(EditorKind::Graph), Some(&*t("g/c"))));
         layouts.open(&t("g/x"), false);
         assert_eq!(layouts.states[&second].editor, None);
         let (window, at) = layouts.find(copy).unwrap();
@@ -1016,7 +1017,7 @@ mod tests {
         layouts.keep(&t("g/c"));
         layouts.open(&t("g/d"), false);
         let third = Pane { kind: PaneKind::Document, instance: 2 };
-        assert_eq!(layouts.subject(third), Some(&t("g/d")));
+        assert_eq!(layouts.subject(third), (Some(&t("g/d"))).map(|path| &**path));
         // The next and the one before go round the group, and a page in front closes as a tab does.
         let order = layouts.active_document().unwrap();
         layouts.next_tab(true);
@@ -1032,7 +1033,7 @@ mod tests {
         let (window, at) = layouts.find(first).unwrap();
         layouts.act(window, at, PaneAction::Close);
         assert!(layouts.find(first).is_none());
-        layouts.close_documents(|path| *path == t("g/d"));
+        layouts.close_documents(|path| *path == *t("g/d"));
         assert_eq!(front(&layouts).as_deref(), Some("g/c"));
         layouts.close_documents(|_| true);
         let last = layouts.documents();

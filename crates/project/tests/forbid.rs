@@ -3,7 +3,7 @@
 
 #[test]
 fn a_process_that_forbids_extensions_loads_none() {
-    let place = pe2_path::HostPath::new(&std::env::temp_dir()).unwrap();
+    let place = sfs::HostPath::new(&std::env::temp_dir()).unwrap();
     let origin = || project::ext::Origin::Component(place.join(&pe2_path::Name::constant("an.extension")));
     // Not forbidden, what is no component fails as that.
     let refused = project::ext::component::load_bytes("an.extension", b"not a component", origin()).err().unwrap();

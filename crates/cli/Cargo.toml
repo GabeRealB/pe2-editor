@@ -39,4 +39,4 @@ interprocess.workspace = true
 tracy = ["project/tracy"]
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

@@ -12,8 +12,10 @@
 //! programs for. What the system has to provide its installation notes say (`install` in its manifest), which a program
 //! it cannot start points to.
 
-use pe2_path::{HostPath, Name, RelPath};
+use pe2_path::{Name, RelPath};
+use sfs::HostPath;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -36,11 +38,12 @@ pub fn elsewhere(platforms: &[String]) -> Option<String> {
 #[must_use]
 pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str) -> Runnable {
     let Ok(within) = RelPath::new(tool) else { return Runnable::Named(tool.to_owned()) };
-    let exe = Name::new(&format!("{}.{}", within.name().unwrap_or_default(), std::env::consts::EXE_EXTENSION)).ok();
+    let exe = format!("{}.{}", within.name().unwrap_or_default(), std::env::consts::EXE_EXTENSION);
+    let exe = Name::new(&exe).ok();
     let with_exe = exe
         .filter(|_| !std::env::consts::EXE_EXTENSION.is_empty())
-        .map(|exe| within.parent().unwrap_or_default().join(&exe));
-    let named: Vec<RelPath> = with_exe.into_iter().chain([within]).collect();
+        .map(|exe| within.parent().unwrap_or_default().join(exe));
+    let named: Vec<Arc<RelPath>> = with_exe.into_iter().chain([within.to_owned()]).collect();
     let found = named.iter().flat_map(|name| places(folder, fetched, name)).find(crate::pack::is_file);
     found.map_or_else(|| Runnable::Named(tool.to_owned()), |p| Runnable::At(runnable(&p)))
 }
@@ -48,7 +51,8 @@ pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str) -> R
 /// Where a place in an extension's tree may be, in order: in what it ships, for this platform then for any, then in
 /// what its setup fetched.
 fn places(folder: Option<&HostPath>, fetched: &[HostPath], within: &RelPath) -> Vec<HostPath> {
-    let platform = Name::new(&platform()).ok();
+    let platform = platform();
+    let platform = Name::new(&platform).ok();
     let shipped = folder.into_iter().flat_map(|folder| {
         let own = platform.as_ref().map(|platform| folder.join(platform).join(within));
         own.into_iter().chain([folder.join(within)])
@@ -128,13 +132,13 @@ pub type Offered = std::sync::Arc<
 #[must_use]
 pub fn in_tree(folder: Option<&HostPath>, fetched: &[HostPath], place: &str) -> Option<HostPath> {
     let within = RelPath::new(place).ok()?;
-    let found = places(folder, fetched, &within).into_iter();
+    let found = places(folder, fetched, within).into_iter();
     found.into_iter().find(|path| crate::pack::is_file(path) || crate::pack::is_dir(path)).map(|path| runnable(&path))
 }
 
 /// The files in a folder - on disk, or an extension's a project holds (`records::held_at`) - by their paths within it,
 /// in order.
-fn files_in(folder: &HostPath, within: &RelPath, files: &mut Vec<(RelPath, HostPath)>) -> Result<()> {
+fn files_in(folder: &HostPath, within: &RelPath, files: &mut Vec<(Arc<RelPath>, HostPath)>) -> Result<()> {
     if !crate::pack::is_dir(folder) {
         anyhow::bail!("{}: no such folder", folder.display());
     }
@@ -166,7 +170,7 @@ pub fn trust(file: &HostPath, folder: Option<&HostPath>, about: &super::componen
         return crate::content::sha1(file).with_context(|| file.display().to_string());
     };
     let mut files = Vec::new();
-    files_in(folder, &RelPath::root(), &mut files)?;
+    files_in(folder, RelPath::root(), &mut files)?;
     let counts = |name: &RelPath| {
         file.file_name().is_some_and(|own| own == name.as_str()) || !super::folder::read_only(name, about)
     };
@@ -184,7 +188,7 @@ mod tests {
     use super::{elsewhere, platform, program, trust};
     use crate::ext::component::About;
     use crate::testing::At as _;
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     fn about() -> About {
         About::default()

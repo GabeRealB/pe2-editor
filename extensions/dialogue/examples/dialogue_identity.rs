@@ -1,8 +1,7 @@
 //! Every dialogue read and made again: `cargo run -p pe2-dialogue --example dialogue_identity -- <files.txt> <args.json>
 //! [<out folder>]`. The files are the chunks the arguments name by position - a dialogue's own file stands for a bundle
 //! holding it as resource 0 - and the arguments are `extract_dialogues`'s, as JSON.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+use sfs::testing::At as _;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -44,7 +43,7 @@ fn main() {
     println!("{read} read exactly ({unsettled} with something unsettled), {failed} failed");
     if let Some(out) = out {
         for (name, bytes) in &files {
-            let path = HostPath::new(std::path::Path::new(&out)).expect("the folder to write in").at(name);
+            let path = std::path::Path::new(&out).at(name);
             std::fs::create_dir_all(path.parent().expect("a folder")).expect("a folder");
             std::fs::write(path, bytes).expect("written");
         }

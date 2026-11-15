@@ -7,7 +7,7 @@
 //!
 //! A plan runs as the work graph's only work (`runner`): after the epoch running, which may be cancelled for it, and
 //! before any event signaled meanwhile, which waits until what it wrote is taken in.
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -40,7 +40,7 @@ pub struct Fill {
     /// Why the last run did not finish, shown until the next.
     failed: Option<String>,
     /// Where the discs are looked for, as being typed: by the mount it locates.
-    look_in: Option<(project::TreePath, String)>,
+    look_in: Option<(Arc<project::TreePath>, String)>,
     /// What a run wrote, being taken in: the take-in's ticket.
     settling: Option<u64>,
 }
@@ -65,7 +65,7 @@ impl Fill {
     }
 }
 
-const PUT_OFF: pe2_path::RelPath = pe2_path::RelPath::constant("fill-put-off.toml");
+const PUT_OFF: &pe2_path::RelPath = pe2_path::RelPath::constant("fill-put-off.toml");
 
 /// How a layer's state is remembered as put off.
 fn remembered(state: &State) -> String {
@@ -144,7 +144,7 @@ fn finish(ws: &mut Workspace) -> Option<String> {
 /// The step, where there is one to show; what a run did, once it is done.
 pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
     if ws.fill.put_off_as.is_none() {
-        let read = std::fs::read_to_string(ws.cache_path(&PUT_OFF)).ok().and_then(|t| toml::from_str(&t).ok());
+        let read = std::fs::read_to_string(ws.cache_path(PUT_OFF)).ok().and_then(|t| toml::from_str(&t).ok());
         ws.fill.put_off_as = Some(read.unwrap_or_default());
     }
     let said = finish(ws);
@@ -224,7 +224,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
             let put = ws.fill.put_off_as.get_or_insert_default();
             put.insert(layer.clone(), state);
             if let Ok(text) = toml::to_string(put) {
-                let _ = std::fs::write(ws.cache_path(&PUT_OFF), text);
+                let _ = std::fs::write(ws.cache_path(PUT_OFF), text);
             }
         }
     }
@@ -317,10 +317,10 @@ fn look_in_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     planned: &crate::plans::Planned,
-) -> Option<(project::TreePath, String)> {
+) -> Option<(Arc<project::TreePath>, String)> {
     let header = planned.header.as_ref().ok()?;
     let look_in = header.inputs.values().next()?.look_in.trim_start_matches("res://").trim_matches('/');
-    let mount = ws.project.unmanaged.iter().find(|m| m.at == look_in)?;
+    let mount = ws.project.unmanaged.iter().find(|m| *m.at == *look_in)?;
     let (at, now) = (mount.at.clone(), mount.path.display().to_string());
     let editing = ws.fill.look_in.get_or_insert_with(|| (at.clone(), now.clone()));
     let mut asked = None;

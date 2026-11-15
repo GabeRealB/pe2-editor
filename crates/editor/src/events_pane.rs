@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, RichText};
 use pe2_ext::events::BUILT_IN;
+use std::sync::Arc;
 
 use crate::workspace::Workspace;
 use crate::{icons, theme};
@@ -11,7 +12,7 @@ struct Row {
     id: String,
     label: String,
     /// Where it is an asset, its path.
-    asset: Option<project::TreePath>,
+    asset: Option<Arc<project::TreePath>>,
 }
 
 fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mut Option<crate::workspace::Nav>) {

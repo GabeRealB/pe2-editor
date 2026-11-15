@@ -23,12 +23,13 @@
 //! into or distributed with this program: the library called is the one installed on the user's system
 //! (`dokan2.dll`), found and loaded at run time.
 
-use pe2_path::HostPath;
-use std::collections::{BTreeMap, HashMap};
+use pe2_path::RelPath;
+use sfs::HostPath;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use windows::Win32::Foundation::FILETIME;
@@ -37,7 +38,7 @@ use windows_core::PCWSTR;
 
 use crate::backend::{Backend, Can, Job, Mount};
 use crate::writes::{Shown, Writes};
-use crate::{Served, Tree, What};
+use crate::{Served, What};
 
 /// An `NTSTATUS`.
 type Status = i32;
@@ -51,6 +52,8 @@ const UNSUCCESSFUL: Status = status(0xC000_0001);
 const ACCESS_DENIED: Status = status(0xC000_0022);
 const NOT_FOUND: Status = status(0xC000_0034);
 const COLLISION: Status = status(0xC000_0035);
+/// `STATUS_OBJECT_NAME_INVALID`: a name no path of the project takes, as Windows refuses an invalid name.
+const NAME_INVALID: Status = status(0xC000_0033);
 const WRITE_PROTECTED: Status = status(0xC000_00A2);
 const IS_A_DIRECTORY: Status = status(0xC000_00BA);
 const NOT_EMPTY: Status = status(0xC000_0101);
@@ -202,17 +205,20 @@ struct Provider {
     name: String,
     /// The room there is where it is mounted: free, and in all.
     room: (u64, u64),
-    folded: Mutex<Folded>,
 }
 
-/// The names in the tree's folders by what they are in lower case, for as long as that tree is served: a name asked
-/// for in another case, or one that is not there - what a compiler looking for a header along its paths mostly asks
-/// for - is answered by it, where listing the folder each time took longer the more it holds.
-#[derive(Default)]
-struct Folded {
-    /// The tree its names are of, and how many changes that had seen.
-    of: Option<(Arc<Tree>, u64)>,
-    folders: HashMap<String, Arc<HashMap<String, String>>>,
+/// A path as Windows writes it (`\a\b`), as a path of the tree: refused (`NAME_INVALID`) where a name of it is none
+/// every system takes.
+fn within(given: &str) -> Result<Arc<RelPath>, Status> {
+    given.split(['\\', '/']).filter(|step| !step.is_empty()).try_fold(RelPath::root().to_owned(), |path, step| {
+        pe2_path::Name::new(step).map(|name| path.join(name)).map_err(|_| NAME_INVALID)
+    })
+}
+
+/// A path of the tree, for one as Windows gives it (`\a\b`): the tree finds it however its names are written. One with
+/// a name no path takes is answered as Windows answers an invalid name.
+fn path_of(given: PCWSTR) -> Result<Arc<RelPath>, Status> {
+    within(&text(given))
 }
 
 /// A string the library gave a callback, as text.
@@ -221,13 +227,9 @@ fn text(given: PCWSTR) -> String {
     if given.is_null() { String::new() } else { String::from_utf16_lossy(unsafe { given.as_wide() }) }
 }
 
-fn join(parent: &str, name: &str) -> String {
-    if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") }
-}
-
 impl Provider {
     /// What a path is: written over the tree where it can be written, else the tree's.
-    fn shown(&self, path: &str) -> Option<Shown> {
+    fn shown(&self, path: &RelPath) -> Option<Shown> {
         if let Some(writes) = &self.writes {
             return writes.shown(path);
         }
@@ -237,7 +239,7 @@ impl Provider {
     }
 
     /// A folder's children, each whether it is a folder; none where it is no folder.
-    fn list(&self, path: &str) -> Option<BTreeMap<String, bool>> {
+    fn list(&self, path: &RelPath) -> Option<BTreeMap<Arc<pe2_path::Name>, bool>> {
         if !self.shown(path)?.folder {
             return None;
         }
@@ -245,69 +247,6 @@ impl Provider {
             return Some(writes.list(path));
         }
         self.served.tree().children(path)
-    }
-
-    /// A path as the tree names it, for one as Windows gives it (`\a\b`): its names matched as Windows matches them
-    /// where they are not the same - whatever their case. What is not there keeps the name given.
-    fn path(&self, given: PCWSTR) -> String {
-        self.resolved(&text(given))
-    }
-
-    /// A path as the tree names it, for one as Windows writes it (`path`).
-    fn resolved(&self, given: &str) -> String {
-        let mut walked = String::new();
-        for step in given.split(['\\', '/']).filter(|step| !step.is_empty()) {
-            let exact = join(&walked, step);
-            if self.shown(&exact).is_some() {
-                walked = exact;
-                continue;
-            }
-            let found = self.by_case(&walked, step);
-            walked = join(&walked, found.as_deref().unwrap_or(step));
-        }
-        walked
-    }
-
-    /// A name of a folder as it is written there, for one written in whatever case; none where nothing there is
-    /// named so.
-    fn by_case(&self, folder: &str, name: &str) -> Option<String> {
-        let lower = name.to_lowercase();
-        // As the tree was when its changes were as many: a view of the shared filesystem is one tree, whatever
-        // changes in it.
-        let (tree, changes) = (self.served.tree(), self.served.changes_from_now());
-        let names = {
-            let mut kept = self.folded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !kept.of.as_ref().is_some_and(|(of, at)| Arc::ptr_eq(of, &tree) && *at == changes) {
-                *kept = Folded { of: Some((tree.clone(), changes)), folders: HashMap::new() };
-            }
-            if let Some(names) = kept.folders.get(folder) {
-                names.clone()
-            } else {
-                let mut names = HashMap::new();
-                // Of two that differ in case alone, the first as the folder lists them.
-                for name in tree.children(folder).unwrap_or_default().into_keys() {
-                    names.entry(name.to_lowercase()).or_insert(name);
-                }
-                let names = Arc::new(names);
-                kept.folders.insert(folder.to_string(), names.clone());
-                names
-            }
-        };
-        if let Some(found) = names.get(&lower).filter(|found| self.shown(&join(folder, found)).is_some()) {
-            return Some(found.clone());
-        }
-        // What was written there since, which the tree does not hold yet.
-        let staged = self.writes.as_ref()?.staged_in(folder);
-        staged.into_iter().find(|staged| staged.to_lowercase() == lower)
-    }
-
-    /// A path as it is given, for what is about to bear its last name: the folder it is in as the tree names it
-    /// (`path`), the name as written.
-    fn named(&self, given: PCWSTR) -> String {
-        let given = text(given);
-        let given = given.trim_matches(['\\', '/']);
-        let (folder, name) = given.rsplit_once(['\\', '/']).unwrap_or(("", given));
-        join(&self.resolved(folder), name)
     }
 
     fn attributes(&self, shown: &Shown) -> u32 {
@@ -368,7 +307,10 @@ unsafe extern "system" fn create_file(
 ) -> Status {
     // SAFETY: a callback's information.
     let Some((info, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    let path = provider.path(name);
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     info.context = 0;
     let (wants_folder, wants_file) = (options & FILE_DIRECTORY_FILE != 0, options & FILE_NON_DIRECTORY_FILE != 0);
     // One there already, opened by what would also have made it, is said so.
@@ -441,8 +383,10 @@ unsafe extern "system" fn cleanup(name: Name, info: Info) {
         let _ = writes.close(info.context, true);
         info.context = 0;
     }
-    if info.delete_pending != 0 {
-        let _ = writes.remove(&provider.path(name));
+    if info.delete_pending != 0
+        && let Ok(path) = path_of(name)
+    {
+        let _ = writes.remove(&path);
     }
 }
 
@@ -465,7 +409,10 @@ unsafe extern "system" fn read_file(
 ) -> Status {
     // SAFETY: a callback's information.
     let Some((_, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    let path = provider.path(name);
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     let offset = u64::try_from(offset).unwrap_or(0);
     // SAFETY: the library's buffer, `length` long, which this call is given to fill.
     let asked = unsafe { std::slice::from_raw_parts_mut(buffer, length as usize) };
@@ -499,7 +446,10 @@ unsafe extern "system" fn write_file(
     // SAFETY: a callback's information.
     let Some((info, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
     let Some(writes) = &provider.writes else { return WRITE_PROTECTED };
-    let path = provider.path(name);
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     let size = provider.shown(&path).map_or(0, |shown| shown.size);
     let offset = if info.write_to_end_of_file != 0 { size } else { u64::try_from(offset).unwrap_or(0) };
     // SAFETY: the library's buffer, `length` long.
@@ -547,7 +497,10 @@ unsafe extern "system" fn get_file_information(
 ) -> Status {
     // SAFETY: a callback's information.
     let Some((_, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    let path = provider.path(name);
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     let Some(shown) = provider.shown(&path) else { return NOT_FOUND };
     let (time, (size_high, size_low)) = (file_time(shown.modified), halves(shown.size));
     let (index_high, index_low) = halves(provider.served.ino(&path));
@@ -596,12 +549,15 @@ unsafe fn tell_entry(provider: &Provider, name: &str, shown: &Shown, fill: Fill,
 unsafe extern "system" fn find_files(name: Name, fill: Fill, info: Info) -> Status {
     // SAFETY: a callback's information.
     let Some((_, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    let path = provider.path(name);
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     let Some(children) = provider.list(&path) else { return NOT_FOUND };
     for (child, _) in children {
-        if let Some(shown) = provider.shown(&join(&path, &child)) {
+        if let Some(shown) = provider.shown(&path.join(&child)) {
             // SAFETY: what the library gave this callback.
-            unsafe { tell_entry(provider, &child, &shown, fill, info) };
+            unsafe { tell_entry(provider, child.as_str(), &shown, fill, info) };
         }
     }
     SUCCESS
@@ -613,24 +569,33 @@ unsafe extern "system" fn find_files(name: Name, fill: Fill, info: Info) -> Stat
 unsafe extern "system" fn find_files_with_pattern(name: Name, pattern: Name, fill: Fill, info: Info) -> Status {
     // SAFETY: a callback's information.
     let (Some((_, provider)), Some(api)) = (unsafe { called(info) }, api()) else { return UNSUCCESSFUL };
-    let (path, wanted) = (provider.path(name), text(pattern));
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let wanted = text(pattern);
     if !wanted.contains(['*', '?', '<', '>', '"']) {
-        let found = provider.resolved(&join(&path, &wanted));
-        if let Some(shown) = provider.shown(&found) {
-            let named = found.rsplit('/').next().unwrap_or(&found);
+        // One name, looked up however it is written - and told as it is written there. One no path takes is none.
+        let Ok(wanted) = pe2_path::Name::new(&wanted) else { return SUCCESS };
+        let tree = provider.served.tree();
+        let written = tree.at(&path.join(wanted)).and_then(|(_, node)| node.path.last().map(pe2_path::Name::to_owned));
+        let staged = || provider.writes.as_ref()?.staged_in(&path).into_iter().find(|staged| **staged == *wanted);
+        if let Some(found) = written.or_else(staged)
+            && let Some(shown) = provider.shown(&path.join(&found))
+        {
             // SAFETY: what the library gave this callback.
-            unsafe { tell_entry(provider, named, &shown, fill, info) };
+            unsafe { tell_entry(provider, found.as_str(), &shown, fill, info) };
         }
         return SUCCESS;
     }
     let Some(children) = provider.list(&path) else { return NOT_FOUND };
     for (child, _) in children {
-        let candidate = wide(&child);
+        let candidate = wide(child.as_str());
         // SAFETY: the pattern as the library gave it and a name ended by a zero, matched as Windows matches them.
         let matches = unsafe { (api.matches)(pattern, PCWSTR(candidate.as_ptr()), 1) } != 0;
-        if matches && let Some(shown) = provider.shown(&join(&path, &child)) {
+        if matches && let Some(shown) = provider.shown(&path.join(&child)) {
             // SAFETY: what the library gave this callback.
-            unsafe { tell_entry(provider, &child, &shown, fill, info) };
+            unsafe { tell_entry(provider, child.as_str(), &shown, fill, info) };
         }
     }
     SUCCESS
@@ -668,7 +633,11 @@ unsafe extern "system" fn delete_file(name: Name, info: Info) -> Status {
     if provider.writes.is_none() {
         return WRITE_PROTECTED;
     }
-    match provider.shown(&provider.path(name)) {
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    match provider.shown(&path) {
         Some(Shown { folder: false, .. }) => SUCCESS,
         Some(_) => ACCESS_DENIED,
         None => NOT_FOUND,
@@ -682,7 +651,11 @@ unsafe extern "system" fn delete_directory(name: Name, info: Info) -> Status {
     if provider.writes.is_none() {
         return WRITE_PROTECTED;
     }
-    match provider.list(&provider.path(name)) {
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    match provider.list(&path) {
         Some(children) if children.is_empty() => SUCCESS,
         Some(_) => NOT_EMPTY,
         None => NOT_FOUND,
@@ -693,11 +666,12 @@ unsafe extern "system" fn move_file(name: Name, to: Name, replace: i32, info: In
     // SAFETY: a callback's information.
     let Some((_, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
     let Some(writes) = &provider.writes else { return WRITE_PROTECTED };
-    let from = provider.path(name);
-    // What is there under the new name, whatever its case, is what it is renamed over - but itself: renamed to its own
-    // name in another case, it takes the name as it is given.
-    let there = provider.path(to);
-    let to = if there == from { provider.named(to) } else { there };
+    let (from, to) = match (path_of(name), path_of(to)) {
+        (Ok(from), Ok(to)) => (from, to),
+        (Err(status), _) | (_, Err(status)) => return status,
+    };
+    // What is there under the new name, however it is written, is what it is renamed over - but itself: renamed to its
+    // own name written otherwise, it takes the name as it is given (paths compare by their names' folds).
     if replace == 0 && to != from && provider.shown(&to).is_some() {
         return COLLISION;
     }
@@ -708,7 +682,7 @@ unsafe extern "system" fn move_file(name: Name, to: Name, replace: i32, info: In
 }
 
 /// A file's length set: applied with what its handle writes, or now where it has none.
-fn set_length(provider: &Provider, path: &str, length: u64, open: bool) -> Status {
+fn set_length(provider: &Provider, path: &RelPath, length: u64, open: bool) -> Status {
     let Some(writes) = &provider.writes else { return WRITE_PROTECTED };
     if let Err(e) = writes.truncate(path, length) {
         return failed(&e);
@@ -725,14 +699,21 @@ fn set_length(provider: &Provider, path: &str, length: u64, open: bool) -> Statu
 unsafe extern "system" fn set_end_of_file(name: Name, length: i64, info: Info) -> Status {
     // SAFETY: a callback's information.
     let Some((info, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    set_length(provider, &provider.path(name), u64::try_from(length).unwrap_or(0), info.context != 0)
+    match path_of(name) {
+        Ok(path) => set_length(provider, &path, u64::try_from(length).unwrap_or(0), info.context != 0),
+        Err(status) => status,
+    }
 }
 
 /// The room a file is given: only less than it holds changes it.
 unsafe extern "system" fn set_allocation_size(name: Name, size: i64, info: Info) -> Status {
     // SAFETY: a callback's information.
     let Some((info, provider)) = (unsafe { called(info) }) else { return UNSUCCESSFUL };
-    let (path, size) = (provider.path(name), u64::try_from(size).unwrap_or(0));
+    let path = match path_of(name) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let size = u64::try_from(size).unwrap_or(0);
     match provider.shown(&path) {
         Some(shown) if size < shown.size => set_length(provider, &path, size, info.context != 0),
         Some(_) => SUCCESS,
@@ -890,13 +871,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str)
     crate::backend::unjoin(&at);
     std::fs::create_dir_all(&at)?;
     let read_only = writes.is_none();
-    let provider = Arc::new(Provider {
-        served: served.clone(),
-        writes,
-        name: name.to_string(),
-        room: room(&at),
-        folded: Mutex::default(),
-    });
+    let provider = Arc::new(Provider { served: served.clone(), writes, name: name.to_string(), room: room(&at) });
     let mount_point = wide(&at.to_string_lossy());
     let raw = Arc::into_raw(provider);
     let mut options = Box::new(Options {
@@ -993,7 +968,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str)
 fn tell_changes(served: &Served, instance: usize, at: &HostPath, stop: &AtomicBool) {
     let Some(api) = api() else { return };
     let instance = instance as Instance;
-    let full = |path: &str| wide(&format!("{}\\{}", at.display(), path.replace('/', "\\")));
+    let full = |path: &RelPath| wide(&format!("{}\\{}", at.display(), path.as_str().replace('/', "\\")));
     let mut from = served.changes_from_now();
     // Woken when the tree changes, where it would else find out when it next looked.
     let (wake, woken) = std::sync::mpsc::channel::<()>();

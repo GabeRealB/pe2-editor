@@ -7,7 +7,7 @@
 //! (`records::EXTENSIONS`): one is added from wherever it is kept - and updated the same way - and removed, each as one
 //! step with what the project requires of it (`[[extension]]`).
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 
 use anyhow::{Context, Result, bail};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
@@ -68,11 +68,12 @@ fn held_in(layer: &crate::Layer, id: &str) -> Option<Says> {
 /// `project.toml` written. Held as it is already, and required so, it is no step.
 pub fn add_extension(
     project: &Project,
-    from: &HostPath,
+    from: &std::path::Path,
     into: Option<&str>,
     history: &mut History,
     label: String,
 ) -> Result<About> {
+    let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
     // One that is only its manifest - programs and what they are fetched from - is checked as loading checks it.
     let about = if folder::alone(from) {
         folder::checked_alone(from).with_context(|| from.display().to_string())?
@@ -234,7 +235,7 @@ mod tests {
     use crate::history::History;
     use crate::lock::Lock;
     use crate::testing::At as _;
-    use pe2_path::HostPath;
+    use sfs::HostPath;
 
     #[test]
     fn writes_what_the_project_says_of_its_extensions_in_place() {

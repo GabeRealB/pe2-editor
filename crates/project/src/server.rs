@@ -11,8 +11,8 @@
 //! in what it serves - what only looks at the folder keeps nothing.
 
 use anyhow::{Result, bail};
-use pe2_path::HostPath;
 use serde::{Deserialize, Serialize};
+use sfs::HostPath;
 
 use crate::role::{Link, Role};
 
@@ -27,7 +27,7 @@ pub static ROLE: Role = Role {
 
 /// What is served of the project, by each path in the served folder (`Index::served`): what the holder says in
 /// the shared filesystem, and the server reads there.
-pub type Listing = std::collections::BTreeMap<String, Shown>;
+pub type Listing = std::collections::BTreeMap<std::sync::Arc<crate::TreePath>, Shown>;
 
 /// A path of what is served.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,21 +62,32 @@ pub enum Source {
     Stored { sha1: String, store: HostPath },
 }
 
-/// What changed of a listing: the paths shown anew or otherwise, and the paths gone.
+/// What changed of a listing: the paths shown anew or otherwise - written otherwise among them - and the paths gone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Delta {
-    pub shown: std::collections::BTreeMap<String, Shown>,
-    pub gone: std::collections::BTreeSet<String>,
+    pub shown: Listing,
+    pub gone: std::collections::BTreeSet<std::sync::Arc<crate::TreePath>>,
+}
+
+/// Put a path in a listing as it is written: one written otherwise that is there gives way (paths compare by their
+/// names' folds, and a map keeps the key it had).
+pub fn put(listing: &mut Listing, path: &std::sync::Arc<crate::TreePath>, shown: &Shown) {
+    if listing.get_key_value(&**path).is_some_and(|(there, _)| there.as_str() != path.as_str()) {
+        listing.remove(&**path);
+    }
+    listing.insert(path.clone(), shown.clone());
 }
 
 impl Delta {
-    /// What changed from one listing to another.
+    /// What changed from one listing to another: what a path shows, or how it is written.
     #[must_use]
     pub fn between(before: &Listing, now: &Listing) -> Delta {
-        let other = now.iter().filter(|(path, it)| before.get(*path) != Some(*it));
+        let differs = |path: &crate::TreePath, it: &Shown| {
+            before.get_key_value(path).is_none_or(|(was, then)| then != it || was.as_str() != path.as_str())
+        };
         Delta {
-            shown: other.map(|(path, it)| (path.clone(), it.clone())).collect(),
-            gone: before.keys().filter(|path| !now.contains_key(*path)).cloned().collect(),
+            shown: now.iter().filter(|(path, it)| differs(path, it)).map(|(p, it)| (p.clone(), it.clone())).collect(),
+            gone: before.keys().filter(|path| !now.contains_key(&***path)).cloned().collect(),
         }
     }
 
@@ -88,39 +99,44 @@ impl Delta {
     /// This, then what changed after it: one change of both.
     pub fn then(&mut self, later: Delta) {
         for path in &later.gone {
-            self.shown.remove(path);
+            self.shown.remove(&**path);
         }
         for path in later.shown.keys() {
-            self.gone.remove(path);
+            self.gone.remove(&**path);
         }
         self.gone.extend(later.gone);
-        self.shown.extend(later.shown);
+        for (path, shown) in &later.shown {
+            put(&mut self.shown, path, shown);
+        }
     }
 
     /// Make a listing what it is after this, where a path gone goes with all that is under it and what is shown
     /// comes after - as the tree served takes it (`shared::changed` says a change so).
     pub fn apply_under(&self, listing: &mut Listing) {
         for path in &self.gone {
-            let inside = format!("{path}/");
-            let under: Vec<String> = listing
-                .range(inside.clone()..)
-                .take_while(|(under, _)| under.starts_with(&inside))
+            // Paths order name by name: what is under one follows it.
+            let under: Vec<std::sync::Arc<crate::TreePath>> = listing
+                .range::<crate::TreePath, _>(pe2_path::from(&**path))
+                .take_while(|(under, _)| under.starts_with(path))
                 .map(|(under, _)| under.clone())
                 .collect();
             for under in under {
-                listing.remove(&under);
+                listing.remove(&*under);
             }
-            listing.remove(path);
         }
-        listing.extend(self.shown.iter().map(|(path, it)| (path.clone(), it.clone())));
+        for (path, shown) in &self.shown {
+            put(listing, path, shown);
+        }
     }
 
     /// Make a listing what it is after this.
     pub fn apply(&self, listing: &mut Listing) {
         for path in &self.gone {
-            listing.remove(path);
+            listing.remove(&**path);
         }
-        listing.extend(self.shown.iter().map(|(path, it)| (path.clone(), it.clone())));
+        for (path, shown) in &self.shown {
+            put(listing, path, shown);
+        }
     }
 }
 
@@ -211,7 +227,7 @@ fn lease(mut link: Link, who: &str) -> Result<Lease> {
 /// # Errors
 /// No server could be started (nothing can serve the project's folder here, as its log says), or it would not be
 /// kept.
-pub fn keep(root: &HostPath, who: &str, program: &HostPath, args: &[String]) -> Result<Lease> {
+pub fn keep(root: &HostPath, who: &str, program: &std::path::Path, args: &[String]) -> Result<Lease> {
     let link = match ROLE.connect(root) {
         Some(link) => link,
         None => ROLE.start(root, program, args)?,

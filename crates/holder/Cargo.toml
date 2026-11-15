@@ -22,4 +22,4 @@ vfs.workspace = true
 sfs.workspace = true
 
 [dev-dependencies]
-pe2-path = { workspace = true, features = ["testing"] }
+sfs = { workspace = true, features = ["testing"] }

@@ -30,15 +30,10 @@ pub enum Why {
     EmptySuffix,
     /// A name the system gave that is not text (on Windows, unpaired UTF-16; elsewhere, bytes that are not UTF-8).
     NotText,
-}
-
-/// Why a place on disk is no place within another, by names: it is elsewhere, or a name in its way is refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NotWithin {
-    /// It is not in the other place at all.
-    Outside,
-    /// It is in it, but by a name that is no path's (`Why`).
-    Refused(PathError),
+    /// A name with a character that turns how text around it reads (U+202E and its kind): shown as what it is not.
+    Direction(char),
+    /// A name longer than a name may be on every system: 255 bytes.
+    Long,
 }
 
 impl PathError {
@@ -63,19 +58,16 @@ impl fmt::Display for PathError {
             Why::NoUid => write!(f, "{text:?} is no uid (`uid://` and its digits)"),
             Why::EmptySuffix => write!(f, "{text:?} has nothing after its `#`"),
             Why::NotText => write!(f, "{text:?} has a name that is not text"),
+            Why::Direction(c) => {
+                write!(
+                    f,
+                    "{text:?} has a character turning which way text reads (U+{:04X}), shown as what it is not",
+                    u32::from(c)
+                )
+            }
+            Why::Long => write!(f, "{text:?} has a name longer than 255 bytes, which not every system takes"),
         }
     }
 }
 
 impl std::error::Error for PathError {}
-
-impl fmt::Display for NotWithin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NotWithin::Outside => f.write_str("it is elsewhere"),
-            NotWithin::Refused(why) => why.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for NotWithin {}

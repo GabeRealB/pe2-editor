@@ -8,7 +8,7 @@
 //! or does not (`Queue::post`). So nothing asked reads a project that lacks what was asked before it, and nobody
 //! waits for anything but its own turn.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -309,7 +309,7 @@ impl Core {
         let mut all = Refreshed::default();
         // The paths the edits made and not taken in yet named: one that names a path at, in or above one of them
         // is made over the project as they left it.
-        let mut earlier: Vec<String> = Vec::new();
+        let mut earlier: Vec<std::sync::Arc<project::TreePath>> = Vec::new();
         for op in ops {
             if !pending.is_empty()
                 && op.follows(&earlier)
@@ -319,7 +319,7 @@ impl Core {
                 changed.append(&mut pending);
                 earlier.clear();
             }
-            earlier.extend(op.paths().into_iter().map(str::to_string));
+            earlier.extend(op.paths().into_iter().map(project::TreePath::to_owned));
             let project = &self.project;
             let mut apply = |index: &Index| {
                 let _span = tracing::info_span!("holder edit apply").entered();

@@ -5,34 +5,64 @@
 //! in place of them: so the host does not serve over them, unless told to set them aside (`set_aside`) or take them in
 //! as edits (`take_in`).
 
-use pe2_path::HostPath;
+use pe2_path::{Name, RelPath};
+use project::TreePath;
+use sfs::HostPath;
 use std::io;
+use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::write::{Change, Owner, is_junk, refused};
 
 /// What the folder at `at` holds that is not the project's, before a backend serves it there: its files, by their path
-/// in it, `/`-separated, but those the backend left there as it served them. Folders are none: a folder holds nothing
-/// of its own.
+/// in it, but those the backend left there as it served them. Folders are none: a folder holds nothing of its own.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    /// Each by its path, in order.
+    pub strays: Vec<Arc<RelPath>>,
+    /// What is named so no path takes it - a file or a folder, with all in it - shown as the system names it: nothing
+    /// here moves it by its path, nor serves over it.
+    pub unnamed: Vec<String>,
+}
+
+impl Found {
+    /// How many it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.strays.len() + self.unnamed.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What the folder at `at` holds that is not the project's, before a backend serves it there (`Found`).
 #[must_use]
-pub fn strays(at: &HostPath, backend: &dyn Backend) -> Vec<String> {
-    let mut found = Vec::new();
-    walk(at, "", backend, &mut found);
-    found.sort();
+pub fn strays(at: &HostPath, backend: &dyn Backend) -> Found {
+    let mut found = Found::default();
+    walk(at, RelPath::root(), backend, &mut found);
+    found.strays.sort();
+    found.unnamed.sort();
     found
 }
 
-fn walk(dir: &HostPath, at: &str, backend: &dyn Backend, found: &mut Vec<String>) {
+fn walk(dir: &HostPath, at: &RelPath, backend: &dyn Backend, found: &mut Found) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = if at.is_empty() { name } else { format!("{at}/{name}") };
         let Ok(kind) = entry.file_type() else { continue };
         let place = dir.entry(&entry.file_name());
+        let Some(name) = entry.file_name().to_str().and_then(|name| Name::new(name).ok()).map(Name::to_owned) else {
+            let shown = entry.file_name().to_string_lossy().into_owned();
+            found.unnamed.push(if at.is_root() { shown } else { format!("{at}/{shown}") });
+            continue;
+        };
+        let path = at.join(&name);
         if kind.is_dir() {
             walk(&place, &path, backend, found);
         } else if !backend.left_as_served(&place) {
-            found.push(path);
+            found.strays.push(path);
         }
     }
 }
@@ -41,10 +71,9 @@ fn walk(dir: &HostPath, at: &str, backend: &dyn Backend, found: &mut Vec<String>
 ///
 /// # Errors
 /// A file cannot be moved.
-pub fn set_aside(at: &HostPath, strays: &[String], to: &HostPath) -> io::Result<()> {
+pub fn set_aside(at: &HostPath, strays: &[Arc<RelPath>], to: &HostPath) -> io::Result<()> {
     for stray in strays {
-        let stray = within(stray)?;
-        let (from, into) = (at.join(&stray), to.join(&stray));
+        let (from, into) = (at.join(&**stray), to.join(&**stray));
         if let Some(parent) = into.parent() {
             std::fs::create_dir_all(&parent)?;
         }
@@ -66,27 +95,28 @@ pub fn set_aside(at: &HostPath, strays: &[String], to: &HostPath) -> io::Result<
 /// A file cannot be read or moved, or an edit is refused: what was taken in before it stays taken.
 pub fn take_in(
     at: &HostPath,
-    strays: &[String],
+    strays: &[Arc<RelPath>],
     owner: &dyn Owner,
     staging: &HostPath,
     aside: &HostPath,
-) -> io::Result<Vec<String>> {
-    let (kept, taken): (Vec<String>, Vec<String>) = strays.iter().cloned().partition(|s| is_junk(s) || refused(s));
+) -> io::Result<Vec<Arc<RelPath>>> {
+    let (kept, taken): (Vec<Arc<RelPath>>, Vec<Arc<RelPath>>) =
+        strays.iter().cloned().partition(|s| is_junk(s) || refused(s));
     let mut ordered = taken.clone();
     // A declaration first: it makes its folder a node, which what is beside it is then a file of.
     ordered.sort_by_key(|path| {
-        let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
-        (folder.to_string(), name != project::index::NODE_FILE, name.to_string())
+        (path.parent().map(RelPath::to_owned), path.last() != Some(project::index::NODE_FILE), path.clone())
     });
     std::fs::create_dir_all(staging)?;
     for path in &ordered {
         let staged: HostPath =
             staging.join(&pe2_path::Name::new(&format!("stray-{}", std::process::id())).map_err(io::Error::other)?);
-        std::fs::copy(at.join(&within(path)?), &staged)?;
-        let applied = owner.change(Change::Write { path: path.clone(), staged: staged.clone().into() });
+        std::fs::copy(at.join(&**path), &staged)?;
+        let change = Change::Write { path: TreePath::within(path).to_owned(), staged: staged.clone().into() };
+        let applied = owner.change(change);
         let _ = std::fs::remove_file(&staged);
         applied.map_err(|why| io::Error::other(format!("{path}: {why}")))?;
-        std::fs::remove_file(at.join(&within(path)?))?;
+        std::fs::remove_file(at.join(&**path))?;
     }
     remove_emptied(at, &taken);
     set_aside(at, &kept, aside)?;
@@ -94,31 +124,30 @@ pub fn take_in(
 }
 
 /// Remove the folders these paths were in where they are left empty, deepest first.
-fn remove_emptied(at: &HostPath, paths: &[String]) {
-    let mut folders: Vec<&str> = paths.iter().flat_map(|p| p.match_indices('/').map(move |(i, _)| &p[..i])).collect();
-    folders.sort_by_key(|f| std::cmp::Reverse(f.len()));
+fn remove_emptied(at: &HostPath, paths: &[Arc<RelPath>]) {
+    let above = |path: &Arc<RelPath>| -> Vec<Arc<RelPath>> {
+        std::iter::successors(path.parent(), |folder| folder.parent())
+            .filter(|f| !f.is_root())
+            .map(RelPath::to_owned)
+            .collect()
+    };
+    let mut folders: Vec<Arc<RelPath>> = paths.iter().flat_map(above).collect();
+    folders.sort_by_key(|folder| std::cmp::Reverse(folder.depth()));
     folders.dedup();
     for folder in folders {
         // Only an empty one goes; one in sync is left to serving.
-        if let Ok(folder) = within(folder) {
-            let _ = std::fs::remove_dir(at.join(&folder));
-        }
+        let _ = std::fs::remove_dir(at.join(&*folder));
     }
-}
-
-/// A path found in the folder served, as a path within it: one that is no path of the project's is refused.
-fn within(path: &str) -> io::Result<pe2_path::RelPath> {
-    pe2_path::RelPath::new(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{set_aside, strays};
-    use pe2_path::testing::At as _;
+    use sfs::testing::At as _;
 
     #[test]
     fn what_a_folder_holds_is_found_and_set_aside_with_its_paths() {
-        let root = pe2_path::testing::scratch("strays");
+        let root = sfs::testing::scratch("strays");
         let (at, aside) = (root.at("assets"), root.at("aside"));
         std::fs::create_dir_all(at.at("notes/deep")).unwrap();
         std::fs::create_dir_all(at.at("empty")).unwrap();
@@ -126,12 +155,29 @@ mod tests {
         std::fs::write(at.at("notes/deep/c.md"), "c").unwrap();
         let backend = crate::dav::BACKEND;
         let found = strays(&at, backend);
-        assert_eq!(found, ["notes/deep/c.md", "stray.txt"]);
-        set_aside(&at, &found, &aside).unwrap();
+        let shown: Vec<&str> = found.strays.iter().map(|path| path.as_str()).collect();
+        assert_eq!((shown, found.unnamed.len()), (vec!["notes/deep/c.md", "stray.txt"], 0));
+        set_aside(&at, &found.strays, &aside).unwrap();
         assert_eq!(std::fs::read_to_string(aside.at("notes/deep/c.md")).unwrap(), "c");
-        assert_eq!(strays(&at, backend), Vec::<String>::new());
+        assert!(strays(&at, backend).is_empty());
         assert!(!at.at("notes").exists(), "a folder emptied goes");
         assert!(at.at("empty").exists(), "one that was empty is no stray's");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What is named so no path takes it is found apart, its folder with all in it: nothing moves it by its path.
+    #[cfg(unix)]
+    #[test]
+    fn what_no_path_names_is_found_apart() {
+        let root = sfs::testing::scratch("strays-unnamed");
+        let at = root.at("assets");
+        std::fs::create_dir_all(at.at("notes")).unwrap();
+        std::fs::write(at.at("notes").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
+        std::fs::create_dir_all(at.entry(std::ffi::OsStr::new("CON"))).unwrap();
+        std::fs::write(at.at("kept.txt"), "k").unwrap();
+        let found = strays(&at, crate::dav::BACKEND);
+        assert_eq!(found.unnamed, ["CON", "notes/a:b.txt"]);
+        assert_eq!(found.strays.iter().map(|path| path.as_str()).collect::<Vec<_>>(), ["kept.txt"]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

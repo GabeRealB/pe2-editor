@@ -4,9 +4,9 @@
 //! is the runner's to lose, and each runs in a project of its own, so that the one open here stays as it is. With no runner
 //! beside the editor, which a build that ships has not, the pane says so and that is all.
 
-use pe2_path::HostPath;
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
@@ -33,8 +33,8 @@ struct Test {
     /// Why it failed.
     why: String,
     /// The files of what the window showed.
-    said: Option<HostPath>,
-    picture: Option<HostPath>,
+    said: Option<PathBuf>,
+    picture: Option<PathBuf>,
 }
 
 /// The runner at work.
@@ -48,7 +48,7 @@ struct Job {
 #[derive(Default)]
 pub struct Tests {
     /// Set by what tests the pane; otherwise it is looked for beside the editor.
-    runner: Option<HostPath>,
+    runner: Option<PathBuf>,
     suites: BTreeMap<String, Vec<Test>>,
     job: Option<Job>,
     asked: bool,
@@ -57,7 +57,7 @@ pub struct Tests {
     /// What the runner said that it should not have.
     trouble: Option<String>,
     /// The picture of the failure selected.
-    shown: Option<(HostPath, egui::TextureHandle)>,
+    shown: Option<(PathBuf, egui::TextureHandle)>,
 }
 
 impl Drop for Tests {
@@ -74,7 +74,7 @@ fn short(name: &str) -> &str {
 impl Tests {
     /// Use this runner, and ask it what there is.
     #[cfg(any(test, feature = "tests"))]
-    pub fn use_runner(&mut self, runner: HostPath) {
+    pub fn use_runner(&mut self, runner: PathBuf) {
         self.runner = Some(runner);
         self.asked = false;
     }
@@ -92,17 +92,17 @@ impl Tests {
         self.job.is_some()
     }
 
-    fn runner(&self) -> Option<HostPath> {
+    fn runner(&self) -> Option<PathBuf> {
         let found = || {
-            let runner = pe2_path::Name::new(&format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX)).ok()?;
-            let beside = HostPath::new(&std::env::current_exe().ok()?).ok()?.parent()?.join(&runner);
+            let runner = format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX);
+            let beside = std::env::current_exe().ok()?.with_file_name(runner);
             beside.is_file().then_some(beside)
         };
         self.runner.clone().or_else(found)
     }
 
     /// Start the runner with these arguments, what it reports read as it comes.
-    fn start(&mut self, ctx: &egui::Context, runner: &HostPath, arguments: &[String]) {
+    fn start(&mut self, ctx: &egui::Context, runner: &std::path::Path, arguments: &[String]) {
         self.stop();
         self.trouble = None;
         let mut command = Command::new(runner.as_os_str());
@@ -180,7 +180,7 @@ impl Tests {
         // Where the runner says it wrote what it is telling of, as the system names it.
         let path = |key: &str| {
             let text = event.get(key).and_then(serde_json::Value::as_str)?;
-            HostPath::new(std::path::Path::new(text)).ok()
+            Some(PathBuf::from(text))
         };
         let seconds = event.get("seconds").and_then(serde_json::Value::as_f64).unwrap_or_default();
         let (suite, name) = (field("suite"), field("name"));
@@ -214,7 +214,7 @@ impl Tests {
     }
 
     /// Run tests, by name: all with none named.
-    fn run(&mut self, ctx: &egui::Context, runner: &HostPath, mut arguments: Vec<String>, names: &[String]) {
+    fn run(&mut self, ctx: &egui::Context, runner: &std::path::Path, mut arguments: Vec<String>, names: &[String]) {
         for test in self.suites.values_mut().flatten() {
             if names.is_empty() || names.contains(&test.name) {
                 *test = Test {
@@ -231,8 +231,7 @@ impl Tests {
             arguments.extend(["--filter".to_string(), name.clone()]);
         }
         // What the last run left goes: only what a test still shows is of use.
-        let Ok(temporary) = HostPath::new(&std::env::temp_dir()) else { return };
-        let artifacts = temporary.join(&pe2_path::Name::constant("pe2-test-failures"));
+        let artifacts = std::env::temp_dir().join("pe2-test-failures");
         if names.is_empty() {
             let _ = std::fs::remove_dir_all(&artifacts);
         }
@@ -291,7 +290,7 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
 }
 
 /// A failure's picture, as a texture.
-fn picture(ctx: &egui::Context, file: &HostPath) -> Option<egui::TextureHandle> {
+fn picture(ctx: &egui::Context, file: &std::path::Path) -> Option<egui::TextureHandle> {
     let decoded = codecs::ora::decode_png(&std::fs::read(file).ok()?).ok()?;
     let codecs::ora::Pixels::Rgba(pixels) = decoded.pixels else { return None };
     let bytes: Vec<u8> = pixels.into_iter().flatten().collect();

@@ -6,8 +6,8 @@
 //! work table, zero bytes between strips), a palette chunk's payload after its 16-byte header - is taken as stored
 //! through its end token, decoded, encoded again and compared, on every core. It reports the streams of each kind
 //! and how many came back the same, and names the first few that did not.
-use pe2_path::HostPath;
-use pe2_path::testing::At as _;
+
+#![allow(clippy::disallowed_methods, reason = "an example: it reads the discs where it is told they are")]
 
 use formats::{cdf, lzss};
 use std::collections::{BTreeMap, HashSet};
@@ -34,16 +34,16 @@ fn stored_at(payload: &[u8], start: usize) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Every stream of the discs under `roms`, each once.
-fn streams(roms: &HostPath) -> Vec<Stream> {
+fn streams(roms: &Path) -> Vec<Stream> {
     let (mut out, mut seen) = (Vec::new(), HashSet::new());
     for disc in ["disk1", "disk2"] {
-        let dir = roms.at(disc);
+        let dir = roms.join(disc);
         let mut containers: Vec<(String, Vec<u8>, Vec<cdf::FileEntry>)> = Vec::new();
-        if let (Ok(hed), Ok(bytes)) = (std::fs::read(dir.at("STAGE0.HED")), std::fs::read(dir.at("STAGE0.CDF"))) {
+        if let (Ok(hed), Ok(bytes)) = (std::fs::read(dir.join("STAGE0.HED")), std::fs::read(dir.join("STAGE0.CDF"))) {
             containers.push(("stage0".into(), bytes, cdf::stage0_files(&hed).expect("STAGE0.HED")));
         }
         for n in 1..=5 {
-            if let Ok(bytes) = std::fs::read(dir.at(&format!("STAGE{n}.CDF"))) {
+            if let Ok(bytes) = std::fs::read(dir.join(format!("STAGE{n}.CDF"))) {
                 let files = cdf::stage_files(&mut bytes.as_slice()).expect("its folders");
                 containers.push((format!("stage{n}"), bytes, files));
             }
@@ -103,7 +103,7 @@ fn streams(roms: &HostPath) -> Vec<Stream> {
 
 fn main() {
     let roms = std::env::args().nth(1).expect("the folder of a release's discs");
-    let streams = streams(&HostPath::new(Path::new(&roms)).expect("the folder of a release's discs"));
+    let streams = streams(Path::new(&roms));
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let per = streams.len().div_ceil(threads).max(1);
     let results: Vec<(Kind, bool, &str)> = std::thread::scope(|scope| {

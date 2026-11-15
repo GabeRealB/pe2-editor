@@ -1,13 +1,13 @@
 //! The shared header: one page (`state`) every process of a project maps, of positions in the log kept as atomics -
 //! read with no call to the system and no question to another process.
 
-use pe2_path::HostPath;
+use crate::HostPath;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The header's file, in the library's folder.
-pub const FILE: pe2_path::Name = pe2_path::Name::constant("state");
+pub const FILE: &pe2_path::Name = pe2_path::Name::constant("state");
 
 const MAGIC: u64 = u64::from_le_bytes(*b"pe2sfs\x00\x01");
 const SIZE: usize = 4096;

@@ -9,7 +9,7 @@
 //! What it serves no program changes: its files are read-only, and removing, renaming, linking or writing one is
 //! refused to every process but this one, which removes what it no longer serves.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
@@ -255,20 +255,14 @@ fn provider<'a>(data: *const PRJ_CALLBACK_DATA) -> Option<(&'a PRJ_CALLBACK_DATA
     Some((data, provider))
 }
 
-/// A node by the path Windows names it by (relative, `\`-separated), its names matched as Windows matches them where
-/// they are not the same.
+/// A node by the path Windows names it by (relative, `\`-separated): the tree finds it however its names are written.
+/// One with a name no path takes is none of the tree's.
 fn node_at(tree: &Tree, path: &str) -> Option<(u64, std::sync::Arc<Node>)> {
-    let mut walked = String::new();
-    for step in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
-        let join = |name: &str| if walked.is_empty() { name.to_string() } else { format!("{walked}/{name}") };
-        let exact = join(step);
-        walked = if tree.at(&exact).is_some() {
-            exact
-        } else {
-            join(tree.children(&walked)?.keys().find(|name| name.eq_ignore_ascii_case(step))?)
-        };
-    }
-    tree.at(&walked)
+    let names = path.split(['\\', '/']).filter(|step| !step.is_empty());
+    let path = names
+        .map(|step| pe2_path::Name::new(step).ok())
+        .try_fold(pe2_path::RelPath::root().to_owned(), |path, name| Some(path.join(name?)))?;
+    tree.at(&path)
 }
 
 /// A node as Windows is told it: a file read-only.
@@ -295,7 +289,7 @@ unsafe extern "system" fn placeholder(data: *const PRJ_CALLBACK_DATA) -> HRESULT
     let Some((_, node)) = node_at(&tree, &text_of(data.FilePathName)) else { return NOT_FOUND };
     let info = PRJ_PLACEHOLDER_INFO { FileBasicInfo: basic(&node), ..PRJ_PLACEHOLDER_INFO::default() };
     // Named as the tree names it.
-    let name = wide(&node.path.replace('/', "\\"));
+    let name = wide(&node.path.as_str().replace('/', "\\"));
     let size = u32::try_from(std::mem::size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX);
     // SAFETY: the context of this instance, a path and its placeholder's information, as documented.
     unsafe {
@@ -312,7 +306,7 @@ unsafe extern "system" fn start_listing(data: *const PRJ_CALLBACK_DATA, id: *con
     let folder = node_at(&tree, &text_of(data.FilePathName));
     let children = folder.and_then(|(_, folder)| tree.entries(&folder.path)).unwrap_or_default();
     let mut entries: Vec<(Vec<u16>, PRJ_FILE_BASIC_INFO)> =
-        children.iter().map(|(name, _, node)| (wide(name), basic(node))).collect();
+        children.iter().map(|(name, _, node)| (wide(name.as_str()), basic(node))).collect();
     // In Windows' order of names, which is how it is listed.
     // SAFETY: two strings ended by zeros.
     entries.sort_by(|a, b| unsafe { (api.compare)(PCWSTR(a.0.as_ptr()), PCWSTR(b.0.as_ptr())) }.cmp(&0));
@@ -470,12 +464,8 @@ impl crate::backend::Mount for Projected {
         self.at.to_string()
     }
 
-    fn released(&self, path: &str) {
+    fn released(&self, path: &pe2_path::RelPath) {
         // What was read of it is kept on disk until removed.
-        // Released by its path in the tree, which holds checked names; one that is none is said, and its copy stays.
-        match pe2_path::RelPath::new(path) {
-            Ok(within) => drop(std::fs::remove_dir_all(self.at.join(&within))),
-            Err(why) => eprintln!("{why}: released, and what was read of it left on disk"),
-        }
+        let _ = std::fs::remove_dir_all(self.at.join(path));
     }
 }

@@ -5,7 +5,7 @@
 //! model holds it in one moment, and nothing of a refresh is said where the refresh failed. Whether a server is
 //! fed makes no difference to it: what feeds one (`files::Files`) only tells it that something was said.
 
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use project::server::{Delta, Listing};

@@ -4,7 +4,7 @@
 //! or that is asked (`want_discs`), its discs are looked for too, each image of a disc's size hashed.
 
 use eframe::egui;
-use pe2_path::HostPath;
+use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::sync::{Arc, mpsc};
 use std::time::SystemTime;
