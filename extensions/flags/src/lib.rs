@@ -59,10 +59,17 @@ pub fn flags_of(settings: &Table) -> Result<Vec<Flag>> {
 
 /// What overlaps in a registry and the others of the project, by IDs: each problem naming both owners.
 #[must_use]
-pub fn overlaps(own: &str, flags: &[Flag], others: &[(String, Vec<Flag>)]) -> Vec<String> {
+pub fn overlaps(
+    own: &pe2_ext::TreePath,
+    flags: &[Flag],
+    others: &[(std::sync::Arc<pe2_ext::TreePath>, Vec<Flag>)],
+) -> Vec<String> {
     let mut owners: BTreeMap<i64, (String, String)> = BTreeMap::new();
     let mut problems = Vec::new();
-    let all = std::iter::once((own.to_string(), flags.to_vec())).chain(others.iter().cloned());
+    // Registries are named in what is said by their paths.
+    let own = own.to_string();
+    let all = std::iter::once((own.clone(), flags.to_vec()))
+        .chain(others.iter().map(|(registry, flags)| (registry.to_string(), flags.clone())));
     for (registry, flags) in all {
         for flag in &flags {
             for id in flag.first..flag.first + flag.count.max(1) {
@@ -92,7 +99,7 @@ pub fn overlaps(own: &str, flags: &[Flag], others: &[(String, Vec<Flag>)]) -> Ve
 /// A registry's IDs by flag, held to every registry of the project: no ID owned twice, none past the bank's end.
 fn ids(call: &mut Call) -> Result<Table> {
     let given = call.given();
-    let own = call.host.path().to_string();
+    let own = call.host.path().to_owned();
     let flags = flags_of(&given)?;
     let mut others = Vec::new();
     for (path, declaration) in call.assets_of("pe2.flags@flag_registry")? {
@@ -158,6 +165,8 @@ fn register(r: &mut Registry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Flag, overlaps};
+    use pe2_ext::TreePath;
+    use std::sync::Arc;
 
     fn flag(name: &str, first: i64, count: i64) -> Flag {
         Flag { name: name.into(), first, count }
@@ -166,9 +175,14 @@ mod tests {
     #[test]
     fn an_id_has_one_owner() {
         let own = [flag("route", 0, 1), flag("objective", 0xA2, 2), flag("late", 0x1F8, 1)];
-        let others = vec![("flags/game".to_string(), vec![flag("chapter", 0x7A, 1), flag("half", 0xA3, 1)])];
-        let found = overlaps("flags/akropolis", &own, &others);
-        assert_eq!(found, vec!["late: ID 0x1f8 is past the bank's end (0x1f8)", "ID 0x0a3: objective here, and flags/game's half"]);
-        assert_eq!(overlaps("flags/akropolis", &own[..1], &others), Vec::<String>::new());
+        let others =
+            vec![(Arc::from(TreePath::constant("flags/game")), vec![flag("chapter", 0x7A, 1), flag("half", 0xA3, 1)])];
+        let akropolis = TreePath::constant("flags/akropolis");
+        let found = overlaps(akropolis, &own, &others);
+        assert_eq!(
+            found,
+            vec!["late: ID 0x1f8 is past the bank's end (0x1f8)", "ID 0x0a3: objective here, and flags/game's half"]
+        );
+        assert_eq!(overlaps(akropolis, &own[..1], &others), Vec::<String>::new());
     }
 }

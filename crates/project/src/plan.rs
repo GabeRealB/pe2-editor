@@ -583,14 +583,15 @@ impl Made {
 type GivenFiles = Vec<(String, Option<Arc<Vec<u8>>>)>;
 
 /// The node an extension's operation runs for in a plan: none, by a name to say in what fails.
+/// A plan's operation run as a node: none of the tree's, so at its root; its id is what its messages name.
 struct Planned(String);
 
 impl crate::graph::exec::Node for Planned {
-    fn path(&self) -> &str {
-        &self.0
+    fn path(&self) -> &'static crate::TreePath {
+        crate::TreePath::constant("")
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         None
     }
 

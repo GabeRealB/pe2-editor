@@ -112,13 +112,13 @@ name = "items"
 fn item(call: &mut Call) -> Result<Table> {
     let reference: Value = item_reference(call)?;
     // An output of another node is read; anything else is the item as it is.
-    let read: Vec<(String, std::sync::Arc<pe2_ext::Asked>)> =
-        match (pe2_ext::target_of(&reference), pe2_ext::asked_of(&reference)?) {
-            (Some(node), Some(asked)) => vec![(node.to_string(), asked)],
+    let read: Vec<(pe2_ext::Reference, std::sync::Arc<pe2_ext::Asked>)> =
+        match (pe2_ext::target_of(&reference)?, pe2_ext::asked_of(&reference)?) {
+            (Some(node), Some(asked)) => vec![(node, asked)],
             _ => Vec::new(),
         };
     #[request]
-    let mut got: Vec<Table> = call.tables_of(read.iter().map(|(node, asked)| (node.as_str(), &**asked)))?;
+    let mut got: Vec<Table> = call.tables_of(read.iter().map(|(node, asked)| (node, &**asked)))?;
     match got.pop() {
         Some(table) => Ok(table),
         None => pe2_ext::tokens::link(Some(&reference)),

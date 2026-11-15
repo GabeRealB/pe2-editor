@@ -26,13 +26,13 @@ fn place(project: &dyn Project, placement: &Value) -> Option<(f32, f32)> {
 
 /// An image's pages in VRAM.
 struct Upload {
-    image: String,
+    image: std::sync::Arc<pe2_ext::TreePath>,
     rect: Rect,
 }
 
 /// A palette's colors in VRAM: a run of halfwords on one row.
 struct PaletteUpload {
-    image: String,
+    image: std::sync::Arc<pe2_ext::TreePath>,
     palette: String,
     rect: Rect,
 }
@@ -54,7 +54,7 @@ impl Uploads {
                 (asset.field("page").and_then(|p| place(project, p)), pair(asset.field("size")))
             {
                 self.pages
-                    .push(Upload { image: asset.path().to_string(), rect: Rect { x, y, width: w / per, height: h } });
+                    .push(Upload { image: asset.path().to_owned(), rect: Rect { x, y, width: w / per, height: h } });
             }
             for palette in 0..palette_names(asset).len() {
                 self.palette(project, asset, palette);
@@ -94,7 +94,7 @@ impl Uploads {
         let width = if deepest == 4 { 16.0 } else { 256.0 };
         let name = palette_names(image).get(palette).cloned().unwrap_or_default();
         self.palettes.push(PaletteUpload {
-            image: image.path().to_string(),
+            image: image.path().to_owned(),
             palette: name,
             rect: Rect { x, y, width, height: 1.0 },
         });
@@ -106,7 +106,7 @@ impl Uploads {
 pub(crate) struct Vram {
     /// Whether the pages' grid is drawn: the user's setting.
     pub(crate) grid: bool,
-    strips: HashMap<(String, String), Option<Texture>>,
+    strips: HashMap<(std::sync::Arc<pe2_ext::TreePath>, String), Option<Texture>>,
 }
 
 impl Vram {
@@ -126,7 +126,7 @@ impl View for Vram {
                 uploads.of(project, asset);
             }
             // The pages' pictures are asked of the host below, once the project is let go of.
-            let pages: Vec<(String, Option<String>, Rect)> =
+            let pages: Vec<(std::sync::Arc<pe2_ext::TreePath>, Option<String>, Rect)> =
                 uploads.pages.iter().map(|u| (u.image.clone(), project.chosen(&u.image, "picture"), u.rect)).collect();
             let mut pictures = vec![];
             for upload in &uploads.palettes {
@@ -138,7 +138,7 @@ impl View for Vram {
                 });
                 if let Some(texture) = strip {
                     let label = Some(format!("{} · {}", upload.image, upload.palette));
-                    let link = Some(upload.image.clone());
+                    let link = Some(upload.image.to_string());
                     pictures.push(Placed { texture: texture.clone(), rect: upload.rect, label, link });
                 }
             }
@@ -175,7 +175,12 @@ impl View for Vram {
         for (image, look, rect) in pages {
             match ui.picture(&image, look.as_deref()) {
                 Some(Ok(texture)) => {
-                    placed.push(Placed { texture, rect, label: Some(image.clone()), link: Some(image) });
+                    placed.push(Placed {
+                        texture,
+                        rect,
+                        label: Some(image.to_string()),
+                        link: Some(image.to_string()),
+                    });
                 }
                 None => drawing += 1,
                 Some(Err(_)) => {}
@@ -198,7 +203,7 @@ impl View for SlotPlace {
     fn show(&mut self, ui: &mut Ui<'_>) {
         use pe2_ext::{Align, Color, Role, Shape};
         let (width, _, _) = ui.available();
-        let Some((own, path)) = ui.asset().map(|asset| (slot_rect(&asset), asset.path().to_string())) else { return };
+        let Some((own, path)) = ui.asset().map(|asset| (slot_rect(&asset), asset.path().to_owned())) else { return };
         let Some(own) = own else {
             ui.label("It has no rectangle: set one, [x, y, width, height] in halfwords.");
             return;
@@ -231,7 +236,7 @@ impl View for SlotPlace {
             .project()
             .find("pe2.images@vram_slot")
             .iter()
-            .filter(|slot| slot.path() != path)
+            .filter(|slot| *slot.path() != *path)
             .filter_map(slot_rect)
             .collect();
         for slot in others {
@@ -251,7 +256,7 @@ impl View for SlotPlace {
             stroke: Some((2.0, theme(Role::Accent))),
             rounding: 0.0,
         });
-        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        let name = path.name().unwrap_or_default().to_string();
         let middle = (f32::midpoint(min.0, max.0), f32::midpoint(min.1, max.1));
         shapes.push(Shape::Text { at: middle, text: name, size: 12.0, color: theme(Role::Text), align: Align::Middle });
         let (_, height) = at(VRAM.0, VRAM.1);

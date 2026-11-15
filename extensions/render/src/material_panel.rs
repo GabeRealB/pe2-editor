@@ -15,7 +15,7 @@ const PREVIEW: f32 = 128.0;
 pub struct Pictures(HashMap<String, Option<Texture>>);
 
 impl Pictures {
-    pub fn get(&mut self, ui: &Ui, image: &str, part: &pe2_ext::Asked) -> Option<&Texture> {
+    pub fn get(&mut self, ui: &Ui, image: &pe2_ext::TreePath, part: &pe2_ext::Asked) -> Option<&Texture> {
         let key = format!("{image}#{part}");
         self.0
             .entry(key.clone())
@@ -32,7 +32,7 @@ pub struct Panel {
 
 /// What can be chosen of the image a texture names.
 pub struct Choices {
-    pub image: String,
+    pub image: std::sync::Arc<pe2_ext::TreePath>,
     pub cells: Vec<String>,
     pub palettes: Vec<String>,
     /// The palette a cell is declared with, where the texture does not say.
@@ -47,7 +47,7 @@ pub fn choices_of(ui: &Ui, texture: &Value) -> Option<Choices> {
     let cell = cell_named.and_then(|cell| image.parts("cells").into_iter().find(|(name, _)| *name == cell));
     let own = cell.and_then(|(_, cell)| cell.get("palette")).and_then(Value::as_str).map(str::to_string);
     Some(Choices {
-        image: image.path().to_string(),
+        image: image.path().to_owned(),
         cells: named(image.parts("cells")),
         palettes: named(image.parts("palettes")),
         own,

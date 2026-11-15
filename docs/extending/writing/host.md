@@ -13,11 +13,18 @@ An operation's `run` receives a `Call`:
 
 Everything an operation reads is recorded, so the editor runs it again when, and only when, what it read changes.
 
+An asset is named by a `Reference`: its uid, or its path in the project's tree, a `TreePath`. A path or a reference
+is never text: one written in the code is `TreePath::constant("packages/aya")` (checked as it is compiled), one read
+from somewhere `TreePath::new(text)?` or `Reference::new(text)?`, which fail on what names nothing, and `Reference::from`
+a uid or a path. What the calls give back are these types: `entries` the paths of a folder's files, `assets_of` each
+asset of a type by its path with its declaration, `node_named` an asset's path, uid and types.
+
 An output is asked for by an `Asked`: its path and, after `?`, its query - `pe2_ext::NATIVE` and `pe2_ext::SETTINGS`,
-which every asset has, `Asked::constant("page")` for a name written in the code (checked as it is compiled), or
-`Asked::new(text)?` for one read from somewhere. A reference held in a field is read with `target_of` (the asset it
-names), `asked_of` (what of it, and how), `address_of`, `query_of(key)` and `fragment_of` (the part read), whether it
-is written as text or as a table.
+which every asset has, `Asked::constant("page")` for a name written in the code, or `Asked::new(text)?` for one read
+from somewhere. A reference held in a field is read with `target_of` (the asset it names: none where the field holds
+no reference, an error where it names nothing an asset can be named by; `target_in` for a field that may be missing),
+`asked_of` (what of it, and how), `address_of`, `query_of(key)` and `fragment_of` (the part read), whether it is
+written as text or as a table.
 
 Only outside the sandbox: `temp()` gives a place a program can write to, `keep(place)` takes that file back into the
 project, `path_of(file)` says where a stored file is on disk, and `serve(files)` hands a program a read-only folder
@@ -35,7 +42,8 @@ Views, tools and services reach the project through `Project`:
 | Know the project | `target`, `revision` |
 | Call a service | `call(service, arguments)`: one the extension provides, or of an extension it requires |
 
-An `Asset` gives its `path`, `uid`, kind, fields, parts and files.
+An `Asset` gives its `path` (a `TreePath`), `uid`, kind, fields, parts and files; `Project`'s calls take an asset's
+`TreePath`, and `Ui::navigate(path, part)` opens one, a part of it selected where one is named.
 
 ## Limits
 

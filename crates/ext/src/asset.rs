@@ -6,8 +6,8 @@ use crate::{Result, Table, Value};
 /// host's `asset` resource.
 pub trait Source {
     /// Its resolved path.
-    fn path(&self) -> &str;
-    fn uid(&self) -> Option<&str>;
+    fn path(&self) -> &crate::TreePath;
+    fn uid(&self) -> Option<crate::Uid>;
     /// Its declaration's fields.
     fn fields(&self) -> &Table;
     /// Its declaration, as written.
@@ -48,27 +48,27 @@ pub trait Source {
         None
     }
     /// What an operation is lent of the project (`CallHost::entries`, `read_entry`): only a source for an operation's run has them.
-    fn entries(&self, folder: &str) -> Option<Result<Vec<String>>> {
+    fn entries(&self, folder: &crate::TreePath) -> Option<Result<Box<[std::sync::Arc<crate::TreePath>]>>> {
         let _ = folder;
         None
     }
-    fn read_entry(&self, path: &str) -> Option<Result<Vec<u8>>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Vec<u8>>> {
         let _ = path;
         None
     }
-    fn assets_of(&self, node_type: &str) -> Option<Result<Vec<(String, String)>>> {
+    fn assets_of(&self, node_type: &str) -> Option<Result<crate::AssetsOf>> {
         let _ = node_type;
         None
     }
-    fn place(&self, path: &str) -> Option<crate::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
         let _ = path;
         None
     }
-    fn output_of(&self, path: &str, asked: &crate::Asked) -> Option<Result<crate::Data>> {
-        let _ = (path, asked);
+    fn output_of(&self, node: &crate::Reference, asked: &crate::Asked) -> Option<Result<crate::Data>> {
+        let _ = (node, asked);
         None
     }
-    fn node_named(&self, reference: &str) -> Option<crate::data::NodeNamed> {
+    fn node_named(&self, reference: &crate::Reference) -> Option<crate::data::NodeNamed> {
         let _ = reference;
         None
     }
@@ -101,12 +101,12 @@ impl<'a> Asset<'a> {
     }
 
     #[must_use]
-    pub fn path(&self) -> &'a str {
+    pub fn path(&self) -> &'a crate::TreePath {
         self.source.path()
     }
 
     #[must_use]
-    pub fn uid(&self) -> Option<&'a str> {
+    pub fn uid(&self) -> Option<crate::Uid> {
         self.source.uid()
     }
 

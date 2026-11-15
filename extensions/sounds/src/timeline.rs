@@ -38,13 +38,13 @@ fn theme(role: Role) -> Color {
 struct Made {
     score: engine::Score,
     commands: Vec<Command>,
-    instruments: Vec<Option<String>>,
+    instruments: Box<[Option<std::sync::Arc<pe2_ext::TreePath>>]>,
     /// The instruments' references, as the script writes them.
-    references: Vec<String>,
+    references: Box<[pe2_ext::Reference]>,
     /// The node's name: what its instruments' names share with it is left out of the lanes' labels.
     name: String,
     /// The script's node, for a bank's slot: where it is edited.
-    script: Option<String>,
+    script: Option<std::sync::Arc<pe2_ext::TreePath>>,
 }
 
 /// What the pointer is doing.
@@ -119,7 +119,7 @@ fn made_of(project: &dyn pe2_ext::Project, asset: &Asset<'_>, slot: Option<usize
         let (bank, entry) = crate::preview::slot_bank(&nodes, &file, settings, slot)?;
         let at = crate::preview::slots(asset).into_iter().find(|(s, _)| *s == slot).map(|(_, script)| script);
         let scripts = asset.array("scripts");
-        let script = at.and_then(|at| scripts.get(at)).and_then(|r| project.resolve(r)).map(|a| a.path().to_string());
+        let script = at.and_then(|at| scripts.get(at)).and_then(|r| project.resolve(r)).map(|a| a.path().to_owned());
         (bank, entry, script)
     } else {
         let (bank, entry) = crate::preview::script_bank(&nodes, settings.clone(), settings)?;
@@ -130,24 +130,26 @@ fn made_of(project: &dyn pe2_ext::Project, asset: &Asset<'_>, slot: Option<usize
         Some(Chunk::Entry { commands, .. }) => commands.clone(),
         _ => Vec::new(),
     };
-    let references = crate::preview::references(settings, "instruments");
-    let instruments =
-        references.iter().map(|r| project.resolve(&Value::String(r.clone())).map(|a| a.path().to_string())).collect();
-    let name = asset.path().rsplit('/').next().unwrap_or_default().to_string();
+    let references = crate::preview::references(settings, "instruments")?;
+    let instruments = references
+        .iter()
+        .map(|r| project.resolve(&Value::String(r.to_string())).map(|a| a.path().to_owned()))
+        .collect();
+    let name = asset.path().name().unwrap_or_default().to_string();
     Ok(Made { score, commands, instruments, references, name, script })
 }
 
 /// An instrument's name without what it shares with the node's, up to a `_` (`level_1_instrument_0` beside
 /// `level_1_script_0`: `instrument_0`).
-fn beside(path: Option<&String>, name: &str) -> String {
+fn beside<'a>(path: Option<&'a pe2_ext::TreePath>, name: &str) -> &'a str {
     let full = short(path);
     let shared = full.chars().zip(name.chars()).take_while(|(a, b)| a == b).count();
     let cut = full[..full.char_indices().nth(shared).map_or(full.len(), |(i, _)| i)].rfind('_').map_or(0, |i| i + 1);
-    if cut > 0 && cut < full.len() { full[cut..].to_string() } else { full }
+    if cut > 0 && cut < full.len() { &full[cut..] } else { full }
 }
 
-fn short(path: Option<&String>) -> String {
-    path.map_or_else(|| "an instrument".to_string(), |p| p.rsplit('/').next().unwrap_or(p).to_string())
+fn short(path: Option<&pe2_ext::TreePath>) -> &str {
+    path.map_or("an instrument", |p| p.name().unwrap_or_default())
 }
 
 /// A label cut to fit a width at a size, an ellipsis where it is cut: its characters taken as about 0.55 of its size
@@ -243,7 +245,7 @@ impl Timeline {
             let top = RULER + LANE * row as f32;
             shapes.push(line((0.0, top + LANE), (width, top + LANE), 1.0, theme(Role::Border)));
             let Command::Voice(v) = &made.commands[command] else { continue };
-            let instrument = made.instruments.get(usize::from(v.program)).and_then(Option::as_ref);
+            let instrument = made.instruments.get(usize::from(v.program)).and_then(Option::as_deref);
             let label =
                 fitted(&format!("#{command} L{} {}", v.layer, beside(instrument, &made.name)), LABEL - 16.0, 12.0);
             let color = if kept.selected == Some(command) { Role::Text } else { Role::Weak };
@@ -499,23 +501,23 @@ fn edited(mut commands: Vec<Table>, edit: Edit) -> Vec<Table> {
 fn adding_ui(ui: &mut Ui<'_>, made: &Made, selected: Option<usize>, edit: &mut Option<Edit>) -> Option<Vec<Value>> {
     let mut added = None;
     ui.horizontal(|ui| {
-        let playing: Vec<String> = made.instruments.iter().map(|p| short(p.as_ref())).collect();
+        let playing: Vec<&str> = made.instruments.iter().map(|p| short(p.as_deref())).collect();
         let says = if playing.is_empty() { "No instruments yet".to_string() } else { playing.join(", ") };
         ui.styled(&format!("Instruments: {says}"), Style::Weak);
         let project = ui.project();
-        let mut offered: Vec<(String, String)> = project
+        let mut offered: Vec<(std::sync::Arc<pe2_ext::TreePath>, pe2_ext::Uid)> = project
             .find("pe2.sounds@instrument")
             .iter()
-            .filter_map(|a| Some((a.path().to_string(), a.uid()?.to_string())))
+            .filter_map(|a| Some((a.path().to_owned(), a.uid()?)))
             .filter(|(path, _)| !made.instruments.iter().flatten().any(|p| p == path))
             .collect();
         offered.sort();
-        let names: Vec<String> = offered.iter().map(|(path, _)| path.clone()).collect();
+        let names: Vec<String> = offered.iter().map(|(path, _)| path.to_string()).collect();
         if names.is_empty() {
             ui.styled("· no other instrument in the project to add", Style::Weak);
         } else if let Some(chosen) = ui.combo("add instrument", "Add an instrument", &names) {
-            let mut references: Vec<Value> = made.references.iter().map(|r| Value::String(r.clone())).collect();
-            references.push(Value::String(offered[chosen].1.clone()));
+            let mut references: Vec<Value> = made.references.iter().map(|r| Value::String(r.to_string())).collect();
+            references.push(Value::String(offered[chosen].1.to_string()));
             added = Some(references);
         }
         if !made.instruments.is_empty() && ui.button("Add a note") {
@@ -558,7 +560,7 @@ impl Timeline {
         let selected = self.kept.and_then(|k| k.selected)?;
         let Some(Command::Voice(v)) = made.commands.get(selected) else { return None };
         let mut edit = None;
-        let instrument = made.instruments.get(usize::from(v.program)).and_then(Option::as_ref);
+        let instrument = made.instruments.get(usize::from(v.program)).and_then(Option::as_deref);
         let fields: [(&str, &str, String); 8] = [
             ("layer", "Layer", v.layer.to_string()),
             ("delay", "Delay", v.delay.to_string()),
@@ -572,8 +574,8 @@ impl Timeline {
         ui.horizontal(|ui| {
             ui.styled(&format!("#{selected}"), Style::Strong);
             if editing && made.instruments.len() > 1 {
-                let names: Vec<String> = made.instruments.iter().map(|p| short(p.as_ref())).collect();
-                if let Some(chosen) = ui.combo("instrument", &short(instrument), &names) {
+                let names: Vec<String> = made.instruments.iter().map(|p| short(p.as_deref()).to_string()).collect();
+                if let Some(chosen) = ui.combo("instrument", short(instrument), &names) {
                     edit = Some(Edit::Set(
                         selected,
                         "instrument".into(),
@@ -581,7 +583,7 @@ impl Timeline {
                     ));
                 }
             } else {
-                ui.label(&short(instrument));
+                ui.label(short(instrument));
             }
             let own = |is: bool| if is { "own" } else { "layer's" };
             ui.styled(
@@ -613,7 +615,7 @@ impl Timeline {
         } else if let Some(script) = &made.script
             && ui.button("Edit its script")
         {
-            ui.navigate(script);
+            ui.navigate(script, None);
         }
         edit
     }
@@ -622,7 +624,7 @@ impl Timeline {
 impl View for Timeline {
     fn show(&mut self, ui: &mut Ui<'_>) {
         let Some(asset) = ui.asset() else { return };
-        let path = asset.path().to_string();
+        let path = asset.path().to_owned();
         let slot = if self.slots {
             let chosen = ui.project().chosen(&path, "picture").and_then(|s| s.parse().ok());
             let Some(slot) = chosen.or_else(|| crate::preview::slots(&asset).first().map(|(slot, _)| *slot)) else {
@@ -673,7 +675,7 @@ mod tests {
 
     #[test]
     fn an_instrument_is_named_without_what_it_shares_with_its_script() {
-        let name = |path: &str| beside(Some(&path.to_string()), "level_1_script_0");
+        let name = |path: &'static str| beside(Some(pe2_ext::TreePath::constant(path)), "level_1_script_0");
         assert_eq!(name("pe/antibody/sounds/level_1_instrument_0"), "instrument_0");
         assert_eq!(name("pe/shared/footstep"), "footstep");
         assert_eq!(beside(None, "x"), "an instrument");

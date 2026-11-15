@@ -235,7 +235,8 @@ mod tests {
 
     fn bound(cell: &str, size: u32) -> Bound {
         let picture = Box::from(&*crate::material::cell_address(cell, None).unwrap());
-        Bound { image: "i".to_string(), cell: cell.to_string(), palette: None, size: [size; 2], picture }
+        let image = Box::from(pe2_ext::TreePath::constant("i"));
+        Bound { image, cell: cell.to_string(), palette: None, size: [size; 2], picture }
     }
 
     fn slot(name: &str, main: Option<Bound>) -> Slot {

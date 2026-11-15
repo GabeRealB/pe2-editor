@@ -231,8 +231,12 @@ pub fn objects(call: &mut Call) -> Result<Typed> {
 
 /// What the gathered tree says a package links besides its own objects (its file `linked`): its dependencies
 /// (`dependency`), and the packages it binds (`bound`), by their paths.
-fn linked_in(listed: &str, kind: &str) -> Vec<String> {
-    listed.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' ')).map(str::to_string).collect()
+///
+/// # Errors
+/// A line names what is no path.
+fn linked_in(listed: &str, kind: &str) -> Result<Box<[pe2_ext::Reference]>> {
+    let named = listed.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' '));
+    named.map(|path| Ok(pe2_ext::Reference::from(pe2_ext::TreePath::new(path)?))).collect()
 }
 
 /// `link_inputs`: what links the package, laid out for a linker - `objects/<name>` (its own, then its dependencies'
@@ -248,14 +252,14 @@ pub fn link_inputs(call: &mut Call) -> Result<Typed> {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
     };
-    let dependencies: Vec<String> = linked_in(&listed, "dependency");
-    let bound: Vec<String> = linked_in(&listed, "bound");
+    let dependencies: Box<[pe2_ext::Reference]> = linked_in(&listed, "dependency")?;
+    let bound: Box<[pe2_ext::Reference]> = linked_in(&listed, "bound")?;
     #[request]
     let read: Vec<pe2_ext::Data> = call.outputs_of(
         dependencies
             .iter()
-            .map(|d| (d.as_str(), pe2_ext::Asked::constant("objects")))
-            .chain(bound.iter().map(|b| (b.as_str(), pe2_ext::Asked::constant("symbols")))),
+            .map(|d| (d, pe2_ext::Asked::constant("objects")))
+            .chain(bound.iter().map(|b| (b, pe2_ext::Asked::constant("symbols")))),
     )?;
     let (objects_read, symbols_read) = read.split_at(dependencies.len());
     let target = target(call)?;
@@ -343,6 +347,7 @@ mod tests {
     fn a_units_object_is_named_by_its_package_and_place() {
         assert_eq!(super::object_name("title", "self/src/package.c"), "title/src/package.o");
         assert_eq!(super::object_name("psyq", "self/lib/libsn/snmain.s"), "psyq/lib/libsn/snmain.o");
-        assert_eq!(super::linked_in("dependency packages/a\nbound packages/b\n", "bound"), ["packages/b"]);
+        let bound = super::linked_in("dependency packages/a\nbound packages/b\n", "bound").unwrap();
+        assert_eq!(*bound, [pe2_ext::Reference::from(pe2_ext::TreePath::constant("packages/b"))]);
     }
 }

@@ -163,8 +163,8 @@ enum Held<'a> {
 /// asked for.
 struct Lent<'a> {
     handle: Held<'a>,
-    path: String,
-    uid: Option<String>,
+    path: std::sync::Arc<crate::TreePath>,
+    uid: Option<crate::Uid>,
     node_type: Option<String>,
     declaration: String,
     fields: OnceCell<Table>,
@@ -176,7 +176,8 @@ impl<'a> Lent<'a> {
             Held::Borrowed(asset) => *asset,
             Held::Owned(asset) => asset,
         };
-        let (path, uid, node_type) = (resource.path(), resource.uid(), resource.node_type());
+        let (path, uid, node_type) = (told_path(&resource.path()), resource.uid(), resource.node_type());
+        let uid = uid.map(|uid| crate::Uid::new(&uid).unwrap_or_else(|why| broken(&why)));
         let declaration = resource.declaration();
         Lent { handle, path, uid, node_type, declaration, fields: OnceCell::new() }
     }
@@ -197,13 +198,28 @@ impl<'a> Lent<'a> {
     }
 }
 
+/// The host broke the contract: it gives only what it checked, written out. A component stops there, saying what.
+fn broken(why: &impl std::fmt::Display) -> ! {
+    panic!("the host gave what is no path: {why}")
+}
+
+/// A path in the tree as the host gives it: one it checked, written out.
+fn told_path(text: &str) -> std::sync::Arc<crate::TreePath> {
+    std::sync::Arc::from(crate::TreePath::new(text).unwrap_or_else(|why| broken(&why)))
+}
+
+/// The assets of a type as the host gives them: each by its path in the tree, with its declaration.
+fn told_assets(told: Vec<(String, String)>) -> crate::AssetsOf {
+    told.into_iter().map(|(path, declaration)| (told_path(&path), declaration.into_boxed_str())).collect()
+}
+
 impl Source for Lent<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         &self.path
     }
 
-    fn uid(&self) -> Option<&str> {
-        self.uid.as_deref()
+    fn uid(&self) -> Option<crate::Uid> {
+        self.uid
     }
 
     fn fields(&self) -> &Table {
@@ -240,31 +256,33 @@ impl Source for Lent<'_> {
         Some(self.resource().temp().map(given).map_err(crate::Error::msg))
     }
 
-    fn entries(&self, folder: &str) -> Option<crate::Result<Vec<String>>> {
-        Some(self.resource().entries(folder).map_err(crate::Error::msg))
+    fn entries(&self, folder: &crate::TreePath) -> Option<crate::Result<Box<[std::sync::Arc<crate::TreePath>]>>> {
+        let told = self.resource().entries(folder.as_str()).map_err(crate::Error::msg);
+        Some(told.map(|paths| paths.iter().map(|path| told_path(path)).collect()))
     }
 
-    fn read_entry(&self, path: &str) -> Option<crate::Result<Vec<u8>>> {
-        Some(self.resource().read_entry(path).map_err(crate::Error::msg))
+    fn read_entry(&self, path: &crate::TreePath) -> Option<crate::Result<Vec<u8>>> {
+        Some(self.resource().read_entry(path.as_str()).map_err(crate::Error::msg))
     }
 
-    fn assets_of(&self, node_type: &str) -> Option<crate::Result<Vec<(String, String)>>> {
-        Some(self.resource().assets_of(node_type).map_err(crate::Error::msg))
+    fn assets_of(&self, node_type: &str) -> Option<crate::Result<crate::AssetsOf>> {
+        Some(self.resource().assets_of(node_type).map(told_assets).map_err(crate::Error::msg))
     }
 
-    fn place(&self, path: &str) -> Option<crate::HostPath> {
-        self.resource().place(path).map(given)
+    fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
+        self.resource().place(path.as_str()).map(given)
     }
 
-    fn output_of(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Data>> {
-        Some(self.resource().output_of(path, address.as_str()).map(from_wit).map_err(crate::Error::msg))
+    fn output_of(&self, node: &crate::Reference, address: &crate::Asked) -> Option<crate::Result<Data>> {
+        let made = self.resource().output_of(&node.to_string(), address.as_str());
+        Some(made.map(from_wit).map_err(crate::Error::msg))
     }
 
-    fn node_named(&self, reference: &str) -> Option<crate::NodeNamed> {
-        self.resource().node_named(reference).map(|named| crate::NodeNamed {
-            path: named.path,
-            uid: named.uid,
-            types: named.types,
+    fn node_named(&self, reference: &crate::Reference) -> Option<crate::NodeNamed> {
+        self.resource().node_named(&reference.to_string()).map(|named| crate::NodeNamed {
+            path: told_path(&named.path),
+            uid: named.uid.map(|uid| crate::Uid::new(&uid).unwrap_or_else(|why| broken(&why))),
+            types: named.types.into_iter().map(String::into_boxed_str).collect(),
         })
     }
 
@@ -337,8 +355,8 @@ impl<'a> Lens<'a> {
 }
 
 impl Project for Lens<'_> {
-    fn asset(&self, path: &str) -> Option<Asset<'_>> {
-        self.project.asset(path).map(|a| self.keep(a))
+    fn asset(&self, path: &crate::TreePath) -> Option<Asset<'_>> {
+        self.project.asset(path.as_str()).map(|a| self.keep(a))
     }
 
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>> {
@@ -353,12 +371,12 @@ impl Project for Lens<'_> {
         self.project.selection().map(|a| self.keep(a))
     }
 
-    fn chosen(&self, path: &str, group: &str) -> Option<String> {
-        self.project.chosen(path, group)
+    fn chosen(&self, path: &crate::TreePath, group: &str) -> Option<String> {
+        self.project.chosen(path.as_str(), group)
     }
 
-    fn picture(&self, path: &str, look: Option<&str>) -> Option<crate::Result<Image>> {
-        self.project.picture(path, look).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    fn picture(&self, path: &crate::TreePath, look: Option<&str>) -> Option<crate::Result<Image>> {
+        self.project.picture(path.as_str(), look).map(|made| made.map(from_image).map_err(crate::Error::msg))
     }
 
     fn target(&self) -> Option<String> {
@@ -369,21 +387,21 @@ impl Project for Lens<'_> {
         self.project.revision()
     }
 
-    fn image(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Image>> {
-        self.project.image(path, address.as_str()).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    fn image(&self, path: &crate::TreePath, address: &crate::Asked) -> Option<crate::Result<Image>> {
+        self.project.image(path.as_str(), address.as_str()).map(|made| made.map(from_image).map_err(crate::Error::msg))
     }
 
-    fn table(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<crate::Table>> {
-        let told = self.project.table(path, address.as_str())?.map_err(crate::Error::msg);
+    fn table(&self, path: &crate::TreePath, address: &crate::Asked) -> Option<crate::Result<crate::Table>> {
+        let told = self.project.table(path.as_str(), address.as_str())?.map_err(crate::Error::msg);
         Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
     }
 
-    fn bytes(&self, path: &str, address: &crate::Asked) -> Option<crate::Result<Vec<u8>>> {
-        Some(self.project.bytes(path, address.as_str())?.map_err(crate::Error::msg))
+    fn bytes(&self, path: &crate::TreePath, address: &crate::Asked) -> Option<crate::Result<Vec<u8>>> {
+        Some(self.project.bytes(path.as_str(), address.as_str())?.map_err(crate::Error::msg))
     }
 
-    fn request(&self, path: &str, address: &crate::Asked) -> crate::Requested {
-        match self.project.request(path, address.as_str()) {
+    fn request(&self, path: &crate::TreePath, address: &crate::Asked) -> crate::Requested {
+        match self.project.request(path.as_str(), address.as_str()) {
             host::Requested::Ready(bytes) => crate::Requested::Ready(bytes),
             host::Requested::Pending(waited) => crate::Requested::Pending { waited },
             host::Requested::Failed(why) => crate::Requested::Failed(why),
@@ -654,8 +672,8 @@ impl UiHost for Frame<'_> {
         });
     }
 
-    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<crate::Texture, String>> {
-        let shown = self.ui().picture(path, look)?;
+    fn picture(&mut self, path: &crate::TreePath, look: Option<&str>) -> Option<Result<crate::Texture, String>> {
+        let shown = self.ui().picture(path.as_str(), look)?;
         Some(shown.map(|(handle, width, height)| {
             crate::Texture::from_host(
                 format!("{path}#{}#picture", look.unwrap_or_default()),
@@ -666,8 +684,9 @@ impl UiHost for Frame<'_> {
         }))
     }
 
-    fn navigate(&mut self, path: &str) {
-        self.ui().navigate(path);
+    fn navigate(&mut self, path: &crate::TreePath, part: Option<&str>) {
+        // The contract takes the editor's own form: the path, and the part after a `#`.
+        self.ui().navigate(&part.map_or_else(|| path.to_string(), |part| format!("{path}#{part}")));
     }
 
     fn selected(&self) -> Option<String> {
@@ -1248,7 +1267,7 @@ fn prepared_to_wit(prepared: crate::Prepared) -> g::Prepared {
         needs: prepared
             .needs
             .into_iter()
-            .map(|need| g::Need { node: need.node, address: need.address.to_string() })
+            .map(|need| g::Need { node: need.node.to_string(), address: need.address.to_string() })
             .collect(),
         micros: prepared.micros.into_iter().map(micro).collect(),
     }
@@ -1258,7 +1277,7 @@ fn prepared_to_wit(prepared: crate::Prepared) -> g::Prepared {
 struct NodeHost<'a>(&'a Lent<'a>);
 
 impl CallHost for NodeHost<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         &self.0.path
     }
 
@@ -1287,27 +1306,27 @@ impl CallHost for NodeHost<'_> {
         Source::writer(self.0, name).ok_or_else(|| crate::anyhow!("the host makes no files for this call"))?
     }
 
-    fn entries(&self, folder: &str) -> crate::Result<Vec<String>> {
+    fn entries(&self, folder: &crate::TreePath) -> crate::Result<Box<[std::sync::Arc<crate::TreePath>]>> {
         Source::entries(self.0, folder).ok_or_else(|| crate::anyhow!("the host lists nothing here"))?
     }
 
-    fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> crate::Result<Vec<u8>> {
         Source::read_entry(self.0, path).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 
-    fn assets_of(&self, node_type: &str) -> crate::Result<Vec<(String, String)>> {
+    fn assets_of(&self, node_type: &str) -> crate::Result<crate::AssetsOf> {
         Source::assets_of(self.0, node_type).ok_or_else(|| crate::anyhow!("the host finds nothing here"))?
     }
 
-    fn place(&self, path: &str) -> Option<crate::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
         Source::place(self.0, path)
     }
 
-    fn node_named(&self, reference: &str) -> Option<crate::NodeNamed> {
+    fn node_named(&self, reference: &crate::Reference) -> Option<crate::NodeNamed> {
         Source::node_named(self.0, reference)
     }
 
-    fn output_of(&self, path: &str, address: &crate::Asked) -> crate::Result<Data> {
+    fn output_of(&self, path: &crate::Reference, address: &crate::Asked) -> crate::Result<Data> {
         Source::output_of(self.0, path, address).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 

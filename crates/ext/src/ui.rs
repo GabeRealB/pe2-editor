@@ -267,9 +267,9 @@ pub trait UiHost {
     fn table(&mut self, id: &str, rows: &[Vec<Cell>]) -> Option<(usize, usize)>;
     /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show it:
     /// none while it is being drawn (the view is drawn again when it is), or why it cannot be.
-    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>>;
-    /// Select the asset at a path, as clicking it in the tree would.
-    fn navigate(&mut self, path: &str);
+    fn picture(&mut self, path: &crate::TreePath, look: Option<&str>) -> Option<Result<Texture, String>>;
+    /// Select the asset at a path, as clicking it in the tree would, and a part of it where one is named (`cells/cursor`).
+    fn navigate(&mut self, path: &crate::TreePath, part: Option<&str>);
     /// The part selected of the asset shown: its fragment (`cells/cursor`), wherever it was selected.
     fn selected(&self) -> Option<String>;
     /// What a view of the asset last left for itself: a view is made again whenever what it shows changes.
@@ -493,13 +493,13 @@ impl<'a> Ui<'a> {
     }
 
     /// An asset's picture in a look as the host draws it: none while it is being drawn, or why it cannot be.
-    pub fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>> {
+    pub fn picture(&mut self, path: &crate::TreePath, look: Option<&str>) -> Option<Result<Texture, String>> {
         self.host.picture(path, look)
     }
 
-    /// Open an asset by its path; `path#part` selects a part of it too.
-    pub fn navigate(&mut self, path: &str) {
-        self.host.navigate(path);
+    /// Open an asset by its path, and select a part of it where one is named.
+    pub fn navigate(&mut self, path: &crate::TreePath, part: Option<&str>) {
+        self.host.navigate(path, part);
     }
 
     /// The part selected of the asset shown, wherever it was selected.

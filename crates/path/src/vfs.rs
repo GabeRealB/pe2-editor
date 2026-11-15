@@ -112,6 +112,12 @@ impl<S: Scope> VfsPath<S> {
         self.path.name()
     }
 
+    /// How many names it has: none for the scope itself.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.path.depth()
+    }
+
     /// Its last name, unless it is the scope itself.
     #[must_use]
     pub fn last(&self) -> Option<&Name> {
@@ -192,6 +198,21 @@ impl<S: Scope> ToOwned for VfsPath<S> {
 impl<S: Scope> From<&VfsPath<S>> for Arc<VfsPath<S>> {
     fn from(path: &VfsPath<S>) -> Arc<VfsPath<S>> {
         path.to_owned()
+    }
+}
+
+impl<S: Scope> From<&VfsPath<S>> for Box<VfsPath<S>> {
+    fn from(path: &VfsPath<S>) -> Box<VfsPath<S>> {
+        let boxed: Box<str> = path.as_str().into();
+        // SAFETY: `VfsPath` is a `RelPath` alone beside a marker of no size, and `RelPath` is `str` alone (both
+        // `repr(transparent)`); the text is a checked path.
+        unsafe { Box::from_raw(Box::into_raw(boxed) as *mut VfsPath<S>) }
+    }
+}
+
+impl<S: Scope> Clone for Box<VfsPath<S>> {
+    fn clone(&self) -> Box<VfsPath<S>> {
+        Box::from(&**self)
     }
 }
 

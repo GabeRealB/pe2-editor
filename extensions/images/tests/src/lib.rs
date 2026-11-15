@@ -5,9 +5,8 @@ use pe2_ext::{Call, Need, Prepared, Project, Registry, Result, Table, Value, bai
 
 pe2_ext::extension!(register);
 
-#[expect(clippy::unnecessary_wraps, reason = "what an operation's step is")]
 fn next_read(call: &mut Call<'_>) -> Result<Prepared> {
-    let next = call.settings.get("next").and_then(Value::as_str);
+    let next = pe2_ext::target_in(call.settings.get("next"))?;
     Ok(Prepared { needs: next.iter().map(|next| Need::new(next, pe2_ext::NATIVE)).collect(), micros: Vec::new() })
 }
 
@@ -35,14 +34,14 @@ fn register(r: &mut Registry) -> Result<()> {
     );
     // Each reads the next, holding its instance while that one runs.
     let _ = r.op("chained").label("Reads the next").output::<ty::Table>().prepare(next_read).run(|call| {
-        if let Some(next) = call.settings.get("next").and_then(Value::as_str) {
-            call.output_of(next, pe2_ext::NATIVE)?;
+        if let Some(next) = pe2_ext::target_in(call.settings.get("next"))? {
+            call.output_of(&next, pe2_ext::NATIVE)?;
         }
         Ok(Table::new())
     });
     // Reads what it never said it reads.
     let _ = r.op("unsaid").label("Reads what it did not say").output::<ty::Table>().run(|call| {
-        call.output_of("chain/0", pe2_ext::NATIVE)?;
+        call.output_of(&pe2_ext::TreePath::constant("chain/0").into(), pe2_ext::NATIVE)?;
         Ok(Table::new())
     });
     let _ = r.test("a_long_chain_of_nodes_is_not_too_deep", "Nodes of one extension reading each other, nothing made first", |project: &dyn Project, _: &Value| {

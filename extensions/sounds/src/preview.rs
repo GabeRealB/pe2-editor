@@ -19,7 +19,7 @@ fn room(call: &Call<'_>) -> Result<engine::Room> {
     let setting = call.settings.get("room").and_then(Value::as_integer);
     let setting = setting.and_then(|s| i8::try_from(s.clamp(-1, 3)).ok()).unwrap_or(engine::ROOM);
     let mode = match call.assets_of(crate::Reverb::NODE)?.first() {
-        Some((path, _)) => Some(crate::reverb::Mode::of(&call.node(path)?.0)?),
+        Some((path, _)) => Some(crate::reverb::Mode::of(&call.node(&pe2_ext::Reference::from(path.clone()))?.0)?),
         None => None,
     };
     Ok(engine::Room { mode, setting })
@@ -31,16 +31,16 @@ pub trait Nodes {
     ///
     /// # Errors
     /// It cannot be read.
-    fn node(&self, reference: &str) -> Result<(Table, Table)>;
+    fn node(&self, reference: &pe2_ext::Reference) -> Result<(Table, Table)>;
     /// A sample's body, by its node.
     ///
     /// # Errors
     /// It cannot be read or made.
-    fn body(&self, reference: &str) -> Result<formats::spk::PoolItem>;
+    fn body(&self, reference: &pe2_ext::Reference) -> Result<formats::spk::PoolItem>;
 }
 
 impl Nodes for Call<'_> {
-    fn node(&self, reference: &str) -> Result<(Table, Table)> {
+    fn node(&self, reference: &pe2_ext::Reference) -> Result<(Table, Table)> {
         let Data::Typed(typed) = self.output_of(reference, pe2_ext::NATIVE)? else {
             anyhow::bail!("{reference}: no file")
         };
@@ -51,7 +51,7 @@ impl Nodes for Call<'_> {
         Ok((table_of(self, &typed)?, typed.settings))
     }
 
-    fn body(&self, reference: &str) -> Result<formats::spk::PoolItem> {
+    fn body(&self, reference: &pe2_ext::Reference) -> Result<formats::spk::PoolItem> {
         let Data::Typed(typed) = self.output_of(reference, pe2_ext::NATIVE)? else {
             anyhow::bail!("{reference}: no body")
         };
@@ -63,13 +63,13 @@ impl Nodes for Call<'_> {
 pub struct Looked<'a>(pub &'a dyn pe2_ext::Project);
 
 impl Looked<'_> {
-    fn asset(&self, reference: &str) -> Result<Asset<'_>> {
+    fn asset(&self, reference: &pe2_ext::Reference) -> Result<Asset<'_>> {
         self.0.resolve(&Value::String(reference.to_string())).ok_or_else(|| anyhow!("no node {reference}"))
     }
 }
 
 impl Nodes for Looked<'_> {
-    fn node(&self, reference: &str) -> Result<(Table, Table)> {
+    fn node(&self, reference: &pe2_ext::Reference) -> Result<(Table, Table)> {
         let asset = self.asset(reference)?;
         // A node holding only what it is set to (a script) is that.
         let Some(name) = FILES.iter().find(|name| asset.has_file(name)) else {
@@ -79,7 +79,7 @@ impl Nodes for Looked<'_> {
         Ok((table, asset.fields().clone()))
     }
 
-    fn body(&self, reference: &str) -> Result<formats::spk::PoolItem> {
+    fn body(&self, reference: &pe2_ext::Reference) -> Result<formats::spk::PoolItem> {
         let asset = self.asset(reference)?;
         let mode = asset.field("mode").and_then(Value::as_str).unwrap_or("normal");
         Ok(formats::spk::PoolItem::Sample(crate::body_of_wav(&asset.read("sound.wav")?, mode)?))
@@ -97,17 +97,21 @@ pub fn table_of(call: &Call<'_>, typed: &Typed) -> Result<Table> {
     Ok(toml::from_str(&String::from_utf8(call.read(typed.file()?)?)?)?)
 }
 
-/// The references a node holds under a key, as uids.
-#[must_use]
-pub fn references(settings: &Table, key: &str) -> Vec<String> {
-    settings
-        .get(key)
-        .and_then(Value::as_array)
-        .map_or_default(|items| items.iter().filter_map(|v| pe2_ext::target_of(v).map(str::to_string)).collect())
+/// The nodes a node names under a key, in order.
+///
+/// # Errors
+/// An item names what is no node.
+pub fn references(settings: &Table, key: &str) -> Result<Box<[pe2_ext::Reference]>> {
+    let items = settings.get(key).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut out = Vec::new();
+    for item in items {
+        out.extend(pe2_ext::target_of(item)?);
+    }
+    Ok(out.into())
 }
 
 /// Where each of `named` is in `among`: the first place it is.
-fn places(named: &[String], among: &[String], what: &str) -> Result<Vec<usize>> {
+fn places(named: &[pe2_ext::Reference], among: &[pe2_ext::Reference], what: &str) -> Result<Vec<usize>> {
     named
         .iter()
         .map(|n| among.iter().position(|a| a == n).ok_or_else(|| anyhow!("{n} is none of the {what} it is with")))
@@ -120,11 +124,11 @@ fn places(named: &[String], among: &[String], what: &str) -> Result<Vec<usize>> 
 /// A node it names cannot be read.
 pub fn script_bank(nodes: &dyn Nodes, script: Table, settings: &Table) -> Result<(Bank, usize)> {
     let mut instruments = Vec::new();
-    let mut samples: Vec<String> = Vec::new();
+    let mut samples: Vec<pe2_ext::Reference> = Vec::new();
     let mut binding = bank::Binding::default();
-    for reference in references(settings, "instruments") {
+    for reference in references(settings, "instruments")? {
         let (instrument, its) = nodes.node(&reference)?;
-        let own = references(&its, "samples");
+        let own = references(&its, "samples")?;
         for sample in &own {
             if !samples.contains(sample) {
                 samples.push(sample.clone());
@@ -149,18 +153,18 @@ pub fn script_bank(nodes: &dyn Nodes, script: Table, settings: &Table) -> Result
 /// The bank has no such slot, or a node it names cannot be read.
 pub fn slot_bank(nodes: &dyn Nodes, file: &Table, settings: &Table, slot: usize) -> Result<(Bank, usize)> {
     let (instrument_refs, script_refs, sample_refs) =
-        (references(settings, "instruments"), references(settings, "scripts"), references(settings, "samples"));
+        (references(settings, "instruments")?, references(settings, "scripts")?, references(settings, "samples")?);
     let mut binding = bank::Binding::default();
     let mut instruments = Vec::new();
     for reference in &instrument_refs {
         let (instrument, its) = nodes.node(reference)?;
-        binding.instruments.push(places(&references(&its, "samples"), &sample_refs, "samples")?);
+        binding.instruments.push(places(&references(&its, "samples")?, &sample_refs, "samples")?);
         instruments.push(instrument);
     }
     let mut scripts = Vec::new();
     for reference in &script_refs {
         let (script, its) = nodes.node(reference)?;
-        binding.scripts.push(places(&references(&its, "instruments"), &instrument_refs, "instruments")?);
+        binding.scripts.push(places(&references(&its, "instruments")?, &instrument_refs, "instruments")?);
         scripts.push(script);
     }
     let pool = sample_refs.iter().map(|s| nodes.body(s)).collect::<Result<_>>()?;
@@ -204,17 +208,16 @@ pub fn contents(asset: &Asset, project: &dyn pe2_ext::Project) -> Contents {
     let mut rows = vec![ContentRow::heading("slots", "Slots")];
     for (slot, script) in slots(asset) {
         let named = scripts.get(script).and_then(|r| project.resolve(r));
-        let label = named.as_ref().map_or_else(
-            || format!("script {script}"),
-            |a| a.path().rsplit('/').next().unwrap_or_default().to_string(),
-        );
+        let label = named
+            .as_ref()
+            .map_or_else(|| format!("script {script}"), |a| a.path().name().unwrap_or_default().to_string());
         let mut row = ContentRow::new(&format!("slot/{slot}"), &format!("Slot {slot}"))
             .depth(1)
             .icon(Icon::Music, Tint::Sound)
             .detail(&label)
             .look(&slot.to_string());
         if let Some(named) = named {
-            row = row.link(named.path());
+            row = row.link(named.path().as_str());
         }
         rows.push(row);
     }

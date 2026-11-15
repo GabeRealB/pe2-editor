@@ -128,7 +128,7 @@ pub fn reading(texture: &Value, cell: &str, palette: Option<&str>) -> Result<Val
         };
         return Ok(Value::Table(table));
     }
-    let uid = pe2_ext::target_of(texture).unwrap_or_default();
+    let uid = pe2_ext::target_of(texture)?.ok_or_else(|| anyhow!("the texture names no image"))?;
     Ok(format!("{uid}/{asked}").into())
 }
 

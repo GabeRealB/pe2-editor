@@ -55,8 +55,8 @@ use pe2_ext::SETTINGS;
 const IDS: &pe2_ext::Asked = pe2_ext::Asked::constant("ids");
 const FACES: [&str; 3] = ["glyphs", "bold", "speakers"];
 
-fn reference(table: &Table, key: &str) -> Result<String> {
-    table.get(key).and_then(pe2_ext::target_of).map(str::to_string).ok_or_else(|| anyhow!("it names no {key}"))
+fn reference(table: &Table, key: &str) -> Result<pe2_ext::Reference> {
+    pe2_ext::target_in(table.get(key))?.ok_or_else(|| anyhow!("it names no {key}"))
 }
 
 /// Each plate's speaker numbers, from a cast's settings.
@@ -118,7 +118,7 @@ fn glyphs_of(face: &str, pictures: &BTreeMap<String, Picture>) -> Vec<Glyph> {
 }
 
 /// A face's UFO files, read into its glyphs.
-fn face_glyphs(call: &Call, face: &Data, what: &str) -> Result<Vec<Glyph>> {
+fn face_glyphs(call: &Call, face: &Data, what: &pe2_ext::Reference) -> Result<Vec<Glyph>> {
     let Data::Typed(typed) = face else { bail!("{what}: its native form is no files") };
     let files = typed.files.iter().map(|file| Ok((file.name.clone(), call.read(file)?))).collect::<Result<_>>()?;
     let font = codecs::ufo::read(&files).map_err(|e| anyhow!("{what}: {e}"))?;
@@ -132,7 +132,7 @@ fn make(call: &mut Call) -> Result<Typed> {
     if let Some(why) = given.get("failed").and_then(Value::as_str) {
         bail!("extraction could not read it exactly: {why}");
     }
-    let reads: Vec<String> = [reference(&given, "strings")?, reference(&given, "cast")?].into();
+    let reads: Vec<pe2_ext::Reference> = [reference(&given, "strings")?, reference(&given, "cast")?].into();
     // The string table's text as the output its reference names has it - translated, say - else as it is set.
     let strings_output = match given.get("strings") {
         Some(strings) => pe2_ext::asked_of(strings)?,
@@ -141,21 +141,21 @@ fn make(call: &mut Call) -> Result<Typed> {
     let addresses: Vec<std::sync::Arc<pe2_ext::Asked>> =
         [strings_output.unwrap_or_else(|| SETTINGS.into()), SETTINGS.into()].into();
     let faces = given.get("faces").and_then(Value::as_table).cloned().unwrap_or_default();
-    let face_nodes: Vec<String> = FACES.iter().map(|f| reference(&faces, f)).collect::<Result<_>>()?;
+    let face_nodes: Vec<pe2_ext::Reference> = FACES.iter().map(|f| reference(&faces, f)).collect::<Result<_>>()?;
     #[request]
-    let tables: Vec<Table> = call.tables_of(reads.iter().zip(&addresses).map(|(r, a)| (r.as_str(), &**a)))?;
-    let registries: Vec<String> = dialogue::registries(&given);
+    let tables: Vec<Table> = call.tables_of(reads.iter().zip(&addresses).map(|(r, a)| (r, &**a)))?;
+    let registries: Box<[pe2_ext::Reference]> = dialogue::registries(&given)?;
     #[request]
-    let ids: Vec<Table> = call.tables_of(registries.iter().map(|r| (r.as_str(), IDS)))?;
+    let ids: Vec<Table> = call.tables_of(registries.iter().map(|r| (r, IDS)))?;
     // The faces last: what a step holds of them is not carried.
     #[request]
-    let natives: Vec<Data> = call.outputs_of(face_nodes.iter().map(|f| (f.as_str(), pe2_ext::NATIVE)))?;
+    let natives: Vec<Data> = call.outputs_of(face_nodes.iter().map(|f| (f, pe2_ext::NATIVE)))?;
     let mut font = Font::default();
     for ((face, native), node) in FACES.iter().zip(&natives).zip(&face_nodes) {
         font.faces.insert((*face).to_string(), pictures_of(&face_glyphs(call, native, node)?));
     }
     let strings = tables[0].get("strings").and_then(Value::as_table).cloned().unwrap_or_default();
-    let flags: BTreeMap<String, BTreeMap<String, i64>> = registries
+    let flags: BTreeMap<pe2_ext::Reference, BTreeMap<String, i64>> = registries
         .iter()
         .zip(&ids)
         .map(|(registry, ids)| {

@@ -30,11 +30,11 @@ impl Bundle {
 }
 
 impl Node for Bundle {
-    fn path(&self) -> &'static str {
-        self.path
+    fn path(&self) -> &'static crate::TreePath {
+        crate::TreePath::constant(self.path)
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         None
     }
 
@@ -130,7 +130,7 @@ fn ops() -> Ops {
     ops.add(OpDef::new("t.tree", "Files of the project", "1").makes(file_type(), |call| {
         ran(3);
         let mut joined = Vec::new();
-        for path in call.entries("src")? {
+        for path in call.entries(crate::TreePath::constant("src"))? {
             joined.extend(call.read_entry(&path)?);
         }
         for (path, declaration) in call.assets_of("package")? {
@@ -694,21 +694,22 @@ impl super::exec::World for Tree {
         Some((&self.0 as &dyn Node, Plan::of(&self.0.fields, &self.1, &[]).0))
     }
 
-    fn entries(&self, folder: &str) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.2.at(folder))
+    fn entries(&self, folder: &crate::TreePath) -> Box<[std::sync::Arc<crate::TreePath>]> {
+        let mut names: Vec<String> = std::fs::read_dir(self.2.at(folder.as_str()))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        names.into_iter().map(|name| format!("{folder}/{name}")).collect()
+        names.into_iter().map(|name| folder.join(pe2_path::Name::new(&name).unwrap())).collect()
     }
 
-    fn entry(&self, path: &str) -> Option<HostPath> {
-        Some(self.2.at(path)).filter(|disk| disk.is_file())
+    fn entry(&self, path: &crate::TreePath) -> Option<HostPath> {
+        Some(self.2.at(path.as_str())).filter(|disk| disk.is_file())
     }
 
-    fn assets_of(&self, _: &str) -> Vec<(String, String)> {
-        vec![("packages/one".to_string(), std::fs::read_to_string(self.2.at("declaration")).unwrap())]
+    fn assets_of(&self, _: &str) -> pe2_ext::AssetsOf {
+        let declaration = std::fs::read_to_string(self.2.at("declaration")).unwrap();
+        Box::new([(crate::TreePath::constant("packages/one").to_owned(), declaration.into_boxed_str())])
     }
 }
 

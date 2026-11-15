@@ -3,7 +3,7 @@
 //! made follows what it reached, and nothing here is a node's output of its own: a model is just a model.
 
 use pe2_ext::tokens::{Args, Yields};
-use pe2_ext::{Call, Data, Registry, Result, Table, Value, anyhow, bail};
+use pe2_ext::{Call, Data, Reference, Registry, Result, Table, TreePath, Value, anyhow, bail};
 use pe2_model::mesh;
 use pe2_model::model::{Arrays, Binding, Model, arrays};
 use pe2_model::skeleton;
@@ -13,7 +13,9 @@ pub use pe2_ext::SETTINGS;
 
 /// Where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
 fn placed(call: &Call, placement: &Value) -> Option<[i64; 2]> {
-    let rect = call.table_of(pe2_ext::target_of(placement.get("slot")?)?, SETTINGS).ok()?;
+    // A placement whose slot cannot be read places nothing, as one whose slot's table cannot be.
+    let slot = pe2_ext::target_in(placement.get("slot")).ok()??;
+    let rect = call.table_of(&slot, SETTINGS).ok()?;
     let rect = rect.get("rect")?.as_array()?.clone();
     let at = placement.get("at").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let added = |n: usize| at.get(n).and_then(Value::as_integer).unwrap_or(0);
@@ -22,8 +24,8 @@ fn placed(call: &Call, placement: &Value) -> Option<[i64; 2]> {
 
 fn binding_of(call: &Call, fields: &Table) -> Result<Binding> {
     material::binding(fields, |texture, bits| {
-        let image = pe2_ext::target_of(texture).ok_or_else(|| anyhow!("its texture names nothing"))?;
-        let settings = call.table_of(image, SETTINGS)?;
+        let image = pe2_ext::target_of(texture)?.ok_or_else(|| anyhow!("its texture names nothing"))?;
+        let settings = call.table_of(&image, SETTINGS)?;
         material::placement_at(
             &material::image_placement(&settings, |placement| placed(call, placement)),
             texture,
@@ -33,13 +35,13 @@ fn binding_of(call: &Call, fields: &Table) -> Result<Binding> {
 }
 
 /// A mesh at rest on its skeleton, the joints a prefab moves where it moves them, and the names of its slots.
-fn rested(call: &Call, reference: &str, pose: Option<&Value>) -> Result<(Model, Vec<String>)> {
+fn rested(call: &Call, reference: &Reference, pose: Option<&Value>) -> Result<(Model, Vec<String>)> {
     let Data::Typed(stored) = call.output_of(reference, pe2_ext::NATIVE)? else {
         bail!("{reference}: its output is no mesh")
     };
     let (mut model, slots) = mesh::read(&String::from_utf8(call.read(stored.file()?)?)?)?;
-    if let Some(named) = call.table_of(reference, SETTINGS)?.get("skeleton").and_then(pe2_ext::target_of) {
-        let table = call.table_of(named, SETTINGS)?;
+    if let Some(named) = pe2_ext::target_in(call.table_of(reference, SETTINGS)?.get("skeleton"))? {
+        let table = call.table_of(&named, SETTINGS)?;
         let joints = skeleton::parse(table.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice))?;
         mesh::pose(&mut model, &joints)?;
         for (part, joint) in model.parts.iter_mut().zip(&joints) {
@@ -53,8 +55,8 @@ fn rested(call: &Call, reference: &str, pose: Option<&Value>) -> Result<(Model, 
 
 /// A model's arrays' input: a model's settings, with what holds it over them where a prefab does.
 fn model_as(call: &Call, fields: &Table, fill: Option<&Value>, pose: Option<&Value>) -> Result<(Model, Vec<Binding>)> {
-    let reference = fields.get("mesh").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("it names no mesh"))?;
-    let (mut model, slots) = rested(call, reference, pose)?;
+    let reference = pe2_ext::target_in(fields.get("mesh"))?.ok_or_else(|| anyhow!("it names no mesh"))?;
+    let (mut model, slots) = rested(call, &reference, pose)?;
     if let (Some(fill), Some(root)) = (fill, model.parts.first_mut()) {
         skeleton::held(root, fill);
     }
@@ -65,8 +67,8 @@ fn model_as(call: &Call, fields: &Table, fill: Option<&Value>, pose: Option<&Val
         let named = overrides
             .and_then(|overrides| overrides.get("material"))
             .or_else(|| materials.and_then(|materials| materials.get(slot)));
-        let filled = named.and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
-        let mut settings = call.table_of(filled, SETTINGS)?;
+        let filled = pe2_ext::target_in(named)?.ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
+        let mut settings = call.table_of(&filled, SETTINGS)?;
         for (key, value) in
             overrides.and_then(Value::as_table).into_iter().flatten().filter(|(key, _)| *key != "material")
         {
@@ -87,8 +89,8 @@ fn member_of(call: &Call, args: &Args) -> Result<(Model, Vec<Binding>)> {
     let fields = call.given();
     let fill = member.split('/').fold(fields.get("groups"), |at, step| at?.get(step));
     let fill = fill.ok_or_else(|| anyhow!("it has no member {member}"))?;
-    let model = fill.get("model").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{member} holds no model"))?;
-    model_as(call, &call.table_of(model, SETTINGS)?, Some(fill), fields.get("pose"))
+    let model = pe2_ext::target_in(fill.get("model"))?.ok_or_else(|| anyhow!("{member} holds no model"))?;
+    model_as(call, &call.table_of(&model, SETTINGS)?, Some(fill), fields.get("pose"))
 }
 
 /// Plain data as what goes between braces: an array in braces, a number as itself, a text as tokens. The largest words read as
@@ -315,16 +317,15 @@ fn list_count(call: &Call, _: &Args) -> Result<String> {
 
 /// An item's `id`, as its own tokenizer reads it: the item's output leads to it, with the args it is read by.
 fn item_id(call: &Call, at: usize) -> Result<i64> {
-    let led = call.table_of(call.host.path(), pe2_ext::Asked::new(&format!("items/{at}"))?)?;
-    let node =
-        led.get(pe2_ext::tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("item {at} leads nowhere"))?;
+    let led = call.table_of(&Reference::from(call.host.path()), pe2_ext::Asked::new(&format!("items/{at}"))?)?;
+    let node = pe2_ext::target_in(led.get(pe2_ext::tokens::NODE))?.ok_or_else(|| anyhow!("item {at} leads nowhere"))?;
     let held = led.get(pe2_ext::tokens::ARGS).and_then(Value::as_table).into_iter().flatten();
     let args = Args(held.filter_map(|(name, value)| Some((name.clone(), vec![value.as_str()?.to_string()]))).collect());
-    let output = crate::gather::tokenizer_of(call, node)?;
+    let output = crate::gather::tokenizer_of(call, &node)?;
     let mut args = args;
     args.0.insert(pe2_ext::tokens::DERIVE.to_string(), vec!["id".to_string()]);
     let address = pe2_ext::tokens::address(&output, &args)?;
-    let text = pe2_ext::tokens::text_of(call, &call.output_of(node, &address)?)?;
+    let text = pe2_ext::tokens::text_of(call, &call.output_of(&node, &address)?)?;
     text.trim().parse().map_err(|_| anyhow!("item {at}'s id is {text}, no number"))
 }
 
@@ -351,13 +352,17 @@ fn group_file_id(call: &Call, args: &Args) -> Result<String> {
         .and_then(Value::as_integer)
         .ok_or_else(|| anyhow!("it has no file {name}"))?;
     let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
-    let layout = call.table_of(&format!("disc/{release}/stage0"), SETTINGS)?;
+    let layout = call.table_of(&Reference::from(TreePath::new(&format!("disc/{release}/stage0"))?), SETTINGS)?;
     let groups = layout.get("groups").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let here = call.host.path();
-    let mine = groups.iter().find(|group| {
-        let named = group.get("asset").and_then(pe2_ext::target_of).and_then(|asset| call.node_named(asset));
-        named.is_some_and(|named| named.path == here)
-    });
+    let mut mine = None;
+    for group in groups {
+        let named = pe2_ext::target_in(group.get("asset"))?.and_then(|asset| call.node_named(&asset));
+        if named.is_some_and(|named| *named.path == *here) {
+            mine = Some(group);
+            break;
+        }
+    }
     let group = mine
         .and_then(|group| group.get("id"))
         .and_then(Value::as_integer)
@@ -393,15 +398,15 @@ fn file_stream_id(call: &Call, args: &Args) -> Result<String> {
 /// A clip's C name, from its path: its steps after the first, in words (`characters/aya/handgun/walk` ->
 /// `_gAyaHandgunWalkClip`).
 #[must_use]
-pub fn clip_name(path: &str) -> String {
-    let steps = path.split('/').skip(1).flat_map(|step| step.split('_'));
+pub fn clip_name(path: &TreePath) -> Box<str> {
+    let steps = path.parts().skip(1).flat_map(|step| step.as_str().split('_'));
     let words: String = steps
         .map(|word| {
             let mut chars = word.chars();
             chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect::<String>())
         })
         .collect();
-    format!("_g{words}Clip")
+    format!("_g{words}Clip").into()
 }
 
 /// A clip's arrays and its `AnimationSet`, as one line of C, its arrays named after it.
@@ -441,11 +446,11 @@ pub fn clip_definition(name: &str, arrays: &clip::Arrays) -> String {
 /// A bank and the banks it is laid over, nearest first.
 fn bank_chain(call: &Call) -> Result<Vec<Table>> {
     let mut chain = vec![call.given()];
-    while let Some(base) = chain.last().and_then(|bank| bank.get("base")).and_then(pe2_ext::target_of) {
+    while let Some(base) = pe2_ext::target_in(chain.last().and_then(|bank| bank.get("base")))? {
         if chain.len() > 32 {
             bail!("its bases go round");
         }
-        let next = call.table_of(base, SETTINGS)?;
+        let next = call.table_of(&base, SETTINGS)?;
         chain.push(next);
     }
     Ok(chain)
@@ -454,30 +459,38 @@ fn bank_chain(call: &Call) -> Result<Vec<Table>> {
 /// What a bank is: its schema, its filled slots each with its clip, and the clips it stores, in order.
 struct Bank {
     schema: Table,
-    filled: Vec<(String, String)>,
-    stored: Vec<String>,
+    filled: Vec<(String, Reference)>,
+    stored: Vec<Reference>,
 }
 
 /// A bank's slots and what fills each, by the schema its chain names, and the clips it stores in the order it stores
 /// them: its `order`, then what its slots reach that the order leaves out.
 fn bank_of(call: &Call) -> Result<Bank> {
     let chain = bank_chain(call)?;
-    let schema = chain
-        .iter()
-        .find_map(|bank| bank.get("schema").and_then(pe2_ext::target_of))
-        .ok_or_else(|| anyhow!("no bank it is laid over names a schema"))?;
-    let schema = call.table_of(schema, SETTINGS)?;
+    let mut schema = None;
+    for bank in &chain {
+        schema = pe2_ext::target_in(bank.get("schema"))?;
+        if schema.is_some() {
+            break;
+        }
+    }
+    let schema = schema.ok_or_else(|| anyhow!("no bank it is laid over names a schema"))?;
+    let schema = call.table_of(&schema, SETTINGS)?;
     let names = schema.get("names").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut filled = Vec::new();
     for name in names.iter().filter_map(Value::as_str).filter(|name| !name.is_empty()) {
-        let clip = chain.iter().find_map(|bank| bank.get("clips")?.get(name).and_then(pe2_ext::target_of));
-        if let Some(clip) = clip {
-            filled.push((name.to_string(), clip.to_string()));
+        for bank in &chain {
+            if let Some(clip) = pe2_ext::target_in(bank.get("clips").and_then(|clips| clips.get(name)))? {
+                filled.push((name.to_string(), clip));
+                break;
+            }
         }
     }
     let order = chain.first().and_then(|bank| bank.get("order")).and_then(Value::as_array);
-    let mut stored: Vec<String> =
-        order.into_iter().flatten().filter_map(pe2_ext::target_of).map(str::to_string).collect();
+    let mut stored: Vec<Reference> = Vec::new();
+    for item in order.into_iter().flatten() {
+        stored.extend(pe2_ext::target_of(item)?);
+    }
     for (_, clip) in &filled {
         if !stored.contains(clip) {
             stored.push(clip.clone());
@@ -487,7 +500,7 @@ fn bank_of(call: &Call) -> Result<Bank> {
 }
 
 /// A clip's arrays, from what its node made, and its path.
-fn clip_arrays(call: &Call, reference: &str, made: Data) -> Result<(String, clip::Arrays)> {
+fn clip_arrays(call: &Call, reference: &Reference, made: Data) -> Result<(std::sync::Arc<TreePath>, clip::Arrays)> {
     let path = call.node_named(reference).ok_or_else(|| anyhow!("no clip {reference}"))?.path;
     let Data::Typed(stored) = made else { bail!("{path}: its output is no clip") };
     let read =
@@ -502,18 +515,19 @@ fn bank_whole(call: &Call, args: &Args) -> Result<String> {
     let prefix = schema.get("prefix").and_then(Value::as_str).unwrap_or_default();
     let capacity =
         schema.get("capacity").and_then(Value::as_integer).ok_or_else(|| anyhow!("its schema has no capacity"))?;
-    let mut defined: Vec<(String, String)> = Vec::new();
+    let mut defined: Vec<(Reference, Box<str>)> = Vec::new();
     let mut out = Vec::new();
     // Every clip asked for at once (`outputs_of`): a tokenizer following what it reads is run until it has them, and
     // asking one at a time took a run each.
-    let made = call.outputs_of(stored.iter().map(|reference| (reference.as_str(), pe2_ext::NATIVE)))?;
+    let made = call.outputs_of(stored.iter().map(|reference| (reference, pe2_ext::NATIVE)))?;
     for (reference, made) in stored.iter().zip(made) {
         let (path, arrays) = clip_arrays(call, reference, made)?;
         let name = clip_name(&path);
         out.push(clip_definition(&name, &arrays));
         defined.push((reference.clone(), name));
     }
-    let defined_as = |clip: &str| defined.iter().find(|(reference, _)| reference == clip).map(|(_, name)| name.clone());
+    let defined_as =
+        |clip: &Reference| defined.iter().find(|(reference, _)| reference == clip).map(|(_, name)| name.clone());
     let entries: Vec<String> = filled
         .iter()
         .map(|(slot, clip)| {
@@ -617,8 +631,8 @@ mod tests {
 
     #[test]
     fn a_clip_is_named_by_its_path_after_its_first_step() {
-        assert_eq!(clip_name("characters/aya/handgun/walk"), "_gAyaHandgunWalkClip");
-        assert_eq!(clip_name("weapons/m93r/aim_idle"), "_gM93rAimIdleClip");
+        assert_eq!(&*clip_name(TreePath::constant("characters/aya/handgun/walk")), "_gAyaHandgunWalkClip");
+        assert_eq!(&*clip_name(TreePath::constant("weapons/m93r/aim_idle")), "_gM93rAimIdleClip");
     }
 
     #[test]

@@ -98,9 +98,9 @@ impl Shared {
 /// What extensions are served by, as they hold what holds them only weakly and neither is to know the other's whole type.
 pub trait Asking: Send + Sync {
     /// An output, kept or on its way.
-    fn request(&self, path: &str, asked: &pe2_path::Asked) -> Requested;
+    fn request(&self, path: &crate::TreePath, asked: &pe2_path::Asked) -> Requested;
     /// An output where it is kept.
-    fn kept(&self, path: &str, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>>;
+    fn kept(&self, path: &crate::TreePath, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>>;
 }
 
 /// The outputs asked for by what shows the project open.
@@ -194,12 +194,7 @@ impl Requests {
 }
 
 impl Asking for Requests {
-    fn request(&self, path: &str, asked: &pe2_path::Asked) -> Requested {
-        // What was asked names its asset as text: checked here, and refused with why where it is no path.
-        let path = match crate::TreePath::new(path) {
-            Ok(path) => path,
-            Err(why) => return Requested::Failed(format!("{path}: {why}")),
-        };
+    fn request(&self, path: &crate::TreePath, asked: &pe2_path::Asked) -> Requested {
         let key = (path.to_owned(), Arc::from(asked));
         let mut state = self.shared.lock();
         if !state.slots.contains_key(&key) {
@@ -233,9 +228,7 @@ impl Asking for Requests {
         answer
     }
 
-    fn kept(&self, path: &str, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>> {
-        // What is no path was never made: `request` refused it.
-        let path = crate::TreePath::new(path).ok()?;
+    fn kept(&self, path: &crate::TreePath, asked: &pe2_path::Asked) -> Option<Arc<Vec<u8>>> {
         match self.shared.lock().slots.get(&(path.to_owned(), Arc::from(asked))) {
             Some(Slot::Made(bytes)) => Some(bytes.clone()),
             _ => None,
@@ -319,7 +312,7 @@ mod tests {
         let address = pe2_path::Asked::new(address).unwrap();
         let started = Instant::now();
         loop {
-            match requests.request("n", address) {
+            match requests.request(crate::TreePath::constant("n"), address) {
                 Requested::Pending { .. } => assert!(started.elapsed() < Duration::from_secs(10), "it never came"),
                 answer => return answer,
             }
@@ -334,12 +327,18 @@ mod tests {
         TAKES.store(150, Ordering::SeqCst);
         let started = Instant::now();
         assert!(
-            matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }),
+            matches!(
+                requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
+                Requested::Pending { .. }
+            ),
             "too long to wait for"
         );
         assert!(started.elapsed() < Duration::from_millis(120), "whoever asked went on");
         // Others asking share it.
-        assert!(matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }));
+        assert!(matches!(
+            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
+            Requested::Pending { .. }
+        ));
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));
         assert_eq!(MADE.load(Ordering::SeqCst), 1);
         drop(ready(&requests, "native"));
@@ -349,7 +348,7 @@ mod tests {
         TAKES.store(0, Ordering::SeqCst);
         requests.clear();
         assert_eq!(
-            requests.request("n", pe2_path::Asked::constant("native")),
+            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
             Requested::Ready(b"made".to_vec()),
             "within what a frame can spare"
         );
@@ -357,7 +356,10 @@ mod tests {
         // What was forgotten while on its way arrives to nobody.
         TAKES.store(60, Ordering::SeqCst);
         requests.clear();
-        assert!(matches!(requests.request("n", pe2_path::Asked::constant("native")), Requested::Pending { .. }));
+        assert!(matches!(
+            requests.request(crate::TreePath::constant("n"), pe2_path::Asked::constant("native")),
+            Requested::Pending { .. }
+        ));
         requests.clear();
         TAKES.store(0, Ordering::SeqCst);
         assert_eq!(ready(&requests, "native"), Requested::Ready(b"made".to_vec()));

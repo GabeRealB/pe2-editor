@@ -46,7 +46,7 @@ impl Slots {
             return;
         }
         self.revision = revision;
-        let Some(path) = ui.asset().map(|asset| asset.path().to_string()) else { return };
+        let Some(path) = ui.asset().map(|asset| asset.path().to_owned()) else { return };
         let told = ui.project().table(&path, pe2_ext::Asked::constant("reflection"));
         self.told = told.map(|told| told.map_err(|e| format!("{e:#}")));
     }
@@ -275,8 +275,11 @@ fn depends(ui: &mut Ui, dependencies: &[Table]) {
             }
         });
     });
-    if let Some(path) = opened {
-        ui.navigate(&path);
+    // What a package's reflection names it by is a path of the tree, as it was made.
+    match opened.map(|path| pe2_ext::TreePath::new(&path).map(ToOwned::to_owned)) {
+        Some(Ok(path)) => ui.navigate(&path, None),
+        Some(Err(why)) => ui.styled(&format!("It cannot be opened: {why}"), Style::Error),
+        None => {}
     }
 }
 
@@ -549,7 +552,7 @@ pub struct Tokens {
 impl View for Tokens {
     fn show(&mut self, ui: &mut Ui) {
         if self.told.is_none() {
-            let Some(path) = ui.asset().map(|asset| asset.path().to_string()) else { return };
+            let Some(path) = ui.asset().map(|asset| asset.path().to_owned()) else { return };
             let own = ui
                 .project()
                 .target()

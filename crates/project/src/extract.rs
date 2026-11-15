@@ -50,19 +50,19 @@ pub(crate) struct Sourcing<'a> {
 
 /// An asset as extraction lends it to its importer: its declaration and the files given.
 struct Lent<'a> {
-    path: &'a str,
-    uid: Option<&'a str>,
+    path: &'a crate::TreePath,
+    uid: Option<pe2_path::Uid>,
     fields: toml::Table,
     declaration: &'a str,
     files: BTreeMap<String, Vec<u8>>,
 }
 
 impl pe2_ext::Source for Lent<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.path
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         None
     }
 
@@ -84,11 +84,11 @@ impl pe2_ext::Source for Lent<'_> {
 }
 
 impl crate::graph::exec::Node for Lent<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.path
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         self.uid
     }
 
@@ -149,7 +149,8 @@ impl Sourcing<'_> {
         let pe2_ext::Type::Named(ty) = &def.output else {
             bail!("{path}: {op} makes {}, no extension's type", def.output)
         };
-        let lent = Lent { path, uid: Some(uid), fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
+        let (tree, uid) = (crate::TreePath::new(path)?, Some(pe2_path::Uid::new(uid)?));
+        let lent = Lent { path: tree, uid, fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
         let files = native.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.clone())).collect();
         let settings = crate::graph::with_settings(&fields);
         let native_form =
@@ -174,8 +175,8 @@ impl Sourcing<'_> {
         let written = crate::imports::without_derived(&toml, &def.derives)?;
         let placed = crate::graph::layers::settings_on_layers(&written)?;
         let lent = Lent {
-            path,
-            uid: Some(uid),
+            path: tree,
+            uid,
             fields: crate::graph::with_settings(&placed.parse()?),
             declaration: &written,
             files: written_files.iter().cloned().collect(),
@@ -232,8 +233,8 @@ pub(crate) fn with_stack(toml: &str, stack: &str) -> String {
 /// A bundle of the layer as written, as a node of the work graph: its declaration and stored files as on disk, each
 /// file hashed once, when first asked.
 struct Written {
-    path: String,
-    uid: String,
+    path: std::sync::Arc<crate::TreePath>,
+    uid: pe2_path::Uid,
     /// The bundle's folder in the layer of its node, and in the layer of its files.
     dirs: [HostPath; 2],
     declaration: String,
@@ -251,8 +252,8 @@ impl Written {
         let fields =
             crate::graph::with_settings(&declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
         Ok(Written {
-            path: path.to_string(),
-            uid: uid.to_string(),
+            path: std::sync::Arc::from(crate::TreePath::new(path)?),
+            uid: pe2_path::Uid::new(uid)?,
             dirs,
             declaration,
             fields,
@@ -270,12 +271,12 @@ impl Written {
 }
 
 impl crate::graph::exec::Node for Written {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         &self.path
     }
 
-    fn uid(&self) -> Option<&str> {
-        Some(&self.uid)
+    fn uid(&self) -> Option<pe2_path::Uid> {
+        Some(self.uid)
     }
 
     fn declaration(&self) -> &str {

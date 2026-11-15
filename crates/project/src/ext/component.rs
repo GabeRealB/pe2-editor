@@ -355,13 +355,23 @@ impl host::Host for State {
     }
 }
 
+/// A path in the tree as a component gives it: checked as it comes in, refused with why where it is none.
+fn tree_of(text: &str) -> std::result::Result<&crate::TreePath, String> {
+    crate::TreePath::new(text).map_err(|why| why.to_string())
+}
+
+/// A node as a component names it, by its uid or its path: checked as it comes in.
+fn reference_of(text: &str) -> std::result::Result<pe2_path::Reference, String> {
+    pe2_path::Reference::new(text).map_err(|why| why.to_string())
+}
+
 impl host::HostAsset for State {
     fn path(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<String> {
         Ok(self.lent(&asset)?.path().to_string())
     }
 
     fn uid(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
-        Ok(self.lent(&asset)?.uid().map(str::to_string))
+        Ok(self.lent(&asset)?.uid().map(|uid| uid.to_string()))
     }
 
     fn node_type(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
@@ -410,33 +420,50 @@ impl host::HostAsset for State {
     }
 
     fn entries(&mut self, asset: Resource<LentAsset>, folder: String) -> wasmtime::Result<Result<Vec<String>, String>> {
+        let folder = match tree_of(&folder) {
+            Ok(folder) => folder,
+            Err(why) => return Ok(Err(why)),
+        };
         Ok(self
             .lent(&asset)?
-            .entries(&folder)
+            .entries(folder)
             .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(|paths| paths.iter().map(ToString::to_string).collect())
             .map_err(|e| format!("{e:#}")))
     }
 
     fn read_entry(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        let path = match tree_of(&path) {
+            Ok(path) => path,
+            Err(why) => return Ok(Err(why)),
+        };
         Ok(self
             .lent(&asset)?
-            .read_entry(&path)
+            .read_entry(path)
             .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
             .map_err(|e| format!("{e:#}")))
     }
 
+    /// What is no path has no place.
     fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<Resource<GivenPath>>> {
-        let placed = self.lent(&asset)?.place(&path);
+        let Ok(path) = tree_of(&path) else { return Ok(None) };
+        let placed = self.lent(&asset)?.place(path);
         placed.map(|at| self.give(&at)).transpose()
     }
 
+    /// What names no node as a uid or a path names nothing.
     fn node_named(
         &mut self,
         asset: Resource<LentAsset>,
         reference: String,
     ) -> wasmtime::Result<Option<host::NodeNamed>> {
+        let Ok(reference) = reference_of(&reference) else { return Ok(None) };
         let named = self.lent(&asset)?.node_named(&reference);
-        Ok(named.map(|named| host::NodeNamed { path: named.path, uid: named.uid, types: named.types }))
+        Ok(named.map(|named| host::NodeNamed {
+            path: named.path.to_string(),
+            uid: named.uid.map(|uid| uid.to_string()),
+            types: named.types.into_iter().map(String::from).collect(),
+        }))
     }
 
     fn output_of(
@@ -446,9 +473,12 @@ impl host::HostAsset for State {
         address: String,
     ) -> wasmtime::Result<Result<types::Value, String>> {
         let lent = self.lent(&asset)?;
-        let told = match pe2_ext::Asked::new(&address) {
-            Ok(asked) => lent.output_of(&path, asked).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))),
-            Err(why) => Err(why.into()),
+        let told = match (reference_of(&path), pe2_ext::Asked::new(&address)) {
+            (Ok(node), Ok(asked)) => {
+                lent.output_of(&node, asked).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            }
+            (Err(why), _) => Err(anyhow!("{why}")),
+            (_, Err(why)) => Err(why.into()),
         };
         Ok(match told {
             Ok(value) => Ok(value_to_wit(value, &mut self.table).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?),
@@ -478,6 +508,7 @@ impl host::HostAsset for State {
             .lent(&asset)?
             .assets_of(&node_type)
             .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(|found| found.into_iter().map(|(path, settings)| (path.to_string(), String::from(settings))).collect())
             .map_err(|e| format!("{e:#}")))
     }
 
@@ -561,7 +592,9 @@ impl host::HostProject for State {
     fn asset(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<Option<Resource<LentAsset>>> {
         // SAFETY: lent for the call running now, taken back before it returns.
         let project = unsafe { &*self.project(&project)? };
-        self.found(project.asset(&path))
+        // What is no path is no asset.
+        let Ok(path) = tree_of(&path) else { return Ok(None) };
+        self.found(project.asset(path))
     }
 
     fn resolve(
@@ -603,7 +636,9 @@ impl host::HostProject for State {
     ) -> wasmtime::Result<Option<String>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
-        Ok(project.chosen(&path, &family))
+        // What is no path has nothing chosen.
+        let Ok(path) = tree_of(&path) else { return Ok(None) };
+        Ok(project.chosen(path, &family))
     }
 
     fn picture(
@@ -613,6 +648,10 @@ impl host::HostProject for State {
         look: Option<String>,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
+        let path: Arc<crate::TreePath> = match tree_of(&path) {
+            Ok(path) => Arc::from(path),
+            Err(why) => return Ok(Some(Err(why))),
+        };
         Ok(elsewhere(project, move |p| {
             p.picture(&path, look.as_deref()).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))
         }))
@@ -637,6 +676,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
+        let path: Arc<crate::TreePath> = match tree_of(&path) {
+            Ok(path) => Arc::from(path),
+            Err(why) => return Ok(Some(Err(why))),
+        };
         let address = match pe2_ext::Asked::new(&address) {
             Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
             Err(why) => return Ok(Some(Err(why.to_string()))),
@@ -653,6 +696,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<String, String>>> {
         let project = self.project(&project)?;
+        let path: Arc<crate::TreePath> = match tree_of(&path) {
+            Ok(path) => Arc::from(path),
+            Err(why) => return Ok(Some(Err(why))),
+        };
         let address = match pe2_ext::Asked::new(&address) {
             Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
             Err(why) => return Ok(Some(Err(why.to_string()))),
@@ -669,6 +716,10 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<Vec<u8>, String>>> {
         let project = self.project(&project)?;
+        let path: Arc<crate::TreePath> = match tree_of(&path) {
+            Ok(path) => Arc::from(path),
+            Err(why) => return Ok(Some(Err(why))),
+        };
         let address = match pe2_ext::Asked::new(&address) {
             Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
             Err(why) => return Ok(Some(Err(why.to_string()))),
@@ -686,6 +737,10 @@ impl host::HostProject for State {
         let address = match pe2_ext::Asked::new(&address) {
             Ok(asked) => Arc::<pe2_ext::Asked>::from(asked),
             Err(why) => return Ok(host::Requested::Failed(why.to_string())),
+        };
+        let path: Arc<crate::TreePath> = match tree_of(&path) {
+            Ok(path) => Arc::from(path),
+            Err(why) => return Ok(host::Requested::Failed(why)),
         };
         Ok(match elsewhere(project, move |p| p.request(&path, &address)) {
             pe2_ext::Requested::Ready(bytes) => host::Requested::Ready(bytes),
@@ -1459,7 +1514,11 @@ impl host::HostUi for State {
         path: String,
         look: Option<String>,
     ) -> wasmtime::Result<Option<Result<(Resource<HostTexture>, u32, u32), String>>> {
-        let Some(shown) = self.frame(&ui)?.picture(&path, look.as_deref()) else { return Ok(None) };
+        let path = match tree_of(&path) {
+            Ok(path) => path,
+            Err(why) => return Ok(Some(Err(why))),
+        };
+        let Some(shown) = self.frame(&ui)?.picture(path, look.as_deref()) else { return Ok(None) };
         Ok(Some(match shown {
             Ok(texture) => {
                 let (width, height) = (u32::try_from(texture.width())?, u32::try_from(texture.height())?);
@@ -1471,8 +1530,12 @@ impl host::HostUi for State {
         }))
     }
 
+    /// The contract gives the editor's own form, the path and the part after a `#`; what is no path goes nowhere.
     fn navigate(&mut self, ui: Resource<Frame>, path: String) -> wasmtime::Result<()> {
-        self.frame(&ui)?.navigate(&path);
+        let (path, part) = path.split_once('#').map_or((path.as_str(), None), |(path, part)| (path, Some(part)));
+        if let Ok(path) = tree_of(path) {
+            self.frame(&ui)?.navigate(path, part);
+        }
         Ok(())
     }
 
@@ -2537,11 +2600,11 @@ impl<'a> Node<'a> {
 }
 
 impl Source for Node<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.host.path()
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         None
     }
 
@@ -2578,31 +2641,31 @@ impl Source for Node<'_> {
         Some(self.host.temp())
     }
 
-    fn entries(&self, folder: &str) -> Option<Result<Vec<String>>> {
+    fn entries(&self, folder: &crate::TreePath) -> Option<Result<Box<[Arc<crate::TreePath>]>>> {
         Some(self.host.entries(folder))
     }
 
-    fn read_entry(&self, path: &str) -> Option<Result<Vec<u8>>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Option<Result<Vec<u8>>> {
         Some(self.host.read_entry(path))
     }
 
-    fn place(&self, path: &str) -> Option<pe2_ext::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<pe2_ext::HostPath> {
         self.host.place(path)
     }
 
-    fn node_named(&self, reference: &str) -> Option<pe2_ext::NodeNamed> {
+    fn node_named(&self, reference: &pe2_path::Reference) -> Option<pe2_ext::NodeNamed> {
         self.host.node_named(reference)
     }
 
-    fn output_of(&self, path: &str, address: &pe2_ext::Asked) -> Option<Result<pe2_ext::Data>> {
-        Some(self.host.output_of(path, address))
+    fn output_of(&self, node: &pe2_path::Reference, address: &pe2_ext::Asked) -> Option<Result<pe2_ext::Data>> {
+        Some(self.host.output_of(node, address))
     }
 
     fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {
         self.host.build_config()
     }
 
-    fn assets_of(&self, node_type: &str) -> Option<Result<Vec<(String, String)>>> {
+    fn assets_of(&self, node_type: &str) -> Option<Result<pe2_ext::AssetsOf>> {
         Some(self.host.assets_of(node_type))
     }
 
@@ -2632,8 +2695,9 @@ fn prepared_from_wit(prepared: g::Prepared) -> Result<pe2_ext::Prepared> {
         ports: micro.ports.into_iter().map(|port| port.into_iter().map(input).collect()).collect(),
         keep: micro.keep,
     };
-    let needs =
-        prepared.needs.iter().map(|need| Ok(pe2_ext::Need::new(&need.node, pe2_ext::Asked::new(&need.address)?)));
+    let needs = prepared.needs.iter().map(|need| {
+        Ok(pe2_ext::Need::new(&pe2_path::Reference::new(&need.node)?, pe2_ext::Asked::new(&need.address)?))
+    });
     Ok(pe2_ext::Prepared {
         needs: needs.collect::<Result<_>>()?,
         micros: prepared.micros.into_iter().map(micro).collect(),

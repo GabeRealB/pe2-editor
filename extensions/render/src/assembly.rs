@@ -20,7 +20,7 @@ use crate::skeleton;
 /// What fills a texture slot: a cell of an image, through a palette of its or the cell's own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bound {
-    pub image: String,
+    pub image: Box<pe2_ext::TreePath>,
     pub cell: String,
     pub palette: Option<String>,
     /// In texels.
@@ -126,10 +126,10 @@ struct Nodes<'c, 'a> {
 /// A node reached, by what the graph makes of it.
 struct Held<'c, 'a> {
     call: &'c Call<'a>,
-    path: String,
-    uid: Option<String>,
+    path: std::sync::Arc<pe2_ext::TreePath>,
+    uid: Option<pe2_ext::Uid>,
     /// What it is.
-    node_type: Option<String>,
+    node_type: Option<Box<str>>,
     settings: Table,
 }
 
@@ -140,12 +140,12 @@ impl Held<'_, '_> {
 }
 
 impl Source for Held<'_, '_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &pe2_ext::TreePath {
         &self.path
     }
 
-    fn uid(&self) -> Option<&str> {
-        self.uid.as_deref()
+    fn uid(&self) -> Option<pe2_ext::Uid> {
+        self.uid
     }
 
     fn fields(&self) -> &Table {
@@ -162,7 +162,8 @@ impl Source for Held<'_, '_> {
 
     /// The stored file a node makes as itself.
     fn read(&self, _: &str) -> Result<Vec<u8>> {
-        let Data::Typed(stored) = self.call.output_of(&self.path, pe2_ext::NATIVE)? else {
+        let Data::Typed(stored) = self.call.output_of(&pe2_ext::Reference::from(self.path.clone()), pe2_ext::NATIVE)?
+        else {
             bail!("{}: it makes no file", self.path)
         };
         self.call.read(stored.file()?)
@@ -171,9 +172,9 @@ impl Source for Held<'_, '_> {
 
 impl<'c, 'a> Nodes<'c, 'a> {
     /// The node a reference names.
-    fn named(&self, reference: &str) -> Result<Held<'c, 'a>> {
+    fn named(&self, reference: &pe2_ext::Reference) -> Result<Held<'c, 'a>> {
         let named = self.call.node_named(reference).ok_or_else(|| anyhow!("{reference}: no such node"))?;
-        let settings = self.call.table_of(&named.path, pe2_ext::SETTINGS)?;
+        let settings = self.call.table_of(&pe2_ext::Reference::from(named.path.clone()), pe2_ext::SETTINGS)?;
         Ok(Held {
             call: self.call,
             path: named.path,
@@ -188,8 +189,8 @@ impl<'c, 'a> Nodes<'c, 'a> {
     }
 }
 
-fn leaf(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+fn leaf(path: &pe2_ext::TreePath) -> &str {
+    path.name().unwrap_or_default()
 }
 
 fn resolved<'c, 'a>(
@@ -199,9 +200,9 @@ fn resolved<'c, 'a>(
     reference: Option<&Value>,
 ) -> Result<Held<'c, 'a>> {
     let reference = reference.ok_or_else(|| anyhow!("{}: no {key}", holder.path()))?;
-    let target = pe2_ext::target_of(reference.get("slot").unwrap_or(reference));
+    let target = pe2_ext::target_of(reference.get("slot").unwrap_or(reference))?;
     let target = target.ok_or_else(|| anyhow!("{}: its {key} is no reference", holder.path()))?;
-    nodes.named(target).map_err(|_| anyhow!("{}: its {key} is not in the project", holder.path()))
+    nodes.named(&target).map_err(|_| anyhow!("{}: its {key} is not in the project", holder.path()))
 }
 
 fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
@@ -219,7 +220,7 @@ fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
         |at: usize| rect.get(at).and_then(Value::as_integer).and_then(|side| u32::try_from(side).ok()).unwrap_or(1);
     let palette = material::palette_of(texture)?;
     Ok(Bound {
-        image: image.path().to_string(),
+        image: Box::from(image.path()),
         cell: cell.to_string(),
         palette: palette.map(str::to_string),
         size: [side(2), side(3)],
@@ -253,7 +254,10 @@ fn slot_of(nodes: &Nodes, model: &Asset, name: &str, overrides: Option<&Value>) 
     let held = held.asset();
     let drawn =
         drawn_of(nodes, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
-    let attached = Attached { path: held.path().to_string(), reference: held.uid().unwrap_or_default().to_string() };
+    let attached = Attached {
+        path: held.path().to_string(),
+        reference: held.uid().map_or_else(String::new, |uid| uid.to_string()),
+    };
     Ok(Slot {
         material: Some(attached),
         reference: Some(reference.clone()),
@@ -397,7 +401,7 @@ fn on_skeleton(nodes: &Nodes, asset: &Asset, skeleton: &Asset, fill: &Value) -> 
     let mesh = mesh.asset();
     let named =
         mesh.field("skeleton").map(|reference| resolved(nodes, &mesh, "skeleton", Some(reference))).transpose()?;
-    Ok(named.is_some_and(|named| named.path == skeleton.path()))
+    Ok(named.is_some_and(|named| *named.path == *skeleton.path()))
 }
 
 /// A part's own node, under the node it hangs on.
@@ -420,8 +424,10 @@ fn hang(nodes: &Nodes, asset: &Asset, tree: &mut Assembled, part: &Filled, on: u
     // What it hangs by is the part; a part of it deeper down keeps its own name.
     if let Some(first) = nodes.first_mut() {
         part.part.clone_into(&mut first.name);
-        first.attached =
-            Some(Attached { path: model.path().to_string(), reference: model.uid().unwrap_or_default().to_string() });
+        first.attached = Some(Attached {
+            path: model.path().to_string(),
+            reference: model.uid().map_or_else(String::new, |uid| uid.to_string()),
+        });
         first.place = place;
     }
     attach(&mut tree.model, built, on);
@@ -493,17 +499,20 @@ fn clip_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     let joints = skeleton::of(&skeleton.asset())?;
     let mut prefabs = nodes.call.assets_of("prefab")?.into_iter().filter_map(|(path, declaration)| {
         let table: Table = declaration.parse().ok()?;
-        let named = table.get("skeleton").and_then(pe2_ext::target_of)?;
-        let same = skeleton.uid.as_deref() == Some(named)
-            || named.trim_start_matches("res://").trim_end_matches(".node") == skeleton.path;
+        // A prefab naming its skeleton by what names no node is none of this clip's.
+        let named = pe2_ext::target_in(table.get("skeleton")).ok()??;
+        let same = named.uid().is_some_and(|uid| skeleton.uid == Some(uid)) || named.path() == Some(&*skeleton.path);
         same.then_some(path)
     });
     let mut tree = match prefabs.next() {
         Some(path) => {
-            let prefab = nodes.named(&path)?;
+            let prefab = nodes.named(&pe2_ext::Reference::from(path))?;
             // A weapon's clips (`weapons/<weapon>/...`) show it held.
             let mut chosen = nodes.chosen.clone();
-            if let Some(weapon) = asset.path().strip_prefix("weapons/").and_then(|rest| rest.split('/').next()) {
+            let mut parts = asset.path().parts();
+            if let (Some(first), Some(weapon)) = (parts.next(), parts.next())
+                && first.as_str() == "weapons"
+            {
                 chosen.entry("weapon".to_string()).or_insert_with(|| weapon.to_string());
             }
             prefab_of(&Nodes { call: nodes.call, chosen }, &prefab.asset())?
@@ -560,7 +569,7 @@ pub fn scene(call: &mut Call) -> Result<Typed> {
     }
     let chosen = parts.chunks(2).map(|pair| (pair[0].to_string(), pair[1].to_string()));
     let nodes = Nodes { call, chosen: chosen.collect() };
-    let own = nodes.named(call.host.path())?;
+    let own = nodes.named(&pe2_ext::Reference::from(call.host.path()))?;
     let assembled = built(&nodes, &own.asset())?;
     let file = File::new(FILE, serde_json::to_vec(&assembled)?);
     Ok(Typed::new("pe2.render@scene", vec![file]))

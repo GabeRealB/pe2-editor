@@ -32,7 +32,10 @@ fn rule(command: &Table, ui: &Ui) -> String {
     let opcode = text(command.get("opcode"));
     let flag = match command.get("game_flag") {
         Some(Value::Table(named)) => {
-            let registry = named.get("flags").and_then(|r| ui.project().resolve(r)).map(|a| a.path().rsplit('/').next().unwrap_or_default().to_string());
+            let registry = named
+                .get("flags")
+                .and_then(|r| ui.project().resolve(r))
+                .map(|a| a.path().name().unwrap_or_default().to_string());
             format!(" {} ({})", text(named.get("flag")), registry.unwrap_or_default())
         }
         Some(other) => format!(" flag {}", text(Some(other))),
@@ -98,10 +101,16 @@ impl View for Script {
             .and_then(|table| table.field("strings").and_then(Value::as_table).cloned())
             .unwrap_or_default();
         let page = settings.get("page").cloned();
-        let strings_path: Option<String> =
-            strings_ref.as_ref().and_then(|r| ui.project().resolve(r)).map(|table| table.path().to_string());
-        let unsettled: Vec<String> =
-            settings.get("unsettled").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        let strings_path: Option<std::sync::Arc<pe2_ext::TreePath>> =
+            strings_ref.as_ref().and_then(|r| ui.project().resolve(r)).map(|table| table.path().to_owned());
+        let unsettled: Vec<String> = settings
+            .get("unsettled")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
         ui.horizontal(|ui| {
             if let Some(reference) = &strings_ref {
                 ui.styled("Text", Style::Weak);
@@ -143,11 +152,16 @@ impl View for Script {
                         continue;
                     }
                     let line = record.get("text").and_then(Value::as_str).unwrap_or_default();
-                    let said = strings.get(line).and_then(Value::as_str).unwrap_or(if line.is_empty() { "" } else { "(not in the table)" });
+                    let said = strings.get(line).and_then(Value::as_str).unwrap_or(if line.is_empty() {
+                        ""
+                    } else {
+                        "(not in the table)"
+                    });
                     // As the caption box shows it: its breaks kept, the one closing it left out.
                     let mut shown = said.trim_end_matches('\n').to_string();
                     if let Some(Value::Table(action)) = record.get("action") {
-                        let acts: Vec<String> = action.iter().map(|(k, v)| format!("{} {}", k.replace('_', " "), text(Some(v)))).collect();
+                        let acts: Vec<String> =
+                            action.iter().map(|(k, v)| format!("{} {}", k.replace('_', " "), text(Some(v)))).collect();
                         shown = format!("{shown} [{}]", acts.join(", "));
                     }
                     let blank = shown.is_empty();
@@ -155,7 +169,11 @@ impl View for Script {
                     rows.push(vec![
                         Cell::Text(key, Style::Note),
                         Cell::Text(speaker(record), Style::Strong),
-                        if blank { Cell::Text("(a blank line)".into(), Style::Weak) } else { Cell::Text(shown, Style::Normal) },
+                        if blank {
+                            Cell::Text("(a blank line)".into(), Style::Weak)
+                        } else {
+                            Cell::Text(shown, Style::Normal)
+                        },
                         if line.is_empty() { Cell::Empty } else { Cell::Button(Icon::Text, "Edit its text".into()) },
                     ]);
                 }
@@ -164,7 +182,7 @@ impl View for Script {
                     && let Some(key) = edit_keys.get(row).filter(|k| !k.is_empty())
                     && let Some(table) = &strings_path
                 {
-                    ui.navigate(&format!("{table}#{key}"));
+                    ui.navigate(table, Some(key));
                 }
             });
         }

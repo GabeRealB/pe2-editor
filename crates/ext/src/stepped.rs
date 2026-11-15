@@ -401,11 +401,11 @@ impl FromOutputs for Result<Table> {
 }
 
 /// An output of another node read, as a step's record holds it: the node, and what of it.
-type Read = (String, Box<crate::Asked>);
+type Read = (crate::Reference, Box<crate::Asked>);
 
 /// The outputs a `#[request]` names: `(node, address)` pairs.
 #[must_use]
-pub fn needs<N: AsRef<str>, A: AsRef<crate::Asked>>(pairs: impl IntoIterator<Item = (N, A)>) -> Vec<Need> {
+pub fn needs<N: AsRef<crate::Reference>, A: AsRef<crate::Asked>>(pairs: impl IntoIterator<Item = (N, A)>) -> Vec<Need> {
     pairs.into_iter().map(|(node, address)| Need::new(node.as_ref(), address.as_ref())).collect()
 }
 
@@ -767,7 +767,7 @@ struct Replaying<'a> {
 }
 
 impl crate::data::CallHost for Replaying<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.inner.path()
     }
 
@@ -795,24 +795,24 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.keep(path, name)
     }
 
-    fn entries(&self, folder: &str) -> Result<Vec<String>> {
+    fn entries(&self, folder: &crate::TreePath) -> Result<Box<[Arc<crate::TreePath>]>> {
         self.inner.entries(folder)
     }
 
-    fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
         self.inner.read_entry(path)
     }
 
-    fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+    fn assets_of(&self, node_type: &str) -> Result<crate::AssetsOf> {
         self.inner.assets_of(node_type)
     }
 
-    fn place(&self, path: &str) -> Option<crate::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
         self.inner.place(path)
     }
 
-    fn output_of(&self, path: &str, address: &crate::Asked) -> Result<Data> {
-        let pair: Read = (path.to_string(), Box::from(address));
+    fn output_of(&self, path: &crate::Reference, address: &crate::Asked) -> Result<Data> {
+        let pair: Read = (path.clone(), Box::from(address));
         if let Some(read) = self.read.get(&pair) {
             return read.clone().map_err(|why| anyhow!("{why}"));
         }
@@ -823,7 +823,7 @@ impl crate::data::CallHost for Replaying<'_> {
         Err(anyhow!("{path}: {address}: not read yet"))
     }
 
-    fn node_named(&self, reference: &str) -> Option<crate::data::NodeNamed> {
+    fn node_named(&self, reference: &crate::Reference) -> Option<crate::data::NodeNamed> {
         self.inner.node_named(reference)
     }
 

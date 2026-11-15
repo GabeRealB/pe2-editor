@@ -23,11 +23,11 @@ pub enum Requested {
 /// What the host answers about the project.
 pub trait Project {
     /// The asset at a resolved path.
-    fn asset(&self, path: &str) -> Option<Asset<'_>>;
+    fn asset(&self, path: &crate::TreePath) -> Option<Asset<'_>>;
     /// The asset a reference names (`"uid://..."`, or `{ uid, path }`).
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>>;
     /// The member of a family of an asset's outputs it is being looked at in (`picture`: its look), where one was chosen.
-    fn chosen(&self, path: &str, family: &str) -> Option<String> {
+    fn chosen(&self, path: &crate::TreePath, family: &str) -> Option<String> {
         let _ = (path, family);
         None
     }
@@ -37,9 +37,9 @@ pub trait Project {
     fn selection(&self) -> Option<Asset<'_>>;
     /// An asset's picture in a look (its first where none is named), drawn by the extension its type is; none where it
     /// has none.
-    fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>>;
+    fn picture(&self, path: &crate::TreePath, look: Option<&str>) -> Option<Result<Image>>;
     /// An output of an asset that is a picture (`palettes/default`): none where it has no such output.
-    fn image(&self, path: &str, asked: &crate::Asked) -> Option<Result<Image>>;
+    fn image(&self, path: &crate::TreePath, asked: &crate::Asked) -> Option<Result<Image>>;
     /// The target of the config in use.
     fn target(&self) -> Option<String> {
         None
@@ -49,19 +49,19 @@ pub trait Project {
         0
     }
     /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
-    fn table(&self, path: &str, asked: &crate::Asked) -> Option<Result<crate::Table>> {
+    fn table(&self, path: &crate::TreePath, asked: &crate::Asked) -> Option<Result<crate::Table>> {
         let _ = (path, asked);
         None
     }
     /// An output of an asset that is one file, whole, made from its settings as they are written: what a viewer shows
     /// of what is being edited. None where it has no such output, or why it could not be made.
-    fn bytes(&self, path: &str, asked: &crate::Asked) -> Option<Result<Vec<u8>>> {
+    fn bytes(&self, path: &crate::TreePath, asked: &crate::Asked) -> Option<Result<Vec<u8>>> {
         let _ = (path, asked);
         None
     }
     /// What `bytes` gives, without waiting for it: for a frame, as how long an output takes is what it reads. What is on its
     /// way is shown again when it is there. Where nothing can make it on the side, it is made here.
-    fn request(&self, path: &str, asked: &crate::Asked) -> Requested {
+    fn request(&self, path: &crate::TreePath, asked: &crate::Asked) -> Requested {
         match self.bytes(path, asked) {
             Some(Ok(bytes)) => Requested::Ready(bytes),
             Some(Err(why)) => Requested::Failed(format!("{why:#}")),

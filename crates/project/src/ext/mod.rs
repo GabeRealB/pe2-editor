@@ -2485,8 +2485,8 @@ pub struct Lens<'a> {
 }
 
 impl Project for Lens<'_> {
-    fn asset(&self, path: &str) -> Option<Asset<'_>> {
-        self.index.asset_at(path).map(|a| self.extensions.lend(a))
+    fn asset(&self, path: &crate::TreePath) -> Option<Asset<'_>> {
+        self.index.assets.get(path).map(|a| self.extensions.lend(a))
     }
 
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>> {
@@ -2502,18 +2502,17 @@ impl Project for Lens<'_> {
         self.index.assets.get(self.selection?).map(|a| self.extensions.lend(a))
     }
 
-    fn chosen(&self, path: &str, family: &str) -> Option<String> {
-        // What an extension names that is no path has nothing chosen, as it has no asset.
-        self.chosen?.get(&(crate::TreePath::new(path).ok()?.to_owned(), family.to_string())).cloned()
+    fn chosen(&self, path: &crate::TreePath, family: &str) -> Option<String> {
+        self.chosen?.get(&(path.to_owned(), family.to_string())).cloned()
     }
 
-    fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>> {
-        let asset = self.index.asset_at(path)?;
+    fn picture(&self, path: &crate::TreePath, look: Option<&str>) -> Option<Result<Image>> {
+        let asset = self.index.assets.get(path)?;
         self.extensions.picture(asset, self.extensions.look_at(asset, look))
     }
 
-    fn image(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Image>> {
-        self.extensions.output_image(self.index.asset_at(path)?, address)
+    fn image(&self, path: &crate::TreePath, address: &pe2_path::Asked) -> Option<Result<Image>> {
+        self.extensions.output_image(self.index.assets.get(path)?, address)
     }
 
     fn revision(&self) -> u64 {
@@ -2524,13 +2523,13 @@ impl Project for Lens<'_> {
         self.extensions.config.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.target.clone()
     }
 
-    fn table(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Table>> {
-        let asset = self.index.asset_at(path)?;
+    fn table(&self, path: &crate::TreePath, address: &pe2_path::Asked) -> Option<Result<Table>> {
+        let asset = self.index.assets.get(path)?;
         Some(self.extensions.table(asset, self.index, address))
     }
 
-    fn bytes(&self, path: &str, address: &pe2_path::Asked) -> Option<Result<Vec<u8>>> {
-        let asset = self.index.asset_at(path)?;
+    fn bytes(&self, path: &crate::TreePath, address: &pe2_path::Asked) -> Option<Result<Vec<u8>>> {
+        let asset = self.index.assets.get(path)?;
         let requests = self.extensions.requests();
         if let Some(kept) = requests.as_ref().and_then(|requests| requests.kept(path, address)) {
             return Some(Ok(kept.to_vec()));
@@ -2538,7 +2537,7 @@ impl Project for Lens<'_> {
         Some(self.extensions.bytes(self.index, asset, address))
     }
 
-    fn request(&self, path: &str, address: &pe2_path::Asked) -> pe2_ext::Requested {
+    fn request(&self, path: &crate::TreePath, address: &pe2_path::Asked) -> pe2_ext::Requested {
         match self.extensions.requests() {
             Some(requests) => requests.request(path, address),
             None => match self.bytes(path, address) {
@@ -2568,9 +2567,14 @@ pub struct Graph<'a> {
 impl graph::exec::World for Graph<'_> {
     fn named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
         let (node, _) = self.node(reference)?;
-        let asset = self.index.asset_at(node.path())?;
-        let types = self.extensions.node_types_of(asset).iter().map(|node_type| node_type.name.to_string()).collect();
-        Some(pe2_ext::NodeNamed { path: node.path().to_string(), uid: node.uid().map(str::to_string), types })
+        let asset = self.index.assets.get(node.path())?;
+        let types = self
+            .extensions
+            .node_types_of(asset)
+            .iter()
+            .map(|node_type| node_type.name.to_string().into_boxed_str())
+            .collect();
+        Some(pe2_ext::NodeNamed { path: asset.path.clone(), uid: asset.uid, types })
     }
 
     fn node(&self, reference: &toml::Value) -> Option<(&dyn graph::exec::Node, graph::Plan)> {
@@ -2586,25 +2590,23 @@ impl graph::exec::World for Graph<'_> {
         Some((asset as &dyn graph::exec::Node, plan))
     }
 
-    fn entries(&self, folder: &str) -> Vec<String> {
-        // A folder named as text: one that is no path holds nothing.
-        let Ok(folder) = crate::TreePath::new(folder.trim_end_matches('/')) else { return Vec::new() };
+    fn entries(&self, folder: &crate::TreePath) -> Box<[Arc<crate::TreePath>]> {
         let inside = self.index.entries.iter().filter(|(path, _)| **path != *folder && path.starts_with(folder));
-        inside.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.to_string()).collect()
+        inside.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.clone()).collect()
     }
 
-    fn place(&self, path: &str) -> Option<HostPath> {
-        Some(self.index.entry_at(path)?.disk.clone())
+    fn place(&self, path: &crate::TreePath) -> Option<HostPath> {
+        Some(self.index.entries.get(path)?.disk.clone())
     }
 
-    fn entry(&self, path: &str) -> Option<HostPath> {
-        self.index.entry_at(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
+    fn entry(&self, path: &crate::TreePath) -> Option<HostPath> {
+        self.index.entries.get(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
     }
 
-    fn assets_of(&self, node_type: &str) -> Vec<(String, String)> {
+    fn assets_of(&self, node_type: &str) -> pe2_ext::AssetsOf {
         let found =
             self.extensions.find(self.index, node_type).filter(|asset| !self.extensions.is_disabled(&asset.path));
-        found.map(|asset| (asset.path.to_string(), asset.settings_text().to_string())).collect()
+        found.map(|asset| (asset.path.clone(), Box::from(asset.settings_text()))).collect()
     }
 }
 
@@ -2646,7 +2648,7 @@ fn start_stream(
     };
     let generator = start(&mut lent)?;
     let node = call.recorder().node();
-    let host = StreamHost { path: node.path().to_string(), contents };
+    let host = StreamHost { path: node.path().to_owned(), contents };
     let (settings, parameter) = (call.settings().clone(), call.parameter().map(str::to_string));
     let query = Box::from(call.query());
     Ok(Box::new(Generating { generator, host, settings, carried: lent_carried, parameter, query }))
@@ -2669,7 +2671,7 @@ pub(crate) fn taken(place: &pe2_ext::HostPath) -> Result<HostPath> {
 }
 
 struct StreamHost {
-    path: String,
+    path: Arc<crate::TreePath>,
     contents: HashMap<String, HostPath>,
 }
 
@@ -2680,7 +2682,7 @@ impl StreamHost {
 }
 
 impl pe2_ext::CallHost for StreamHost {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         &self.path
     }
 
@@ -2766,7 +2768,7 @@ impl graph::stream::Producer for Generating {
 }
 
 impl pe2_ext::CallHost for Hosted<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.call.recorder().node().path()
     }
 
@@ -2790,31 +2792,31 @@ impl pe2_ext::CallHost for Hosted<'_> {
         Ok(given(self.call.temp()?))
     }
 
-    fn entries(&self, folder: &str) -> Result<Vec<String>> {
+    fn entries(&self, folder: &crate::TreePath) -> Result<Box<[Arc<crate::TreePath>]>> {
         self.call.entries(folder)
     }
 
-    fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
         self.call.read_entry(path)
     }
 
-    fn place(&self, path: &str) -> Option<pe2_ext::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<pe2_ext::HostPath> {
         self.call.place(path).map(given)
     }
 
-    fn node_named(&self, reference: &str) -> Option<pe2_ext::NodeNamed> {
+    fn node_named(&self, reference: &pe2_path::Reference) -> Option<pe2_ext::NodeNamed> {
         self.call.node_named(&toml::Value::String(reference.to_string()))
     }
 
-    fn output_of(&self, path: &str, address: &pe2_path::Asked) -> Result<graph::Value> {
-        Ok((*self.call.output_of(&toml::Value::String(path.to_string()), address)?).clone())
+    fn output_of(&self, node: &pe2_path::Reference, address: &pe2_path::Asked) -> Result<graph::Value> {
+        Ok((*self.call.output_of(&toml::Value::String(node.to_string()), address)?).clone())
     }
 
     fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {
         self.call.config()
     }
 
-    fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+    fn assets_of(&self, node_type: &str) -> Result<pe2_ext::AssetsOf> {
         self.call.assets_of(node_type)
     }
 
@@ -2838,12 +2840,12 @@ impl pe2_ext::CallHost for Hosted<'_> {
 }
 
 impl Source for index::Asset {
-    fn path(&self) -> &str {
-        self.path.as_str()
+    fn path(&self) -> &crate::TreePath {
+        &self.path
     }
 
-    fn uid(&self) -> Option<&str> {
-        self.named.as_deref()
+    fn uid(&self) -> Option<pe2_path::Uid> {
+        self.uid
     }
 
     fn fields(&self) -> &toml::Table {
@@ -3328,7 +3330,8 @@ mod calling {
     fn scene(r: &mut Registry) -> Result<()> {
         r.service("frame", "A frame", "{}", |project: &dyn Project, _| {
             let color = project.call("test.paint@red", &Value::Table(Table::new()))?;
-            let picture = project.picture("a", None).ok_or_else(|| anyhow!("no picture"))??;
+            let picture =
+                project.picture(pe2_ext::TreePath::constant("a"), None).ok_or_else(|| anyhow!("no picture"))??;
             Ok(Value::String(format!("{} {}x{}", color.as_str().unwrap_or_default(), picture.width, picture.height)))
         });
         Ok(())

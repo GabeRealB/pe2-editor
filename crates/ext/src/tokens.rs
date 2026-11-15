@@ -31,19 +31,23 @@ pub const ARGS: &str = "args";
 /// An output leading to the node a reference names.
 ///
 /// # Errors
-/// It names nothing.
+/// It names nothing, or what it holds names no node.
 pub fn link(reference: Option<&Value>) -> Result<Table> {
-    let target = reference.and_then(crate::target_of).ok_or_else(|| anyhow!("it names nothing there"))?;
-    Ok(Table::from_iter([(NODE.to_string(), target.into())]))
+    let target = match reference {
+        Some(reference) => crate::target_of(reference)?,
+        None => None,
+    };
+    let target = target.ok_or_else(|| anyhow!("it names nothing there"))?;
+    Ok(Table::from_iter([(NODE.to_string(), target.to_string().into())]))
 }
 
 /// An output leading on from a node as something else than it is, which its tokenizer reads by these args: a prefab's member
 /// is a model, read from the prefab.
 #[must_use]
-pub fn leads_on(node: &str, reads_as: &str, args: &[(&str, &str)]) -> Table {
+pub fn leads_on(node: &crate::TreePath, reads_as: &str, args: &[(&str, &str)]) -> Table {
     let args = args.iter().map(|(name, value)| ((*name).to_string(), Value::String((*value).to_string())));
     Table::from_iter([
-        (NODE.to_string(), node.into()),
+        (NODE.to_string(), node.as_str().into()),
         (AS.to_string(), reads_as.into()),
         (ARGS.to_string(), Value::Table(args.collect())),
     ])

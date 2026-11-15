@@ -1602,7 +1602,11 @@ fn bundle_at(rel: &TreePath) -> Option<Arc<TreePath>> {
 #[must_use]
 pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     match value {
-        toml::Value::String(s) if s.starts_with("uid://") => Some((pe2_ext::target_of(value)?.to_string(), None)),
+        // One naming no node as a uid keeps its text: it resolves to nothing, and is said as a reference leading nowhere.
+        toml::Value::String(s) if s.starts_with("uid://") => match pe2_ext::target_of(value) {
+            Ok(Some(target)) => Some((target.to_string(), None)),
+            _ => Some((s.clone(), None)),
+        },
         toml::Value::Table(t) => {
             let uid = t.get("uid")?.as_str()?;
             let rel = t.get("path")?.as_str()?.strip_prefix("res://")?;

@@ -842,9 +842,10 @@ fn retargeted(value: &toml::Value, asset: &Asset) -> Option<toml::Value> {
 
 fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value> {
     let toml::Value::Table(table) = value else {
-        // What it names of its asset, kept: all that follows its uid.
+        // What it names of its asset, kept: all that follows its uid; one by its path names the asset alone.
         let text = value.as_str()?;
-        let part = &text[pe2_ext::target_of(value)?.len()..];
+        let part =
+            text.strip_prefix("uid://").map_or("", |rest| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]);
         return Some(format!("{uid}{part}").into());
     };
     let mut table = table.clone();

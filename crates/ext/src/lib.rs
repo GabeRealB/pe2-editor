@@ -44,7 +44,11 @@ pub use extract::{Declared, Discs, Given, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use pe2_ext_macros::{extension, steps};
-pub use pe2_path::{Address, Asked, Query, ResourcePath, Uid};
+pub use pe2_path::{Address, Asked, Query, Reference, RelPath, ResourcePath, Uid};
+/// A path in the project's tree: what an asset is found by, beside its uid.
+pub type TreePath = pe2_path::VfsPath<pe2_path::Tree>;
+/// The assets of a type, each by its path with its declaration's text (`CallHost::assets_of`).
+pub type AssetsOf = Box<[(std::sync::Arc<TreePath>, Box<str>)]>;
 pub use place::{Arg, ArgPart, HostPath, Place};
 pub use project::{Project, Requested};
 pub use registry::{
@@ -60,20 +64,36 @@ pub const NATIVE: &Asked = Asked::constant("native");
 /// The output every node has: its settings, as declared.
 pub const SETTINGS: &Asked = Asked::constant("settings");
 
-/// What a reference names, as a host call asks for it: a uid or a path, whatever holds it (`{ slot = ... }`), without
-/// what of it it names (`uid://x` of `uid://x/cells/body?palette=default`).
-#[must_use]
-pub fn target_of(reference: &Value) -> Option<&str> {
+/// The node a reference names, as a host call asks for it: by its uid, or by its path, whatever holds it
+/// (`{ slot = ... }`), without what of it it names (`uid://x` of `uid://x/cells/body?palette=default`). None where it
+/// holds no reference.
+///
+/// # Errors
+/// What it holds names no node: no uid, or no path.
+pub fn target_of(reference: &Value) -> Result<Option<Reference>> {
     let reference = reference.get("slot").unwrap_or(reference);
     let reference = reference.get("slot").unwrap_or(reference);
-    match reference {
+    let named = match reference {
         Value::String(text) => match text.strip_prefix(UID_PREFIX) {
-            Some(digits) => Some(&text[..UID_PREFIX.len() + digits.find(['/', '?', '#']).unwrap_or(digits.len())]),
-            None => Some(text.as_str()),
+            Some(digits) => &text[..UID_PREFIX.len() + digits.find(['/', '?', '#']).unwrap_or(digits.len())],
+            None => text.as_str(),
         },
-        Value::Table(table) => table.get("uid")?.as_str(),
-        _ => None,
-    }
+        Value::Table(table) => match table.get("uid") {
+            Some(Value::String(uid)) => uid.as_str(),
+            Some(other) => bail!("its `uid` is {}, no text", other.type_str()),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(Reference::new(named)?))
+}
+
+/// The node a field names, where the field is there: as `target_of` reads it.
+///
+/// # Errors
+/// As `target_of`.
+pub fn target_in(reference: Option<&Value>) -> Result<Option<Reference>> {
+    reference.map_or(Ok(None), target_of)
 }
 
 /// What of an asset a reference names, and how it asks for it: what follows its uid (`cells/body?palette=default` of
@@ -193,15 +213,16 @@ mod references {
             .parse::<crate::Table>()
             .unwrap()["r"]
             .clone();
+        let x = crate::Reference::new("uid://x").unwrap();
         for reference in [&text, &table] {
-            assert_eq!(target_of(reference), Some("uid://x"));
+            assert_eq!(target_of(reference).unwrap(), Some(x.clone()));
             assert_eq!(asked_of(reference).unwrap().unwrap().to_string(), "cells/body?palette=night");
             assert_eq!(address_of(reference).unwrap().unwrap().as_str(), "cells/body");
             assert_eq!(query_of(reference, "palette").unwrap(), Some("night"));
             assert_eq!(fragment_of(reference).unwrap().unwrap().as_str(), "rect/2");
         }
         let asset = Value::String("uid://x#joints/3".to_string());
-        assert_eq!((target_of(&asset), asked_of(&asset).unwrap()), (Some("uid://x"), None));
+        assert_eq!((target_of(&asset).unwrap(), asked_of(&asset).unwrap()), (Some(x.clone()), None));
         assert_eq!(fragment_of(&asset).unwrap().unwrap().as_str(), "joints/3");
         assert!(asked_of(&Value::String("uid://x/cells/body@night".to_string())).is_err());
     }

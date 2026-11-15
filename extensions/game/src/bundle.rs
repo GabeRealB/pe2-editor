@@ -50,8 +50,8 @@ fn integer(table: &Table, key: &str) -> Option<i64> {
     table.get(key).and_then(Value::as_integer)
 }
 
-fn target(value: Option<&Value>, what: &str) -> Result<String> {
-    value.and_then(pe2_ext::target_of).map(str::to_string).ok_or_else(|| anyhow!("{what} names nothing"))
+fn target(value: Option<&Value>, what: &str) -> Result<pe2_ext::Reference> {
+    pe2_ext::target_in(value)?.ok_or_else(|| anyhow!("{what} names nothing"))
 }
 
 fn pair(value: Option<&Value>) -> Option<(i64, i64)> {
@@ -84,7 +84,7 @@ fn resources(given: &Table) -> Result<Vec<Resource<'_>>> {
 
 /// A palette entry: the image whose palette it is and the palette's name; none for a run no image owns, whose colors
 /// are the stored chunk's (`resources/<index>.bin`).
-fn entry(value: &Value) -> Result<Option<(String, String)>> {
+fn entry(value: &Value) -> Result<Option<(pe2_ext::Reference, Box<str>)>> {
     let Some(palette) = value.get("palette") else { return Ok(None) };
     let image = target(Some(palette), "a palette")?;
     let asked = pe2_ext::asked_of(palette)?.ok_or_else(|| anyhow!("{image}: a palette names no output"))?;
@@ -93,7 +93,7 @@ fn entry(value: &Value) -> Result<Option<(String, String)>> {
         ("palettes", Some(name)) if asked.query().is_empty() => name,
         _ => bail!("{image}: {asked} is no palette"),
     };
-    Ok(Some((image, name.to_string())))
+    Ok(Some((image, name.into())))
 }
 
 /// Whether a palette resource holds a run no image owns.
@@ -115,18 +115,18 @@ fn rect(settings: &Table, what: &str) -> Result<[i64; 4]> {
 /// slots those and its runs are placed in, and its stored chunk where it holds runs.
 struct PaletteMaking<'a> {
     upload: Option<&'a Table>,
-    images: &'a [(String, String, Table)],
+    images: &'a [(pe2_ext::Reference, Box<str>, Table)],
     pictures: &'a [Data],
-    slots: &'a [(String, Table)],
+    slots: &'a [(pe2_ext::Reference, Table)],
     stored_chunk: Option<&'a [u8]>,
     stored_bytes: Option<usize>,
 }
 
 /// Where a place in a slot is in VRAM.
-fn absolute(slots: &[(String, Table)], placed: &Value, what: &str) -> Result<(i64, i64)> {
+fn absolute(slots: &[(pe2_ext::Reference, Table)], placed: &Value, what: &str) -> Result<(i64, i64)> {
     let slot = target(placed.get("slot"), what)?;
     let found = slots.iter().find(|(s, _)| *s == slot).ok_or_else(|| anyhow!("{slot}: not read"))?;
-    let [px, py, _, _] = rect(&found.1, &slot)?;
+    let [px, py, _, _] = rect(&found.1, &slot.to_string())?;
     let (at_x, at_y) = pair(placed.get("at")).unwrap_or((0, 0));
     Ok((px + at_x, py + at_y))
 }
@@ -170,7 +170,8 @@ fn palette_resource(resource: &Resource<'_>, making: &PaletteMaking<'_>) -> Resu
         put((rx, ry), &mut words, name)?;
     }
     for ((image, name, settings), picture) in making.images.iter().zip(making.pictures) {
-        let placed = settings.get("palettes").and_then(|p| p.get(name)).ok_or_else(|| anyhow!("{image}: no {name}"))?;
+        let placed =
+            settings.get("palettes").and_then(|p| p.get(&**name)).ok_or_else(|| anyhow!("{image}: no {name}"))?;
         let at = absolute(making.slots, placed, &format!("{image}'s {name}"))?;
         let Data::Image(picture) = picture else { bail!("{image}: its {name} is no picture") };
         let mut words = picture.rgba.as_chunks::<4>().0.iter().map(|c| codecs_color(*c));
@@ -186,7 +187,7 @@ fn codecs_color(rgba: [u8; 4]) -> u16 {
 }
 
 /// The slots palette resources upload into, each palette entry's image and palette, and the slots its runs are in.
-type PaletteReads = (Vec<String>, Vec<(String, String)>, Vec<String>);
+type PaletteReads = (Box<[pe2_ext::Reference]>, Box<[(pe2_ext::Reference, Box<str>)]>, Box<[pe2_ext::Reference]>);
 
 /// What a bundle's palette resources read.
 fn palette_reads(given: &Table) -> Result<PaletteReads> {
@@ -196,7 +197,7 @@ fn palette_reads(given: &Table) -> Result<PaletteReads> {
         .filter_map(|r| r.table.get("upload").and_then(|u| u.get("slot")))
         .map(|slot| target(Some(slot), "an upload"))
         .collect::<Result<_>>()?;
-    let entries: Vec<Option<(String, String)>> =
+    let entries: Vec<Option<(pe2_ext::Reference, Box<str>)>> =
         palettes().flat_map(|r| list(r.table, "palettes")).map(entry).collect::<Result<_>>()?;
     let runs = palettes()
         .flat_map(|r| list(r.table, "palettes"))
@@ -207,10 +208,14 @@ fn palette_reads(given: &Table) -> Result<PaletteReads> {
 }
 
 /// The slots the images place their palettes in, and the runs are in, each once.
-fn placing_slots(images: &[(String, String, Table)], runs: &[String]) -> Result<Vec<String>> {
-    let mut placing: Vec<String> = Vec::new();
+fn placing_slots(
+    images: &[(pe2_ext::Reference, Box<str>, Table)],
+    runs: &[pe2_ext::Reference],
+) -> Result<Box<[pe2_ext::Reference]>> {
+    let mut placing: Vec<pe2_ext::Reference> = Vec::new();
     for (image, name, settings) in images {
-        let placed = settings.get("palettes").and_then(|p| p.get(name)).ok_or_else(|| anyhow!("{image}: no {name}"))?;
+        let placed =
+            settings.get("palettes").and_then(|p| p.get(&**name)).ok_or_else(|| anyhow!("{image}: no {name}"))?;
         let slot = target(placed.get("slot"), &format!("{image}'s {name}"))?;
         if !placing.contains(&slot) {
             placing.push(slot);
@@ -221,7 +226,7 @@ fn placing_slots(images: &[(String, String, Table)], runs: &[String]) -> Result<
             placing.push(slot.clone());
         }
     }
-    Ok(placing)
+    Ok(placing.into())
 }
 
 /// The bundle joined: each resource made, laid out as the game's tool laid it out.
@@ -230,20 +235,20 @@ pub fn join(call: &mut Call) -> Result<Typed> {
     let given: Table = call.given();
     // The slots palette resources upload into, and the images whose palettes they hold.
     let reads: PaletteReads = palette_reads(&given)?;
-    let uploads: Vec<String> = reads.0;
-    let entries: Vec<(String, String)> = reads.1;
-    let runs: Vec<String> = reads.2;
+    let uploads: Box<[pe2_ext::Reference]> = reads.0;
+    let entries: Box<[(pe2_ext::Reference, Box<str>)]> = reads.1;
+    let runs: Box<[pe2_ext::Reference]> = reads.2;
     #[request]
-    let upload_settings: Vec<Table> = call.tables_of(uploads.iter().map(|s| (s.as_str(), crate::SETTINGS)))?;
+    let upload_settings: Vec<Table> = call.tables_of(uploads.iter().map(|s| (s, crate::SETTINGS)))?;
     #[request]
-    let image_settings: Vec<Table> = call.tables_of(entries.iter().map(|(i, _)| (i.as_str(), crate::SETTINGS)))?;
-    let images: Vec<(String, String, Table)> =
+    let image_settings: Vec<Table> = call.tables_of(entries.iter().map(|(i, _)| (i, crate::SETTINGS)))?;
+    let images: Box<[(pe2_ext::Reference, Box<str>, Table)]> =
         entries.into_iter().zip(image_settings).map(|((i, n), s)| (i, n, s)).collect();
-    let placing: Vec<String> = placing_slots(&images, &runs)?;
+    let placing: Box<[pe2_ext::Reference]> = placing_slots(&images, &runs)?;
     #[request]
-    let placing_settings: Vec<Table> = call.tables_of(placing.iter().map(|s| (s.as_str(), crate::SETTINGS)))?;
-    let slots: Vec<(String, Table)> = placing.into_iter().zip(placing_settings).collect();
-    let dialogues: Vec<String> = resources(&given)?
+    let placing_settings: Vec<Table> = call.tables_of(placing.iter().map(|s| (s, crate::SETTINGS)))?;
+    let slots: Box<[(pe2_ext::Reference, Table)]> = placing.into_iter().zip(placing_settings).collect();
+    let dialogues: Box<[pe2_ext::Reference]> = resources(&given)?
         .iter()
         .filter(|r| r.kind() == "dialogue")
         .map(|r| target(r.table.get("dialogue"), &format!("dialogue {}", r.index)))
@@ -253,10 +258,9 @@ pub fn join(call: &mut Call) -> Result<Typed> {
         .map(|(_, n, _)| Ok(std::sync::Arc::from(pe2_ext::Asked::new(&format!("palettes/{n}"))?)))
         .collect::<Result<_>>()?;
     // The palettes' pictures, then the dialogues' files: one request, as what a step holds of them is not carried.
-    let pictures_of = images.iter().zip(&addresses).map(|((i, _, _), a)| (i.as_str(), &**a));
+    let pictures_of = images.iter().zip(&addresses).map(|((i, _, _), a)| (i, &**a));
     #[request]
-    let made: Vec<Data> =
-        call.outputs_of(pictures_of.chain(dialogues.iter().map(|d| (d.as_str(), pe2_ext::NATIVE))))?;
+    let made: Vec<Data> = call.outputs_of(pictures_of.chain(dialogues.iter().map(|d| (d, pe2_ext::NATIVE))))?;
     let (pictures, natives) = made.split_at(images.len());
     let all = resources(&given)?;
     let layout = call.take::<ty::Bytes>(1)?;

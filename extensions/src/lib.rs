@@ -984,11 +984,11 @@ mod tests {
     }
 
     impl project::graph::exec::Node for Texture {
-        fn path(&self) -> &'static str {
-            "test/texture"
+        fn path(&self) -> &'static project::TreePath {
+            project::TreePath::constant("test/texture")
         }
 
-        fn uid(&self) -> Option<&str> {
+        fn uid(&self) -> Option<pe2_path::Uid> {
             None
         }
 

@@ -788,11 +788,11 @@ mod tests {
     }
 
     impl Source for Lent {
-        fn path(&self) -> &'static str {
-            "test/atlas"
+        fn path(&self) -> &'static pe2_ext::TreePath {
+            pe2_ext::TreePath::constant("test/atlas")
         }
 
-        fn uid(&self) -> Option<&str> {
+        fn uid(&self) -> Option<pe2_ext::Uid> {
             None
         }
 

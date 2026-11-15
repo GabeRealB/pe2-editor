@@ -624,19 +624,14 @@ impl UiHost for Host<'_> {
         self.last = None;
     }
 
-    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>> {
-        // A view asking for what is no path is told why, as for an asset that has no picture.
-        let path = match project::TreePath::new(path) {
-            Ok(path) => path,
-            Err(why) => return Some(Err(format!("{path}: {why}"))),
-        };
+    fn picture(&mut self, path: &project::TreePath, look: Option<&str>) -> Option<Result<Texture, String>> {
         let look = self.lens.index.assets.get(path).map_or(0, |asset| self.lens.extensions.look_at(asset, look));
         let drawn = self.textures.pictures.as_mut()?.get(path, look)?;
         Some(drawn.map(|image| Texture::shared(format!("{path}#{look}#picture"), image)))
     }
 
-    fn navigate(&mut self, path: &str) {
-        *self.nav = Some(crate::workspace::Nav::link(path));
+    fn navigate(&mut self, path: &project::TreePath, part: Option<&str>) {
+        *self.nav = Some(crate::workspace::Nav::Asset(path.to_owned(), part.map(str::to_string)));
     }
 
     fn selected(&self) -> Option<String> {

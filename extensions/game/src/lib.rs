@@ -39,14 +39,12 @@ retain = "cache"
 pub(crate) use pe2_ext::SETTINGS;
 
 /// The groups or folders a stage's layout lists, by their nodes, in its order: stage 0's groups, a stage's folders.
-fn layout_parts(layout: &Table) -> Result<Vec<String>> {
+fn layout_parts(layout: &Table) -> Result<Box<[pe2_ext::Reference]>> {
     let key = if layout.contains_key("groups") { "groups" } else { "folders" };
     let parts = layout.get(key).and_then(Value::as_array).into_iter().flatten();
     parts
         .map(|part| {
-            part.get("asset")
-                .and_then(pe2_ext::target_of)
-                .map(str::to_string)
+            pe2_ext::target_in(part.get("asset"))?
                 .ok_or_else(|| anyhow!("a group or folder of the layout names nothing"))
         })
         .collect()
@@ -55,12 +53,15 @@ fn layout_parts(layout: &Table) -> Result<Vec<String>> {
 /// A stage's files in its order, each once, given what its groups or folders hold (`layout_parts`'s, in order): stage
 /// 0's across its groups by id (a group's number, as many ten thousands, and the file's in it), a stage's folders in its
 /// layout's order and their files by id.
-fn stage_files(layout: &Table, held: &[Table]) -> Vec<String> {
+///
+/// # Errors
+/// A file names its asset by what names no node.
+fn stage_files(layout: &Table, held: &[Table]) -> Result<Box<[pe2_ext::Reference]>> {
     let list = |table: &Table, key: &str| table.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
     let id = |v: &Value| v.get("id").and_then(Value::as_integer).unwrap_or(0);
-    let asset = |v: &Value| v.get("asset").and_then(pe2_ext::target_of).map(str::to_string);
-    let mut out: Vec<String> = Vec::new();
-    let mut take = |mut files: Vec<(i64, String)>| {
+    let asset = |v: &Value| pe2_ext::target_in(v.get("asset"));
+    let mut out: Vec<pe2_ext::Reference> = Vec::new();
+    let mut take = |mut files: Vec<(i64, pe2_ext::Reference)>| {
         files.sort_by_key(|f| f.0);
         for (_, file) in files {
             if !out.contains(&file) {
@@ -71,34 +72,42 @@ fn stage_files(layout: &Table, held: &[Table]) -> Vec<String> {
     if layout.contains_key("groups") {
         let mut files = Vec::new();
         for (group, table) in list(layout, "groups").iter().zip(held) {
-            files.extend(
-                list(table, "files").iter().filter_map(|file| Some((id(group) * 10_000 + id(file), asset(file)?))),
-            );
+            for file in list(table, "files") {
+                if let Some(named) = asset(&file)? {
+                    files.push((id(group) * 10_000 + id(&file), named));
+                }
+            }
         }
         take(files);
     } else {
         for table in held {
-            take(list(table, "files").iter().filter_map(|f| Some((id(f), asset(f)?))).collect());
+            let mut files = Vec::new();
+            for file in list(table, "files") {
+                if let Some(named) = asset(&file)? {
+                    files.push((id(&file), named));
+                }
+            }
+            take(files);
         }
     }
-    out
+    Ok(out.into())
 }
 
 /// The movies with sound the files play on a disc, in the files' order: a movie entry with a volume (a movie without
 /// plays from the stage), naming this disc where it names one.
-fn movies_of(files: &[String], fields: &[Table], disc: i64) -> Result<Vec<String>> {
+fn movies_of(files: &[pe2_ext::Reference], fields: &[Table], disc: i64) -> Result<Box<[pe2_ext::Reference]>> {
     let mut movies = Vec::new();
     for (file, fields) in files.iter().zip(fields) {
         for entry in fields.get("streams").and_then(Value::as_array).into_iter().flatten() {
             let integer = |key: &str| entry.get(key).and_then(Value::as_integer);
             let movie = entry.get("type").and_then(Value::as_str) == Some("movie");
             if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc) {
-                let asset = entry.get("asset").and_then(pe2_ext::target_of);
-                movies.push(asset.ok_or_else(|| anyhow!("{file}: a stream names nothing"))?.to_string());
+                let asset = pe2_ext::target_in(entry.get("asset"))?;
+                movies.push(asset.ok_or_else(|| anyhow!("{file}: a stream names nothing"))?);
             }
         }
     }
-    Ok(movies)
+    Ok(movies.into())
 }
 
 /// A disc's movie file: the movies with sound its stages' files play on this disc, in the stages' order, joined. Each
@@ -108,29 +117,29 @@ fn movies_of(files: &[String], fields: &[Table], disc: i64) -> Result<Vec<String
 fn inter(call: &mut Call) -> Result<Typed> {
     let given = call.given();
     let disc: i64 = given.get("disc").and_then(Value::as_integer).ok_or_else(|| anyhow!("it names no disc"))?;
-    let stages: Vec<String> = given
+    let stages: Vec<pe2_ext::Reference> = given
         .get("stages")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|stage| pe2_ext::target_of(stage).map(str::to_string).ok_or_else(|| anyhow!("a stage names nothing")))
+        .map(|stage| pe2_ext::target_of(stage)?.ok_or_else(|| anyhow!("a stage names nothing")))
         .collect::<Result<_>>()?;
     #[request]
-    let layouts: Vec<Table> = call.tables_of(stages.iter().map(|stage| (stage.as_str(), SETTINGS)))?;
-    let parts: Vec<Vec<String>> = layouts.iter().map(layout_parts).collect::<Result<_>>()?;
+    let layouts: Vec<Table> = call.tables_of(stages.iter().map(|stage| (stage, SETTINGS)))?;
+    let parts: Vec<Box<[pe2_ext::Reference]>> = layouts.iter().map(layout_parts).collect::<Result<_>>()?;
     #[request]
-    let held: Vec<Table> = call.tables_of(parts.iter().flatten().map(|part| (part.as_str(), SETTINGS)))?;
-    let mut files: Vec<String> = Vec::new();
+    let held: Vec<Table> = call.tables_of(parts.iter().flatten().map(|part| (part, SETTINGS)))?;
+    let mut files: Vec<pe2_ext::Reference> = Vec::new();
     let mut at = 0;
     for (layout, parts) in layouts.iter().zip(&parts) {
-        files.extend(stage_files(layout, &held[at..at + parts.len()]));
+        files.extend(stage_files(layout, &held[at..at + parts.len()])?);
         at += parts.len();
     }
     #[request]
-    let fields: Vec<Table> = call.tables_of(files.iter().map(|file| (file.as_str(), SETTINGS)))?;
-    let movies: Vec<String> = movies_of(&files, &fields, disc)?;
+    let fields: Vec<Table> = call.tables_of(files.iter().map(|file| (file, SETTINGS)))?;
+    let movies: Box<[pe2_ext::Reference]> = movies_of(&files, &fields, disc)?;
     #[request]
-    let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie.as_str(), pe2_ext::NATIVE)))?;
+    let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie, pe2_ext::NATIVE)))?;
     let mut writer = call.writer("native.str")?;
     for (movie, native) in movies.iter().zip(&natives) {
         let Data::Typed(native) = native else { pe2_ext::bail!("{movie}: its native is no file") };

@@ -258,7 +258,7 @@ impl Imports {
             let Some(asset) = index.assets.get(&path) else { continue };
             let node = graph::exec::id(&**asset);
             for (reader, nodes) in read_from.iter() {
-                if !changed.contains(reader) && !found.contains(reader) && nodes.contains(node) {
+                if !changed.contains(reader) && !found.contains(reader) && nodes.contains(&node) {
                     found.insert(reader.clone());
                     next.push(reader.clone());
                 }
@@ -710,7 +710,7 @@ pub fn sweep_if_due(store: &Store, index: &Index) -> Option<(usize, usize, usize
 /// The project's nodes, as traces name them: what the store keeps for others goes in a sweep.
 #[must_use]
 pub fn live_nodes(index: &Index) -> HashSet<String> {
-    index.assets.values().map(|a| graph::exec::id(&**a).to_string()).collect()
+    index.assets.values().map(|a| graph::exec::id(&**a)).collect()
 }
 
 /// What makes an asset's result - the operation its stack ends with - and the output keeping it, where its result is
@@ -1036,13 +1036,23 @@ mod attaching {
         static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
+    /// The node a setting names.
+    fn node_in(value: Option<&Value>) -> Result<pe2_ext::Reference> {
+        pe2_ext::target_in(value)?.ok_or_else(|| anyhow::anyhow!("it names no node"))
+    }
+
+    /// A node of the tree, by its path.
+    fn node(path: &'static str) -> pe2_ext::Reference {
+        pe2_ext::Reference::from(pe2_ext::TreePath::constant(path))
+    }
+
     #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
     fn links(r: &mut Registry) -> Result<()> {
         let _ = r.value_type::<Strip>();
-        let next_of = |call: &pe2_ext::Call<'_>| call.settings.get("next").and_then(Value::as_str).map(str::to_string);
-        let reads = move |call: &mut pe2_ext::Call<'_>| {
+        let reads = |call: &mut pe2_ext::Call<'_>| {
+            let next = pe2_ext::target_in(call.settings.get("next"))?;
             Ok(pe2_ext::Prepared {
-                needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, pe2_ext::NATIVE)).collect(),
+                needs: next.iter().map(|next| pe2_ext::Need::new(next, pe2_ext::NATIVE)).collect(),
                 micros: Vec::new(),
             })
         };
@@ -1052,8 +1062,8 @@ mod attaching {
                 depth.get()
             });
             DEEPEST.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
-            let next = call.settings.get("next").and_then(Value::as_str).map(str::to_string);
-            let read = next.map(|next| call.output_of(&next, pe2_ext::NATIVE)).transpose();
+            let read = pe2_ext::target_in(call.settings.get("next"))
+                .and_then(|next| next.map(|next| call.output_of(&next, pe2_ext::NATIVE)).transpose());
             DEPTH.with(|depth| depth.set(depth.get() - 1));
             read?;
             Ok(Typed {
@@ -1108,10 +1118,12 @@ mod attaching {
     fn copying(r: &mut Registry) -> Result<()> {
         strips(r)?;
         let needs = |_: &mut pe2_ext::Call<'_>| {
-            Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", pe2_ext::NATIVE)], micros: Vec::new() })
+            let read = pe2_ext::Reference::new("uid://s")?;
+            Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new(&read, pe2_ext::NATIVE)], micros: Vec::new() })
         };
         let _ = r.op("copy").output::<Strip>().prepare(needs).run(|call| {
-            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", pe2_ext::NATIVE)? else {
+            let pe2_ext::Data::Typed(read) = call.output_of(&pe2_ext::Reference::new("uid://s")?, pe2_ext::NATIVE)?
+            else {
                 anyhow::bail!("uid://s makes no files")
             };
             let bytes = call.read(read.file()?)?;
@@ -1222,33 +1234,25 @@ mod attaching {
         });
         // Reads what the setting names, and what that says comes next: known only once the first is made.
         let _ = r.op("hops").output::<ty::Table>().steps(pe2_ext::stepped::replayed(|call| {
-            let first = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
-            let found = call.table_of(&first, pe2_ext::NATIVE)?;
-            let next = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
-            call.table_of(&next, pe2_ext::NATIVE)
+            let found = call.table_of(&node_in(call.settings.get("first"))?, pe2_ext::NATIVE)?;
+            call.table_of(&node_in(found.get("next"))?, pe2_ext::NATIVE)
         }));
         // Reads each of its `reads`, a list of nodes.
-        let list = |call: &pe2_ext::Call<'_>| -> Vec<String> {
-            call.settings
-                .get("reads")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
+        let list = |call: &pe2_ext::Call<'_>| -> Result<Vec<pe2_ext::Reference>> {
+            let reads = call.settings.get("reads").and_then(Value::as_array).into_iter().flatten();
+            reads.map(|read| node_in(Some(read))).collect()
         };
         let _ = r
             .op("reader")
             .output::<ty::Table>()
             .prepare(move |call| {
                 Ok(pe2_ext::Prepared {
-                    needs: list(call).iter().map(|node| pe2_ext::Need::new(node, pe2_ext::NATIVE)).collect(),
+                    needs: list(call)?.iter().map(|node| pe2_ext::Need::new(node, pe2_ext::NATIVE)).collect(),
                     micros: Vec::new(),
                 })
             })
             .run(move |call| {
-                for node in list(call) {
+                for node in list(call)? {
                     call.table_of(&node, pe2_ext::NATIVE)?;
                 }
                 Ok(Table::new())
@@ -1312,12 +1316,12 @@ mod attaching {
     /// each its own micro op, counted; then reads both nodes again, each an item reading its own in steps.
     #[pe2_ext::steps]
     fn chained(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
-        let first: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        let first: pe2_ext::Reference = node_in(call.settings.get("first"))?;
         #[request]
         let found: Table = call.table_of(&first, pe2_ext::NATIVE)?;
-        let next: String = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
+        let next: pe2_ext::Reference = node_in(found.get("next"))?;
         #[request]
-        let arrived: Vec<Table> = call.tables_of([(next.as_str(), pe2_ext::NATIVE)])?;
+        let arrived: Vec<Table> = call.tables_of([(&next, pe2_ext::NATIVE)])?;
         #[each]
         let doubled: Vec<i64> = vec![1_i64, 2, 3]
             .into_iter()
@@ -1336,7 +1340,7 @@ mod attaching {
 
     /// An item reading the node it is given.
     #[pe2_ext::steps]
-    fn hop(call: &mut pe2_ext::Call<'_>, node: String) -> Result<Table> {
+    fn hop(call: &mut pe2_ext::Call<'_>, node: pe2_ext::Reference) -> Result<Table> {
         #[request]
         let got: Table = call.table_of(&node, pe2_ext::NATIVE)?;
         Ok(got)
@@ -1345,14 +1349,14 @@ mod attaching {
     /// Follows `next` from node to node, a step each, until a node names none: the nodes it went through.
     #[pe2_ext::steps]
     fn followed(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
-        let mut at: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        let mut at: pe2_ext::Reference = node_in(call.settings.get("first"))?;
         let mut seen: Vec<String> = Vec::new();
         loop {
             #[request]
             let found: Table = call.table_of(&at, pe2_ext::NATIVE)?;
-            seen.push(at.clone());
-            let Some(next) = found.get("next").and_then(Value::as_str) else { break };
-            at = next.to_string();
+            seen.push(at.to_string());
+            let Some(next) = pe2_ext::target_in(found.get("next"))? else { break };
+            at = next;
         }
         Ok(Table::from_iter([("seen".to_string(), Value::Array(seen.into_iter().map(Value::String).collect()))]))
     }
@@ -1360,10 +1364,10 @@ mod attaching {
     /// How many nodes follow from the first, `next` after `next`: a helper calling itself while there is a next.
     #[pe2_ext::steps]
     fn counted_on(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
-        let first: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        let first: pe2_ext::Reference = node_in(call.settings.get("first"))?;
         #[call]
         let length: i64 = depth(call, first)?;
-        let names: Vec<String> = vec!["one".to_string(), "two".to_string()];
+        let names: Vec<pe2_ext::Reference> = vec![node("one"), node("two")];
         let mut keys: Vec<String> = Vec::new();
         for name in names {
             #[request]
@@ -1378,11 +1382,11 @@ mod attaching {
 
     /// How many nodes there are from this one on.
     #[pe2_ext::steps]
-    fn depth(call: &mut pe2_ext::Call<'_>, node: String) -> Result<i64> {
+    fn depth(call: &mut pe2_ext::Call<'_>, node: pe2_ext::Reference) -> Result<i64> {
         #[request]
         let found: Table = call.table_of(&node, pe2_ext::NATIVE)?;
-        if let Some(next) = found.get("next").and_then(Value::as_str) {
-            let next: String = next.to_string();
+        if let Some(next) = pe2_ext::target_in(found.get("next"))? {
+            let next: pe2_ext::Reference = next;
             #[call]
             let below: i64 = depth(call, next)?;
             return Ok(below + 1);
@@ -1393,9 +1397,9 @@ mod attaching {
     /// Reads what nothing requested.
     #[pe2_ext::steps]
     fn unasked(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
-        let read: Table = call.table_of("one", pe2_ext::NATIVE)?;
+        let read: Table = call.table_of(&node("one"), pe2_ext::NATIVE)?;
         #[request]
-        let never: Table = call.table_of("two", pe2_ext::NATIVE)?;
+        let never: Table = call.table_of(&node("two"), pe2_ext::NATIVE)?;
         Ok(read)
     }
 

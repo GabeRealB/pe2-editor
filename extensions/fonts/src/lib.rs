@@ -387,8 +387,8 @@ fn register_atlas(r: &mut Registry, page: &str) -> pe2_ext::Name {
 /// what is set on it.
 #[pe2_ext::steps]
 fn atlas_texture(call: &mut Call) -> Result<Typed> {
-    let atlas: String =
-        call.given().get("atlas").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("it names no atlas"))?.to_string();
+    let atlas: pe2_ext::Reference =
+        pe2_ext::target_in(call.given().get("atlas"))?.ok_or_else(|| anyhow!("it names no atlas"))?;
     #[request]
     let page: Data = call.output_of(&atlas, pe2_ext::Asked::constant("page"))?;
     let given = call.given();
@@ -462,8 +462,8 @@ fn face_spec(name: &str, face: &Table, entry: &Table, encoding: &Table) -> Resul
 }
 
 /// The encoding a face names.
-fn encoding_of<'a>(name: &str, face: &'a Table) -> Result<&'a str> {
-    face.get("encoding").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{name}: it names no encoding"))
+fn encoding_of(name: &(impl std::fmt::Display + ?Sized), face: &Table) -> Result<pe2_ext::Reference> {
+    pe2_ext::target_in(face.get("encoding"))?.ok_or_else(|| anyhow!("{name}: it names no encoding"))
 }
 
 /// A face's own characters for codes, over its encoding's (`characters = { "0x24" = "○" }`).
@@ -685,24 +685,19 @@ pub fn layout_text(layout: &Layout) -> String {
 }
 
 /// The fonts an atlas's faces draw from, by their nodes, in its order.
-fn atlas_fonts(given: &Table) -> Result<Vec<String>> {
+fn atlas_fonts(given: &Table) -> Result<Box<[pe2_ext::Reference]>> {
     let faces = given.get("faces").and_then(Value::as_array).into_iter().flatten();
-    faces
-        .map(|entry| {
-            let font = entry.get("font").and_then(pe2_ext::target_of);
-            font.map(str::to_string).ok_or_else(|| anyhow!("a face names no font"))
-        })
-        .collect()
+    faces.map(|entry| pe2_ext::target_in(entry.get("font"))?.ok_or_else(|| anyhow!("a face names no font"))).collect()
 }
 
 /// The encodings the fonts' faces name, in the faces' order.
-fn atlas_encodings(fonts: &[String], sources: &[Data]) -> Result<Vec<String>> {
+fn atlas_encodings(fonts: &[pe2_ext::Reference], sources: &[Data]) -> Result<Box<[pe2_ext::Reference]>> {
     fonts
         .iter()
         .zip(sources)
         .map(|(node, source)| {
             let Data::Typed(source) = source else { bail!("{node}: its native form is no files") };
-            Ok(encoding_of(node, &source.settings)?.to_string())
+            encoding_of(node, &source.settings)
         })
         .collect()
 }
@@ -712,7 +707,7 @@ fn atlas_encodings(fonts: &[String], sources: &[Data]) -> Result<Vec<String>> {
 fn atlas_faces(
     call: &Call,
     given: &Table,
-    fonts: &[String],
+    fonts: &[pe2_ext::Reference],
     read: &[Data],
 ) -> Result<(PageSpec, Vec<FaceSpec>, Vec<Vec<atlas::Glyph>>)> {
     let page = page_spec(given)?;
@@ -722,8 +717,8 @@ fn atlas_faces(
     for (((entry, node), source), encoding) in entries.zip(fonts).zip(sources).zip(encodings) {
         let entry = entry.as_table().ok_or_else(|| anyhow!("a face is not a table"))?;
         // Named as its layout names it: by its node's name, which a reference by uid does not say.
-        let path = call.node_named(node).map_or_else(|| node.clone(), |named| named.path);
-        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let named = call.node_named(node).ok_or_else(|| anyhow!("{node}: no such node"))?;
+        let name = named.path.name().unwrap_or_default().to_string();
         let Data::Typed(source) = source else { bail!("{node}: its native form is no files") };
         let Data::Table(encoding) = encoding else { bail!("{node}: its encoding's settings are no table") };
         let files = source.files.iter().map(|file| Ok((file.name.clone(), call.read(file)?))).collect::<Result<_>>()?;
@@ -736,11 +731,11 @@ fn atlas_faces(
 
 /// What an atlas reads, both requests' pairs: its fonts' native forms, then their encodings' settings.
 fn atlas_reads<'a>(
-    fonts: &'a [String],
-    encodings: &'a [String],
-) -> impl Iterator<Item = (&'a str, &'a pe2_ext::Asked)> {
-    let natives = fonts.iter().map(|node| (node.as_str(), pe2_ext::NATIVE));
-    natives.chain(encodings.iter().map(|encoding| (encoding.as_str(), pe2_ext::SETTINGS)))
+    fonts: &'a [pe2_ext::Reference],
+    encodings: &'a [pe2_ext::Reference],
+) -> impl Iterator<Item = (&'a pe2_ext::Reference, &'a pe2_ext::Asked)> {
+    let natives = fonts.iter().map(|node| (node, pe2_ext::NATIVE));
+    natives.chain(encodings.iter().map(|encoding| (encoding, pe2_ext::SETTINGS)))
 }
 
 /// An atlas's layout, from the file its stack reads.
@@ -752,10 +747,10 @@ fn layout_given(call: &mut Call) -> Result<Layout> {
 /// The page and its faces' tables, made from its layout and its faces' UFOs.
 #[pe2_ext::steps]
 fn make_atlas(call: &mut Call) -> Result<Typed> {
-    let fonts: Vec<String> = atlas_fonts(&call.take::<ty::Table>(1)?)?;
+    let fonts: Box<[pe2_ext::Reference]> = atlas_fonts(&call.take::<ty::Table>(1)?)?;
     #[request]
     let sources: Vec<Data> = call.outputs_of(atlas_reads(&fonts, &[]))?;
-    let encodings: Vec<String> = atlas_encodings(&fonts, &sources)?;
+    let encodings: Box<[pe2_ext::Reference]> = atlas_encodings(&fonts, &sources)?;
     #[request]
     let read: Vec<Data> = call.outputs_of(atlas_reads(&fonts, &encodings))?;
     let layout = layout_given(call)?;
@@ -803,10 +798,10 @@ fn make_atlas(call: &mut Call) -> Result<Typed> {
 /// The layout with what it does not place packed, as its file; the atlas's settings handed on.
 #[pe2_ext::steps]
 fn pack_layout(call: &mut Call) -> Result<Typed> {
-    let fonts: Vec<String> = atlas_fonts(&call.given())?;
+    let fonts: Box<[pe2_ext::Reference]> = atlas_fonts(&call.given())?;
     #[request]
     let sources: Vec<Data> = call.outputs_of(atlas_reads(&fonts, &[]))?;
-    let encodings: Vec<String> = atlas_encodings(&fonts, &sources)?;
+    let encodings: Box<[pe2_ext::Reference]> = atlas_encodings(&fonts, &sources)?;
     #[request]
     let read: Vec<Data> = call.outputs_of(atlas_reads(&fonts, &encodings))?;
     let layout = layout_given(call)?;
@@ -831,7 +826,7 @@ fn atlas_contents(asset: &pe2_ext::Asset, project: &dyn pe2_ext::Project) -> Con
     let mut rows = vec![ContentRow::heading("faces", "Faces")];
     for entry in asset.array("faces") {
         let Some(font) = entry.get("font").and_then(|reference| project.resolve(reference)) else { continue };
-        let name = font.path().rsplit('/').next().unwrap_or(font.path());
+        let name = font.path().name().unwrap_or_default();
         let placed =
             layout.faces.get(name).map_or(0, |face| face.rows.iter().map(|row| row.cells.len()).sum::<usize>());
         let kept = layout.faces.get(name).map_or(0, |face| face.kept.len());
@@ -846,7 +841,7 @@ fn atlas_contents(asset: &pe2_ext::Asset, project: &dyn pe2_ext::Project) -> Con
                 .depth(1)
                 .icon(Icon::Text, Tint::Plain)
                 .detail(&detail)
-                .link(font.path()),
+                .link(font.path().as_str()),
         );
     }
     let actions = vec![ContentAction::new(PACK, "Pack unplaced").icon(Icon::Grid)];
@@ -869,7 +864,7 @@ fn atlas_act(
             if asset.read(LAYOUT).is_ok_and(|now| now == packed) {
                 bail!("its layout places everything its faces draw");
             }
-            let name = asset.path().rsplit('/').next().unwrap_or(asset.path());
+            let name = asset.path().name().unwrap_or_default();
             Ok(ContentOutcome {
                 label: format!("Pack what {name} does not place"),
                 writes: Some((LAYOUT.to_string(), packed)),

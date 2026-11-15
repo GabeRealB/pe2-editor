@@ -30,17 +30,19 @@ fn atlas_table(settings: &Table) -> Table {
 }
 
 /// The registries a dialogue's commands name their flags by.
-#[must_use]
-pub fn registries(settings: &Table) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+///
+/// # Errors
+/// A command names its registry by what names no node.
+pub fn registries(settings: &Table) -> pe2_ext::Result<Box<[pe2_ext::Reference]>> {
+    let mut out: Vec<pe2_ext::Reference> = Vec::new();
     for command in settings.get("command").and_then(Value::as_array).into_iter().flatten() {
-        if let Some(registry) = command.get("game_flag").and_then(|f| f.get("flags")).and_then(pe2_ext::target_of)
-            && !out.iter().any(|r| r == registry)
+        if let Some(registry) = pe2_ext::target_in(command.get("game_flag").and_then(|f| f.get("flags")))?
+            && !out.contains(&registry)
         {
-            out.push(registry.to_string());
+            out.push(registry);
         }
     }
-    out
+    Ok(out.into())
 }
 
 /// Make a dialogue: its file, and its cells and atlas laid out. `strings` its string table's entries, `cast` each
@@ -54,15 +56,16 @@ pub fn make(
     strings: &Table,
     cast: &BTreeMap<String, Vec<u8>>,
     font: &Font,
-    flags: &BTreeMap<String, BTreeMap<String, i64>>,
+    flags: &BTreeMap<pe2_ext::Reference, BTreeMap<String, i64>>,
 ) -> Result<(Vec<u8>, Laid), String> {
     let mut settings = settings.clone();
     if let Some(Value::Array(commands)) = settings.get_mut("command") {
         for command in commands.iter_mut().filter_map(Value::as_table_mut) {
             let Some(Value::Table(named)) = command.get("game_flag") else { continue };
-            let registry = named.get("flags").and_then(pe2_ext::target_of).ok_or("a game flag names no registry")?;
+            let registry = pe2_ext::target_in(named.get("flags")).map_err(|why| format!("{why:#}"))?;
+            let registry = registry.ok_or("a game flag names no registry")?;
             let flag = named.get("flag").and_then(Value::as_str).ok_or("a game flag names no flag")?;
-            let id = flags.get(registry).and_then(|f| f.get(flag)).ok_or_else(|| format!("{registry} has no flag {flag}"))?;
+            let id = flags.get(&registry).and_then(|f| f.get(flag)).ok_or_else(|| format!("{registry} has no flag {flag}"))?;
             command.insert("game_flag".into(), Value::Integer(*id));
         }
     }
@@ -284,9 +287,10 @@ pub fn decode(bytes: &[u8], reading: &Reading<'_>, font: &mut Font) -> Result<De
 
 /// Whether what is read makes the dialogue, and the atlas it generates, again.
 fn remakes(bytes: &[u8], reading: &Reading<'_>, settings: &Table, strings: &Table, font: &Font) -> Result<(), String> {
-    let mut named_flags: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    let mut named_flags: BTreeMap<pe2_ext::Reference, BTreeMap<String, i64>> = BTreeMap::new();
     for (id, (registry, flag)) in reading.flags {
-        named_flags.entry(registry.clone()).or_default().insert(flag.clone(), i64::from(*id));
+        let registry = pe2_ext::Reference::new(registry).map_err(|why| why.to_string())?;
+        named_flags.entry(registry).or_default().insert(flag.clone(), i64::from(*id));
     }
     let (rebuilt, laid) = make(settings, strings, reading.cast, font, &named_flags)?;
     if rebuilt != bytes {

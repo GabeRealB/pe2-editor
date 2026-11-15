@@ -5,10 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use pe2_ext::tokens::{self, Args};
 use pe2_ext::ty::{Registered, SourceTree};
-use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Call, File, Reference, RelPath, Result, Table, TreePath, Typed, Value, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::tokenizers::SETTINGS;
@@ -42,18 +43,45 @@ const LINE: usize = 32_000;
 
 /// A package of the build graph: the graph has one, by name.
 pub struct Package {
-    pub path: String,
+    pub path: Arc<TreePath>,
     /// What it declares, as its target reads it (`pe2_ext::targeted`) ...
     fields: Table,
     /// ... and as written, every target's part with it.
     declared: Table,
     /// Its files, by their paths, as the stack resolves them.
-    files: BTreeSet<String>,
+    files: BTreeSet<Arc<TreePath>>,
     /// What it depends on, by name, as its declaration says for its target.
     dependencies: Vec<String>,
+    /// The folders its own quoted includes are found in, within it: its public one (`headers.public`), then its private
+    /// ones (`headers.private`).
+    headers: Box<[Arc<RelPath>]>,
+    /// The folder of what others may include of it, within it, if it has one: one, which its name stands for.
+    public: Option<Arc<RelPath>>,
 }
 
 impl Package {
+    /// A package as its target reads it, its header folders checked.
+    ///
+    /// # Errors
+    /// What it declares is not shaped as a package's declaration is, or a header folder is no path.
+    fn new(
+        path: Arc<TreePath>,
+        fields: Table,
+        written: Table,
+        files: BTreeSet<Arc<TreePath>>,
+        dependencies: Vec<String>,
+    ) -> Result<Package> {
+        shaped(&path, &fields)?;
+        let folder = |text: &str| {
+            RelPath::new(text).map(Arc::from).map_err(|why| anyhow!("{path}: its header folder {text}: {why}"))
+        };
+        let public = fields.get("headers").and_then(|headers| headers.get(PUBLIC)).and_then(Value::as_str);
+        let public = public.map(folder).transpose()?;
+        let private = declared(&fields, "headers", PRIVATE).into_iter().map(folder);
+        let headers = public.iter().cloned().map(Ok).chain(private).collect::<Result<_>>()?;
+        Ok(Package { path, fields, declared: written, files, dependencies, headers, public })
+    }
+
     /// Whether it has anything of its own to build.
     pub fn compiles(&self) -> bool {
         VISIBILITIES.iter().any(|visibility| !declared(&self.fields, "sources", visibility).is_empty())
@@ -70,26 +98,24 @@ impl Package {
         self.fields.contains_key("link_script") || self.fields.contains_key("symbols")
     }
 
-    /// The folders its own quoted includes are found in, within it: its public one (`headers.public`), then its private ones
-    /// (`headers.private`).
-    pub fn header_folders(&self) -> Vec<&str> {
-        let headers = self.fields.get("headers");
-        let public = headers.and_then(|headers| headers.get(PUBLIC)).and_then(Value::as_str);
-        public.into_iter().chain(declared(&self.fields, "headers", PRIVATE)).collect()
+    /// The folders its own quoted includes are found in, within it: its public one, then its private ones.
+    pub fn own_header_folders(&self) -> &[Arc<RelPath>] {
+        &self.headers
     }
 
-    /// The folder of what others may include of it, from the project's root, if it has one: one, which its name stands for.
-    pub fn public_folder(&self) -> Option<String> {
-        let headers = self.fields.get("headers");
-        headers
-            .and_then(|headers| headers.get(PUBLIC))
-            .and_then(Value::as_str)
-            .map(|folder| format!("{}/{folder}", self.path))
+    /// The folders its own quoted includes are found in, in the project's tree.
+    pub fn header_folders(&self) -> Box<[Arc<TreePath>]> {
+        self.headers.iter().map(|folder| self.path.join_path(folder)).collect()
+    }
+
+    /// The folder of what others may include of it, in the project's tree, if it has one.
+    pub fn public_folder(&self) -> Option<Arc<TreePath>> {
+        self.public.as_ref().map(|folder| self.path.join_path(folder))
     }
 
     /// Whether a file is one of its.
-    fn owns(&self, file: &str) -> bool {
-        file.strip_prefix(self.path.as_str()).is_some_and(|inside| inside.starts_with('/'))
+    fn owns(&self, file: &TreePath) -> bool {
+        within(file, &self.path)
     }
 }
 
@@ -112,7 +138,7 @@ fn declared<'a>(fields: &'a Table, key: &str, visibility: &str) -> Vec<&'a str> 
 }
 
 /// Whether a package declares its kinds as both builds read them: each by visibility, its public headers one folder.
-fn shaped(path: &str, fields: &Table) -> Result<()> {
+fn shaped(path: &TreePath, fields: &Table) -> Result<()> {
     for key in ["headers", "sources", "objects"] {
         let Some(kind) = fields.get(key) else { continue };
         let by_visibility = kind
@@ -130,7 +156,7 @@ fn shaped(path: &str, fields: &Table) -> Result<()> {
 
 /// A file to take in: where it is in the project, where it goes in the tree, and whose it is.
 struct Taken {
-    entry: String,
+    entry: Arc<TreePath>,
     place: String,
     owner: String,
 }
@@ -152,16 +178,13 @@ struct Gathering<'a> {
 /// Every package's name, by its path: what others include it by (`<engine/fs.h>`) and its objects are named by - its folder's name,
 /// after the name of the nearest package whose folder holds it. A package nests in packages, not in folders: `packages/a/aya` and
 /// `packages/b/aya` are both `aya`, and `packages/aya/akropolis` is `aya/akropolis`.
-fn package_names(paths: &[String]) -> HashMap<String, String> {
-    let mut sorted: Vec<&String> = paths.iter().collect();
+fn package_names(paths: &[Arc<TreePath>]) -> HashMap<Arc<TreePath>, String> {
+    let mut sorted: Vec<&Arc<TreePath>> = paths.iter().collect();
     sorted.sort();
-    let mut names: HashMap<String, String> = HashMap::new();
+    let mut names: HashMap<Arc<TreePath>, String> = HashMap::new();
     for path in sorted {
-        let outer = paths
-            .iter()
-            .filter(|other| path.strip_prefix(other.as_str()).is_some_and(|rest| rest.starts_with('/')))
-            .max_by_key(|other| other.len());
-        let last = name_of(path);
+        let outer = paths.iter().filter(|other| within(path, other)).max_by_key(|other| other.depth());
+        let last = path.name().unwrap_or_default();
         let name = match outer.and_then(|outer| names.get(outer)) {
             Some(outer) => format!("{outer}/{last}"),
             None => last.to_string(),
@@ -174,18 +197,18 @@ fn package_names(paths: &[String]) -> HashMap<String, String> {
 /// Where a package declares its slots and options: one of its units, the first that does, which any other declaring breaks
 /// (`gen_package_values.py`'s `gathered`) - never a header, which whatever includes it reads.
 struct Declaring {
-    file: Option<String>,
+    file: Option<Arc<TreePath>>,
     /// The package's units, by their paths, and its name.
-    units: BTreeSet<String>,
+    units: BTreeSet<Arc<TreePath>>,
     own: String,
 }
 
 impl Declaring {
-    fn of(own: &str, units: &[String]) -> Declaring {
+    fn of(own: &str, units: &[Arc<TreePath>]) -> Declaring {
         Declaring { file: None, units: units.iter().cloned().collect(), own: own.to_string() }
     }
 
-    fn check(&mut self, found: &scan::Use, file: &str) -> Result<()> {
+    fn check(&mut self, found: &scan::Use, file: &TreePath) -> Result<()> {
         if !DECLARING.contains(&found.name) {
             return Ok(());
         }
@@ -198,23 +221,23 @@ impl Declaring {
             );
         }
         match &self.file {
-            Some(first) if first != file => {
+            Some(first) if **first != *file => {
                 bail!(
                     "{at}: {} outside {first}: a package's slots and options are declared in one file, in the order the editor lists them",
                     found.name
                 )
             }
-            _ => self.file = Some(file.to_string()),
+            _ => self.file = Some(file.to_owned()),
         }
         Ok(())
     }
 }
 
 /// The name of the package at a path, in the graph.
-fn name_at(packages: &HashMap<String, Package>, path: &str) -> Result<String> {
+fn name_at(packages: &HashMap<String, Package>, path: &TreePath) -> Result<String> {
     packages
         .iter()
-        .find(|(_, package)| package.path == path)
+        .find(|(_, package)| *package.path == *path)
         .map(|(name, _)| name.clone())
         .ok_or_else(|| anyhow!("{path} is no package of the graph"))
 }
@@ -229,11 +252,11 @@ fn spelled<'a>(packages: &HashMap<String, Package>, spelled: &'a str) -> Option<
 }
 
 /// The package a file is of: the one whose folder holds it nearest.
-fn owner_of(packages: &HashMap<String, Package>, file: &str) -> Option<String> {
+fn owner_of(packages: &HashMap<String, Package>, file: &TreePath) -> Option<String> {
     packages
         .iter()
         .filter(|(_, package)| package.owns(file))
-        .max_by_key(|(_, package)| package.path.len())
+        .max_by_key(|(_, package)| package.path.depth())
         .map(|(name, _)| name.clone())
 }
 
@@ -282,27 +305,27 @@ fn linked(packages: &HashMap<String, Package>, own: &str) -> (Vec<String>, Vec<S
 fn resolved(
     packages: &HashMap<String, Package>,
     owner: &str,
-    from: &str,
+    from: &TreePath,
     written: &str,
     quoted: bool,
     at: &str,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(Arc<TreePath>, String)>> {
     let package = packages.get(owner).ok_or_else(|| anyhow!("{at}: {owner} is no package"))?;
     if quoted {
         if MADE.contains(&written) {
             return Ok(None);
         }
-        let public = package.public_folder();
-        let in_public = public.as_ref().is_some_and(|public| from.starts_with(&format!("{public}/")));
-        let mut folders = vec![folder_of(from).to_string()];
+        let public = package.public_folder().filter(|public| within(from, public));
+        let in_public = public.is_some();
+        let mut folders = vec![from.parent().unwrap_or_default().to_owned()];
         if !in_public {
-            folders.extend(package.header_folders().into_iter().map(|folder| format!("{}/{folder}", package.path)));
+            folders.extend(package.header_folders());
         }
-        let within = if in_public { public.unwrap_or_default() } else { package.path.clone() };
+        let inside = public.unwrap_or_else(|| package.path.clone());
         for folder in folders {
-            let entry = normal(&format!("{folder}/{written}"));
-            if packages.values().any(|any| any.files.contains(&entry)) {
-                if !entry.starts_with(&format!("{within}/")) {
+            let entry = entry_in(&folder, written, at)?;
+            if packages.values().any(|any| any.files.contains(&*entry)) {
+                if !within(&entry, &inside) {
                     bail!(
                         "{at}: \"{written}\" is not {} of {owner}",
                         if in_public { "a public file" } else { "a file" }
@@ -317,26 +340,40 @@ fn resolved(
     if !package.dependencies.contains(&name) {
         bail!("{at}: <{written}> is {name}'s, which {owner} does not depend on");
     }
-    let entry = packages.get(&name).and_then(Package::public_folder).map(|public| format!("{public}/{inside}"));
-    Ok(entry
-        .filter(|entry| packages.get(&name).is_some_and(|dependency| dependency.files.contains(entry)))
-        .map(|entry| (entry, name)))
+    let Some(public) = packages.get(&name).and_then(Package::public_folder) else { return Ok(None) };
+    let entry = entry_in(&public, inside, at)?;
+    Ok(packages.get(&name).is_some_and(|dependency| dependency.files.contains(&*entry)).then_some((entry, name)))
+}
+
+/// Whether a path is strictly within a folder.
+fn within(path: &TreePath, folder: &TreePath) -> bool {
+    path.strip_prefix(folder).is_some_and(|inside| !inside.is_root())
+}
+
+/// The file an include names from a folder: the path written, its `.` and `..` steps gone, as a path of the tree.
+///
+/// # Errors
+/// What is written is no path.
+fn entry_in(folder: &TreePath, written: &str, at: &str) -> Result<Arc<TreePath>> {
+    let text = normal(&format!("{folder}/{written}"));
+    TreePath::new(&text).map(Arc::from).map_err(|why| anyhow!("{at}: {written} names no file: {why}"))
 }
 
 /// Where a file goes in a package's tree: its own at `self/<path>`, a dependency's public file at `dep/<name>/<path>`, where the
 /// dependency's name is what includes it in angle brackets.
-fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: &str) -> String {
+fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: &TreePath) -> String {
     let Some(package) = packages.get(owner) else { return entry.to_string() };
     if owner == own {
-        return format!("self/{}", entry.strip_prefix(&format!("{}/", package.path)).unwrap_or(entry));
+        return format!("self/{}", entry.strip_prefix(&package.path).map_or(entry.as_str(), RelPath::as_str));
     }
-    let public = package.public_folder().unwrap_or_default();
-    format!("{DEP}/{owner}/{}", entry.strip_prefix(&format!("{public}/")).unwrap_or(entry))
+    let public = package.public_folder();
+    let inside = public.as_deref().and_then(|public| entry.strip_prefix(public));
+    format!("{DEP}/{owner}/{}", inside.map_or(entry.as_str(), RelPath::as_str))
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
-    let path = call.host.path().to_string();
+    let path = call.host.path().to_owned();
     let mut packages = packages(call)?;
     let mut name = name_at(&packages, &path)?;
     // A variant is built as a package of its own, beside its package and named so: what it sets over the package's.
@@ -344,13 +381,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         let base = &packages[&name];
         let declared = with_variant(&base.declared, Some(&variant)).map_err(|why| anyhow!("{path}: {why:#}"))?;
         let fields = pe2_ext::targeted(&declared, target_of(call).as_deref());
-        let made = Package {
-            path: base.path.clone(),
-            fields,
-            declared,
-            files: base.files.clone(),
-            dependencies: base.dependencies.clone(),
-        };
+        let made = Package::new(base.path.clone(), fields, declared, base.files.clone(), base.dependencies.clone())?;
         name = variant_name(&name, &variant);
         if packages.insert(name.clone(), made).is_some() {
             bail!("{path}: its variant {variant} is named {name}, as another package is");
@@ -371,13 +402,13 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     };
     // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
     let fields = own_fields(call);
-    let units = if gathering.packages[&name].compiles() { selected(&fields, &own_path, &own_files)? } else { vec![] };
+    let units =
+        if gathering.packages[&name].compiles() { selected(&fields, &own_path, &own_files)? } else { Box::default() };
     gathering.declaring = Declaring::of(&name, &units.iter().map(|(unit, _)| unit.clone()).collect::<Vec<_>>());
-    let within = format!("{own_path}/");
     // Each unit by its visibility and place: what the target compiles, and whether what it makes goes to what links the package.
     let mut listed = String::new();
     for (unit, visibility) in &units {
-        let place = format!("self/{}", unit.strip_prefix(&within).unwrap_or(unit));
+        let place = format!("self/{}", unit.strip_prefix(&own_path).map_or(unit.as_str(), RelPath::as_str));
         let _ = writeln!(listed, "{visibility} {place}");
         gathering.pending.push(Taken { entry: unit.clone(), place, owner: name.clone() });
     }
@@ -389,7 +420,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.take_target_files(&name)?;
     // Where its includes are found: in quotes, its own folders; in angle brackets, its dependencies, each under its name.
     let own = &gathering.packages[&name];
-    let mut dirs: Vec<String> = own.header_folders().into_iter().map(|folder| format!("quote self/{folder}")).collect();
+    let mut dirs: Vec<String> = own.own_header_folders().iter().map(|folder| format!("quote self/{folder}")).collect();
     dirs.push(format!("angle {DEP}"));
     // What its image links besides its own: the objects of the libraries it takes, and what the images it depends on publish.
     let mut linked = String::new();
@@ -412,10 +443,6 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let settings =
         Table::from_iter([("unset".to_string(), Value::Array(unset.into_iter().map(Value::String).collect()))]);
     Ok(Typed { notes, settings: pe2_ext::merged(&call.given(), &settings), ..Typed::new(SourceTree::NAME, files) })
-}
-
-fn name_of(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The target the config builds for, which a package is read as (`pe2_ext::targeted`); none outside a build.
@@ -459,31 +486,28 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
     for (path, declaration) in call.assets_of("package")? {
         let declared: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
         let fields = pe2_ext::targeted(&declared, target.as_deref());
-        shaped(&path, &fields)?;
-        let files: BTreeSet<String> = call.entries(&path)?.into_iter().collect();
+        let files: BTreeSet<Arc<TreePath>> = call.entries(&path)?.into_iter().collect();
         read.push((path, fields, declared, files));
     }
-    let paths: Vec<String> = read.iter().map(|(path, ..)| path.clone()).collect();
+    let paths: Vec<Arc<TreePath>> = read.iter().map(|(path, ..)| path.clone()).collect();
     let names = package_names(&paths);
     let mut packages = HashMap::new();
     for (path, fields, declared, mut files) in read {
         // Its own files: a package inside its folder holds what is in its own (`aya`'s are not `aya/mist`'s).
-        let inner: Vec<String> = paths
-            .iter()
-            .filter(|other| other.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/')))
-            .map(|other| format!("{other}/"))
-            .collect();
-        files.retain(|file| !inner.iter().any(|folder| file.starts_with(folder.as_str())));
+        let inner: Vec<&Arc<TreePath>> = paths.iter().filter(|other| within(other, &path)).collect();
+        files.retain(|file| !inner.iter().any(|folder| within(file, folder)));
         let mut dependencies = vec![];
         for reference in fields.get("dependencies").and_then(Value::as_array).into_iter().flatten() {
-            let target = pe2_ext::target_of(reference).ok_or_else(|| anyhow!("{path}: a dependency names nothing"))?;
+            let target = pe2_ext::target_of(reference)
+                .map_err(|why| anyhow!("{path}: a dependency: {why:#}"))?
+                .ok_or_else(|| anyhow!("{path}: a dependency names nothing"))?;
             let node =
-                call.node_named(target).ok_or_else(|| anyhow!("{path}: its dependency {target} names nothing"))?;
+                call.node_named(&target).ok_or_else(|| anyhow!("{path}: its dependency {target} names nothing"))?;
             dependencies
                 .push(names.get(&node.path).cloned().ok_or_else(|| anyhow!("{path}: {} is no package", node.path))?);
         }
         let name = names[&path].clone();
-        let package = Package { path: path.clone(), fields, declared, files, dependencies };
+        let package = Package::new(path.clone(), fields, declared, files, dependencies)?;
         if let Some(other) = packages.insert(name.clone(), package) {
             bail!("{} and {path} are both named {name}, in the same package or none", other.path);
         }
@@ -500,10 +524,13 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
     Ok(packages)
 }
 
+/// A package's units: each file it compiles, with its visibility.
+type Units = Box<[(Arc<TreePath>, &'static str)]>;
+
 /// The files `sources` names, of every visibility, each with its visibility: a path or a glob of `*` within a step, a leading `!`
 /// leaving out what is matched.
-fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<(String, &'static str)>> {
-    let kept: Vec<(String, &'static str)> = VISIBILITIES
+fn selected(fields: &Table, path: &TreePath, files: &BTreeSet<Arc<TreePath>>) -> Result<Units> {
+    let kept: Units = VISIBILITIES
         .iter()
         .flat_map(|visibility| {
             listed(fields, "sources", visibility, path, files).into_iter().map(move |file| (file, *visibility))
@@ -517,20 +544,26 @@ fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<
 
 /// The files a package declares of a kind and visibility (`sources.private`, `objects.public`): globs from its folder, a leading
 /// `!` leaving out what is matched.
-fn listed(fields: &Table, key: &str, visibility: &str, path: &str, files: &BTreeSet<String>) -> Vec<String> {
+fn listed(
+    fields: &Table,
+    key: &str,
+    visibility: &str,
+    path: &TreePath,
+    files: &BTreeSet<Arc<TreePath>>,
+) -> Box<[Arc<TreePath>]> {
     let patterns = declared(fields, key, visibility);
-    let within = format!("{path}/");
-    let matched = |file: &str, wanted: bool| {
+    let matched = |file: &RelPath, wanted: bool| {
+        let file = file.as_str();
         patterns.iter().filter(|p| p.starts_with('!') != wanted).any(|p| matches(p.trim_start_matches('!'), file))
     };
-    let kept: Vec<String> = files
+    files
         .iter()
         .filter(|file| {
-            file.strip_prefix(&within).is_some_and(|inside| matched(inside, true) && !matched(inside, false))
+            file.strip_prefix(path)
+                .is_some_and(|inside| !inside.is_root() && matched(inside, true) && !matched(inside, false))
         })
         .cloned()
-        .collect();
-    kept
+        .collect()
 }
 
 /// A path against a pattern, step by step.
@@ -561,10 +594,6 @@ fn normal(path: &str) -> String {
     steps.join("/")
 }
 
-fn folder_of(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(folder, _)| folder)
-}
-
 /// The file a line includes, and whether it is quoted, so looked for beside it first: `#include "path"` or `#include <path>`.
 fn included(line: &str) -> Option<(&str, bool)> {
     let rest = line.trim_start().strip_prefix('#')?.trim_start().strip_prefix("include")?.trim_start();
@@ -586,22 +615,20 @@ fn assembled(text: &str) -> Vec<&str> {
     names
 }
 
-fn is_source(file: &str) -> bool {
-    std::path::Path::new(file)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| ["c", "h", "inc"].contains(&extension))
+fn is_source(file: &TreePath) -> bool {
+    let extension = file.name().and_then(|name| name.rsplit_once('.')).map(|(_, extension)| extension);
+    extension.is_some_and(|extension| ["c", "h", "inc"].contains(&extension))
 }
 
 /// What a package's files say, read as text: what it compiles, its slots, each with its type, the addresses read and the args given, and
 /// its options. What it is set to is its asset's, as written: a view shows that.
 pub fn reflection(call: &mut Call) -> Result<Table> {
     let call: &Call = call;
-    let path = call.host.path().to_string();
+    let path = call.host.path().to_owned();
     let packages = packages(call)?;
     let name = name_at(&packages, &path)?;
     let own = &packages[&name];
-    let units: Vec<String> = if own.compiles() {
+    let units: Vec<Arc<TreePath>> = if own.compiles() {
         selected(&own.fields, &path, &own.files)?.into_iter().map(|(unit, _)| unit).collect()
     } else {
         vec![]
@@ -622,11 +649,12 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
         walk.file(file)?;
     }
     let Walk { slots, options, .. } = walk;
-    let within = format!("{path}/");
     let fields = &own_fields(call);
-    let sources = if own.compiles() { selected(fields, &path, &own.files)? } else { vec![] };
-    let sources =
-        sources.iter().map(|(file, _)| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
+    let sources = if own.compiles() { selected(fields, &path, &own.files)? } else { Box::default() };
+    let sources = sources
+        .iter()
+        .map(|(file, _)| Value::String(file.strip_prefix(&path).map_or(file.as_str(), RelPath::as_str).to_string()))
+        .collect();
     let mut table = Table::new();
     table.insert("sources".into(), Value::Array(sources));
     table.insert("slots".into(), Value::Array(slots.described(&packages)));
@@ -639,7 +667,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
 struct Walk<'a> {
     call: &'a Call<'a>,
     packages: &'a HashMap<String, Package>,
-    seen: BTreeSet<String>,
+    seen: BTreeSet<Arc<TreePath>>,
     label: String,
     order: i64,
     slots: Slots,
@@ -648,8 +676,8 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn file(&mut self, file: &str) -> Result<()> {
-        if !self.seen.insert(file.to_string()) {
+    fn file(&mut self, file: &TreePath) -> Result<()> {
+        if !self.seen.insert(file.to_owned()) {
             return Ok(());
         }
         let bytes = self.call.read_entry(file)?;
@@ -677,7 +705,7 @@ impl Walk<'_> {
     }
 
     /// A file included, as the build finds it (`resolved`).
-    fn include(&mut self, from: &str, line: usize, written: &str, quoted: bool) -> Result<()> {
+    fn include(&mut self, from: &TreePath, line: usize, written: &str, quoted: bool) -> Result<()> {
         let owner = owner_of(self.packages, from).ok_or_else(|| anyhow!("{from} is no package's"))?;
         match resolved(self.packages, &owner, from, written, quoted, &format!("{from}:{line}"))? {
             Some((entry, _)) => self.file(&entry),
@@ -753,7 +781,7 @@ impl Slots {
                 slot.reads.iter().map(|args| Value::String(Read { binding: name.clone(), args: args.clone() }.said()));
             out.insert("reads".into(), Value::Array(reads.collect()));
             if let Some(package) = packages.get(&name).filter(|_| slot.ty.as_deref() == Some("package")) {
-                out.insert("package".into(), package.path.clone().into());
+                out.insert("package".into(), package.path.to_string().into());
             }
             out.insert("name".into(), name.into());
             Value::Table(out)
@@ -1157,7 +1185,7 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
     let pass: Pass = Pass::of(&scanned);
     let mut uses: Vec<Use> = uses_of(call, &scanned);
     loop {
-        let wanted: Vec<(usize, String, String)> = uses
+        let wanted: Vec<(usize, Reference, Box<str>)> = uses
             .iter()
             .enumerate()
             .filter_map(|(at, used)| used.wanted().map(|(node, address)| (at, node, address)))
@@ -1174,10 +1202,7 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
             .collect();
         #[request]
         let got: Vec<Result<pe2_ext::Data>> = call.outputs_tried(
-            wanted
-                .iter()
-                .zip(&asked)
-                .filter_map(|((_, node, _), asked)| Some((node.as_str(), &**asked.as_ref().ok()?))),
+            wanted.iter().zip(&asked).filter_map(|((_, node, _), asked)| Some((node, &**asked.as_ref().ok()?))),
         );
         let mut got = got.into_iter();
         for ((at, ..), asked) in wanted.iter().zip(&asked) {
@@ -1270,7 +1295,8 @@ fn uses_of(call: &Call, scanned: &Scanned) -> Vec<Use> {
     for (name, slot) in &slots.held {
         let ty = slot.ty.as_deref().unwrap_or_default();
         if ty != "package" {
-            let walk = bound(call, fields, slots, name).map(|bound| Trail::new(&bound, Vec::new()));
+            let walk = bound(call, fields, slots, name)
+                .map(|bound| bound.map_or_else(Trail::failed, |bound| Trail::new(&bound, Vec::new())));
             uses.push(Use::Slot { name: name.clone(), ty: ty.to_string(), walk });
         }
     }
@@ -1285,7 +1311,8 @@ fn uses_of(call: &Call, scanned: &Scanned) -> Vec<Use> {
             (_, _, Err(why)) => Stage::Said(Err(why.clone())),
             (None, _, _) => Stage::Said(Err("it has no PE2_BIND".into())),
             (_, None, _) => Stage::Said(Err("nothing fills it on this package".into())),
-            (Some(_), Some(bound), Ok((_, fragment))) => Stage::Walking(Trail::new(&bound, fragment.clone())),
+            (_, Some(Err(why)), _) => Stage::Said(Err(why)),
+            (Some(_), Some(Ok(bound)), Ok((_, fragment))) => Stage::Walking(Trail::new(&bound, fragment.clone())),
         };
         let args = parts.map_or_default(|(query, _)| query);
         let stage = match stage {
@@ -1296,7 +1323,7 @@ fn uses_of(call: &Call, scanned: &Scanned) -> Vec<Use> {
     }
     for query in queries {
         let filled = |name: &str| {
-            bound(call, fields, slots, name).ok_or_else(|| format!("nothing fills {name} on this package"))
+            bound(call, fields, slots, name).unwrap_or_else(|| Err(format!("nothing fills {name} on this package")))
         };
         let stage = match asked(query, slots) {
             Err(why) => Stage::Said(Err(why)),
@@ -1344,31 +1371,31 @@ enum Stage {
     Walking(Trail),
     /// Finding which output makes the node's tokens, then the tokens made by these args.
     Probing {
-        target: String,
+        target: Reference,
         args: BTreeMap<String, Vec<String>>,
         probe: Probe,
     },
     Reading {
-        target: String,
-        address: String,
+        target: Reference,
+        address: Box<str>,
     },
     /// Finding what the slot asked about holds (`wanted` none), then what the own slot holds.
     Holding {
-        wanted: Option<String>,
+        wanted: Option<Arc<TreePath>>,
         holder: Holder,
         own: std::result::Result<Bound, String>,
     },
     /// Reading what the own slot holds, to look in it for what the other does.
     Looking {
-        wanted: String,
-        held: String,
+        wanted: Arc<TreePath>,
+        held: Arc<TreePath>,
     },
     Said(Said),
 }
 
 impl Use {
     /// What it reads next: none once it has its result.
-    fn wanted(&self) -> Option<(String, String)> {
+    fn wanted(&self) -> Option<(Reference, Box<str>)> {
         match self {
             Use::Slot { walk, .. } => walk.as_ref()?.wanted(),
             Use::Value { stage, .. } | Use::Query { stage, .. } => match stage {
@@ -1376,7 +1403,7 @@ impl Use {
                 Stage::Probing { probe, .. } => probe.wanted(),
                 Stage::Reading { target, address } => Some((target.clone(), address.clone())),
                 Stage::Holding { holder, .. } => holder.wanted(),
-                Stage::Looking { held, .. } => Some((held.clone(), SETTINGS.to_string())),
+                Stage::Looking { held, .. } => Some((Reference::from(held.clone()), SETTINGS.to_string().into())),
                 Stage::Said(_) => None,
             },
         }
@@ -1401,12 +1428,10 @@ impl Use {
                         match probe.found.clone() {
                             None => Stage::Probing { target, args, probe },
                             Some(Err(why)) => Stage::Said(Err(why)),
-                            Some(Ok(output)) => {
-                                match pe2_ext::tokens::address(&output, &Args(args)) {
-                                    Ok(address) => Stage::Reading { target, address: address.to_string() },
-                                    Err(why) => Stage::Said(Err(format!("{why:#}"))),
-                                }
-                            }
+                            Some(Ok(output)) => match pe2_ext::tokens::address(&output, &Args(args)) {
+                                Ok(address) => Stage::Reading { target, address: address.to_string().into() },
+                                Err(why) => Stage::Said(Err(format!("{why:#}"))),
+                            },
                         }
                     }
                     Stage::Reading { .. } => Stage::Said(
@@ -1442,7 +1467,7 @@ impl Use {
                 let own = match walk.ended.as_ref()? {
                     Ok(Reached::Node { reads_as: Some(reads_as), .. }) => reads_as.clone(),
                     Ok(Reached::Node { node, .. }) => {
-                        let types = call.node_named(node).map_or_else(Vec::new, |named| named.types);
+                        let types = call.node_named(node).map_or_else(Box::default, |named| named.types);
                         if types.iter().any(|known| known.rsplit('@').next() == Some(ty)) {
                             return Some(Ok(String::new()));
                         }
@@ -1484,7 +1509,12 @@ fn value_walked(args: &BTreeMap<String, Vec<String>>, active: Option<&str>, walk
 }
 
 /// Where a query's holders leave it: the slot asked about's found, the own slot's next; both found, what it holds read.
-fn query_held(call: &Call, wanted: Option<String>, holder: Holder, own: std::result::Result<Bound, String>) -> Stage {
+fn query_held(
+    call: &Call,
+    wanted: Option<Arc<TreePath>>,
+    holder: Holder,
+    own: std::result::Result<Bound, String>,
+) -> Stage {
     match (holder.found.clone(), wanted) {
         (None, wanted) => Stage::Holding { wanted, holder, own },
         (Some(Err(why)), _) => Stage::Said(Err(why)),
@@ -1516,7 +1546,7 @@ struct Trail {
     reached: Reached,
     at: usize,
     /// The output the reference names, read first where it names one: its address and query, as text.
-    first: Option<(String, String)>,
+    first: Option<(Reference, Box<str>)>,
     /// Whether the family member at this step was tried and is none: its plain output is read.
     member_tried: bool,
     ended: Option<std::result::Result<Reached, String>>,
@@ -1525,13 +1555,16 @@ struct Trail {
 impl Trail {
     fn new(from: &Bound, path: Vec<String>) -> Trail {
         let reached = Reached::Node { node: from.node.clone(), reads_as: None, args: BTreeMap::new() };
-        let (first, ended) = match &from.output {
-            Ok(output) => (output.clone().map(|output| (from.node.clone(), output)), None),
-            Err(why) => (None, Some(Err(format!("{}: {why}", from.node)))),
-        };
-        let mut walk = Trail { path, reached, at: 0, first, member_tried: false, ended };
+        let first = from.output.clone().map(|output| (from.node.clone(), output));
+        let mut walk = Trail { path, reached, at: 0, first, member_tried: false, ended: None };
         walk.settle();
         walk
+    }
+
+    /// A walk ended before it started: why its binding names nothing to walk from. What it reached is never read.
+    fn failed(why: String) -> Trail {
+        let reached = Reached::Value(Value::Table(Table::new()));
+        Trail { path: Vec::new(), reached, at: 0, first: None, member_tried: false, ended: Some(Err(why)) }
     }
 
     /// Ended where nothing is left to read: at the path's end, or where it reached a value before.
@@ -1546,7 +1579,7 @@ impl Trail {
         }
     }
 
-    fn wanted(&self) -> Option<(String, String)> {
+    fn wanted(&self) -> Option<(Reference, Box<str>)> {
         if self.ended.is_some() {
             return None;
         }
@@ -1556,8 +1589,8 @@ impl Trail {
         let Reached::Node { node, .. } = &self.reached else { return None };
         let step = &self.path[self.at];
         Some(match self.path.get(self.at + 1).filter(|_| !self.member_tried) {
-            Some(member) => (node.clone(), format!("{step}/{member}")),
-            None => (node.clone(), step.clone()),
+            Some(member) => (node.clone(), format!("{step}/{member}").into()),
+            None => (node.clone(), step.as_str().into()),
         })
     }
 
@@ -1565,9 +1598,10 @@ impl Trail {
         if let Some((node, output)) = self.first.take() {
             match table(got) {
                 Err(_) => self.ended = Some(Err(format!("{node} has no output {output}"))),
-                Ok(table) => match table.get(tokens::NODE).and_then(Value::as_str) {
-                    Some(next) => self.reached = Reached::leading_on(&table, next.to_string()),
-                    None => self.ended = Some(Err(format!("nothing goes on from {output}"))),
+                Ok(table) => match pe2_ext::target_in(table.get(tokens::NODE)) {
+                    Ok(Some(next)) => self.reached = Reached::leading_on(&table, next),
+                    Ok(None) => self.ended = Some(Err(format!("nothing goes on from {output}"))),
+                    Err(why) => self.ended = Some(Err(format!("{output}: {why:#}"))),
                 },
             }
             self.settle();
@@ -1589,8 +1623,15 @@ impl Trail {
     fn went(&mut self, table: &Table, used: usize) {
         self.member_tried = false;
         self.at += used;
-        if let Some(next) = table.get(tokens::NODE).and_then(Value::as_str) {
-            self.reached = Reached::leading_on(table, next.to_string());
+        let next = match pe2_ext::target_in(table.get(tokens::NODE)) {
+            Ok(next) => next,
+            Err(why) => {
+                self.ended = Some(Err(format!("{}: {why:#}", self.path[..self.at].join("/"))));
+                return;
+            }
+        };
+        if let Some(next) = next {
+            self.reached = Reached::leading_on(table, next);
             self.settle();
         } else if let Some(value) = table.get(tokens::VALUE).filter(|_| self.at == self.path.len()) {
             self.ended = Some(Ok(Reached::Value(value.clone())));
@@ -1603,34 +1644,34 @@ impl Trail {
 /// The output making a node's tokens, a read at a time: the active target's own, where the node declares one, else its own.
 #[derive(Clone, Serialize, Deserialize)]
 struct Probe {
-    target: String,
+    target: Reference,
     active: Option<String>,
     /// Whether the target's own was looked for, and is none.
     own_tried: bool,
-    found: Option<std::result::Result<String, String>>,
+    found: Option<std::result::Result<Box<str>, String>>,
 }
 
 impl Probe {
-    fn new(target: String, active: Option<String>) -> Probe {
+    fn new(target: Reference, active: Option<String>) -> Probe {
         let own_tried = active.is_none();
         Probe { target, active, own_tried, found: None }
     }
 
-    fn wanted(&self) -> Option<(String, String)> {
+    fn wanted(&self) -> Option<(Reference, Box<str>)> {
         if self.found.is_some() {
             return None;
         }
         Some(match (&self.active, self.own_tried) {
-            (Some(active), false) => (self.target.clone(), format!("{}_{active}", tokens::DECLARED)),
-            _ => (self.target.clone(), tokens::DECLARED.to_string()),
+            (Some(active), false) => (self.target.clone(), format!("{}_{active}", tokens::DECLARED).into()),
+            _ => (self.target.clone(), tokens::DECLARED.into()),
         })
     }
 
     fn given(&mut self, got: Result<pe2_ext::Data>) {
         match (&self.active, self.own_tried, table(got).is_ok()) {
-            (Some(active), false, true) => self.found = Some(Ok(format!("{}_{active}", tokens::OUTPUT))),
+            (Some(active), false, true) => self.found = Some(Ok(format!("{}_{active}", tokens::OUTPUT).into())),
             (Some(_), false, false) => self.own_tried = true,
-            (_, _, true) => self.found = Some(Ok(tokens::OUTPUT.to_string())),
+            (_, _, true) => self.found = Some(Ok(tokens::OUTPUT.into())),
             (_, _, false) => self.found = Some(Err("it has no tokenizer".into())),
         }
     }
@@ -1641,8 +1682,8 @@ impl Probe {
 struct Holder {
     walk: Trail,
     /// The group a file of it is read from, and the file's name, once the walk ends at one.
-    group: Option<(String, String)>,
-    found: Option<std::result::Result<String, String>>,
+    group: Option<(Reference, Box<str>)>,
+    found: Option<std::result::Result<Arc<TreePath>, String>>,
 }
 
 impl Holder {
@@ -1650,12 +1691,12 @@ impl Holder {
         Holder { walk: Trail::new(bound, Vec::new()), group: None, found: None }
     }
 
-    fn wanted(&self) -> Option<(String, String)> {
+    fn wanted(&self) -> Option<(Reference, Box<str>)> {
         if self.found.is_some() {
             return None;
         }
         match &self.group {
-            Some((node, _)) => Some((node.clone(), SETTINGS.to_string())),
+            Some((node, _)) => Some((node.clone(), SETTINGS.to_string().into())),
             None => self.walk.wanted(),
         }
     }
@@ -1664,9 +1705,10 @@ impl Holder {
         if let Some((node, file)) = self.group.take() {
             let found = table(got).map_err(|why| format!("{why:#}")).and_then(|group| {
                 let files = group.get("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-                let entry = files.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(file.as_str()));
-                let asset = entry.and_then(|entry| entry.get("asset")).and_then(pe2_ext::target_of);
-                path_of(call, asset.ok_or_else(|| format!("{node} has no file {file}"))?)
+                let entry = files.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(&*file));
+                let asset = pe2_ext::target_in(entry.and_then(|entry| entry.get("asset")))
+                    .map_err(|why| format!("{node}: {file}: {why:#}"))?;
+                path_of(call, &asset.ok_or_else(|| format!("{node} has no file {file}"))?)
             });
             self.found = Some(found);
             return;
@@ -1684,7 +1726,7 @@ impl Holder {
             Some(Ok(Reached::Node { node, reads_as, args })) => {
                 match args.get("file").and_then(|file| file.first()).filter(|_| reads_as.as_deref() == Some("file")) {
                     Some(file) => {
-                        self.group = Some((node, file.clone()));
+                        self.group = Some((node, file.as_str().into()));
                         None
                     }
                     None => Some(path_of(call, &node)),
@@ -1695,7 +1737,7 @@ impl Holder {
 }
 
 /// A reference's node, by its path.
-fn path_of(call: &Call, reference: &str) -> std::result::Result<String, String> {
+fn path_of(call: &Call, reference: &Reference) -> std::result::Result<Arc<TreePath>, String> {
     call.node_named(reference).map(|named| named.path).ok_or_else(|| format!("{reference} names nothing"))
 }
 
@@ -1774,8 +1816,11 @@ impl Query {
 }
 
 /// Whether a value names, anywhere in it, the node at a path.
-fn names(call: &Call, value: &Value, wanted: &str) -> bool {
-    if pe2_ext::target_of(value).and_then(|target| call.node_named(target)).is_some_and(|named| named.path == wanted) {
+fn names(call: &Call, value: &Value, wanted: &TreePath) -> bool {
+    // A value that is no reference names nothing: what is looked through is any value, most of them plain.
+    if let Ok(Some(target)) = pe2_ext::target_of(value)
+        && call.node_named(&target).is_some_and(|named| *named.path == *wanted)
+    {
         return true;
     }
     match value {
@@ -1806,21 +1851,24 @@ const HIDDEN: &str = "hidden";
 /// why what it names is none.
 #[derive(Clone, Serialize, Deserialize)]
 struct Bound {
-    node: String,
-    output: std::result::Result<Option<String>, String>,
+    node: Reference,
+    output: Option<Box<str>>,
 }
 
 /// What its package's declaration fills a slot with; else, for a slot filled by default with the package built, the package.
-fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<Bound> {
+/// None where nothing fills it; why not where what its declaration fills it with names nothing it can be.
+fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<std::result::Result<Bound, String>> {
     let Some(reference) = fields.get("bind").and_then(|bind| bind.get(name)) else {
         let own = slots.held.get(name).is_some_and(|slot| slot.attributes.contains("self"));
-        return own.then(|| Bound { node: call.host.path().to_string(), output: Ok(None) });
+        return own.then(|| Ok(Bound { node: Reference::from(call.host.path()), output: None }));
     };
-    Some(Bound {
-        node: pe2_ext::target_of(reference)?.to_string(),
-        output: pe2_ext::asked_of(reference)
-            .map(|asked| asked.map(|asked| asked.to_string()))
-            .map_err(|why| format!("{why:#}")),
+    let node = match pe2_ext::target_of(reference) {
+        Ok(node) => node?,
+        Err(why) => return Some(Err(format!("{why:#}"))),
+    };
+    Some(match pe2_ext::asked_of(reference) {
+        Ok(asked) => Ok(Bound { node, output: asked.map(|asked| asked.to_string().into()) }),
+        Err(why) => Err(format!("{node}: {why:#}")),
     })
 }
 
@@ -1828,12 +1876,12 @@ fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<Bound
 /// plain value.
 #[derive(Clone, Serialize, Deserialize)]
 enum Reached {
-    Node { node: String, reads_as: Option<String>, args: BTreeMap<String, Vec<String>> },
+    Node { node: Reference, reads_as: Option<String>, args: BTreeMap<String, Vec<String>> },
     Value(Value),
 }
 
 impl Reached {
-    fn leading_on(table: &Table, node: String) -> Reached {
+    fn leading_on(table: &Table, node: Reference) -> Reached {
         let held = table.get(tokens::ARGS).and_then(Value::as_table).into_iter().flatten();
         let args = held.filter_map(|(name, value)| Some((name.clone(), vec![value.as_str()?.to_string()])));
         Reached::Node {
@@ -1845,16 +1893,16 @@ impl Reached {
 }
 
 /// The output making a node's tokens: the target's own, where it has one.
-pub fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
+pub fn tokenizer_of(call: &Call, target: &Reference) -> Result<Box<str>> {
     let active = call.config().and_then(|config| config.target);
     if let Some(active) = active {
         let own = format!("{}_{active}", tokens::OUTPUT);
         if call.table_of(target, pe2_ext::Asked::new(&format!("{}_{active}", tokens::DECLARED))?).is_ok() {
-            return Ok(own);
+            return Ok(own.into());
         }
     }
     call.table_of(target, pe2_ext::Asked::constant(tokens::DECLARED))
-        .map(|_| tokens::OUTPUT.to_string())
+        .map(|_| Box::from(tokens::OUTPUT))
         .map_err(|_| anyhow!("it has no tokenizer"))
 }
 
@@ -1888,10 +1936,11 @@ impl Gathering<'_> {
                 }
             }
             // What the assembler reads is core's, where its public files are.
-            for name in assembled(&text) {
-                let entry =
-                    self.packages.get(CORE).and_then(Package::public_folder).map(|public| format!("{public}/{name}"));
-                if let Some(entry) = entry.filter(|entry| self.packages[CORE].files.contains(entry)) {
+            let public = self.packages.get(CORE).and_then(Package::public_folder);
+            for name in public.iter().flat_map(|public| assembled(&text).into_iter().map(move |name| (public, name))) {
+                let (public, name) = name;
+                let entry = entry_in(public, name, &taken.entry.to_string())?;
+                if self.packages[CORE].files.contains(&*entry) {
                     let place = place_of(&self.packages, &self.own, CORE, &entry);
                     self.pending.push(Taken { entry, place, owner: CORE.to_string() });
                 }
@@ -1904,14 +1953,11 @@ impl Gathering<'_> {
     /// the package's own `objects`, as the target reads them, under `objects/<visibility>/`.
     fn take_target_files(&mut self, own: &str) -> Result<()> {
         if let Some(package) = self.packages.get(own) {
-            let within = format!("{}/", package.path);
             let target = target_of(self.call).unwrap_or_default();
             for visibility in VISIBILITIES {
                 for entry in listed(&package.fields, "objects", visibility, &package.path, &package.files) {
-                    let place = format!(
-                        "target/{target}/{own}/objects/{visibility}/{}",
-                        entry.strip_prefix(&within).unwrap_or(&entry)
-                    );
+                    let inside = entry.strip_prefix(&package.path).map_or(entry.as_str(), RelPath::as_str);
+                    let place = format!("target/{target}/{own}/objects/{visibility}/{inside}");
                     let bytes = self.call.read_entry(&entry)?;
                     self.tree.insert(place, bytes);
                 }
@@ -1923,12 +1969,12 @@ impl Gathering<'_> {
             let mut files = vec![];
             for (target, values) in targets {
                 for (key, value) in values.as_table().into_iter().flatten() {
-                    let entry = value
-                        .as_str()
-                        .map(|file| format!("{}/{file}", package.path))
-                        .filter(|entry| package.files.contains(entry));
-                    if let Some(entry) = entry {
-                        files.push((format!("target/{target}/{name}/{key}/{}", name_of(&entry)), entry));
+                    // What names no file of the package is a setting of the target's, which it reads itself.
+                    let Some(file) = value.as_str().and_then(|file| RelPath::new(file).ok()) else { continue };
+                    let entry = package.path.join_path(file);
+                    if package.files.contains(&*entry) {
+                        let named = entry.name().unwrap_or_default();
+                        files.push((format!("target/{target}/{name}/{key}/{named}"), entry));
                     }
                 }
             }

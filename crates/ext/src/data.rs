@@ -464,7 +464,7 @@ pub enum Retain {
 /// What an operation is lent of its node and the host while it runs.
 pub trait CallHost {
     /// Its node's path.
-    fn path(&self) -> &str;
+    fn path(&self) -> &crate::TreePath;
     /// Its node's type, qualified.
     fn node_type(&self) -> Option<&str>;
     /// A content, whole.
@@ -505,37 +505,37 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    fn entries(&self, folder: &str) -> Result<Vec<String>> {
+    fn entries(&self, folder: &crate::TreePath) -> Result<Box<[std::sync::Arc<crate::TreePath>]>> {
         bail!("{}: {folder}: no project to list here", self.path())
     }
     /// A plain file of the project by its path, as the stack resolves it; recorded as read.
     ///
     /// # Errors
     /// The project cannot be reached from here, or holds no such file.
-    fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+    fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
         bail!("{}: {path}: no project to read here", self.path())
     }
     /// The assets of a type, each by its path with its declaration as written; recorded as read.
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+    fn assets_of(&self, node_type: &str) -> Result<crate::AssetsOf> {
         bail!("{}: {node_type}: no project to look in here", self.path())
     }
     /// Where a file or folder of the project is on disk, followed through links; none where it has no such place.
-    fn place(&self, path: &str) -> Option<crate::HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
         let _ = path;
         None
     }
-    /// An output of another asset, by its path or a reference to it; recorded as read.
+    /// An output of another asset, by its path or its uid; recorded as read.
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
-    fn output_of(&self, path: &str, asked: &crate::Asked) -> Result<Value> {
-        bail!("{path}: {asked}: no project to look in here")
+    fn output_of(&self, node: &crate::Reference, asked: &crate::Asked) -> Result<Value> {
+        bail!("{node}: {asked}: no project to look in here")
     }
     /// The node a reference names.
-    fn node_named(&self, reference: &str) -> Option<NodeNamed> {
+    fn node_named(&self, reference: &crate::Reference) -> Option<NodeNamed> {
         let _ = reference;
         None
     }
@@ -562,10 +562,10 @@ pub trait CallHost {
 /// A node as a reference names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeNamed {
-    pub path: String,
-    pub uid: Option<String>,
+    pub path: std::sync::Arc<crate::TreePath>,
+    pub uid: Option<crate::Uid>,
     /// What it is, each type qualified: what its stack makes, first what it comes to.
-    pub types: Vec<String>,
+    pub types: Box<[Box<str>]>,
 }
 
 /// A file being made: appended to, then finished into its file - its content inline, or a blob the host keeps.
@@ -728,7 +728,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    pub fn entries(&self, folder: &str) -> Result<Vec<String>> {
+    pub fn entries(&self, folder: &crate::TreePath) -> Result<Box<[std::sync::Arc<crate::TreePath>]>> {
         self.host.entries(folder)
     }
 
@@ -736,7 +736,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The project cannot be reached from here, or holds no such file.
-    pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+    pub fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
         self.host.read_entry(path)
     }
 
@@ -744,22 +744,22 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    pub fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+    pub fn assets_of(&self, node_type: &str) -> Result<crate::AssetsOf> {
         self.host.assets_of(node_type)
     }
 
     /// Where a file or folder of the project is on disk, followed through links.
     #[must_use]
-    pub fn place(&self, path: &str) -> Option<crate::HostPath> {
+    pub fn place(&self, path: &crate::TreePath) -> Option<crate::HostPath> {
         self.host.place(path)
     }
 
-    /// An output of another asset, by its path or a reference to it; what reads it is made again when it changes.
+    /// An output of another asset, by its path or its uid; what reads it is made again when it changes.
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
-    pub fn output_of(&self, path: &str, asked: &crate::Asked) -> Result<Value> {
-        self.host.output_of(path, asked)
+    pub fn output_of(&self, node: &crate::Reference, asked: &crate::Asked) -> Result<Value> {
+        self.host.output_of(node, asked)
     }
 
     /// How its output is asked for: the keys it declares taking (`OpBuilder::asks`), as a reference set them.
@@ -770,7 +770,7 @@ impl Call<'_> {
 
     /// The node a reference names; none where nothing is so named.
     #[must_use]
-    pub fn node_named(&self, reference: &str) -> Option<NodeNamed> {
+    pub fn node_named(&self, reference: &crate::Reference) -> Option<NodeNamed> {
         self.host.node_named(reference)
     }
 
@@ -778,10 +778,10 @@ impl Call<'_> {
     ///
     /// # Errors
     /// As `output_of`, or it is no table.
-    pub fn table_of(&self, path: &str, asked: &crate::Asked) -> Result<Table> {
-        match self.output_of(path, asked)? {
+    pub fn table_of(&self, node: &crate::Reference, asked: &crate::Asked) -> Result<Table> {
+        match self.output_of(node, asked)? {
             Value::Table(table) => Ok(table),
-            other => bail!("{path}: {asked} is {}, no table", other.ty()),
+            other => bail!("{node}: {asked} is {}, no table", other.ty()),
         }
     }
 
@@ -791,7 +791,10 @@ impl Call<'_> {
     ///
     /// # Errors
     /// As `output_of`, for the first that fails.
-    pub fn outputs_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>) -> Result<Vec<Value>> {
+    pub fn outputs_of<'a>(
+        &self,
+        wanted: impl IntoIterator<Item = (&'a crate::Reference, &'a crate::Asked)>,
+    ) -> Result<Vec<Value>> {
         let got: Vec<Result<Value>> = wanted.into_iter().map(|(path, asked)| self.output_of(path, asked)).collect();
         got.into_iter().collect()
     }
@@ -801,23 +804,26 @@ impl Call<'_> {
     #[must_use]
     pub fn outputs_tried<'a>(
         &self,
-        wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>,
+        wanted: impl IntoIterator<Item = (&'a crate::Reference, &'a crate::Asked)>,
     ) -> Vec<Result<Value>> {
-        wanted.into_iter().map(|(path, address)| self.output_of(path, address)).collect()
+        wanted.into_iter().map(|(node, address)| self.output_of(node, address)).collect()
     }
 
     /// Tables of several assets, asked for together as `outputs_of` asks.
     ///
     /// # Errors
     /// As `outputs_of`, or one is no table.
-    pub fn tables_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a crate::Asked)>) -> Result<Vec<Table>> {
-        let wanted: Vec<(&str, &crate::Asked)> = wanted.into_iter().collect();
+    pub fn tables_of<'a>(
+        &self,
+        wanted: impl IntoIterator<Item = (&'a crate::Reference, &'a crate::Asked)>,
+    ) -> Result<Vec<Table>> {
+        let wanted: Vec<(&crate::Reference, &crate::Asked)> = wanted.into_iter().collect();
         let got = self.outputs_of(wanted.iter().copied())?;
         got.into_iter()
             .zip(wanted)
-            .map(|(value, (path, address))| match value {
+            .map(|(value, (node, address))| match value {
                 Value::Table(table) => Ok(table),
-                other => bail!("{path}: {address} is {}, no table", other.ty()),
+                other => bail!("{node}: {address} is {}, no table", other.ty()),
             })
             .collect()
     }
@@ -933,11 +939,11 @@ impl<'a> Lent<'a> {
 }
 
 impl Source for Lent<'_> {
-    fn path(&self) -> &str {
+    fn path(&self) -> &crate::TreePath {
         self.host.path()
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<crate::Uid> {
         None
     }
 
@@ -1060,15 +1066,15 @@ pub type PrepareOp = dyn Fn(&mut Call<'_>) -> Result<Prepared> + Send + Sync;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Need {
     /// The node, by its path or a reference to it.
-    pub node: String,
+    pub node: crate::Reference,
     /// What of it, and how it is asked for.
     pub address: std::sync::Arc<crate::Asked>,
 }
 
 impl Need {
     #[must_use]
-    pub fn new(node: &str, asked: &crate::Asked) -> Need {
-        Need { node: node.to_string(), address: std::sync::Arc::from(asked) }
+    pub fn new(node: &crate::Reference, asked: &crate::Asked) -> Need {
+        Need { node: node.clone(), address: std::sync::Arc::from(asked) }
     }
 }
 

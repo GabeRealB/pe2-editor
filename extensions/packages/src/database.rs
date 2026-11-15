@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use pe2_ext::{Call, Data, File, Need, Prepared, Result, Typed, Value, anyhow};
+use pe2_ext::{Call, Data, File, Need, Prepared, Reference, Result, Typed, Value, anyhow};
 use serde_json::json;
 
 use crate::gather::{Package, packages};
@@ -51,7 +51,7 @@ const REFLECTION: &pe2_ext::Asked = pe2_ext::Asked::constant("reflection");
 pub fn server_values_reads(call: &mut Call) -> Result<Prepared> {
     let compiling = sorted(call)?.into_iter().filter(|(_, package)| package.compiles());
     Ok(Prepared {
-        needs: compiling.map(|(_, package)| Need::new(&package.path, RESOLVED)).collect(),
+        needs: compiling.map(|(_, package)| Need::new(&Reference::from(package.path), RESOLVED)).collect(),
         micros: Vec::new(),
     })
 }
@@ -60,8 +60,9 @@ pub fn server_values_reads(call: &mut Call) -> Result<Prepared> {
 pub fn database_reads(call: &mut Call) -> Result<Prepared> {
     let mut needs = Vec::new();
     for (_, package) in sorted(call)? {
-        needs.push(Need::new(&package.path, FLAGS));
-        needs.push(Need::new(&package.path, REFLECTION));
+        let node = Reference::from(package.path);
+        needs.push(Need::new(&node, FLAGS));
+        needs.push(Need::new(&node, REFLECTION));
     }
     Ok(Prepared { needs, micros: Vec::new() })
 }
@@ -74,7 +75,7 @@ pub fn server_values(call: &mut Call) -> Result<Typed> {
             continue;
         }
         // A package that cannot be read fails this too: leaving it out would be kept, and read again by nothing once it is mended.
-        let Data::Typed(tree) = call.output_of(&package.path, RESOLVED)? else { continue };
+        let Data::Typed(tree) = call.output_of(&Reference::from(package.path), RESOLVED)? else { continue };
         let _ = writeln!(text, "#ifdef PE2_PACKAGE_{}", define_of(&name));
         for file in tree
             .files
@@ -91,7 +92,8 @@ pub fn server_values(call: &mut Call) -> Result<Typed> {
 pub fn database(call: &mut Call) -> Result<Typed> {
     let folder = folder(call)?;
     let packages = sorted(call)?;
-    let flags = packages.iter().find_map(|(_, package)| call.table_of(&package.path, FLAGS).ok());
+    let flags =
+        packages.iter().find_map(|(_, package)| call.table_of(&Reference::from(package.path.clone()), FLAGS).ok());
     let Some(flags) = flags else {
         return Err(anyhow!("no target says what a language server needs: is one enabled?"));
     };
@@ -104,10 +106,11 @@ pub fn database(call: &mut Call) -> Result<Typed> {
     args.extend([format!("-I{folder}/virtual"), "-ivfsoverlay".to_string(), format!("{folder}/overlay.yaml")]);
     let mut commands = vec![];
     for (name, package) in &packages {
-        let Ok(reflected) = call.table_of(&package.path, REFLECTION) else { continue };
+        let Ok(reflected) = call.table_of(&Reference::from(package.path.clone()), REFLECTION) else { continue };
         // What it includes in quotes is in its own folders; in angle brackets, in the virtual folder, every package under its name.
-        let own = package.header_folders().into_iter().map(|folder| format!("{}/{folder}", package.path));
-        let path: Vec<String> = own
+        let path: Vec<String> = package
+            .header_folders()
+            .into_iter()
             .filter_map(|folder| call.place(&folder))
             .flat_map(|place| ["-iquote".to_string(), place.native()])
             .collect();
@@ -116,7 +119,8 @@ pub fn database(call: &mut Call) -> Result<Typed> {
         for source in sources.iter().filter_map(Value::as_str).filter(|source| {
             std::path::Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("c"))
         }) {
-            let Some(place) = call.place(&format!("{}/{source}", package.path)).map(|place| place.native()) else {
+            let source = package.path.join_path(pe2_ext::RelPath::new(source)?);
+            let Some(place) = call.place(&source).map(|place| place.native()) else {
                 continue;
             };
             let mut arguments = args.clone();

@@ -229,22 +229,24 @@ fn attach_model(
     path: &str,
 ) -> Result<ContentOutcome> {
     let target = &assembled.nodes[node_at(assembled, onto)?];
-    let dropped = project.asset(path).ok_or_else(|| anyhow!("{path} is not in the project"))?;
-    let uid = dropped.uid().ok_or_else(|| anyhow!("{path} has no uid"))?;
-    let name = path.rsplit('/').next().unwrap_or(path);
+    // What the window dropped names its asset as text: checked here.
+    let tree = pe2_ext::TreePath::new(path)?;
+    let dropped = project.asset(tree).ok_or_else(|| anyhow!("{path} is not in the project"))?;
+    let uid = dropped.uid().ok_or_else(|| anyhow!("{path} has no uid"))?.to_string();
+    let name = tree.name().unwrap_or_default();
     if let (Some(Place::Fill(within)), None) = (&target.place, &target.attached) {
         let mut at = within.clone();
         at.push("model".to_string());
         return Ok(ContentOutcome {
             label: format!("Fill {} with {name}", target.name),
-            sets: vec![(at, Some(reference(uid)))],
+            sets: vec![(at, Some(reference(&uid)))],
             writes: None,
             select: None,
         });
     }
     let mut part = pe2_ext::Table::new();
     part.insert("node".to_string(), target.name.as_str().into());
-    part.insert("model".to_string(), reference(uid));
+    part.insert("model".to_string(), reference(&uid));
     let at = vec!["parts".to_string(), new_part(asset, name)];
     Ok(ContentOutcome {
         label: format!("Attach {name} to {}", target.name),

@@ -61,7 +61,9 @@ impl View for Strings {
         let found: Vec<(&String, &str)> = strings
             .iter()
             .filter_map(|(k, v)| Some((k, v.as_str()?)))
-            .filter(|(k, v)| needle.is_empty() || k.to_lowercase().contains(&needle) || v.to_lowercase().contains(&needle))
+            .filter(|(k, v)| {
+                needle.is_empty() || k.to_lowercase().contains(&needle) || v.to_lowercase().contains(&needle)
+            })
             .collect();
         let mut rows = Vec::new();
         for (key, text) in found.iter().take(SHOWN) {

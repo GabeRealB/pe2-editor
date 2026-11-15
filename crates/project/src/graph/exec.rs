@@ -18,8 +18,8 @@ use super::{Content, File, Ops, Plan, Retain, Typed, Value};
 
 /// A node as its operations read it: an asset - its declaration and its bundle's stored files.
 pub trait Node: Sync {
-    fn path(&self) -> &str;
-    fn uid(&self) -> Option<&str>;
+    fn path(&self) -> &crate::TreePath;
+    fn uid(&self) -> Option<pe2_path::Uid>;
     /// Its declaration, as written.
     fn declaration(&self) -> &str;
     /// Its declaration's fields.
@@ -71,12 +71,12 @@ pub trait Node: Sync {
 /// An asset of the index is a node: its stored files those of its bundle, not what imports made; its declaration and
 /// files as its working copy has them, where it has unsaved changes.
 impl Node for crate::index::Asset {
-    fn path(&self) -> &str {
-        self.path.as_str()
+    fn path(&self) -> &crate::TreePath {
+        &self.path
     }
 
-    fn uid(&self) -> Option<&str> {
-        self.named.as_deref()
+    fn uid(&self) -> Option<pe2_path::Uid> {
+        self.uid
     }
 
     fn declaration(&self) -> &str {
@@ -224,32 +224,28 @@ pub trait World: Sync {
     /// The node a reference names, as what reads it is told.
     fn named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
         let (node, _) = self.node(reference)?;
-        Some(pe2_ext::NodeNamed {
-            path: node.path().to_string(),
-            uid: node.uid().map(str::to_string),
-            types: Vec::new(),
-        })
+        Some(pe2_ext::NodeNamed { path: node.path().to_owned(), uid: node.uid(), types: Box::default() })
     }
     /// The plain files under a folder of the project, by their paths, in order.
-    fn entries(&self, folder: &str) -> Vec<String> {
+    fn entries(&self, folder: &crate::TreePath) -> Box<[Arc<crate::TreePath>]> {
         let _ = folder;
-        vec![]
+        Box::default()
     }
     /// Where a plain file of the project is on disk.
-    fn entry(&self, path: &str) -> Option<HostPath> {
+    fn entry(&self, path: &crate::TreePath) -> Option<HostPath> {
         let _ = path;
         None
     }
 
     /// Where a file or folder is on disk, followed through links.
-    fn place(&self, path: &str) -> Option<HostPath> {
+    fn place(&self, path: &crate::TreePath) -> Option<HostPath> {
         let _ = path;
         None
     }
     /// The assets of a type, each by its path with its declaration as written.
-    fn assets_of(&self, node_type: &str) -> Vec<(String, String)> {
+    fn assets_of(&self, node_type: &str) -> pe2_ext::AssetsOf {
         let _ = node_type;
-        vec![]
+        Box::default()
     }
 }
 
@@ -257,14 +253,15 @@ pub trait World: Sync {
 const TYPE_READ: &str = "type:";
 
 /// The hash a type's assets have together, what tells one changed, come or gone.
-fn type_hash(assets: &[(String, String)]) -> String {
+fn type_hash(assets: &[(Arc<crate::TreePath>, Box<str>)]) -> String {
     let joined: Vec<String> = assets.iter().map(|(path, text)| format!("{path}\n{text}")).collect();
     list_hash(&joined)
 }
 
 /// The hash a folder's list has, what tells a file added or gone.
-fn list_hash(files: &[String]) -> String {
-    crate::extract::sha1_hex(files.join("\n").as_bytes())
+fn list_hash(files: &[impl AsRef<str>]) -> String {
+    let joined: Vec<&str> = files.iter().map(AsRef::as_ref).collect();
+    crate::extract::sha1_hex(joined.join("\n").as_bytes())
 }
 
 /// What evaluation reaches beyond its node: the engine making other nodes' outputs, in a world of them.
@@ -316,9 +313,14 @@ impl<'a> Reach<'a> {
             self.engine.find(read.to_string(), made, &hash);
             return Some(hash);
         }
+        // A trace keeps what it read as text: one that is no path any more names nothing, so the trace does not hold.
         match read.strip_suffix('/') {
-            Some(folder) => Some(list_hash(&self.world.entries(folder))),
-            None => crate::content::sha1_known(&self.world.entry(read)?).ok(),
+            Some(folder) => {
+                let files = self.world.entries(crate::TreePath::new(folder).ok()?);
+                let listed: Vec<&str> = files.iter().map(|file| file.as_str()).collect();
+                Some(list_hash(&listed))
+            }
+            None => crate::content::sha1_known(&self.world.entry(crate::TreePath::new(read).ok()?)?).ok(),
         }
     }
 
@@ -649,15 +651,16 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// Nothing beyond its node is reachable here.
-    pub fn entries(&self, folder: &str) -> Result<Vec<String>> {
+    pub fn entries(&self, folder: &crate::TreePath) -> Result<Box<[Arc<crate::TreePath>]>> {
         let files = self.reach.context("the project is not reachable here")?.world.entries(folder);
-        let read = format!("{}/", folder.trim_end_matches('/'));
+        let read = format!("{folder}/");
+        let listed: Vec<&str> = files.iter().map(|file| file.as_str()).collect();
         self.recorder
             .reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
-            .insert(read, list_hash(&files));
+            .insert(read, list_hash(&listed));
         Ok(files)
     }
 
@@ -665,7 +668,7 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// Nothing beyond its node is reachable here, the project holds no such file, or it cannot be read.
-    pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+    pub fn read_entry(&self, path: &crate::TreePath) -> Result<Vec<u8>> {
         let disk = self
             .reach
             .context("the project is not reachable here")?
@@ -687,7 +690,7 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// Nothing beyond its node is reachable here.
-    pub fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+    pub fn assets_of(&self, node_type: &str) -> Result<pe2_ext::AssetsOf> {
         let assets = self.reach.context("the project is not reachable here")?.world.assets_of(node_type);
         let read = format!("{TYPE_READ}{node_type}");
         self.recorder
@@ -707,7 +710,7 @@ impl<'a> Call<'a> {
 
     /// Where a file or folder of the project is on disk.
     #[must_use]
-    pub fn place(&self, path: &str) -> Option<HostPath> {
+    pub fn place(&self, path: &crate::TreePath) -> Option<HostPath> {
         self.reach?.world.place(path)
     }
 
@@ -1389,7 +1392,7 @@ impl Evaluation<'_> {
                 let trace = Trace {
                     value: hash,
                     reads: reads.clone(),
-                    node: id(self.node).to_string(),
+                    node: id(self.node),
                     output: format!("item/{n}"),
                     made: FOR_EACH_MADE.to_string(),
                 };
@@ -1563,7 +1566,7 @@ impl Evaluation<'_> {
         let Some(reach) = self.reach else { return };
         let mut keyed: Vec<(String, toml::Value, Arc<pe2_path::Asked>)> = Vec::new();
         for need in wanted {
-            let reference = toml::Value::String(need.node.clone());
+            let reference = toml::Value::String(need.node.to_string());
             // What names no node is refused where it is read: `output_of` finds no key for it.
             let Ok(key) = reach.key(&reference, &need.address) else { continue };
             if !keyed.iter().any(|(known, ..)| *known == key) {
@@ -1785,7 +1788,7 @@ impl Evaluation<'_> {
                 let trace = Trace {
                     value: hash,
                     reads: reads.clone(),
-                    node: id(self.node).to_string(),
+                    node: id(self.node),
                     output: format!("micro/{}", micro.label),
                     made: made.clone(),
                 };
@@ -2073,7 +2076,7 @@ impl Engine {
             let trace = Trace {
                 value: hash.clone(),
                 reads: reads.clone(),
-                node: id(node).to_string(),
+                node: id(node),
                 output: address.to_string(),
                 made: plan.made(output, &self.ops),
             };
@@ -2226,11 +2229,11 @@ pub struct Nowhere {
 }
 
 impl Node for Nowhere {
-    fn path(&self) -> &'static str {
-        ""
+    fn path(&self) -> &'static crate::TreePath {
+        crate::TreePath::constant("")
     }
 
-    fn uid(&self) -> Option<&str> {
+    fn uid(&self) -> Option<pe2_path::Uid> {
         None
     }
 
@@ -2253,6 +2256,6 @@ impl Node for Nowhere {
 
 /// A node as traces name it: by uid, else by path.
 #[must_use]
-pub fn id(node: &dyn Node) -> &str {
-    node.uid().unwrap_or_else(|| node.path())
+pub fn id(node: &dyn Node) -> String {
+    node.uid().map_or_else(|| node.path().to_string(), |uid| uid.to_string())
 }

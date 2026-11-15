@@ -19,8 +19,10 @@ pub(crate) const PALETTE_ARGUMENTS: &str = r#"{
 pub(crate) fn palette(project: &dyn Project, arguments: &Value) -> Result<Value> {
     let name = arguments.get("asset").and_then(Value::as_str).ok_or_else(|| anyhow!("no asset given"))?;
     let wanted = arguments.get("palette").and_then(Value::as_str).ok_or_else(|| anyhow!("no palette given"))?;
-    let asset = project
-        .asset(name)
+    // Named by its path, or by a reference to it.
+    let asset = pe2_ext::TreePath::new(name)
+        .ok()
+        .and_then(|path| project.asset(path))
         .or_else(|| project.resolve(&Value::String(name.to_string())))
         .ok_or_else(|| anyhow!("no asset is named {name}"))?;
     let names = palette_names(&asset);

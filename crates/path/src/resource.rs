@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{PathError, Why};
+use crate::vfs::{Tree, VfsPath};
 
 /// An asset's uid: 63 bits, written `uid://` and their digits in base 36 (0-9a-z), most significant first - Godot's
 /// scheme, with the full alphabet. It is drawn once, when an asset is first declared, and kept from then on.
@@ -525,9 +526,90 @@ impl std::str::FromStr for ResourcePath {
 crate::serde_as_text!(Uid);
 crate::serde_as_text!(ResourcePath);
 
+/// A node, as what reads it names it: by its uid, or by its path in the project's tree. Written as either
+/// (`uid://abc`, `packages/aya/mist`); what of the node is read is said beside it, never in it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Reference {
+    Uid(Uid),
+    Path(Arc<VfsPath<Tree>>),
+}
+
+impl Reference {
+    /// `text` as a reference: a uid where it starts as one does, else a path in the tree.
+    ///
+    /// # Errors
+    /// It is no uid alone, or no path.
+    pub fn new(text: &str) -> Result<Reference, PathError> {
+        if text.starts_with(UID_PREFIX) {
+            return Uid::new(text).map(Reference::Uid);
+        }
+        VfsPath::<Tree>::new(text).map(|path| Reference::Path(Arc::from(path)))
+    }
+
+    /// The uid it names the node by, where it names it by one.
+    #[must_use]
+    pub fn uid(&self) -> Option<Uid> {
+        match self {
+            Reference::Uid(uid) => Some(*uid),
+            Reference::Path(_) => None,
+        }
+    }
+
+    /// The path it names the node by, where it names it by one.
+    #[must_use]
+    pub fn path(&self) -> Option<&VfsPath<Tree>> {
+        match self {
+            Reference::Uid(_) => None,
+            Reference::Path(path) => Some(path),
+        }
+    }
+}
+
+impl fmt::Display for Reference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reference::Uid(uid) => write!(f, "{uid}"),
+            Reference::Path(path) => f.write_str(path.as_str()),
+        }
+    }
+}
+
+impl std::str::FromStr for Reference {
+    type Err = PathError;
+    fn from_str(text: &str) -> Result<Reference, PathError> {
+        Reference::new(text)
+    }
+}
+
+impl AsRef<Reference> for Reference {
+    fn as_ref(&self) -> &Reference {
+        self
+    }
+}
+
+impl From<Uid> for Reference {
+    fn from(uid: Uid) -> Reference {
+        Reference::Uid(uid)
+    }
+}
+
+impl From<&VfsPath<Tree>> for Reference {
+    fn from(path: &VfsPath<Tree>) -> Reference {
+        Reference::Path(Arc::from(path))
+    }
+}
+
+impl From<Arc<VfsPath<Tree>>> for Reference {
+    fn from(path: Arc<VfsPath<Tree>>) -> Reference {
+        Reference::Path(path)
+    }
+}
+
+crate::serde_as_text!(Reference);
+
 #[cfg(test)]
 mod tests {
-    use super::{Address, Asked, Query, ResourcePath, Uid};
+    use super::{Address, Asked, Query, Reference, ResourcePath, Uid};
     use crate::Why;
 
     #[test]
@@ -591,5 +673,21 @@ mod tests {
         assert_eq!((of_asset.asked, of_asset.fragment.as_deref().map(Address::as_str)), (None, Some("joints/3")));
         let read: ResourcePath = serde_json::from_str("\"uid://abc/objects?palette=default\"").unwrap();
         assert_eq!(serde_json::to_string(&read).unwrap(), "\"uid://abc/objects?palette=default\"");
+    }
+
+    #[test]
+    fn a_reference_names_a_node_by_its_uid_or_its_path() {
+        let by_uid = Reference::new("uid://abc").unwrap();
+        assert_eq!((by_uid.uid(), by_uid.path()), (Some(Uid::new("uid://abc").unwrap()), None));
+        let by_path = Reference::new("packages/aya/mist").unwrap();
+        assert_eq!(by_path.path().map(crate::VfsPath::as_str), Some("packages/aya/mist"));
+        assert_eq!(
+            (by_uid.to_string(), by_path.to_string()),
+            ("uid://abc".to_string(), "packages/aya/mist".to_string())
+        );
+        assert_eq!(Reference::new("uid://abc/objects").unwrap_err().why, Why::NoUid);
+        assert!(Reference::new("a/../b").is_err());
+        let read: Reference = serde_json::from_str("\"uid://abc\"").unwrap();
+        assert_eq!(read, by_uid);
     }
 }
