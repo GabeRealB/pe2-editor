@@ -740,7 +740,7 @@ fn add_lists(ops: &mut Ops) {
     ops.add(OpDef::new(CONCATENATE, "Concatenate", "1").input(port("files", Type::List(Box::new(Type::Any)))).makes(
         Type::Bytes,
         |call| {
-            let name = call.setting_str("name")?;
+            let name = pe2_path::RelPath::new(call.setting_str("name")?)?;
             let Value::List(items) = call.take(0)?.take() else { anyhow::bail!("given no list") };
             let mut writer = call.writer(name);
             for (i, item) in items.iter().enumerate() {
@@ -761,7 +761,7 @@ impl Default for Ops {
         let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()), definitions: Arc::default() };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             // A file the releases have apart is read as the release being built has it (`<release>/<file>`).
-            let name = call.of_release(call.setting_str("file")?);
+            let name = call.of_release(pe2_path::RelPath::new(call.setting_str("file")?)?);
             // A file the node may lack (`optional`): none, without it.
             if call.settings().get("optional").and_then(Toml::as_bool) == Some(true) {
                 return call.stored_if_any(&name).map(Value::Typed);

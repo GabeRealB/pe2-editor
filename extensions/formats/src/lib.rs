@@ -27,7 +27,7 @@ fn register(r: &mut Registry) -> Result<()> {
             let picture = call.take::<ty::Image>(0)?;
             let bytes = codecs::texture::rgba_png(picture.width, picture.height, &picture.rgba)
                 .map_err(|e| anyhow!("the picture could not be written: {e}"))?;
-            Ok(Typed::new(Png::NAME, vec![pe2_ext::File::new("picture.png", bytes)]))
+            Ok(Typed::new(Png::NAME, vec![pe2_ext::File::new(pe2_ext::RelPath::constant("picture.png"), bytes)]))
         });
     Ok(())
 }

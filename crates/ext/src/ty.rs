@@ -66,7 +66,7 @@ pub struct Tokens;
 
 impl Tokens {
     /// The one file it is.
-    pub const FILE: &'static str = "tokens";
+    pub const FILE: &'static crate::RelPath = crate::RelPath::constant("tokens");
 }
 
 impl Registered for Tokens {

@@ -7,9 +7,10 @@
 //! a face where its table is (`from.<release>.at`, the executable's disc slot, with the table's `address` and its
 //! `sha1`), the table's `count` records from `first`.
 
-use pe2_ext::{Declared, Discs, Made, Result, Table, Value, anyhow, bail};
+use pe2_ext::{Declared, Discs, Made, RelPath, Result, Table, TreePath, Value, anyhow, bail};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::atlas::{self, FaceSpec, Glyph, Layout};
 use crate::encoding::Encoding;
@@ -21,25 +22,27 @@ const EXE_LOAD: usize = 0x18;
 
 /// A face as an atlas holds it, by its declaration's path.
 struct Held {
-    path: String,
+    path: Arc<TreePath>,
     entry: Table,
 }
+
+/// Declarations of a type, each by its path.
+type Declarations = Box<[(Arc<TreePath>, Table)]>;
 
 /// An atlas as read in a release: its faces' UFOs' files, its layout, and what lies under its glyphs, as its PNG.
 type Read = (Vec<BTreeMap<String, Vec<u8>>>, Layout, Option<Vec<u8>>);
 
 struct Fonts {
-    atlases: BTreeMap<String, (Table, Vec<Held>)>,
-    faces: BTreeMap<String, Table>,
-    encodings: BTreeMap<String, Table>,
+    atlases: BTreeMap<Arc<TreePath>, (Table, Vec<Held>)>,
+    faces: BTreeMap<Arc<TreePath>, Table>,
+    encodings: BTreeMap<Arc<TreePath>, Table>,
     /// What an atlas was read into, per release: its faces' UFOs' files and its layout.
-    read: BTreeMap<(String, String), Read>,
+    read: BTreeMap<(Arc<TreePath>, String), Read>,
 }
 
-/// The declaration a reference names, by its path: `{ uid, path = "res://<group>/<name>.node" }`.
-fn declared_path(reference: &Value) -> Option<&str> {
-    let path = reference.get("path")?.as_str()?;
-    Some(path.trim_start_matches("res://").trim_end_matches(".node"))
+/// The declaration a field names, by its path (`pe2_ext::declared_path`).
+fn named_by(field: Option<&Value>) -> Result<Option<Arc<TreePath>>> {
+    field.map(pe2_ext::declared_path).transpose().map(Option::flatten)
 }
 
 fn begin(declared: &dyn Declared) -> Result<Fonts> {
@@ -48,9 +51,8 @@ fn begin(declared: &dyn Declared) -> Result<Fonts> {
         let mut held = Vec::new();
         for entry in table.get("faces").and_then(Value::as_array).into_iter().flatten() {
             let entry = entry.as_table().ok_or_else(|| anyhow!("{path}: a face is not a table"))?;
-            let face =
-                entry.get("font").and_then(declared_path).ok_or_else(|| anyhow!("{path}: a face names no font"))?;
-            held.push(Held { path: face.to_string(), entry: entry.clone() });
+            let face = named_by(entry.get("font"))?.ok_or_else(|| anyhow!("{path}: a face names no font"))?;
+            held.push(Held { path: face, entry: entry.clone() });
         }
         atlases.insert(path, (table, held));
     }
@@ -97,12 +99,11 @@ impl Fonts {
     fn face(&self, held: &Held, release: &str, discs: &mut dyn Discs) -> Result<(FaceSpec, Vec<u8>, Table)> {
         let path = &held.path;
         let table = self.faces.get(path).ok_or_else(|| anyhow!("{path}: no such font"))?;
-        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let name = path.name().unwrap_or_default().to_string();
         let integer =
             |t: &Table, key: &str| t.get(key).and_then(Value::as_integer).ok_or_else(|| anyhow!("{path}: no {key}"));
-        let encoding =
-            table.get("encoding").and_then(declared_path).ok_or_else(|| anyhow!("{path}: it names no encoding"))?;
-        let encoding_table = self.encodings.get(encoding).ok_or_else(|| anyhow!("{path}: no encoding {encoding}"))?;
+        let encoding = named_by(table.get("encoding"))?.ok_or_else(|| anyhow!("{path}: it names no encoding"))?;
+        let encoding_table = self.encodings.get(&encoding).ok_or_else(|| anyhow!("{path}: no encoding {encoding}"))?;
         let mut encoding = Encoding::of(encoding_table).map_err(|e| anyhow!("{path}: {e}"))?;
         crate::apply_characters(&mut encoding, table).map_err(|e| anyhow!("{path}: {e}"))?;
         let (missing, nothing) = crate::binding(table).map_err(|e| anyhow!("{path}: {e}"))?;
@@ -172,8 +173,8 @@ impl Fonts {
     }
 
     /// An atlas read into its faces' UFOs and its layout, held to make its page and tables again.
-    fn read_atlas(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<()> {
-        let key = (path.to_string(), release.to_string());
+    fn read_atlas(&mut self, path: &TreePath, release: &str, discs: &mut dyn Discs) -> Result<()> {
+        let key = (path.to_owned(), release.to_string());
         if self.read.contains_key(&key) {
             return Ok(());
         }
@@ -278,28 +279,32 @@ impl Fonts {
     }
 
     /// The atlas holding a face, and the face's place in it.
-    fn atlas_of(&self, face: &str) -> Option<(String, usize)> {
+    fn atlas_of(&self, face: &TreePath) -> Option<(Arc<TreePath>, usize)> {
         self.atlases
             .iter()
-            .find_map(|(path, (_, held))| Some((path.clone(), held.iter().position(|h| h.path == face)?)))
+            .find_map(|(path, (_, held))| Some((path.clone(), held.iter().position(|h| *h.path == *face)?)))
     }
 }
 
 impl Fonts {
     /// An atlas's files, or a face's, in one release: the atlas read once for all of them.
-    fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
+    fn extract(&mut self, path: &TreePath, release: &str, discs: &mut dyn Discs) -> Result<Made> {
         if self.atlases.contains_key(path) {
             self.read_atlas(path, release, discs)?;
-            let (_, layout, under) = &self.read[&(path.to_string(), release.to_string())];
-            let mut made = vec![("layout.toml".to_string(), crate::layout_text(layout).into_bytes())];
-            made.extend(under.iter().map(|png| ("under.png".to_string(), png.clone())));
-            return Ok(made);
+            let (_, layout, under) = &self.read[&(path.to_owned(), release.to_string())];
+            let mut made = vec![(RelPath::constant("layout.toml").to_owned(), crate::layout_text(layout).into_bytes())];
+            made.extend(under.iter().map(|png| (RelPath::constant("under.png").to_owned(), png.clone())));
+            return Ok(made.into());
         }
         let (atlas, at) = self.atlas_of(path).ok_or_else(|| anyhow!("{path}: no atlas holds it"))?;
         self.read_atlas(&atlas, release, discs)?;
         let (ufos, _, _) = &self.read[&(atlas, release.to_string())];
-        let name = path.rsplit('/').next().unwrap_or(path);
-        Ok(ufos[at].iter().map(|(file, bytes)| (format!("{name}.ufo/{file}"), bytes.clone())).collect())
+        let name = path.name().unwrap_or_default();
+        // A UFO's files, named as the codec names them: each a path within the face's folder.
+        ufos[at]
+            .iter()
+            .map(|(file, bytes)| Ok((RelPath::new(&format!("{name}.ufo/{file}"))?.to_owned(), bytes.clone())))
+            .collect()
     }
 }
 
@@ -313,32 +318,38 @@ impl Fonts {
 /// the page and the tables again.
 pub fn extract_atlas(chunks: Vec<Vec<u8>>, args: &Table) -> Result<Made> {
     let text = |key: &str| args.get(key).and_then(Value::as_str).ok_or_else(|| anyhow!("no {key}"));
-    let (path, release) = (text("atlas")?, text("release")?);
-    let tables = |key: &str| -> Vec<(String, Table)> {
+    let (path, release) = (TreePath::new(text("atlas")?)?, text("release")?);
+    // The declarations given, each by its path; a value of one that is no table is no declaration.
+    let tables = |key: &str| -> Result<Declarations> {
         let given = args.get(key).and_then(Value::as_table).cloned().unwrap_or_default();
-        given.into_iter().filter_map(|(path, table)| Some((path, table.as_table()?.clone()))).collect()
+        let mut found = Vec::new();
+        for (path, table) in given {
+            let table = table.as_table().ok_or_else(|| anyhow!("{key}: {path} is declared by no table"))?.clone();
+            found.push((Arc::from(TreePath::new(&path)?), table));
+        }
+        Ok(found.into())
     };
     let lent = Lent {
-        types: [("font_atlas", tables("atlases")), ("font", tables("faces")), ("encoding", tables("encodings"))],
+        types: [("font_atlas", tables("atlases")?), ("font", tables("faces")?), ("encoding", tables("encodings")?)],
     };
     let mut fonts = begin(&lent)?;
     let reads = args.get("reads").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut given = pe2_ext::Given::new(&reads, chunks)?;
-    let mut made = fonts.extract(path, release, &mut given)?;
-    for (face, _) in tables("faces") {
+    let mut made = fonts.extract(path, release, &mut given)?.into_vec();
+    for (face, _) in tables("faces")? {
         let files = fonts.extract(&face, release, &mut given)?;
-        made.extend(files.into_iter().map(|(name, bytes)| (format!("{face}/{name}"), bytes)));
+        made.extend(files.into_iter().map(|(name, bytes)| (face.rel().join_path(&name), bytes)));
     }
-    Ok(made)
+    Ok(made.into())
 }
 
 /// The declarations an atlas was given, as a session begins with them.
 struct Lent {
-    types: [(&'static str, Vec<(String, Table)>); 3],
+    types: [(&'static str, Declarations); 3],
 }
 
 impl Declared for Lent {
-    fn declarations(&self, node_type: &str) -> Vec<(String, Table)> {
-        self.types.iter().find(|(ty, _)| *ty == node_type).map_or_else(Vec::new, |(_, tables)| tables.clone())
+    fn declarations(&self, node_type: &str) -> Declarations {
+        self.types.iter().find(|(ty, _)| *ty == node_type).map_or_else(Box::default, |(_, tables)| tables.clone())
     }
 }

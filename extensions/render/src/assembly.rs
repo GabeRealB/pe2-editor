@@ -156,12 +156,12 @@ impl Source for Held<'_, '_> {
         ""
     }
 
-    fn has_file(&self, name: &str) -> bool {
+    fn has_file(&self, name: &pe2_ext::RelPath) -> bool {
         self.read(name).is_ok()
     }
 
     /// The stored file a node makes as itself.
-    fn read(&self, _: &str) -> Result<Vec<u8>> {
+    fn read(&self, _: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let Data::Typed(stored) = self.call.output_of(&pe2_ext::Reference::from(self.path.clone()), pe2_ext::NATIVE)?
         else {
             bail!("{}: it makes no file", self.path)
@@ -576,7 +576,7 @@ pub fn scene(call: &mut Call) -> Result<Typed> {
 }
 
 /// The file a scene is held in.
-const FILE: &str = "scene.json";
+const FILE: &pe2_ext::RelPath = pe2_ext::RelPath::constant("scene.json");
 
 fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     // A type comes qualified by what registered it.

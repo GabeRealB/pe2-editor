@@ -26,7 +26,7 @@ use crate::skeleton::Joint;
 use crate::usda::{self, Prim, Value};
 
 /// The name a clip's file has in its bundle.
-pub const FILE: &str = "clip.usda";
+pub const FILE: &pe2_ext::RelPath = pe2_ext::RelPath::constant("clip.usda");
 pub const FPS: u32 = 30;
 
 type Rows = [[f64; 3]; 3];

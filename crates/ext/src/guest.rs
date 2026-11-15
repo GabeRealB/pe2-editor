@@ -208,6 +208,11 @@ fn told_path(text: &str) -> std::sync::Arc<crate::TreePath> {
     std::sync::Arc::from(crate::TreePath::new(text).unwrap_or_else(|why| broken(&why)))
 }
 
+/// A file's name as the host gives it: a path within its value.
+fn told_name(text: &str) -> std::sync::Arc<crate::RelPath> {
+    std::sync::Arc::from(crate::RelPath::new(text).unwrap_or_else(|why| broken(&why)))
+}
+
 /// The assets of a type as the host gives them: each by its path in the tree, with its declaration.
 fn told_assets(told: Vec<(String, String)>) -> crate::AssetsOf {
     told.into_iter().map(|(path, declaration)| (told_path(&path), declaration.into_boxed_str())).collect()
@@ -230,25 +235,25 @@ impl Source for Lent<'_> {
         &self.declaration
     }
 
-    fn has_file(&self, name: &str) -> bool {
-        self.resource().has_file(name)
+    fn has_file(&self, name: &crate::RelPath) -> bool {
+        self.resource().has_file(name.as_str())
     }
 
-    fn read(&self, name: &str) -> crate::Result<Vec<u8>> {
-        self.resource().read(name).map_err(crate::Error::msg)
+    fn read(&self, name: &crate::RelPath) -> crate::Result<Vec<u8>> {
+        self.resource().read(name.as_str()).map_err(crate::Error::msg)
     }
 
-    fn size(&self, name: &str) -> Option<u64> {
-        self.resource().size(name)
+    fn size(&self, name: &crate::RelPath) -> Option<u64> {
+        self.resource().size(name.as_str())
     }
 
-    fn read_range(&self, name: &str, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
         let len = u32::try_from(len).unwrap_or(u32::MAX);
-        self.resource().read_range(name, offset, len).map_err(crate::Error::msg)
+        self.resource().read_range(name.as_str(), offset, len).map_err(crate::Error::msg)
     }
 
-    fn writer(&self, name: &str) -> Option<crate::Result<Box<dyn crate::FileWriter>>> {
-        let writer = self.resource().writer(name).map_err(crate::Error::msg);
+    fn writer(&self, name: &crate::RelPath) -> Option<crate::Result<Box<dyn crate::FileWriter>>> {
+        let writer = self.resource().writer(name.as_str()).map_err(crate::Error::msg);
         Some(writer.map(|w| Box::new(HostWriter(Some(w))) as Box<dyn crate::FileWriter>))
     }
 
@@ -297,15 +302,15 @@ impl Source for Lent<'_> {
         })
     }
 
-    fn keep(&self, path: &crate::HostPath, name: &str) -> Option<crate::Result<crate::File>> {
+    fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> Option<crate::Result<crate::File>> {
         let Some(path) = handle(path) else {
             return Some(Err(crate::anyhow!("{path}: no place the host gave")));
         };
-        Some(self.resource().keep(path, name).map(file_from_wit).map_err(crate::Error::msg))
+        Some(self.resource().keep(path, name.as_str()).map(file_from_wit).map_err(crate::Error::msg))
     }
 
-    fn path_of(&self, name: &str) -> Option<crate::HostPath> {
-        self.resource().path_of(name).map(given)
+    fn path_of(&self, name: &crate::RelPath) -> Option<crate::HostPath> {
+        self.resource().path_of(name.as_str()).map(given)
     }
 
     fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<crate::Result<crate::HostPath>> {
@@ -1288,7 +1293,8 @@ impl CallHost for NodeHost<'_> {
     fn read(&self, content: &Content) -> crate::Result<Vec<u8>> {
         match content {
             Content::Inline(bytes) => Ok(bytes.clone()),
-            Content::Stored { sha1, .. } => Source::read(self.0, sha1),
+            // A stored content is read by its hash, which the contract sends where it sends a file's name.
+            Content::Stored { sha1, .. } => self.0.resource().read(sha1).map_err(crate::Error::msg),
         }
     }
 
@@ -1298,11 +1304,14 @@ impl CallHost for NodeHost<'_> {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
                 Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
             }
-            Content::Stored { sha1, .. } => Source::read_range(self.0, sha1, offset, len),
+            Content::Stored { sha1, .. } => {
+                let len = u32::try_from(len).unwrap_or(u32::MAX);
+                self.0.resource().read_range(sha1, offset, len).map_err(crate::Error::msg)
+            }
         }
     }
 
-    fn writer(&self, name: &str) -> crate::Result<Box<dyn crate::FileWriter>> {
+    fn writer(&self, name: &crate::RelPath) -> crate::Result<Box<dyn crate::FileWriter>> {
         Source::writer(self.0, name).ok_or_else(|| crate::anyhow!("the host makes no files for this call"))?
     }
 
@@ -1338,14 +1347,14 @@ impl CallHost for NodeHost<'_> {
         Source::temp(self.0).ok_or_else(|| crate::anyhow!("the host has no temporary files for this call"))?
     }
 
-    fn keep(&self, path: &crate::HostPath, name: &str) -> crate::Result<crate::File> {
+    fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> crate::Result<crate::File> {
         Source::keep(self.0, path, name).ok_or_else(|| crate::anyhow!("the host keeps nothing for this call"))?
     }
 
     fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
         match content {
             Content::Inline(_) => None,
-            Content::Stored { sha1, .. } => Source::path_of(self.0, sha1),
+            Content::Stored { sha1, .. } => self.0.resource().path_of(sha1).map(given),
         }
     }
 
@@ -1449,7 +1458,7 @@ fn file_to_wit(f: crate::File) -> types::File {
         Content::Inline(bytes) => types::Content::Inline(bytes),
         Content::Stored { sha1, size } => types::Content::Stored((sha1, size)),
     };
-    types::File { name: f.name, content }
+    types::File { name: f.name.to_string(), content }
 }
 
 fn typed_to_wit(t: crate::Typed) -> types::Typed {
@@ -1526,7 +1535,7 @@ fn file_from_wit(f: types::File) -> crate::File {
         types::Content::Inline(bytes) => Content::Inline(bytes),
         types::Content::Stored((sha1, size)) => Content::Stored { sha1, size },
     };
-    crate::File { name: f.name, content }
+    crate::File { name: told_name(&f.name), content }
 }
 
 /// A view, kept between frames.

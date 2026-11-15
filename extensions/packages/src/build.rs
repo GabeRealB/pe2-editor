@@ -10,10 +10,10 @@
 //! What a target holds of a package is under `target/<target>/<package>/` of the tree, `<target>` the configuration's.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::sync::Arc;
 
 use pe2_ext::ty::{self, Files, Registered, SourceTree};
-use pe2_ext::{Call, File, Registry, Result, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Call, File, Registry, RelPath, Result, Table, Typed, Value, anyhow, bail};
 
 /// A package's objects: its units compiled and what it links as it is, each named by its package and its place in it;
 /// which of them are public (`public`, for what links it).
@@ -96,25 +96,42 @@ pub fn register(r: &mut Registry) {
 }
 
 /// A file of the gathered tree, as text.
-fn text_in(call: &Call, tree: &Typed, name: &str) -> Result<String> {
-    let file = tree.files.iter().find(|file| file.name == name).ok_or_else(|| anyhow!("the tree has no {name}"))?;
+fn text_in(call: &Call, tree: &Typed, name: &RelPath) -> Result<String> {
+    let file = tree.files.iter().find(|file| *file.name == *name).ok_or_else(|| anyhow!("the tree has no {name}"))?;
     Ok(String::from_utf8_lossy(&call.read(file)?).into_owned())
 }
 
+/// The files of the gathered tree this reads: what it names the package, its units, where its includes are found, what
+/// it links.
+const PACKAGE: &RelPath = RelPath::constant(crate::gather::NAME);
+const UNITS: &RelPath = RelPath::constant("units");
+const INCLUDES: &RelPath = RelPath::constant(crate::gather::INCLUDES);
+const LINKED: &RelPath = RelPath::constant(crate::gather::LINKED);
+
 /// The units a gathered tree lists, each with its visibility (`public self/lib/libsn/snmain.s`).
-fn units_of(listed: &str) -> Vec<(String, String)> {
-    listed
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .map(|(visibility, unit)| (visibility.to_string(), unit.to_string()))
-        .collect()
+///
+/// # Errors
+/// A unit is no path.
+fn units_of(listed: &str) -> Result<Vec<(String, Arc<RelPath>)>> {
+    let lines = listed.lines().filter_map(|line| line.split_once(' '));
+    lines.map(|(visibility, unit)| Ok((visibility.to_string(), RelPath::new(unit)?.to_owned()))).collect()
+}
+
+/// A path's extension: what follows the last `.` of its name.
+fn extension_of(path: &RelPath) -> Option<&str> {
+    path.name()?.rsplit_once('.').map(|(_, extension)| extension)
 }
 
 /// What a unit's object is named: its package and its place in it (`title/src/package.o`), as a link script names it.
-#[must_use]
-pub fn object_name(package: &str, unit: &str) -> String {
-    let inside = unit.strip_prefix("self/").unwrap_or(unit);
-    format!("{package}/{}", Path::new(inside).with_extension("o").display())
+///
+/// # Errors
+/// The package's name or the unit's makes no path.
+pub fn object_name(package: &str, unit: &RelPath) -> Result<Arc<RelPath>> {
+    let inside = unit.strip_prefix(RelPath::constant("self")).unwrap_or(unit);
+    let name = inside.name().ok_or_else(|| anyhow!("{unit}: no file"))?;
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let folder = inside.parent().unwrap_or_default();
+    Ok(RelPath::new(package)?.join_path(folder).join_path(RelPath::new(&format!("{stem}.o"))?))
 }
 
 /// The configuration's target: where what a target holds of a package is in its tree.
@@ -132,24 +149,24 @@ pub fn units(call: &mut Call) -> Result<Vec<Typed>> {
     let extension = call.settings.get("extension").and_then(Value::as_str).unwrap_or("c").trim_start_matches('.');
     let extension = extension.to_string();
     let tree = call.take::<SourceTree>(0)?;
-    let package = text_in(call, &tree, "package")?;
-    let includes = text_in(call, &tree, "includes").unwrap_or_default();
+    let package = text_in(call, &tree, PACKAGE)?;
+    let includes = text_in(call, &tree, INCLUDES).unwrap_or_default();
     let searched = |kind: &str| -> Value {
         let folders = includes.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' '));
         Value::Array(folders.map(|folder| Value::String(folder.to_string())).collect())
     };
     let (quote, angle) = (searched("quote"), searched("angle"));
     let mut items = vec![];
-    for (visibility, unit) in units_of(&text_in(call, &tree, "units")?) {
-        if Path::new(&unit).extension().is_none_or(|e| e.to_string_lossy() != extension) {
+    for (visibility, unit) in units_of(&text_in(call, &tree, UNITS)?)? {
+        if extension_of(&unit) != Some(extension.as_str()) {
             continue;
         }
         let own = tree.files.iter().find(|file| file.name == unit).ok_or_else(|| anyhow!("the tree has no {unit}"))?;
         let mut files = vec![own.clone()];
         files.extend(tree.files.iter().filter(|file| file.name != unit).cloned());
         let settings = Table::from_iter([
-            ("unit".to_string(), Value::String(unit.clone())),
-            ("object".to_string(), Value::String(object_name(&package, &unit))),
+            ("unit".to_string(), Value::String(unit.to_string())),
+            ("object".to_string(), Value::String(object_name(&package, &unit)?.to_string())),
             ("visibility".to_string(), Value::String(visibility)),
             ("quote".to_string(), quote.clone()),
             ("angle".to_string(), angle.clone()),
@@ -202,25 +219,28 @@ pub fn objects(call: &mut Call) -> Result<Typed> {
     let target = target(call)?;
     let tree = call.take::<SourceTree>(0)?;
     let compiled = typed_all(call.take_all::<ty::Any>(1)?);
-    let package = text_in(call, &tree, "package")?;
-    let units = units_of(&text_in(call, &tree, "units")?);
-    let mut public: Vec<Value> = units
-        .iter()
-        .filter(|(visibility, _)| visibility == "public")
-        .map(|(_, unit)| Value::String(object_name(&package, unit)))
-        .collect();
+    let package = text_in(call, &tree, PACKAGE)?;
+    let units = units_of(&text_in(call, &tree, UNITS)?)?;
+    let mut public: Vec<Value> = Vec::new();
+    for (visibility, unit) in &units {
+        if visibility == "public" {
+            public.push(Value::String(object_name(&package, unit)?.to_string()));
+        }
+    }
+    let objects_of = RelPath::new(&package)?;
     let mut files: Vec<File> = vec![];
     for made in compiled {
         let [file] = made.files.as_slice() else { bail!("a compiled unit is {} files, not one", made.files.len()) };
         files.push(file.clone());
     }
     for visibility in ["private", "public"] {
-        let own = format!("target/{target}/{package}/objects/{visibility}/");
-        for file in tree.files.iter().filter(|file| file.name.starts_with(&own)) {
+        let own = RelPath::new(&format!("target/{target}/{package}/objects/{visibility}"))?.to_owned();
+        for file in &tree.files {
+            let Some(inside) = file.name.strip_prefix(&own).filter(|inside| !inside.is_root()) else { continue };
             let mut file = file.clone();
-            file.name = format!("{package}/{}", &file.name[own.len()..]);
+            file.name = objects_of.join_path(inside);
             if visibility == "public" {
-                public.push(Value::String(file.name.clone()));
+                public.push(Value::String(file.name.to_string()));
             }
             files.push(file);
         }
@@ -246,7 +266,7 @@ fn linked_in(listed: &str, kind: &str) -> Result<Box<[pe2_ext::Reference]>> {
 pub fn link_inputs(call: &mut Call) -> Result<Typed> {
     let listed: String = {
         let tree = call.take::<SourceTree>(0)?;
-        let file = tree.files.iter().find(|file| file.name == "linked");
+        let file = tree.files.iter().find(|file| *file.name == *LINKED);
         file.map(|file| call.read(file))
             .transpose()?
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -265,15 +285,16 @@ pub fn link_inputs(call: &mut Call) -> Result<Typed> {
     let target = target(call)?;
     let tree = call.take::<SourceTree>(0)?;
     let own = call.take::<Objects>(1)?;
-    let package = text_in(call, &tree, "package")?;
+    let package = text_in(call, &tree, PACKAGE)?;
     let mut files: Vec<File> = vec![];
-    let mut placed = |mut file: File, at: String| {
+    let mut placed = |mut file: File, at: Arc<RelPath>| {
         file.name = at;
         files.push(file);
     };
+    let (own_folder, objects_folder) = (RelPath::constant("own"), RelPath::constant("objects"));
     for file in own.files.clone() {
-        placed(file.clone(), format!("own/{}", file.name));
-        let at = format!("objects/{}", file.name);
+        placed(file.clone(), own_folder.join_path(&file.name));
+        let at = objects_folder.join_path(&file.name);
         placed(file, at);
     }
     for (dependency, objects) in dependencies.iter().zip(objects_read) {
@@ -287,35 +308,38 @@ pub fn link_inputs(call: &mut Call) -> Result<Typed> {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
-        for file in objects.files.into_iter().filter(|file| public.contains(&file.name)) {
-            let at = format!("objects/{}", file.name);
+        // Its public objects, as its `objects` names them.
+        for file in objects.files.into_iter().filter(|file| public.iter().any(|name| *file.name == **name)) {
+            let at = objects_folder.join_path(&file.name);
             placed(file, at);
         }
     }
-    let script = format!("target/{target}/{package}/link_script/");
-    let script = tree.files.iter().find(|file| file.name.starts_with(&script));
+    let script = RelPath::new(&format!("target/{target}/{package}/link_script"))?.to_owned();
+    let script = tree.files.iter().find(|file| file.name.strip_prefix(&script).is_some_and(|inside| !inside.is_root()));
     let script = script.ok_or_else(|| anyhow!("{package} has no link_script for {target}"))?;
-    let name = script.name.rsplit('/').next().unwrap_or("link.ld").to_string();
-    placed(script.clone(), format!("script/{name}"));
+    let name = script.name.last().ok_or_else(|| anyhow!("{package}'s link script is no file"))?;
+    placed(script.clone(), RelPath::constant("script").join(name));
     // What each package of the tree publishes as it is: its one file under `symbols/`.
     let mut publishing = std::collections::BTreeMap::new();
-    let prefix = format!("target/{target}/");
+    let targeted = RelPath::new(&format!("target/{target}"))?.to_owned();
     for file in &tree.files {
-        let Some((owner, rest)) = file.name.strip_prefix(&prefix).and_then(|rest| rest.split_once('/')) else {
-            continue;
-        };
-        if rest.starts_with("symbols/") {
+        let Some(rest) = file.name.strip_prefix(&targeted) else { continue };
+        let mut parts = rest.parts();
+        if let (Some(owner), Some(kind), Some(_)) = (parts.next(), parts.next(), parts.next())
+            && *kind == *"symbols"
+        {
             publishing.entry(owner.to_string()).or_insert_with(|| file.clone());
         }
     }
+    let published = |at: usize| RelPath::new(&format!("published/{at:03}.ld")).map(ToOwned::to_owned);
     let mut at = 0;
     for file in publishing.into_values() {
-        placed(file, format!("published/{at:03}.ld"));
+        placed(file, published(at)?);
         at += 1;
     }
     for (bound, symbols) in bound.iter().zip(symbols_read) {
         let pe2_ext::Data::Typed(symbols) = symbols else { bail!("{bound}: what it publishes is no file") };
-        placed(symbols.file()?.clone(), format!("published/{at:03}.ld"));
+        placed(symbols.file()?.clone(), published(at)?);
         at += 1;
     }
     Ok(Typed { notes: tree.notes.clone(), ..Typed::new(LinkInputs::NAME, files) })
@@ -338,15 +362,16 @@ pub fn published(call: &mut Call) -> Result<Typed> {
             let _ = writeln!(published, "PROVIDE({symbol} = 0x{address});");
         }
     }
-    Ok(Typed::new(Symbols::NAME, vec![File::new("symbols.ld", published.into_bytes())]))
+    Ok(Typed::new(Symbols::NAME, vec![File::new(pe2_ext::RelPath::constant("symbols.ld"), published.into_bytes())]))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn a_units_object_is_named_by_its_package_and_place() {
-        assert_eq!(super::object_name("title", "self/src/package.c"), "title/src/package.o");
-        assert_eq!(super::object_name("psyq", "self/lib/libsn/snmain.s"), "psyq/lib/libsn/snmain.o");
+        let object = |package, unit| super::object_name(package, pe2_ext::RelPath::constant(unit)).unwrap().to_string();
+        assert_eq!(object("title", "self/src/package.c"), "title/src/package.o");
+        assert_eq!(object("psyq", "self/lib/libsn/snmain.s"), "psyq/lib/libsn/snmain.o");
         let bound = super::linked_in("dependency packages/a\nbound packages/b\n", "bound").unwrap();
         assert_eq!(*bound, [pe2_ext::Reference::from(pe2_ext::TreePath::constant("packages/b"))]);
     }

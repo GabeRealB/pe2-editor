@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::{TexelImage, bpp, cells, halfwords, palette_names, texels_per_halfword};
 
 /// Where a source is when the declaration does not say.
-pub const SOURCE: &str = "source.ora";
+pub const SOURCE: &pe2_ext::RelPath = pe2_ext::RelPath::constant("source.ora");
 const TEXELS_LAYER: &str = "texels";
 const PALETTES: &str = "palettes";
 const CELLS: &str = "cells";
@@ -452,7 +452,12 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
             layer.apply(&mut texels, edited);
         }
     }
-    let palettes = names.into_iter().zip(colors).collect();
+    // A palette is named after its layer, which names the file its colors are stored in.
+    let palettes = names
+        .into_iter()
+        .zip(colors)
+        .map(|(name, colors)| crate::texels::Palette::new(name, colors))
+        .collect::<Result<_>>()?;
     Ok(TexelImage { width, height, bpp, texels: texels.stored(), palettes, derived: settings, notes })
 }
 
@@ -562,12 +567,12 @@ mod tests {
             ""
         }
 
-        fn has_file(&self, name: &str) -> bool {
-            self.files.contains_key(name)
+        fn has_file(&self, name: &pe2_ext::RelPath) -> bool {
+            self.files.contains_key(name.as_str())
         }
 
-        fn read(&self, name: &str) -> Result<Vec<u8>> {
-            self.files.get(name).cloned().ok_or_else(|| anyhow!("no {name}"))
+        fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+            self.files.get(name.as_str()).cloned().ok_or_else(|| anyhow!("no {name}"))
         }
     }
 
@@ -615,7 +620,7 @@ mod tests {
             .files
             .into_iter()
             .map(|f| match f.content {
-                pe2_ext::Content::Inline(bytes) => (f.name, bytes),
+                pe2_ext::Content::Inline(bytes) => (f.name.to_string(), bytes),
                 pe2_ext::Content::Stored { .. } => panic!("made stored"),
             })
             .collect();

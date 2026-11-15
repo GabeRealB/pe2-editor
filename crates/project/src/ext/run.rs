@@ -107,6 +107,13 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
         })
         .collect::<Result<_>>()?;
     let stdout = settings.get("stdout").and_then(Toml::as_str).map(|name| named(name, first, &told));
+    let stdout = stdout
+        .map(|name| {
+            let path =
+                RelPath::new(&name).with_context(|| format!("its stdout {name}, which is no path within a folder"))?;
+            Ok::<_, anyhow::Error>(path.to_owned())
+        })
+        .transpose()?;
     for name in &outputs {
         if let Some(parent) = laid.output.join(name).parent() {
             std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
@@ -169,7 +176,7 @@ fn run(call: &mut exec::Call<'_>, offered: &super::unsandboxed::Offered) -> Resu
         if rewrite.iter().any(|r| named(r, first, &told) == name.as_str()) {
             bytes = rewritten(&String::from_utf8_lossy(&bytes), &laid).into_bytes();
         }
-        made.push(File { name: name.to_string(), content: Content::Inline(bytes) });
+        made.push(File { name: name.clone(), content: Content::Inline(bytes) });
     }
     let makes = settings.get("makes").and_then(Toml::as_str).unwrap_or(FILES);
     Ok(Value::Typed(Typed::new(makes, made)))
@@ -199,14 +206,13 @@ fn lay_out(call: &exec::Call<'_>, given: &[File]) -> Result<Laid> {
     std::fs::create_dir_all(&laid.input).with_context(|| laid.input.to_string())?;
     let mut laid = laid;
     for file in given {
-        let name = RelPath::new(&file.name)
-            .with_context(|| format!("it is given {}, which is no path within a folder", file.name))?;
-        let path = laid.input.join(&name);
+        let name = &file.name;
+        let path = laid.input.join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
         }
         std::fs::write(&path, call.read(&file.content)?).with_context(|| path.to_string())?;
-        laid.files.push(name.to_owned());
+        laid.files.push(name.clone());
     }
     Ok(laid)
 }

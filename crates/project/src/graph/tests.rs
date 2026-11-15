@@ -2,7 +2,7 @@ use crate::testing::At as _;
 use sfs::HostPath;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -14,12 +14,13 @@ struct Bundle {
     path: &'static str,
     declaration: String,
     fields: toml::Table,
-    files: Mutex<BTreeMap<String, Vec<u8>>>,
+    files: Mutex<BTreeMap<Arc<pe2_ext::RelPath>, Vec<u8>>>,
 }
 
 impl Bundle {
     fn new(declaration: &str, files: &[(&str, &str)]) -> Bundle {
-        let files = files.iter().map(|(n, b)| (n.to_string(), b.as_bytes().to_vec())).collect();
+        let files =
+            files.iter().map(|(n, b)| (Arc::from(pe2_ext::RelPath::new(n).unwrap()), b.as_bytes().to_vec())).collect();
         Bundle {
             path: "test/bundle",
             declaration: declaration.to_string(),
@@ -46,15 +47,15 @@ impl Node for Bundle {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &str) -> Option<String> {
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
         self.files.lock().unwrap().get(name).map(|b| crate::extract::sha1_hex(b))
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         self.files.lock().unwrap().get(name).cloned().context("no such file")
     }
 
-    fn file_names(&self) -> Vec<String> {
+    fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
         self.files.lock().unwrap().keys().cloned().collect()
     }
 
@@ -104,7 +105,7 @@ fn bytes(call: &Call<'_>, value: &Value) -> Result<Vec<u8>> {
 }
 
 fn file(bytes: Vec<u8>) -> Value {
-    Value::Typed(Typed::new(pe2_ext::data::BYTES, vec![File::new("made", bytes)]))
+    Value::Typed(Typed::new(pe2_ext::data::BYTES, vec![File::new(pe2_ext::RelPath::constant("made"), bytes)]))
 }
 
 /// A moment from now: a sweep then takes what was just written.
@@ -167,9 +168,9 @@ fn ops() -> Ops {
             let input = call.take(0)?.take();
             let Value::Typed(typed) = input else { anyhow::bail!("not a file") };
             let mut files = typed.files.clone();
-            files.push(File::new("dir/extra.txt", b"!".to_vec()));
+            files.push(File::new(pe2_ext::RelPath::constant("dir/extra.txt"), b"!".to_vec()));
             let folder = call.serve(&files, &crate::content::Use::default())?;
-            let mut read = std::fs::read(folder.at(&files[0].name))?;
+            let mut read = std::fs::read(folder.at(files[0].name.as_str()))?;
             read.extend(std::fs::read(folder.at("dir/extra.txt"))?);
             Ok(file(read))
         },
@@ -454,7 +455,7 @@ fn an_optional_stored_file_is_none_where_the_node_lacks_it_and_read_once_it_is_t
     let made_of = |node: &Bundle| {
         let (made, reads) = evaluate(&plan, &ops, node, &[(source, Asking::none())], &Vec::new(), (None, None));
         let Value::Typed(typed) = &**made[0].as_ref().unwrap() else { panic!("not files") };
-        (typed.files.iter().map(|file| file.name.clone()).collect::<Vec<_>>(), reads)
+        (typed.files.iter().map(|file| file.name.to_string()).collect::<Vec<_>>(), reads)
     };
     let (none, reads) = made_of(&Bundle::new(stack, &[("other.txt", "o")]));
     assert_eq!(none, Vec::<String>::new());
@@ -483,7 +484,7 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
         let made =
             engine.output_in(Some(reach), &plan, node, pe2_path::Asked::constant("source"), None, false).unwrap();
         let Value::Typed(typed) = &*made.value.unwrap() else { panic!("not a file") };
-        typed.files[0].name.clone()
+        typed.files[0].name.to_string()
     };
     assert_eq!(read_for(&engine), "native.bin", "no config: what the releases share");
     let config = |release: &str| pe2_ext::data::BuildConfig {
@@ -525,7 +526,7 @@ fn a_kept_output_holds_while_what_it_read_does() {
     let (upper, _) = plan.output("upper").unwrap();
     assert!(engine.traced(None, &plan, &node, upper, Asking::none()).is_some());
     // The file changed: made again.
-    node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
+    node.files.lock().unwrap().insert(pe2_ext::RelPath::constant("a.txt").to_owned(), b"abcd".to_vec());
     let changed = engine.output(&plan, &node, pe2_path::Asked::constant("source"), true).unwrap();
     assert!(!changed.kept);
     assert_eq!(data(&node, changed.value.as_deref().unwrap()), b"abcd");
@@ -546,7 +547,7 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     assert!(!engine.output(&plan, &one, pe2_path::Asked::constant("source"), false).unwrap().kept);
     assert!(!engine.output(&plan, &two, pe2_path::Asked::constant("source"), false).unwrap().kept);
     // Each found kept by its own trace; the other's file changing leaves it.
-    two.files.lock().unwrap().insert("a.txt".into(), b"xyz".to_vec());
+    two.files.lock().unwrap().insert(pe2_ext::RelPath::constant("a.txt").to_owned(), b"xyz".to_vec());
     assert!(engine.output(&plan, &one, pe2_path::Asked::constant("source"), false).unwrap().kept);
     let count = |sub: &str| std::fs::read_dir(dir.at(sub)).unwrap().count();
     assert_eq!((count("traces"), count("values")), (2, 1));
@@ -581,9 +582,9 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     assert_eq!(counted.value.as_deref(), Some(&Value::Table(toml::from_str("len = 3").unwrap())));
     // It read what the native form read: what neither read changing leaves both; what they read, makes them again.
     assert_eq!(counted.reads.files.keys().collect::<Vec<_>>(), ["a.txt"]);
-    node.files.lock().unwrap().insert("b.txt".into(), b"changed".to_vec());
+    node.files.lock().unwrap().insert(pe2_ext::RelPath::constant("b.txt").to_owned(), b"changed".to_vec());
     assert!(engine.output(&plan, &node, pe2_path::Asked::constant("counted"), false).unwrap().kept);
-    node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
+    node.files.lock().unwrap().insert(pe2_ext::RelPath::constant("a.txt").to_owned(), b"abcd".to_vec());
     let again = engine.output(&plan, &node, pe2_path::Asked::constant("counted"), true).unwrap();
     assert_eq!((again.kept, again.value.as_deref()), (false, Some(&Value::Table(toml::from_str("len = 4").unwrap()))));
     // An output's trace is under one key: its older value goes with the sweep (the count of three), and what was
@@ -786,7 +787,7 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     assert_eq!(first.reads.outputs.len(), 2);
     assert!(make("test/joined").unwrap().kept);
     // A part changed: made again.
-    world.0[0].files.lock().unwrap().insert("part.bin".into(), b"HEAD-".to_vec());
+    world.0[0].files.lock().unwrap().insert(pe2_ext::RelPath::constant("part.bin").to_owned(), b"HEAD-".to_vec());
     let changed = make("test/joined").unwrap();
     assert!(!changed.kept);
     assert_eq!(stored(&changed)[..5], *b"HEAD-");
@@ -842,7 +843,7 @@ fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() 
     assert_eq!(world.2.load(std::sync::atomic::Ordering::Relaxed), 1, "asked for once, whoever reads it");
     // Something is made in the run - the part itself, changed: what was found before it is found again, and
     // what read the part is made again.
-    nodes.0[0].files.lock().unwrap().insert("part.bin".into(), b"HEAD-".to_vec());
+    nodes.0[0].files.lock().unwrap().insert(pe2_ext::RelPath::constant("part.bin").to_owned(), b"HEAD-".to_vec());
     assert!(!make("test/a").kept);
     assert!(!make("test/one").kept, "held again to what it read, which changed");
     assert!(!make("test/two").kept);
@@ -1054,7 +1055,7 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
     let file_type = || Type::File(Box::new(Type::Any));
     // Spilled past what a writer holds, then failed: as an operation stopped to read what is not made yet is.
     ops.add(OpDef::new("t.spill_fail", "Spill and fail", "1").makes(file_type(), |call| {
-        let mut writer = call.writer("big.bin");
+        let mut writer = call.writer(pe2_ext::RelPath::constant("big.bin"));
         std::io::Write::write_all(&mut writer, &vec![7u8; super::exec::SPILL * 2])?;
         anyhow::bail!("it stopped")
     }));
@@ -1063,7 +1064,7 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
         let (kept, lost) = (call.temp()?, call.temp()?);
         std::fs::write(&kept, b"made")?;
         std::fs::write(&lost, b"scratch")?;
-        let file = call.keep(&kept, "made.bin")?;
+        let file = call.keep(&kept, pe2_ext::RelPath::constant("made.bin"))?;
         Ok(Value::Typed(Typed { ty: "bytes".into(), files: vec![file], ..Typed::default() }))
     }));
     let engine = Engine::new(ops, Some(Store::at(dir.clone()).unwrap()));

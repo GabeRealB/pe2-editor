@@ -19,6 +19,12 @@ from somewhere `TreePath::new(text)?` or `Reference::new(text)?`, which fail on 
 a uid or a path. What the calls give back are these types: `entries` the paths of a folder's files, `assets_of` each
 asset of a type by its path with its declaration, `node_named` an asset's path, uid and types.
 
+A file's name - within an asset (`asset.read(name)`, `has_file`), within a value (`File::name`, `File::new`), or one an
+operation makes (`writer(name)`, `keep(place, name)`) - is a `RelPath`: `RelPath::constant("native.bin")` in the
+code, `RelPath::new(text)?` for one made or read, so `objects/a.o` is a path, not text with slashes in it. What an
+extraction makes is `Made`, its files each by that name; a reference written with its bundle's path
+(`{ uid, path = "res://<path>.node" }`) is read with `declared_path`.
+
 An output is asked for by an `Asked`: its path and, after `?`, its query - `pe2_ext::NATIVE` and `pe2_ext::SETTINGS`,
 which every asset has, `Asked::constant("page")` for a name written in the code, or `Asked::new(text)?` for one read
 from somewhere. A reference held in a field is read with `target_of` (the asset it names: none where the field holds

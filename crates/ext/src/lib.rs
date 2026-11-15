@@ -88,6 +88,21 @@ pub fn target_of(reference: &Value) -> Result<Option<Reference>> {
     Ok(Some(Reference::new(named)?))
 }
 
+/// The node a reference written with its bundle's path names (`{ uid, path = "res://<path>.node" }`), by that path: what
+/// declarations a plan gives, which no index resolves, name nodes by. None where it says no path.
+///
+/// # Errors
+/// What it says is no such path.
+pub fn declared_path(reference: &Value) -> Result<Option<std::sync::Arc<TreePath>>> {
+    let Some(written) = reference.get("path") else { return Ok(None) };
+    let text = written.as_str().ok_or_else(|| anyhow!("its `path` is {}, no text", written.type_str()))?;
+    let path = text
+        .strip_prefix("res://")
+        .and_then(|path| path.strip_suffix(".node"))
+        .ok_or_else(|| anyhow!("{text}: no bundle's path (`res://<path>.node`)"))?;
+    Ok(Some(std::sync::Arc::from(TreePath::new(path)?)))
+}
+
 /// The node a field names, where the field is there: as `target_of` reads it.
 ///
 /// # Errors

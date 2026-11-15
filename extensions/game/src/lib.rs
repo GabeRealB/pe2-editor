@@ -140,7 +140,7 @@ fn inter(call: &mut Call) -> Result<Typed> {
     let movies: Box<[pe2_ext::Reference]> = movies_of(&files, &fields, disc)?;
     #[request]
     let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie, pe2_ext::NATIVE)))?;
-    let mut writer = call.writer("native.str")?;
+    let mut writer = call.writer(pe2_ext::RelPath::constant("native.str"))?;
     for (movie, native) in movies.iter().zip(&natives) {
         let Data::Typed(native) = native else { pe2_ext::bail!("{movie}: its native is no file") };
         std::io::Write::write_all(&mut writer, &call.read(native.file()?)?)?;
@@ -229,7 +229,7 @@ fn bundle_types(r: &mut Registry) {
             };
             let files = bundle::extract(&chunk, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File::new(&name, bytes))
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
                 .collect();
             Ok(Data::Typed(Typed::new("bytes", files)))
         });

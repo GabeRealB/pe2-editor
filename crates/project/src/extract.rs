@@ -6,10 +6,11 @@ use anyhow::{Context, Result, bail};
 use pe2_path::RelPath;
 use sfs::HostPath;
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
+use std::sync::Arc;
 
 use crate::changeset::Changeset;
 use crate::ext::Extensions;
@@ -54,7 +55,7 @@ struct Lent<'a> {
     uid: Option<pe2_path::Uid>,
     fields: toml::Table,
     declaration: &'a str,
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<Arc<RelPath>, Vec<u8>>,
 }
 
 impl pe2_ext::Source for Lent<'_> {
@@ -74,11 +75,11 @@ impl pe2_ext::Source for Lent<'_> {
         self.declaration
     }
 
-    fn has_file(&self, name: &str) -> bool {
+    fn has_file(&self, name: &pe2_ext::RelPath) -> bool {
         self.files.contains_key(name)
     }
 
-    fn read(&self, name: &str) -> pe2_ext::Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> pe2_ext::Result<Vec<u8>> {
         self.files.get(name).cloned().ok_or_else(|| pe2_ext::anyhow!("{}: no file {name}", self.path))
     }
 }
@@ -100,15 +101,15 @@ impl crate::graph::exec::Node for Lent<'_> {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &str) -> Option<String> {
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
         self.files.get(name).map(|bytes| sha1_hex(bytes))
     }
 
-    fn file_names(&self) -> Vec<String> {
+    fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
         self.files.keys().cloned().collect()
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
     }
 
@@ -152,24 +153,26 @@ impl Sourcing<'_> {
         let (tree, uid) = (crate::TreePath::new(path)?, Some(pe2_path::Uid::new(uid)?));
         let lent = Lent { path: tree, uid, fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
         let files = native.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.clone())).collect();
+        // Where its source is in the bundle, as its import names it.
+        let source_name =
+            RelPath::new(source.trim_end_matches('/')).with_context(|| format!("{path}: its source {source}"))?;
         let settings = crate::graph::with_settings(&fields);
         let native_form =
             crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, settings, ..pe2_ext::Typed::default() });
         let written = self.engine.run(&inverse, vec![vec![native_form]], &toml::Table::new(), &lent);
         // One file, the source itself (`source.ora`); several, a folder of that name (`medium.ufo/glyphs/A_.glif`).
-        let written_files: Vec<(String, Vec<u8>)> = match written
-            .with_context(|| format!("{path}: {inverse} could not write its source"))?
-        {
-            crate::graph::Value::Typed(written) if written.files.len() == 1 => {
-                vec![(source.clone(), self.read(&written.file()?.content)?)]
-            }
-            crate::graph::Value::Typed(written) if !written.files.is_empty() => written
-                .files
-                .iter()
-                .map(|file| Ok((format!("{}/{}", source.trim_end_matches('/'), file.name), self.read(&file.content)?)))
-                .collect::<Result<_>>()?,
-            other => bail!("{path}: {inverse} wrote {}, not a file", other.ty()),
-        };
+        let written_files: pe2_ext::Made =
+            match written.with_context(|| format!("{path}: {inverse} could not write its source"))? {
+                crate::graph::Value::Typed(written) if written.files.len() == 1 => {
+                    Box::new([(source_name.to_owned(), self.read(&written.file()?.content)?)])
+                }
+                crate::graph::Value::Typed(written) if !written.files.is_empty() => written
+                    .files
+                    .iter()
+                    .map(|file| Ok((source_name.join_path(&file.name), self.read(&file.content)?)))
+                    .collect::<Result<_>>()?,
+                other => bail!("{path}: {inverse} wrote {}, not a file", other.ty()),
+            };
         // What the bundle says: the declaration without what the source holds. Imported back by its stack, as the
         // project will - which keeps the import.
         let written = crate::imports::without_derived(&toml, &def.derives)?;
@@ -196,11 +199,11 @@ impl Sourcing<'_> {
         let Some(crate::graph::Value::Typed(made)) = given.value.as_deref() else {
             bail!("{path}: its import made no native form");
         };
-        let made_map: BTreeMap<String, Vec<u8>> =
+        let made_map: BTreeMap<Arc<RelPath>, Vec<u8>> =
             made.files.iter().map(|f| Ok((f.name.clone(), self.read(&f.content)?))).collect::<Result<_>>()?;
-        let native_map: BTreeMap<String, Vec<u8>> = native.into_iter().collect();
+        let native_map: BTreeMap<Arc<RelPath>, Vec<u8>> = native.into_iter().collect();
         if made_map != native_map {
-            let differ: Vec<&String> =
+            let differ: Vec<&Arc<RelPath>> =
                 native_map.keys().chain(made_map.keys()).filter(|n| native_map.get(*n) != made_map.get(*n)).collect();
             bail!("{path}: its {source} does not import back into the disc's files ({differ:?} differ)");
         }
@@ -239,7 +242,7 @@ struct Written {
     dirs: [HostPath; 2],
     declaration: String,
     fields: toml::Table,
-    sha1s: std::sync::Mutex<HashMap<String, String>>,
+    sha1s: std::sync::Mutex<HashMap<Arc<RelPath>, String>>,
 }
 
 impl Written {
@@ -262,11 +265,9 @@ impl Written {
     }
 
     /// A file's place: in the layer of its files, else beside the node.
-    fn at(&self, name: &str) -> HostPath {
-        // A file of the node is named as its node names it: one that is no path is the node's folder, which no file is.
-        let Ok(name) = RelPath::new(name) else { return self.dirs[0].clone() };
-        let filled = self.dirs[1].join(&name);
-        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(&name) }
+    fn at(&self, name: &RelPath) -> HostPath {
+        let filled = self.dirs[1].join(name);
+        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(name) }
     }
 }
 
@@ -287,38 +288,33 @@ impl crate::graph::exec::Node for Written {
         &self.fields
     }
 
-    fn file_sha1(&self, name: &str) -> Option<String> {
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
         let mut sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sha1) = sha1s.get(name) {
             return Some(sha1.clone());
         }
         let sha1 = crate::content::sha1(&self.at(name)).ok()?;
-        sha1s.insert(name.to_string(), sha1.clone());
+        sha1s.insert(name.to_owned(), sha1.clone());
         Some(sha1)
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let path = self.at(name);
         crate::content::read(&path).with_context(|| path.display().to_string())
     }
 
-    fn file_names(&self) -> Vec<String> {
+    fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
         // What a bundle holds by a name no path takes is none of its files: the index says so (`Problem::Refused`).
-        let mut names: Vec<String> = self
-            .dirs
-            .iter()
-            .flat_map(|d| crate::index::bundle_files(d).0.into_keys().map(|name| name.to_string()))
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        let names: BTreeSet<Arc<RelPath>> =
+            self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).0.into_keys()).collect();
+        names.into_iter().collect()
     }
 
-    fn file_size(&self, name: &str) -> Option<u64> {
+    fn file_size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
         crate::content::len(&self.at(name)).ok()
     }
 
-    fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
+    fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
         crate::content::head(&self.at(name), len)
     }
 

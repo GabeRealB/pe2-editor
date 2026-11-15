@@ -50,7 +50,7 @@ pub fn register(r: &mut Registry) {
         });
 }
 
-fn files(name: &str, bytes: Vec<u8>) -> Data {
+fn files(name: &pe2_ext::RelPath, bytes: Vec<u8>) -> Data {
     Data::Typed(Typed::new(FILES, vec![File::new(name, bytes)]))
 }
 
@@ -71,9 +71,9 @@ fn stored(call: &Call<'_>, name: &str) -> Result<Vec<u8>> {
 }
 
 /// A file given at a port, by name.
-fn file_of(call: &Call<'_>, name: &str, file: &str) -> Result<Vec<u8>> {
+fn file_of(call: &Call<'_>, name: &str, file: &pe2_ext::RelPath) -> Result<Vec<u8>> {
     let given = port(call, name)?;
-    let found = given.files.iter().find(|f| f.name == file).ok_or_else(|| anyhow!("its {name} holds no {file}"))?;
+    let found = given.files.iter().find(|f| *f.name == *file).ok_or_else(|| anyhow!("its {name} holds no {file}"))?;
     call.read(found)
 }
 

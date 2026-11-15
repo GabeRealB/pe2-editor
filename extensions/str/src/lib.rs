@@ -24,7 +24,7 @@ pe2_ext::extension!(register);
 const MOVIE: &str = "pe2.movies@movie";
 
 /// A movie's native file: its sectors.
-pub const NATIVE: &str = "native.str";
+pub const NATIVE: &pe2_ext::RelPath = pe2_ext::RelPath::constant("native.str");
 
 /// How many sectors at either end are looked through for a video one, or an audio one (they are interleaved).
 const LOOK: u64 = 32;
@@ -37,7 +37,7 @@ impl Registered for Str {
     const LABEL: &str = "STR movie";
 
     fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(NATIVE.into())]
+        vec![Signature::Name(NATIVE.as_str().into())]
     }
 }
 

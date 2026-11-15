@@ -13,7 +13,7 @@ fn define_of(name: &str) -> String {
     name.replace('/', "_")
 }
 
-fn file(name: &str, value: &serde_json::Value) -> Result<Typed> {
+fn file(name: &pe2_ext::RelPath, value: &serde_json::Value) -> Result<Typed> {
     let bytes = serde_json::to_vec_pretty(value)?;
     Ok(Typed::new(pe2_ext::data::BYTES, vec![File::new(name, bytes)]))
 }
@@ -39,7 +39,10 @@ pub fn overlay(call: &mut Call) -> Result<Typed> {
             );
         }
     }
-    file("overlay.yaml", &json!({ "version": 0, "case-sensitive": "true", "fallthrough": "true", "roots": roots }))
+    file(
+        pe2_ext::RelPath::constant("overlay.yaml"),
+        &json!({ "version": 0, "case-sensitive": "true", "fallthrough": "true", "roots": roots }),
+    )
 }
 
 /// A package's outputs this reads: what it resolved to, what its target tells a language server, what it reflects.
@@ -86,7 +89,7 @@ pub fn server_values(call: &mut Call) -> Result<Typed> {
         }
         let _ = writeln!(text, "#endif");
     }
-    Ok(Typed::new(pe2_ext::data::BYTES, vec![File::new("pe2_server.h", text.into_bytes())]))
+    Ok(Typed::new(pe2_ext::data::BYTES, vec![File::new(pe2_ext::RelPath::constant("pe2_server.h"), text.into_bytes())]))
 }
 
 pub fn database(call: &mut Call) -> Result<Typed> {
@@ -130,5 +133,5 @@ pub fn database(call: &mut Call) -> Result<Typed> {
             commands.push(json!({ "directory": folder, "file": place, "arguments": arguments }));
         }
     }
-    file("compile_commands.json", &serde_json::Value::Array(commands))
+    file(pe2_ext::RelPath::constant("compile_commands.json"), &serde_json::Value::Array(commands))
 }

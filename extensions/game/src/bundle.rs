@@ -312,7 +312,7 @@ pub fn join(call: &mut Call) -> Result<Typed> {
         };
         bundle.resources.insert(resource.index, made);
     }
-    let mut writer = call.writer("native.bin")?;
+    let mut writer = call.writer(pe2_ext::RelPath::constant("native.bin"))?;
     std::io::Write::write_all(&mut writer, &formats::bundle::write(&bundle))?;
     Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
 }
@@ -320,7 +320,7 @@ pub fn join(call: &mut Call) -> Result<Typed> {
 /// A resource's stored bytes, `resources/<index>.bin`.
 fn stored_file(call: &Call, stored: &Typed, index: usize) -> Result<Vec<u8>> {
     let name = format!("{index}.bin");
-    let file = stored.files.iter().find(|f| f.name.rsplit('/').next() == Some(name.as_str()));
+    let file = stored.files.iter().find(|f| f.name.last().is_some_and(|last| *last == *name));
     call.read(file.ok_or_else(|| anyhow!("resource {index}: no resources/{name}"))?)
 }
 
@@ -329,8 +329,9 @@ fn stored_file(call: &Call, stored: &Typed, index: usize) -> Result<Vec<u8>> {
 ///
 /// # Errors
 /// The chunk is no bundle laid out as the game's tool lays one out, or it differs from what the node declares.
-pub fn extract(chunk: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
+pub fn extract(chunk: &[u8], args: &Table) -> Result<pe2_ext::Made> {
     let path = args.get("bundle").and_then(Value::as_str).ok_or_else(|| anyhow!("no bundle"))?;
+    let path = pe2_ext::TreePath::new(path)?;
     let bundle = formats::bundle::parse(chunk).map_err(|e| anyhow!("{path}: {e}"))?;
     let declared = resources(args)?;
     let indices: Vec<usize> = declared.iter().map(|r| r.index).collect();
@@ -355,7 +356,9 @@ pub fn extract(chunk: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
     if !short.is_empty() {
         layout.insert("palette_bytes".into(), Value::Table(short));
     }
-    let mut out = vec![(format!("{path}/bundle.toml"), toml_text(&layout).into_bytes())];
+    let mut out =
+        vec![(path.rel().join_path(pe2_ext::RelPath::constant("bundle.toml")), toml_text(&layout).into_bytes())];
+    let resources = path.rel().join_path(pe2_ext::RelPath::constant("resources"));
     let stored = |r: &Resource<'_>| match r.kind() {
         "dialogue" => false,
         "palette" => r.table.get("runs").and_then(Value::as_bool) == Some(true) || has_runs(r.table),
@@ -363,9 +366,9 @@ pub fn extract(chunk: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
     };
     for resource in declared.iter().filter(|r| stored(r)) {
         let (_, bytes) = &bundle.resources[&resource.index];
-        out.push((format!("{path}/resources/{}.bin", resource.index), bytes.clone()));
+        out.push((resources.join_path(pe2_ext::RelPath::new(&format!("{}.bin", resource.index))?), bytes.clone()));
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 /// A table as TOML, the base in hex as the game's addresses are written.

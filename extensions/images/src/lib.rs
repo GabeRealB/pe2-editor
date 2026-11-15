@@ -551,8 +551,11 @@ pub fn pages(asset: &Asset) -> ((f32, f32), f32) {
 }
 
 /// A palette's file: its colors, as the extraction (`extract`) and the import (`ora`) make them.
-pub(crate) fn colors_file(palette: &str) -> String {
-    format!("native.{palette}.colors")
+///
+/// # Errors
+/// The palette's name makes no file's.
+pub(crate) fn colors_file(palette: &str) -> pe2_ext::Result<std::sync::Arc<pe2_ext::RelPath>> {
+    Ok(pe2_ext::RelPath::new(&format!("native.{palette}.colors"))?.to_owned())
 }
 
 pub(crate) fn halfwords(bytes: &[u8]) -> Vec<u16> {
@@ -565,7 +568,10 @@ pub(crate) fn halfwords(bytes: &[u8]) -> Vec<u16> {
 /// Its colors cannot be read.
 #[must_use]
 pub fn palette_colors(asset: &Asset, palette: usize) -> Option<Result<Vec<u16>>> {
-    let file = colors_file(palette_names(asset).get(palette)?);
+    let file = match colors_file(palette_names(asset).get(palette)?) {
+        Ok(file) => file,
+        Err(why) => return Some(Err(why)),
+    };
     (is_texture(asset) && asset.has_file(&file)).then(|| asset.read(&file).map(|b| halfwords(&b)))
 }
 
@@ -577,8 +583,8 @@ pub fn rgba(color: u16) -> [u8; 4] {
 
 // --- pictures -----------------------------------------------------------------------------------------------------
 
-const BS: &str = "native.bs";
-pub(crate) const TEXELS: &str = "native.texels";
+const BS: &pe2_ext::RelPath = pe2_ext::RelPath::constant("native.bs");
+pub(crate) const TEXELS: &pe2_ext::RelPath = pe2_ext::RelPath::constant("native.texels");
 
 /// An image's looks by name, as its picture's members are named: its looks, or - where it has none - `default`.
 fn look_names(asset: &Asset) -> Vec<String> {
@@ -594,7 +600,7 @@ impl Registered for BsPicture {
     const LABEL: &str = "BS picture";
 
     fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(BS.into()), Signature::Name("*.bs".into())]
+        vec![Signature::Name(BS.as_str().into()), Signature::Name("*.bs".into())]
     }
 }
 
@@ -804,12 +810,12 @@ mod tests {
             ""
         }
 
-        fn has_file(&self, name: &str) -> bool {
-            self.files.contains_key(name)
+        fn has_file(&self, name: &pe2_ext::RelPath) -> bool {
+            self.files.contains_key(name.as_str())
         }
 
-        fn read(&self, name: &str) -> Result<Vec<u8>> {
-            self.files.get(name).cloned().ok_or_else(|| anyhow!("no {name}"))
+        fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
+            self.files.get(name.as_str()).cloned().ok_or_else(|| anyhow!("no {name}"))
         }
     }
 

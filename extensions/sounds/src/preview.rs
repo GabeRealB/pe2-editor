@@ -82,12 +82,19 @@ impl Nodes for Looked<'_> {
     fn body(&self, reference: &pe2_ext::Reference) -> Result<formats::spk::PoolItem> {
         let asset = self.asset(reference)?;
         let mode = asset.field("mode").and_then(Value::as_str).unwrap_or("normal");
-        Ok(formats::spk::PoolItem::Sample(crate::body_of_wav(&asset.read("sound.wav")?, mode)?))
+        Ok(formats::spk::PoolItem::Sample(crate::body_of_wav(
+            &asset.read(pe2_ext::RelPath::constant("sound.wav"))?,
+            mode,
+        )?))
     }
 }
 
 /// The files the nodes a script or bank names are stored as.
-const FILES: [&str; 3] = ["instrument.toml", "bank.toml", "reverb.toml"];
+const FILES: [&pe2_ext::RelPath; 3] = [
+    pe2_ext::RelPath::constant("instrument.toml"),
+    pe2_ext::RelPath::constant("bank.toml"),
+    pe2_ext::RelPath::constant("reverb.toml"),
+];
 
 /// A node's file, as an operation is given it, as a table.
 ///
@@ -196,7 +203,10 @@ pub fn slot(call: &Call<'_>, typed: &Typed, slot: usize) -> Result<Vec<Vec<i16>>
 /// The slots of a bank that play a script, as its file has them: each its number, and the script's place in the bank's
 /// list.
 pub fn slots(asset: &Asset) -> Vec<(usize, usize)> {
-    let Some(file) = asset.read("bank.toml").ok().and_then(|b| String::from_utf8(b).ok()) else { return vec![] };
+    let Some(file) = asset.read(pe2_ext::RelPath::constant("bank.toml")).ok().and_then(|b| String::from_utf8(b).ok())
+    else {
+        return vec![];
+    };
     let Ok(file) = toml::from_str::<Table>(&file) else { return vec![] };
     let slots = file.get("slots").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     slots.iter().enumerate().filter_map(|(n, s)| Some((n, usize::try_from(s.as_integer()?).ok()?))).collect()

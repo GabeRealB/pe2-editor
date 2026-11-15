@@ -268,7 +268,7 @@ mod tests {
         let _ = r.op("slow").output::<Blob>().run(|_| {
             MADE.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(TAKES.load(Ordering::SeqCst)));
-            Ok(Typed::new(Blob::NAME, vec![File::new("made.bin", b"made".to_vec())]))
+            Ok(Typed::new(Blob::NAME, vec![File::new(pe2_ext::RelPath::constant("made.bin"), b"made".to_vec())]))
         });
         Ok(())
     }

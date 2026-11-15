@@ -179,7 +179,7 @@ impl Site<'_> {
         let file = typed.file()?;
         let bytes = self.bytes(file)?;
         for place in places {
-            let relative = deployed(place, &self.config_name, &file.name)?;
+            let relative = deployed(place, &self.config_name, file.name.as_str())?;
             let to = self.project.root.join(&relative);
             if let Some(folder) = to.parent() {
                 std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
@@ -254,7 +254,7 @@ impl Site<'_> {
             && let Ok(file) = typed.file()
         {
             for place in &plan.outputs[at].events.deploy {
-                if let Ok(relative) = deployed(place, &self.config_name, &file.name) {
+                if let Ok(relative) = deployed(place, &self.config_name, file.name.as_str()) {
                     let _ = std::fs::remove_file(self.project.root.join(&relative));
                 }
             }

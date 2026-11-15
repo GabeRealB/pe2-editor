@@ -128,7 +128,7 @@ fn register(r: &mut Registry) -> Result<()> {
             let encoding = Encoding::parse(&call.parameter::<String>()?)?;
             let stream = call.take::<ty::Stream<ty::Playback>>(0)?;
             let rate = stream.header().get("rate").and_then(Value::as_float).unwrap_or(15.0);
-            let source = format!("source.{}", ask::extension(&encoding.container)?);
+            let source = pe2_ext::RelPath::new(&format!("source.{}", ask::extension(&encoding.container)?))?.to_owned();
             let video = call.temp()?;
             let mut encoder: Option<Process> = None;
             let mut sound: Vec<AudioData> = Vec::new();

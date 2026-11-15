@@ -63,7 +63,7 @@ impl Registered for Usd {
     const LABEL: &str = "USD text";
 
     fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(mesh::FILE.into())]
+        vec![Signature::Name(mesh::FILE.as_str().into())]
     }
 }
 
@@ -77,7 +77,7 @@ impl Registered for ClipUsd {
     const LABEL: &str = "Clip as USD text";
 
     fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(clip_usd::FILE.into())]
+        vec![Signature::Name(clip_usd::FILE.as_str().into())]
     }
 }
 

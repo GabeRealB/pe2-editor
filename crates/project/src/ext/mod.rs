@@ -2178,7 +2178,8 @@ impl Extensions {
         let by_name = recognizers.clone();
         let named = move |settings: &toml::Table| named_type(&by_name, settings.get("file")?.as_str()?);
         let stored = graph::OpDef::new(graph::FILE, "Stored file", "1").output_of(named).makes(any_file, move |call| {
-            let name = call.setting_str("file")?.to_string();
+            // The file it reads, as its node names it: a path within its bundle.
+            let name = pe2_path::RelPath::new(call.setting_str("file")?)?.to_owned();
             // A file the node may lack (`optional`): none, without it.
             if call.settings().get("optional").and_then(toml::Value::as_bool) == Some(true)
                 && call.recorder().node().file_sha1(&name).is_none()
@@ -2188,7 +2189,7 @@ impl Extensions {
             let node = call.recorder().node();
             let head = node.read_head(&name, HEAD);
             let size = node.file_size(&name).unwrap_or_default();
-            let known = recognize_head(&recognizers, &name, size, &head);
+            let known = recognize_head(&recognizers, name.as_str(), size, &head);
             call.stored(&name, type_names(known.iter().map(|(i, _)| &recognizers[*i]))).map(graph::Value::Typed)
         });
         ops.add(stored);
@@ -2784,7 +2785,7 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.read_range(content, offset, len)
     }
 
-    fn writer(&self, name: &str) -> Result<Box<dyn pe2_ext::FileWriter>> {
+    fn writer(&self, name: &pe2_ext::RelPath) -> Result<Box<dyn pe2_ext::FileWriter>> {
         Ok(Box::new(self.call.writer(name)))
     }
 
@@ -2820,7 +2821,7 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.assets_of(node_type)
     }
 
-    fn keep(&self, path: &pe2_ext::HostPath, name: &str) -> Result<pe2_ext::File> {
+    fn keep(&self, path: &pe2_ext::HostPath, name: &pe2_ext::RelPath) -> Result<pe2_ext::File> {
         self.call.keep(&taken(path)?, name)
     }
 
@@ -2856,21 +2857,21 @@ impl Source for index::Asset {
         self.settings_text()
     }
 
-    fn has_file(&self, name: &str) -> bool {
+    fn has_file(&self, name: &pe2_ext::RelPath) -> bool {
         self.files.iter().any(|f| *f.name == *name)
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
-    fn size(&self, name: &str) -> Option<u64> {
+    fn size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
         Some(self.files.iter().find(|f| *f.name == *name)?.size)
     }
 
-    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read_range(&file.path, offset, len).with_context(|| file.path.display().to_string())

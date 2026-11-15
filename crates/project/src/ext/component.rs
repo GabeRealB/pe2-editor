@@ -365,6 +365,11 @@ fn reference_of(text: &str) -> std::result::Result<pe2_path::Reference, String> 
     pe2_path::Reference::new(text).map_err(|why| why.to_string())
 }
 
+/// A file's name as a component says it: a path within an asset or a value, checked as it comes in.
+fn name_of(text: &str) -> std::result::Result<&pe2_path::RelPath, String> {
+    pe2_path::RelPath::new(text).map_err(|why| why.to_string())
+}
+
 impl host::HostAsset for State {
     fn path(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<String> {
         Ok(self.lent(&asset)?.path().to_string())
@@ -383,15 +388,23 @@ impl host::HostAsset for State {
     }
 
     fn has_file(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<bool> {
-        Ok(self.lent(&asset)?.has_file(&name))
+        // What is no name is no file of any asset.
+        let Ok(name) = name_of(&name) else { return Ok(false) };
+        Ok(self.lent(&asset)?.has_file(name))
     }
 
     fn read(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
-        Ok(self.lent(&asset)?.read(&name).map_err(|e| format!("{e:#}")))
+        let name = match name_of(&name) {
+            Ok(name) => name,
+            Err(why) => return Ok(Err(why)),
+        };
+        Ok(self.lent(&asset)?.read(name).map_err(|e| format!("{e:#}")))
     }
 
     fn size(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<u64>> {
-        Ok(self.lent(&asset)?.size(&name))
+        // What is no name is no file of any asset.
+        let Ok(name) = name_of(&name) else { return Ok(None) };
+        Ok(self.lent(&asset)?.size(name))
     }
 
     fn read_range(
@@ -401,7 +414,11 @@ impl host::HostAsset for State {
         offset: u64,
         len: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, String>> {
-        Ok(self.lent(&asset)?.read_range(&name, offset, len as usize).map_err(|e| format!("{e:#}")))
+        let name = match name_of(&name) {
+            Ok(name) => name,
+            Err(why) => return Ok(Err(why)),
+        };
+        Ok(self.lent(&asset)?.read_range(name, offset, len as usize).map_err(|e| format!("{e:#}")))
     }
 
     fn writer(
@@ -409,7 +426,11 @@ impl host::HostAsset for State {
         asset: Resource<LentAsset>,
         name: String,
     ) -> wasmtime::Result<Result<Resource<HostWriter>, String>> {
-        let made = match self.lent(&asset)?.writer(&name) {
+        let name = match name_of(&name) {
+            Ok(name) => name,
+            Err(why) => return Ok(Err(why)),
+        };
+        let made = match self.lent(&asset)?.writer(name) {
             Some(made) => made.map_err(|e| format!("{e:#}")),
             None => Err(format!("{}: lent for no operation's run, it makes no files", self.lent(&asset)?.path())),
         };
@@ -533,7 +554,11 @@ impl host::HostAsset for State {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
         let path = pe2_ext::HostPath::of_host(self.table.get(&path)?.0.clone().into_path_buf());
-        let kept = self.lent(&asset)?.keep(&path, &name).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        let name = match name_of(&name) {
+            Ok(name) => name,
+            Err(why) => return Ok(Err(why)),
+        };
+        let kept = self.lent(&asset)?.keep(&path, name).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
         Ok(kept.map(file_to_wit).map_err(|e| format!("{e:#}")))
     }
 
@@ -541,7 +566,9 @@ impl host::HostAsset for State {
         if self.unsandboxed.is_none() {
             return Ok(None);
         }
-        let found = self.lent(&asset)?.path_of(&name);
+        // What is no name is no file of any asset.
+        let Ok(name) = name_of(&name) else { return Ok(None) };
+        let found = self.lent(&asset)?.path_of(name);
         found.map(|at| self.give(&at)).transpose()
     }
 
@@ -554,7 +581,10 @@ impl host::HostAsset for State {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        let files: Vec<pe2_ext::File> = files.into_iter().map(file_from_wit).collect();
+        let files: Vec<pe2_ext::File> = match files.into_iter().map(file_from_wit).collect() {
+            Ok(files) => files,
+            Err(why) => return Ok(Err(format!("{why:#}"))),
+        };
         let how = pe2_ext::Use { often: how.often, ranges: how.ranges };
         let served =
             self.lent(&asset)?.serve(&files, &how).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
@@ -2594,7 +2624,8 @@ impl<'a> Node<'a> {
         Node { host, declaration: String::new() }
     }
 
-    fn content(name: &str) -> pe2_ext::Content {
+    /// What an operation's asset reads by name: a content, by its hash, which the contract sends where it sends a name.
+    fn content(name: &pe2_ext::RelPath) -> pe2_ext::Content {
         pe2_ext::Content::Stored { sha1: name.to_string(), size: 0 }
     }
 }
@@ -2617,23 +2648,23 @@ impl Source for Node<'_> {
         &self.declaration
     }
 
-    fn has_file(&self, _: &str) -> bool {
+    fn has_file(&self, _: &pe2_ext::RelPath) -> bool {
         true
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         self.host.read(&Node::content(name))
     }
 
-    fn size(&self, _: &str) -> Option<u64> {
+    fn size(&self, _: &pe2_ext::RelPath) -> Option<u64> {
         None
     }
 
-    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.host.read_range(&Node::content(name), offset, len)
     }
 
-    fn writer(&self, name: &str) -> Option<Result<Box<dyn pe2_ext::FileWriter>>> {
+    fn writer(&self, name: &pe2_ext::RelPath) -> Option<Result<Box<dyn pe2_ext::FileWriter>>> {
         Some(self.host.writer(name))
     }
 
@@ -2669,11 +2700,11 @@ impl Source for Node<'_> {
         Some(self.host.assets_of(node_type))
     }
 
-    fn keep(&self, path: &pe2_ext::HostPath, name: &str) -> Option<Result<pe2_ext::File>> {
+    fn keep(&self, path: &pe2_ext::HostPath, name: &pe2_ext::RelPath) -> Option<Result<pe2_ext::File>> {
         Some(self.host.keep(path, name))
     }
 
-    fn path_of(&self, name: &str) -> Option<pe2_ext::HostPath> {
+    fn path_of(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::HostPath> {
         self.host.path_of(&Node::content(name))
     }
 
@@ -2784,7 +2815,7 @@ fn file_to_wit(f: pe2_ext::File) -> types::File {
         pe2_ext::Content::Inline(bytes) => types::Content::Inline(bytes),
         pe2_ext::Content::Stored { sha1, size } => types::Content::Stored((sha1, size)),
     };
-    types::File { name: f.name, content }
+    types::File { name: f.name.to_string(), content }
 }
 
 /// A value as the contract carried it.
@@ -2823,7 +2854,7 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
         types::Item::Typed(t) => Data::Typed(pe2_ext::Typed {
             ty: t.ty,
             also: t.also,
-            files: t.files.into_iter().map(file_from_wit).collect(),
+            files: t.files.into_iter().map(file_from_wit).collect::<Result<_>>()?,
             settings: toml::from_str(&t.settings).unwrap_or_default(),
             notes: t.notes,
         }),
@@ -2850,12 +2881,14 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
     })
 }
 
-fn file_from_wit(f: types::File) -> pe2_ext::File {
+/// A file as a component gives it: its name checked as it comes in.
+fn file_from_wit(f: types::File) -> Result<pe2_ext::File> {
     let content = match f.content {
         types::Content::Inline(bytes) => pe2_ext::Content::Inline(bytes),
         types::Content::Stored((sha1, size)) => pe2_ext::Content::Stored { sha1, size },
     };
-    pe2_ext::File { name: f.name, content }
+    let name = pe2_path::RelPath::new(&f.name).with_context(|| format!("a file named {}", f.name))?;
+    Ok(pe2_ext::File { name: name.to_owned(), content })
 }
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.

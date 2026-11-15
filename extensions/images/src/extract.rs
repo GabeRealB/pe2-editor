@@ -201,7 +201,7 @@ impl Textures {
             let inflated = formats::lzss::decode_stream(&read(discs, at)?, 0).0;
             let held = inflated.get(offset..offset + size).ok_or_else(|| anyhow!("past the end of its package"))?;
             check(held, loc.sha1.as_ref().ok_or_else(|| anyhow!("no texels sha1"))?, "texels")?;
-            return Ok(vec![("native.texels".to_string(), held.to_vec())]);
+            return Ok(Box::new([(pe2_ext::RelPath::constant("native.texels").to_owned(), held.to_vec())]));
         }
         let pages = codecs::texture::pages(&read(discs, at)?)?;
         let first = at.page.unwrap_or(0);
@@ -223,7 +223,8 @@ impl Textures {
         let stored = h.min(columns[0].1);
         let want = loc.sha1.as_ref().ok_or_else(|| anyhow!("no texels sha1"))?;
         check(&codecs::texture::texel_bytes(&texels[..w * stored], bpp), want, "texels")?;
-        let mut out = vec![("native.texels".to_string(), codecs::texture::texel_bytes(&texels, bpp))];
+        let mut out =
+            vec![(pe2_ext::RelPath::constant("native.texels").to_owned(), codecs::texture::texel_bytes(&texels, bpp))];
         for (name, palette) in tex.palettes()? {
             let (Some(slot), Some(place)) = (&palette.slot, palette.at) else { continue }; // an executable's
             // A slot naming the image's palette uploads it; else a named run at its place (a palette the system
@@ -240,9 +241,9 @@ impl Textures {
             let bytes: Vec<u8> = colors.iter().flat_map(|c| c.to_le_bytes()).collect();
             let declared = loc.palettes.get(&name).ok_or_else(|| anyhow!("{name}: no sha1"))?;
             check(&bytes, declared, &name)?;
-            out.push((format!("native.{name}.colors"), bytes));
+            out.push((crate::colors_file(&name)?, bytes));
         }
-        Ok(out)
+        Ok(out.into())
     }
 }
 

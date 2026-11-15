@@ -34,7 +34,7 @@ impl Registered for Vag {
     const LABEL: &str = "SPU-ADPCM sample";
 
     fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(VAG.into())]
+        vec![Signature::Name(VAG.as_str().into())]
     }
 }
 
@@ -100,7 +100,7 @@ fn room_field() -> Field {
 }
 
 /// A sample's native file.
-pub const VAG: &str = "native.vag";
+pub const VAG: &pe2_ext::RelPath = pe2_ext::RelPath::constant("native.vag");
 
 /// The modes Sony's encoder runs in, by the filters it weighs.
 const MODES: [(&str, &str); 4] =
@@ -154,7 +154,7 @@ fn samples(r: &mut Registry) {
             let native = call.take::<Vag>(0)?;
             let body = call.read(native.file()?)?;
             let (bytes, _) = wav_of(&body, rate_of(&pe2_ext::merged(call.settings, &native.settings)))?;
-            Ok(Typed::new("audio/wav", vec![pe2_ext::File::new("sound.wav", bytes)]))
+            Ok(Typed::new("audio/wav", vec![pe2_ext::File::new(pe2_ext::RelPath::constant("sound.wav"), bytes)]))
         });
     let _ = r
         .op("wav")
@@ -244,7 +244,7 @@ fn recorded(r: &mut Registry) {
             let (channels, rate) = format.ok_or_else(|| anyhow!("nothing was played"))?;
             let channels = u16::try_from(channels).map_err(|_| anyhow!("{channels} channels"))?;
             let bytes = wav::write_interleaved(&pcm, channels, rate);
-            Ok(Typed::new("audio/wav", vec![pe2_ext::File::new("played.wav", bytes)]))
+            Ok(Typed::new("audio/wav", vec![pe2_ext::File::new(pe2_ext::RelPath::constant("played.wav"), bytes)]))
         });
 }
 
@@ -253,7 +253,7 @@ fn recorded(r: &mut Registry) {
 ///
 /// # Errors
 /// It is no PS-X executable, or the addresses are not in it.
-pub fn extract_reverb(exe: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
+pub fn extract_reverb(exe: &[u8], args: &Table) -> Result<pe2_ext::Made> {
     anyhow::ensure!(exe.starts_with(b"PS-X EXE") && exe.len() > 0x800, "not a PS-X executable");
     let load = u32::from_le_bytes(exe[0x18..0x1C].try_into()?);
     let at = |key: &str| -> Result<usize> {
@@ -270,8 +270,9 @@ pub fn extract_reverb(exe: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>
         *register = word(first + 2 * n)?;
     }
     let mode = reverb::Mode { registers, work_area: word(at("work_area")?)? };
-    let node = args.get("node").and_then(Value::as_str).ok_or_else(|| anyhow!("no node"))?;
-    Ok(vec![(format!("{node}/reverb.toml"), bank::text(&mode.table()).into_bytes())])
+    let node = pe2_ext::TreePath::new(args.get("node").and_then(Value::as_str).ok_or_else(|| anyhow!("no node"))?)?;
+    let file = node.rel().join_path(pe2_ext::RelPath::constant("reverb.toml"));
+    Ok(Box::new([(file, bank::text(&mode.table()).into_bytes())]))
 }
 
 /// What a plan runs of them: a bank's nodes' files - its own, its instruments', scripts' and samples' - from its
@@ -290,7 +291,7 @@ fn planned(r: &mut Registry) {
             };
             let files = extract_bank(&chunk, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File::new(&name, bytes))
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
                 .collect();
             Ok(pe2_ext::Data::Typed(Typed::new("bytes", files)))
         });
@@ -305,8 +306,10 @@ fn planned(r: &mut Registry) {
                 Some(pe2_ext::Data::Typed(typed)) => call.read(typed.file()?)?,
                 _ => anyhow::bail!("no executable given"),
             };
-            let files =
-                extract_reverb(&exe, call.settings)?.into_iter().map(|(n, b)| pe2_ext::File::new(&n, b)).collect();
+            let files = extract_reverb(&exe, call.settings)?
+                .into_iter()
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
+                .collect();
             Ok(pe2_ext::Data::Typed(Typed::new("bytes", files)))
         });
 }
@@ -320,18 +323,17 @@ fn planned(r: &mut Registry) {
 ///
 /// # Errors
 /// The bank is not as its declarations say, or a sample cannot be decoded in the mode its node states.
-pub fn extract_bank(blob: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
+pub fn extract_bank(blob: &[u8], args: &Table) -> Result<pe2_ext::Made> {
     let bank = bank::read(blob)?;
-    let path = args.get("bank").and_then(Value::as_str).ok_or_else(|| anyhow!("no bank"))?;
+    let path = pe2_ext::TreePath::new(args.get("bank").and_then(Value::as_str).ok_or_else(|| anyhow!("no bank"))?)?;
     let list = |key: &str| -> Result<Vec<Value>> {
         Ok(args.get(key).and_then(Value::as_array).ok_or_else(|| anyhow!("no {key}"))?.clone())
     };
     let (instruments, scripts, samples) = (list("instruments")?, list("scripts")?, list("samples")?);
-    let path_of = |v: &Value| {
-        v.as_str()
-            .or_else(|| v.get("path").and_then(Value::as_str))
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("no path"))
+    // A node's file, by the node's path as declared: written alone, or as the table's `path`.
+    let file_of = |v: &Value, file: &'static str| -> Result<std::sync::Arc<pe2_ext::RelPath>> {
+        let path = v.as_str().or_else(|| v.get("path").and_then(Value::as_str)).ok_or_else(|| anyhow!("no path"))?;
+        Ok(pe2_ext::TreePath::new(path)?.rel().join_path(pe2_ext::RelPath::constant(file)))
     };
     anyhow::ensure!(
         instruments.len() == bank.programs.len(),
@@ -347,9 +349,9 @@ pub fn extract_bank(blob: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>>
         script_files.len()
     );
     let text = |t: &Table| -> Result<Vec<u8>> { Ok(bank::text(t).into_bytes()) };
-    let mut out = vec![(format!("{path}/bank.toml"), text(&file)?)];
+    let mut out = vec![(path.rel().join_path(pe2_ext::RelPath::constant("bank.toml")), text(&file)?)];
     // A file once, where the bank binds the same instrument, script or sample at several places.
-    let mut add = |name: String, bytes: Vec<u8>| -> Result<()> {
+    let mut add = |name: std::sync::Arc<pe2_ext::RelPath>, bytes: Vec<u8>| -> Result<()> {
         match out.iter().find(|(n, _)| *n == name) {
             Some((_, made)) => anyhow::ensure!(*made == bytes, "{name} is made twice, not alike"),
             None => out.push((name, bytes)),
@@ -357,10 +359,10 @@ pub fn extract_bank(blob: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>>
         Ok(())
     };
     for (t, made) in instruments.iter().zip(&instrument_files) {
-        add(format!("{}/instrument.toml", path_of(t)?), text(made)?)?;
+        add(file_of(t, "instrument.toml")?, text(made)?)?;
     }
     for (t, made) in scripts.iter().zip(&script_files) {
-        add(format!("{}/settings.toml", path_of(t)?), text(made)?)?;
+        add(file_of(t, "settings.toml")?, text(made)?)?;
     }
     anyhow::ensure!(
         samples.len() == bank.pool.len(),
@@ -373,10 +375,11 @@ pub fn extract_bank(blob: &[u8], args: &Table) -> Result<Vec<(String, Vec<u8>)>>
         let settings = t.as_table().ok_or_else(|| anyhow!("a sample is no table"))?;
         let declared = settings.get("mode").and_then(Value::as_str).unwrap_or("normal");
         let (wav, mode) = wav_of(body, rate_of(settings))?;
-        anyhow::ensure!(mode == declared, "{}: declares mode {declared}; its body needs {mode}", path_of(t)?);
-        add(format!("{}/sound.wav", path_of(t)?), wav)?;
+        let sound = file_of(t, "sound.wav")?;
+        anyhow::ensure!(mode == declared, "{sound}: declares mode {declared}; its body needs {mode}");
+        add(sound, wav)?;
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 /// A sample's stack: its WAV, made into its body.

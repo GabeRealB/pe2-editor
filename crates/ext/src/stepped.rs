@@ -440,8 +440,8 @@ pub const RECORD: &str = "stepped@record";
 pub const OWN: usize = 2;
 
 /// The record's file in a step's record, and the file the host adds where it had what the step carries sealed.
-const RECORD_FILE: &str = "record.cbor";
-const SEALED_FILE: &str = "state.cbor";
+const RECORD_FILE: &crate::RelPath = crate::RelPath::constant("record.cbor");
+const SEALED_FILE: &crate::RelPath = crate::RelPath::constant("state.cbor");
 
 /// What a step ending at a cut hands on, for the host to go on from: which cut, the token what it carries is held by,
 /// what it requests, what it spawns and runs it; and the operations of its extension running the next step and its items.
@@ -494,13 +494,13 @@ pub fn is_record(data: &Data) -> bool {
     matches!(data, Data::Typed(typed) if typed.ty == RECORD)
 }
 
-fn record_file<'a>(typed: &'a Typed, name: &str) -> Result<&'a File> {
+fn record_file<'a>(typed: &'a Typed, name: &crate::RelPath) -> Result<&'a File> {
     typed.files.iter().find(|file| file.name == name).ok_or_else(|| anyhow!("a step's record has no {name}"))
 }
 
 /// What an item made, as a value the host moves and keeps: one file.
 fn made_value(bytes: Vec<u8>) -> Data {
-    Data::Typed(Typed::new(crate::data::BYTES, vec![File::new("made.cbor", bytes)]))
+    Data::Typed(Typed::new(crate::data::BYTES, vec![File::new(crate::RelPath::constant("made.cbor"), bytes)]))
 }
 
 /// The bytes of the one file a value holds.
@@ -783,7 +783,7 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.read_range(content, offset, len)
     }
 
-    fn writer(&self, name: &str) -> Result<Box<dyn crate::data::FileWriter>> {
+    fn writer(&self, name: &crate::RelPath) -> Result<Box<dyn crate::data::FileWriter>> {
         self.inner.writer(name)
     }
 
@@ -791,7 +791,7 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.temp()
     }
 
-    fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
+    fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> Result<File> {
         self.inner.keep(path, name)
     }
 

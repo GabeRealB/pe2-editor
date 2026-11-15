@@ -26,7 +26,8 @@ fn main() {
     let files = pe2_dialogue::extract_dialogues(&chunks, &table).expect("extracted");
     let (mut failed, mut read, mut unsettled) = (0, 0, 0);
     for (name, bytes) in &files {
-        if !name.ends_with("settings.toml") || name.starts_with("strings") {
+        let settings = name.last().is_some_and(|last| *last == *"settings.toml");
+        if !settings || name.parts().next().is_some_and(|first| *first == *"strings") {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
@@ -43,7 +44,7 @@ fn main() {
     println!("{read} read exactly ({unsettled} with something unsettled), {failed} failed");
     if let Some(out) = out {
         for (name, bytes) in &files {
-            let path = std::path::Path::new(&out).at(name);
+            let path = std::path::Path::new(&out).at(name.as_str());
             std::fs::create_dir_all(path.parent().expect("a folder")).expect("a folder");
             std::fs::write(path, bytes).expect("written");
         }

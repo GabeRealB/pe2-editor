@@ -58,8 +58,10 @@ counting, as that is what it is.
   goes unused or grows, one for views. An instance that traps is dropped.
 - **Lending.** Host objects (an asset, the project, a UI frame) are put in the resource table for the length of one
   call and taken out before it returns, so a guest can never keep one.
-- **Names are types on both sides, text between.** The contract carries an asset's path, a reference and an
-  output's address as strings; the SDK and the host check each into its `pe2-path` type where it arrives. What a
+- **Names are types on both sides, text between.** The contract carries an asset's path, a reference, an output's
+  address and a file's name (`RelPath`, within an asset or a value) as strings; the SDK and the host check each into
+  its `pe2-path` type where it arrives. An operation's lent asset reads a stored content by its hash where a name
+  goes, and the host takes it as one (`component.rs`, `Node::content`). What a
   guest sends that is no path or reference is refused as the call's error (`component.rs`, `tree_of`, `reference_of`);
   what the host sends that is none is a broken host, and the guest traps (`guest.rs`, `told_path`).
 - Calls block their thread. They must not be made from an async runtime's thread.

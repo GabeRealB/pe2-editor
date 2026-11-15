@@ -3,15 +3,17 @@
 //! An extension's code reads them as it would read the discs (`Discs`) and the declarations (`Declared`), so that what
 //! reads a texture's pages or an atlas's faces needs no knowledge of where they came from.
 
-use crate::{Result, Table};
+use std::sync::Arc;
+
+use crate::{Result, Table, TreePath};
 
 /// Files made, each by its name in the bundle.
-pub type Made = Vec<(String, Vec<u8>)>;
+pub type Made = Box<[(std::sync::Arc<crate::RelPath>, Vec<u8>)]>;
 
 /// Declarations as an operation was given them: each the table its group file declares it by.
 pub trait Declared {
     /// Every declaration of a type given (`file`, `image`, `vram_slot`), by path, in path order.
-    fn declarations(&self, node_type: &str) -> Vec<(String, Table)>;
+    fn declarations(&self, node_type: &str) -> Box<[(Arc<TreePath>, Table)]>;
 }
 
 /// The discs, as an extension's code reads them: here, what a plan gave it (`Given`).

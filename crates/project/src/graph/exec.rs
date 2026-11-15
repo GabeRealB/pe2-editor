@@ -29,22 +29,22 @@ pub trait Node: Sync {
         crate::extract::sha1_hex(self.declaration().as_bytes())
     }
     /// A stored file's hash; none where its bundle has no such file.
-    fn file_sha1(&self, name: &str) -> Option<String>;
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String>;
     /// Its stored files' names, a file in a folder of the bundle as `<folder>/<file>`: what a folder of it holds.
-    fn file_names(&self) -> Vec<String> {
-        Vec::new()
+    fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
+        Box::default()
     }
     /// A stored file, whole.
     ///
     /// # Errors
     /// Its bundle has no such file, or it cannot be read.
-    fn read(&self, name: &str) -> Result<Vec<u8>>;
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>>;
     /// A stored file's size.
-    fn file_size(&self, name: &str) -> Option<u64> {
+    fn file_size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
         self.read(name).ok().map(|b| b.len() as u64)
     }
     /// A stored file's first bytes, up to `len`: what its formats are recognized by.
-    fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
+    fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
         self.read(name).map_or_else(
             |_| Vec::new(),
             |mut b| {
@@ -88,21 +88,21 @@ impl Node for crate::index::Asset {
         crate::index::Asset::fields_toml(self)
     }
 
-    fn file_sha1(&self, name: &str) -> Option<String> {
+    fn file_sha1(&self, name: &pe2_ext::RelPath) -> Option<String> {
         self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.sha1.clone())
     }
 
-    fn file_names(&self) -> Vec<String> {
-        self.files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.to_string()).collect()
+    fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
+        self.files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.clone()).collect()
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let file = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none());
         let file = file.with_context(|| format!("{}: no file {name}", self.path))?;
         crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
-    fn file_size(&self, name: &str) -> Option<u64> {
+    fn file_size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
         self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()).map(|f| f.size)
     }
 
@@ -110,7 +110,7 @@ impl Node for crate::index::Asset {
         self.files.iter().find(|f| f.sha1 == sha1).map(|f| f.path.clone())
     }
 
-    fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
+    fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
         let Some(file) = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()) else { return Vec::new() };
         crate::content::head(&file.path, len)
     }
@@ -204,8 +204,10 @@ impl Reads {
     /// Each of the project's files and folders read has its too.
     #[must_use]
     pub fn hold(&self, node: &dyn Node, reach: Option<Reach<'_>>) -> bool {
-        self.files.iter().all(|(name, sha1)| node.file_sha1(name).unwrap_or_default() == *sha1)
-            && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
+        // A file recorded by a name no path takes is read no more: what read it is made again.
+        self.files.iter().all(|(name, sha1)| {
+            pe2_path::RelPath::new(name).is_ok_and(|name| node.file_sha1(name).unwrap_or_default() == *sha1)
+        }) && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
             && (self.outputs.is_empty()
                 || reach.is_some_and(|reach| {
                     self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))
@@ -360,7 +362,7 @@ pub struct Recorder<'a> {
 }
 
 impl<'a> Recorder<'a> {
-    pub fn file(&self, name: &str) {
+    pub fn file(&self, name: &pe2_ext::RelPath) {
         let sha1 = self.node.file_sha1(name).unwrap_or_default();
         self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).files.insert(name.to_string(), sha1);
     }
@@ -494,16 +496,22 @@ fn making_as(chain: &[String], work: impl FnOnce() -> Result<Got>) -> Result<Got
     done
 }
 
+/// Whether a file of a bundle is within a folder of it, strictly.
+fn inside(file: &pe2_ext::RelPath, folder: &pe2_ext::RelPath) -> bool {
+    file.strip_prefix(folder).is_some_and(|rest| !rest.is_root())
+}
+
 /// A value with only these of its files: each a whole name, or a folder ending in `/`.
 fn only_files(input: &Input, files: &[String]) -> std::result::Result<Input, String> {
     if files.is_empty() {
         return Ok(input.clone());
     }
     let Value::Typed(typed) = input.value() else { return Err(format!("it holds no files: {}", input.value().ty())) };
+    // What is kept is named as the setting names it: whole, or a folder by its leading parts and a `/`.
     let wanted =
         |name: &str| files.iter().any(|file| name == file || (file.ends_with('/') && name.starts_with(file.as_str())));
     let mut typed = typed.clone();
-    typed.files.retain(|file| wanted(&file.name));
+    typed.files.retain(|file| wanted(file.name.as_str()));
     Ok(Input(Arc::new(Value::Typed(typed))))
 }
 
@@ -556,28 +564,29 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// The node has no such file.
-    pub fn stored(&self, name: &str, mut names: Vec<String>) -> Result<Typed> {
+    pub fn stored(&self, name: &pe2_ext::RelPath, mut names: Vec<String>) -> Result<Typed> {
         let node = self.recorder.node;
         let ty = if names.is_empty() { pe2_ext::data::BYTES.to_string() } else { names.remove(0) };
         let settings = super::set_on(super::FILE, self.settings);
         // A folder of the bundle (a UFO font): every file in it, named within it.
         if node.file_sha1(name).is_none() {
-            let within = format!("{}/", name.trim_end_matches('/'));
-            let held: Vec<String> = node.file_names().into_iter().filter(|file| file.starts_with(&within)).collect();
+            let held: Vec<Arc<pe2_ext::RelPath>> =
+                node.file_names().into_iter().filter(|file| inside(file, name)).collect();
             anyhow::ensure!(!held.is_empty(), "{}: no file or folder {name}", node.path());
             let mut files = Vec::with_capacity(held.len());
             for file in held {
                 self.recorder.file(&file);
                 let sha1 = node.file_sha1(&file).with_context(|| format!("{}: no file {file}", node.path()))?;
                 let size = node.file_size(&file).unwrap_or_default();
-                files.push(File { name: file[within.len()..].to_string(), content: Content::Stored { sha1, size } });
+                let within = file.strip_prefix(name).unwrap_or(&file).to_owned();
+                files.push(File { name: within, content: Content::Stored { sha1, size } });
             }
             return Ok(Typed { ty, also: names, files, settings, ..Typed::default() });
         }
         self.recorder.file(name);
         let sha1 = node.file_sha1(name).with_context(|| format!("{}: no file {name}", node.path()))?;
         let size = node.file_size(name).unwrap_or_default();
-        let file = File { name: name.to_string(), content: Content::Stored { sha1, size } };
+        let file = File { name: name.to_owned(), content: Content::Stored { sha1, size } };
         // A stored file comes with what is said of it, on its layer.
         Ok(Typed { ty, also: names, files: vec![file], settings, ..Typed::default() })
     }
@@ -586,22 +595,24 @@ impl<'a> Call<'a> {
     /// `<name>`, what the releases share), the one of the config's release where it has one - the config then recorded
     /// as read - else `name`.
     #[must_use]
-    pub fn of_release(&self, name: &str) -> String {
+    pub fn of_release(&self, name: &pe2_ext::RelPath) -> Arc<pe2_ext::RelPath> {
         let node = self.recorder.node;
-        let within = name.trim_end_matches('/');
         let apart = node.file_names().iter().any(|file| {
-            file.split_once('/').is_some_and(|(release, rest)| {
-                !release.contains('.') && (rest == within || rest.starts_with(&format!("{within}/")))
+            file.parts().next().is_some_and(|release| {
+                !release.as_str().contains('.')
+                    && file.strip_prefix(release.as_rel()).is_some_and(|rest| *rest == *name || inside(rest, name))
             })
         });
         if !apart {
-            return name.to_string();
+            return name.to_owned();
         }
-        let Some(release) = self.release() else { return name.to_string() };
-        let ours = format!("{release}/{name}");
-        let held = node.file_sha1(&ours).is_some()
-            || node.file_names().iter().any(|file| file.starts_with(&format!("{release}/{within}/")));
-        if held { ours } else { name.to_string() }
+        // A release no name takes keeps no file apart: what the releases share is read.
+        let Some(release) = self.release().and_then(|release| pe2_path::Name::new(&release).ok().map(Arc::from)) else {
+            return name.to_owned();
+        };
+        let ours = pe2_path::Name::into_rel(release).join_path(name);
+        let held = node.file_sha1(&ours).is_some() || node.file_names().iter().any(|file| inside(file, &ours));
+        if held { ours } else { name.to_owned() }
     }
 
     /// A stored file or folder of the node, as `stored` gives it; where it has neither, no files - its absence recorded,
@@ -609,10 +620,9 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// What `stored` fails with, but the file's absence.
-    pub fn stored_if_any(&self, name: &str) -> Result<Typed> {
+    pub fn stored_if_any(&self, name: &pe2_ext::RelPath) -> Result<Typed> {
         let node = self.recorder.node;
-        let within = format!("{}/", name.trim_end_matches('/'));
-        if node.file_sha1(name).is_none() && !node.file_names().iter().any(|file| file.starts_with(&within)) {
+        if node.file_sha1(name).is_none() && !node.file_names().iter().any(|file| inside(file, name)) {
             self.recorder.file(name);
             let settings = super::set_on(super::FILE, self.settings);
             return Ok(Typed { ty: pe2_ext::data::BYTES.to_string(), settings, ..Typed::default() });
@@ -757,9 +767,9 @@ impl<'a> Call<'a> {
     /// A file being made, named `name`: held in memory while small, spilled to the store past `SPILL` bytes (where
     /// there is a store), and finished into a file whose content is inline or stored - which readers cannot tell.
     #[must_use]
-    pub fn writer(&self, name: &str) -> Writer {
+    pub fn writer(&self, name: &pe2_ext::RelPath) -> Writer {
         Writer {
-            name: name.to_string(),
+            name: name.to_owned(),
             store: self.store.cloned(),
             memory: Vec::new(),
             spilled: None,
@@ -798,10 +808,8 @@ impl<'a> Call<'a> {
                     )),
                 },
             };
-            // Its name is a path in the folder: checked here, where it becomes one.
-            let name = crate::content::GivenPath::new(&file.name)
-                .with_context(|| format!("{}: no path in a folder", file.name))?;
-            given.insert(name.to_owned(), content);
+            // Its name is a path in the folder it is served in.
+            given.insert(crate::content::GivenPath::within(&file.name).to_owned(), content);
         }
         let project = self.store.and_then(Store::project);
         let fallback = match self.store {
@@ -818,12 +826,12 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// There is no store, or it cannot be read or moved.
-    pub fn keep(&self, path: &HostPath, name: &str) -> Result<File> {
+    pub fn keep(&self, path: &HostPath, name: &pe2_ext::RelPath) -> Result<File> {
         let store = self.store.context("no store to keep it in")?;
         let sha1 = crate::extract::sha1_file(path).with_context(|| path.display().to_string())?;
         let size = std::fs::metadata(path).with_context(|| path.display().to_string())?.len();
         store.adopt(path, &sha1)?;
-        Ok(File { name: name.to_string(), content: Content::Stored { sha1, size } })
+        Ok(File { name: name.to_owned(), content: Content::Stored { sha1, size } })
     }
 
     /// Copy a content into a writer, a range at a time: never read whole.
@@ -935,7 +943,7 @@ pub const SPILL: usize = 1 << 20;
 /// A file being made (`Call::writer`): its bytes in memory up to `SPILL`, past it in a file of the store's, hashed as
 /// they come.
 pub struct Writer {
-    name: String,
+    name: Arc<pe2_ext::RelPath>,
     store: Option<Store>,
     memory: Vec<u8>,
     spilled: Option<(std::fs::File, HostPath)>,
@@ -974,9 +982,9 @@ impl Writer {
     /// # Errors
     /// What was spilled cannot be written or kept.
     pub fn finish(mut self) -> Result<File> {
-        let name = std::mem::take(&mut self.name);
+        let name = self.name.clone();
         let Some((mut file, path)) = self.spilled.take() else {
-            return Ok(File::new(&name, std::mem::take(&mut self.memory)));
+            return Ok(File { name, content: Content::Inline(std::mem::take(&mut self.memory)) });
         };
         // Its file is the store's from here, whatever comes of keeping it: removed where it cannot be kept.
         let kept = (|| {
@@ -2245,11 +2253,11 @@ impl Node for Nowhere {
         &self.fields
     }
 
-    fn file_sha1(&self, _: &str) -> Option<String> {
+    fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<String> {
         None
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         anyhow::bail!("{name}: it has no node")
     }
 }

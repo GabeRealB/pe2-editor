@@ -33,11 +33,13 @@ const DECLARING: [&str; 4] = ["PE2_BIND", "PE2_BIND_SELF", "PE2_OPTION_DEF", "PE
 /// What a gathered tree is of: the package's name, which names its objects.
 pub const NAME: &str = "package";
 /// Where a package's tree holds what it can include of others, each under its name: what it includes in angle brackets.
-const DEP: &str = "dep";
+const DEP: &RelPath = RelPath::constant("dep");
+/// Where a package's tree holds its own files.
+const OWN: &RelPath = RelPath::constant("self");
 /// What the build makes for the package being built, which core's `pe2.h` includes in quotes.
 const MADE: [&str; 3] = [VALUES, OPTIONS, "pe2_server.h"];
 /// Where a first pass leaves what it made of each unit.
-const FIRST: &str = "first/";
+const FIRST: &RelPath = RelPath::constant("first");
 /// The most a line of a macro takes, as a preprocessor may limit one, so a long value is a chain of macros.
 const LINE: usize = 32_000;
 
@@ -157,7 +159,7 @@ fn shaped(path: &TreePath, fields: &Table) -> Result<()> {
 /// A file to take in: where it is in the project, where it goes in the tree, and whose it is.
 struct Taken {
     entry: Arc<TreePath>,
-    place: String,
+    place: Arc<RelPath>,
     owner: String,
 }
 
@@ -167,7 +169,7 @@ struct Gathering<'a> {
     packages: HashMap<String, Package>,
     /// The package gathered.
     own: String,
-    tree: BTreeMap<String, Vec<u8>>,
+    tree: BTreeMap<Arc<RelPath>, Vec<u8>>,
     /// The packages whose target files it takes: its own, and the images it links against.
     reached: BTreeSet<String>,
     pending: Vec<Taken>,
@@ -195,7 +197,7 @@ fn package_names(paths: &[Arc<TreePath>]) -> HashMap<Arc<TreePath>, String> {
 }
 
 /// Where a package declares its slots and options: one of its units, the first that does, which any other declaring breaks
-/// (`gen_package_values.py`'s `gathered`) - never a header, which whatever includes it reads.
+/// - never a header, which whatever includes it reads.
 struct Declaring {
     file: Option<Arc<TreePath>>,
     /// The package's units, by their paths, and its name.
@@ -361,14 +363,18 @@ fn entry_in(folder: &TreePath, written: &str, at: &str) -> Result<Arc<TreePath>>
 
 /// Where a file goes in a package's tree: its own at `self/<path>`, a dependency's public file at `dep/<name>/<path>`, where the
 /// dependency's name is what includes it in angle brackets.
-fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: &TreePath) -> String {
-    let Some(package) = packages.get(owner) else { return entry.to_string() };
+///
+/// # Errors
+/// It is no file of its owner's, or its owner is no package.
+fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: &TreePath) -> Result<Arc<RelPath>> {
+    let package = packages.get(owner).ok_or_else(|| anyhow!("{entry}: {owner} is no package"))?;
     if owner == own {
-        return format!("self/{}", entry.strip_prefix(&package.path).map_or(entry.as_str(), RelPath::as_str));
+        let inside = entry.strip_prefix(&package.path).ok_or_else(|| anyhow!("{entry} is no file of {owner}"))?;
+        return Ok(OWN.join_path(inside));
     }
-    let public = package.public_folder();
-    let inside = public.as_deref().and_then(|public| entry.strip_prefix(public));
-    format!("{DEP}/{owner}/{}", inside.map_or(entry.as_str(), RelPath::as_str))
+    let public = package.public_folder().ok_or_else(|| anyhow!("{entry}: {owner} has no public files"))?;
+    let inside = entry.strip_prefix(&public).ok_or_else(|| anyhow!("{entry} is no public file of {owner}"))?;
+    Ok(DEP.join_path(RelPath::new(owner)?).join_path(inside))
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
@@ -408,7 +414,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     // Each unit by its visibility and place: what the target compiles, and whether what it makes goes to what links the package.
     let mut listed = String::new();
     for (unit, visibility) in &units {
-        let place = format!("self/{}", unit.strip_prefix(&own_path).map_or(unit.as_str(), RelPath::as_str));
+        let place = OWN.join_path(unit.strip_prefix(&own_path).ok_or_else(|| anyhow!("{unit} is no file of {name}"))?);
         let _ = writeln!(listed, "{visibility} {place}");
         gathering.pending.push(Taken { entry: unit.clone(), place, owner: name.clone() });
     }
@@ -416,7 +422,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.reached.extend(images.iter().cloned());
     gathering.follow()?;
     let header = gathering.options.header(call)?;
-    gathering.tree.insert(OPTIONS.to_string(), header.into_bytes());
+    gathering.tree.insert(RelPath::constant(OPTIONS).to_owned(), header.into_bytes());
     gathering.take_target_files(&name)?;
     // Where its includes are found: in quotes, its own folders; in angle brackets, its dependencies, each under its name.
     let own = &gathering.packages[&name];
@@ -431,10 +437,10 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         let _ = writeln!(linked, "bound {}", gathering.packages[name].path);
     }
     let mut files: Vec<File> = vec![
-        File::new("units", listed.into_bytes()),
-        File::new(INCLUDES, dirs.join("\n").into_bytes()),
-        File::new(LINKED, linked.into_bytes()),
-        File::new(NAME, name.into_bytes()),
+        File::new(pe2_ext::RelPath::constant("units"), listed.into_bytes()),
+        File::new(RelPath::constant(INCLUDES), dirs.join("\n").into_bytes()),
+        File::new(RelPath::constant(LINKED), linked.into_bytes()),
+        File::new(RelPath::constant(NAME), name.into_bytes()),
     ];
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
@@ -1220,7 +1226,7 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
     let said = uses.iter().map(|used| used.outcome(call)).collect();
     let (header, failed) = header(&pass, said);
     notes.extend(failed);
-    kept.push(File::new(VALUES, header.into_bytes()));
+    kept.push(File::new(RelPath::constant(VALUES), header.into_bytes()));
     Ok(Typed { notes, settings: call.given(), ..Typed::new(SourceTree::NAME, kept) })
 }
 
@@ -1931,7 +1937,7 @@ impl Gathering<'_> {
                     &format!("{}:{}", taken.entry, at + 1),
                 )?;
                 if let Some((entry, owner)) = reached {
-                    let place = place_of(&self.packages, &self.own, &owner, &entry);
+                    let place = place_of(&self.packages, &self.own, &owner, &entry)?;
                     self.pending.push(Taken { entry, place, owner });
                 }
             }
@@ -1941,7 +1947,7 @@ impl Gathering<'_> {
                 let (public, name) = name;
                 let entry = entry_in(public, name, &taken.entry.to_string())?;
                 if self.packages[CORE].files.contains(&*entry) {
-                    let place = place_of(&self.packages, &self.own, CORE, &entry);
+                    let place = place_of(&self.packages, &self.own, CORE, &entry)?;
                     self.pending.push(Taken { entry, place, owner: CORE.to_string() });
                 }
             }
@@ -1955,9 +1961,11 @@ impl Gathering<'_> {
         if let Some(package) = self.packages.get(own) {
             let target = target_of(self.call).unwrap_or_default();
             for visibility in VISIBILITIES {
+                let folder = RelPath::new(&format!("target/{target}/{own}/objects/{visibility}"))?.to_owned();
                 for entry in listed(&package.fields, "objects", visibility, &package.path, &package.files) {
-                    let inside = entry.strip_prefix(&package.path).map_or(entry.as_str(), RelPath::as_str);
-                    let place = format!("target/{target}/{own}/objects/{visibility}/{inside}");
+                    let inside =
+                        entry.strip_prefix(&package.path).ok_or_else(|| anyhow!("{entry} is no file of {own}"))?;
+                    let place = folder.join_path(inside);
                     let bytes = self.call.read_entry(&entry)?;
                     self.tree.insert(place, bytes);
                 }
@@ -1972,9 +1980,10 @@ impl Gathering<'_> {
                     // What names no file of the package is a setting of the target's, which it reads itself.
                     let Some(file) = value.as_str().and_then(|file| RelPath::new(file).ok()) else { continue };
                     let entry = package.path.join_path(file);
-                    if package.files.contains(&*entry) {
-                        let named = entry.name().unwrap_or_default();
-                        files.push((format!("target/{target}/{name}/{key}/{named}"), entry));
+                    if package.files.contains(&*entry)
+                        && let Some(named) = entry.last()
+                    {
+                        files.push((RelPath::new(&format!("target/{target}/{name}/{key}"))?.join(named), entry));
                     }
                 }
             }

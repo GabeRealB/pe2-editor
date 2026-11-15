@@ -130,7 +130,7 @@ struct Look {
 /// An import as attaching uses it.
 struct Known {
     importer: String,
-    files: Vec<(String, Blob)>,
+    files: Box<[(Arc<RelPath>, Blob)]>,
     /// The settings it derived, the paths it derives them at, and its notes: resolved over the declaration as it stands
     /// each time it is attached, as its settings may have changed - unsaved, in a working copy.
     made: pe2_value::Table,
@@ -268,7 +268,10 @@ impl Imports {
     }
 
     /// An import's files where the store keeps them, by their hashes: one whose hash names no file is kept by none.
-    fn kept_files<'s>(&'s self, files: &'s [(String, Blob)]) -> impl Iterator<Item = (&'s String, &'s Blob, HostPath)> {
+    fn kept_files<'s>(
+        &'s self,
+        files: &'s [(Arc<RelPath>, Blob)],
+    ) -> impl Iterator<Item = (&'s Arc<RelPath>, &'s Blob, HostPath)> {
         files.iter().filter_map(|(name, blob)| Some((name, blob, self.store.blob_path(&blob.sha1).ok()?)))
     }
 
@@ -397,20 +400,11 @@ impl Imports {
             else {
                 continue;
             };
-            asset.files.retain(|f| !import.files.iter().any(|(name, _)| *f.name == *name.as_str()));
+            asset.files.retain(|f| !import.files.iter().any(|(name, _)| f.name == *name));
             for (name, blob, path) in self.kept_files(&import.files) {
-                // What an importer made is named as it said: one that is no path is said, and no file of the asset.
-                let name = match RelPath::new(name) {
-                    Ok(name) => name,
-                    Err(why) => {
-                        let error = format!("its import made a file named so no path takes it: {why}");
-                        problems.push(Problem::Import { asset: path.to_string(), error });
-                        continue;
-                    }
-                };
                 asset.files.push(BundleFile {
                     path,
-                    name: name.to_owned(),
+                    name: name.clone(),
                     size: blob.size,
                     modified: (0, 0),
                     layer: layer.clone(),
@@ -670,7 +664,7 @@ fn known_of(extensions: &Extensions, importer: String, kept: Kept, reads: Reads)
         anyhow::bail!("its import is kept as something else than an extension's type");
     };
     let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
-    let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
+    let files: Box<[(Arc<RelPath>, Blob)]> = files.into_iter().map(|f| (f.name, f.blob)).collect();
     Ok((reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
 }
 
@@ -1011,7 +1005,7 @@ mod attaching {
         settings
             .insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
         settings.insert("cells".into(), Value::Table(cells));
-        let files = vec![File::new("native.bin", source.bytes().rev().collect())];
+        let files = vec![File::new(pe2_ext::RelPath::constant("native.bin"), source.bytes().rev().collect())];
         Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
     }
 
@@ -1068,7 +1062,7 @@ mod attaching {
             read?;
             Ok(Typed {
                 ty: Strip::NAME.into(),
-                files: vec![File::new("native.bin", b"a".to_vec())],
+                files: vec![File::new(pe2_ext::RelPath::constant("native.bin"), b"a".to_vec())],
                 ..Typed::default()
             })
         });
@@ -1128,7 +1122,11 @@ mod attaching {
             };
             let bytes = call.read(read.file()?)?;
             anyhow::ensure!(!bytes.is_empty(), "uid://s is empty");
-            Ok(Typed { ty: Strip::NAME.into(), files: vec![File::new("native.bin", bytes)], ..Typed::default() })
+            Ok(Typed {
+                ty: Strip::NAME.into(),
+                files: vec![File::new(pe2_ext::RelPath::constant("native.bin"), bytes)],
+                ..Typed::default()
+            })
         });
         Ok(())
     }

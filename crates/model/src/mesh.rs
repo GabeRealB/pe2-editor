@@ -15,7 +15,7 @@ use crate::model::{Corner, Face, Material, Model, Part, Shading};
 use crate::skeleton::{self, Joint};
 use crate::usda::{self, Prim};
 
-pub const FILE: &str = "mesh.usda";
+pub const FILE: &pe2_ext::RelPath = pe2_ext::RelPath::constant("mesh.usda");
 
 /// What a missing index is written as, and a texel with no UV.
 const NONE: i64 = -1;

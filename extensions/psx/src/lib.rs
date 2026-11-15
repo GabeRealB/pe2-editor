@@ -127,24 +127,26 @@ fn finish(call: &mut Call) -> Result<Typed> {
     let name = name_in(call, &sources)?;
     let bytes = call.read(image.file()?)?;
     if pe2_ext::targeted(&fields, Some(TARGET)).get("executable").and_then(Value::as_bool) != Some(true) {
-        let made = File::new(&format!("{}.pe2pkg", file_name(&name)), bytes);
+        let made = File::new(pe2_ext::RelPath::new(&format!("{}.pe2pkg", file_name(&name)))?, bytes);
         return Ok(Typed { notes: sources.notes.clone(), ..Typed::new(Package::NAME, vec![made]) });
     }
     let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
     let elf = call.read(elf.file()?)?;
-    let exe = File::new(&format!("{}.exe", file_name(&name)), exe_header(&bytes, &elf, load_address(&elf)?, &release)?);
+    let header = exe_header(&bytes, &elf, load_address(&elf)?, &release)?;
+    let exe = File::new(pe2_ext::RelPath::new(&format!("{}.exe", file_name(&name)))?, header);
     Ok(Typed { notes: sources.notes.clone(), ..Typed::new(Package::NAME, vec![exe]) })
 }
 
 /// A file of the gathered tree, as text.
-fn text_in(call: &Call, sources: &Typed, name: &str) -> Result<String> {
-    let file = sources.files.iter().find(|file| file.name == name).ok_or_else(|| anyhow!("the tree has no {name}"))?;
+fn text_in(call: &Call, sources: &Typed, name: &pe2_ext::RelPath) -> Result<String> {
+    let file =
+        sources.files.iter().find(|file| *file.name == *name).ok_or_else(|| anyhow!("the tree has no {name}"))?;
     Ok(String::from_utf8_lossy(&call.read(file)?).into_owned())
 }
 
 /// A package's name, in the gathered tree.
 fn name_in(call: &Call, sources: &Typed) -> Result<String> {
-    text_in(call, sources, "package").map_err(|_| anyhow!("the tree names no package"))
+    text_in(call, sources, pe2_ext::RelPath::constant("package")).map_err(|_| anyhow!("the tree names no package"))
 }
 
 /// The file an image is written to: its package's name as the release names its files, the path's steps joined by `_` (`aya/mist`:

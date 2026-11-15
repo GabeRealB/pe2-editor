@@ -70,7 +70,7 @@ pub struct Blob {
 /// A kept file: its name, its content's blob.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFile {
-    pub name: String,
+    pub name: std::sync::Arc<pe2_path::RelPath>,
     pub blob: Blob,
 }
 

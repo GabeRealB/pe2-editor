@@ -94,7 +94,7 @@ const SAMPLE: &str = "The quick brown fox jumps over the lazy dog.\n0123456789 !
 /// A face's glyphs, read from its UFO's files.
 fn glyphs_of(call: &mut Call) -> Result<Vec<atlas::Glyph>> {
     let source = call.take::<UfoFont>(0)?;
-    let files = source.files.iter().map(|file| Ok((file.name.clone(), call.read(file)?))).collect::<Result<_>>()?;
+    let files = source.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
     let font = codecs::ufo::read(&files).map_err(|e| anyhow!(e))?;
     face::from_ufo(&font, &raster_of(&source.settings)?).map_err(|e| anyhow!(e))
 }
@@ -156,7 +156,7 @@ retain = "cache"
 "#;
 
 /// The file an atlas's layout is.
-const LAYOUT: &str = "layout.toml";
+const LAYOUT: &pe2_ext::RelPath = pe2_ext::RelPath::constant("layout.toml");
 /// An atlas's modes: each glyph where its layout places it, or its text's glyphs packed by a rule, the layout placing
 /// those it names.
 const PLACED: &str = "placed";
@@ -417,14 +417,14 @@ fn atlas_texture(call: &mut Call) -> Result<Typed> {
             let one = texels
                 .get(sheet * length..(sheet + 1) * length)
                 .ok_or_else(|| anyhow!("{atlas} has no page {sheet}"))?;
-            let mut writer = call.writer("native.texels")?;
+            let mut writer = call.writer(pe2_ext::RelPath::constant("native.texels"))?;
             std::io::Write::write_all(&mut writer, one)?;
             writer.finish()?.content
         }
     };
     Ok(Typed {
         ty: TEXELS.to_string(),
-        files: vec![pe2_ext::File { name: "native.texels".into(), content }],
+        files: vec![pe2_ext::File { name: pe2_ext::RelPath::constant("native.texels").to_owned(), content }],
         settings: given,
         ..Typed::default()
     })
@@ -721,7 +721,8 @@ fn atlas_faces(
         let name = named.path.name().unwrap_or_default().to_string();
         let Data::Typed(source) = source else { bail!("{node}: its native form is no files") };
         let Data::Table(encoding) = encoding else { bail!("{node}: its encoding's settings are no table") };
-        let files = source.files.iter().map(|file| Ok((file.name.clone(), call.read(file)?))).collect::<Result<_>>()?;
+        let files =
+            source.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
         let font = codecs::ufo::read(&files).map_err(|e| anyhow!("{node}: {e}"))?;
         glyphs.push(face::from_ufo(&font, &raster_of(&source.settings)?).map_err(|e| anyhow!("{node}: {e}"))?);
         specs.push(face_spec(&name, &source.settings, entry, encoding)?);
@@ -785,12 +786,12 @@ fn make_atlas(call: &mut Call) -> Result<Typed> {
             atlas::Format::GlyphCell => "glyphcell",
             atlas::Format::StfGlyph => "stfglyph",
         };
-        let mut writer = call.writer(&format!("{}.{extension}", spec.name))?;
+        let mut writer = call.writer(pe2_ext::RelPath::new(&format!("{}.{extension}", spec.name))?)?;
         std::io::Write::write_all(&mut writer, table)?;
         written.push(writer.finish()?);
     }
     call.make("tables", Data::Typed(Typed::new(pe2_ext::data::BYTES, written)));
-    let mut writer = call.writer("native.texels")?;
+    let mut writer = call.writer(pe2_ext::RelPath::constant("native.texels"))?;
     std::io::Write::write_all(&mut writer, &texels)?;
     Ok(Typed::new(AtlasPage::NAME, vec![writer.finish()?]))
 }

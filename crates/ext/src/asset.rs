@@ -13,28 +13,28 @@ pub trait Source {
     /// Its declaration, as written.
     fn declaration(&self) -> &str;
     /// Whether its bundle has a file of this name.
-    fn has_file(&self, name: &str) -> bool;
+    fn has_file(&self, name: &crate::RelPath) -> bool;
     /// A file of its bundle, whole.
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    fn read(&self, name: &str) -> Result<Vec<u8>>;
+    fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>>;
     /// A file's size in bytes; none where it has no such file. (A host that knows it without reading the file says so.)
-    fn size(&self, name: &str) -> Option<u64> {
+    fn size(&self, name: &crate::RelPath) -> Option<u64> {
         self.read(name).ok().map(|bytes| bytes.len() as u64)
     }
     /// Up to `len` bytes of a file from `offset`: fewer at its end, none past it. (A host reads only those.)
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         let bytes = self.read(name)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
         Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
     }
     /// A file its operation makes, written through the host (`CallHost::writer`): only an asset lent for an
     /// operation's run has one.
-    fn writer(&self, name: &str) -> Option<Result<Box<dyn crate::FileWriter>>> {
+    fn writer(&self, name: &crate::RelPath) -> Option<Result<Box<dyn crate::FileWriter>>> {
         let _ = name;
         None
     }
@@ -43,7 +43,7 @@ pub trait Source {
     fn temp(&self) -> Option<Result<crate::HostPath>> {
         None
     }
-    fn keep(&self, path: &crate::HostPath, name: &str) -> Option<Result<crate::File>> {
+    fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> Option<Result<crate::File>> {
         let _ = (path, name);
         None
     }
@@ -75,7 +75,7 @@ pub trait Source {
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
         None
     }
-    fn path_of(&self, name: &str) -> Option<crate::HostPath> {
+    fn path_of(&self, name: &crate::RelPath) -> Option<crate::HostPath> {
         let _ = name;
         None
     }
@@ -141,7 +141,7 @@ impl<'a> Asset<'a> {
     }
 
     #[must_use]
-    pub fn has_file(&self, name: &str) -> bool {
+    pub fn has_file(&self, name: &crate::RelPath) -> bool {
         self.source.has_file(name)
     }
 
@@ -149,13 +149,13 @@ impl<'a> Asset<'a> {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    pub fn read(&self, name: &str) -> Result<Vec<u8>> {
+    pub fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
         self.source.read(name)
     }
 
     /// A file's size in bytes, without reading it.
     #[must_use]
-    pub fn size(&self, name: &str) -> Option<u64> {
+    pub fn size(&self, name: &crate::RelPath) -> Option<u64> {
         self.source.size(name)
     }
 
@@ -164,7 +164,7 @@ impl<'a> Asset<'a> {
     ///
     /// # Errors
     /// It has no such file, or it cannot be read.
-    pub fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.source.read_range(name, offset, len)
     }
 

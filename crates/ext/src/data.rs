@@ -216,7 +216,8 @@ impl Content {
 /// A file of a value's encoding: its name, its content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
-    pub name: String,
+    /// Its name within the value: a path, as a program finds it where the value is laid out (`objects/a.o`).
+    pub name: std::sync::Arc<crate::RelPath>,
     pub content: Content,
 }
 
@@ -250,8 +251,8 @@ impl Use {
 impl File {
     /// A file made now, its bytes inline.
     #[must_use]
-    pub fn new(name: &str, bytes: Vec<u8>) -> File {
-        File { name: name.to_string(), content: Content::Inline(bytes) }
+    pub fn new(name: &crate::RelPath, bytes: Vec<u8>) -> File {
+        File { name: name.to_owned(), content: Content::Inline(bytes) }
     }
 }
 
@@ -482,8 +483,8 @@ pub trait CallHost {
     ///
     /// # Errors
     /// The host cannot make one.
-    fn writer(&self, name: &str) -> Result<Box<dyn FileWriter>> {
-        Ok(Box::new(InMemory { name: name.to_string(), bytes: Vec::new() }))
+    fn writer(&self, name: &crate::RelPath) -> Result<Box<dyn FileWriter>> {
+        Ok(Box::new(InMemory { name: name.to_owned(), bytes: Vec::new() }))
     }
     /// A path for a program to write to, for an unsandboxed extension's operation.
     ///
@@ -496,7 +497,7 @@ pub trait CallHost {
     ///
     /// # Errors
     /// It cannot be kept.
-    fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
+    fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> Result<File> {
         let _ = (path, name);
         bail!("{}: nothing is kept here", self.path())
     }
@@ -580,7 +581,7 @@ pub trait FileWriter: Send {
 
 /// A file made in memory, its content inline.
 struct InMemory {
-    name: String,
+    name: std::sync::Arc<crate::RelPath>,
     bytes: Vec<u8>,
 }
 
@@ -591,7 +592,7 @@ impl FileWriter for InMemory {
     }
 
     fn finish(self: Box<Self>) -> Result<File> {
-        Ok(File::new(&self.name, self.bytes))
+        Ok(File { name: self.name, content: Content::Inline(self.bytes) })
     }
 }
 
@@ -694,7 +695,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// The host cannot make one.
-    pub fn writer(&self, name: &str) -> Result<Writer> {
+    pub fn writer(&self, name: &crate::RelPath) -> Result<Writer> {
         Ok(Writer { inner: self.host.writer(name)?, piece: Vec::new() })
     }
 
@@ -720,7 +721,7 @@ impl Call<'_> {
     ///
     /// # Errors
     /// It cannot be kept.
-    pub fn keep(&self, path: &crate::HostPath, name: &str) -> Result<File> {
+    pub fn keep(&self, path: &crate::HostPath, name: &crate::RelPath) -> Result<File> {
         self.host.keep(path, name)
     }
 
@@ -933,7 +934,7 @@ impl<'a> Lent<'a> {
         Asset::new(self, self.host.node_type())
     }
 
-    fn file(&self, name: &str) -> Result<&File> {
+    fn file(&self, name: &crate::RelPath) -> Result<&File> {
         self.files.iter().find(|f| f.name == name).ok_or_else(|| anyhow!("{}: no file {name}", self.host.path()))
     }
 }
@@ -955,22 +956,22 @@ impl Source for Lent<'_> {
         ""
     }
 
-    fn has_file(&self, name: &str) -> bool {
+    fn has_file(&self, name: &crate::RelPath) -> bool {
         self.files.iter().any(|f| f.name == name)
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
         match &self.file(name)?.content {
             Content::Inline(bytes) => Ok(bytes.clone()),
             stored @ Content::Stored { .. } => self.host.read(stored),
         }
     }
 
-    fn size(&self, name: &str) -> Option<u64> {
+    fn size(&self, name: &crate::RelPath) -> Option<u64> {
         Some(self.file(name).ok()?.content.size())
     }
 
-    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read_range(&self, name: &crate::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
         match &self.file(name)?.content {
             Content::Inline(bytes) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
@@ -1218,7 +1219,7 @@ mod tests {
         // Recognized as several things, as one file: it fits a port naming any, and one asking for a file.
         let source = Typed {
             also: vec!["x.ext@zip".into(), "image/openraster".into()],
-            ..Typed::new("x.ext@ora", vec![File::new("s.ora", vec![])])
+            ..Typed::new("x.ext@ora", vec![File::new(crate::RelPath::constant("s.ora"), vec![])])
         };
         let given = Value::Typed(source).ty();
         assert!(
@@ -1229,8 +1230,11 @@ mod tests {
         );
         assert!(!fits("png", &given));
         // Two files: still of its type; that it is no one file is found when it is given.
-        let indexed =
-            Value::Typed(Typed::new("x.ext@indexed", vec![File::new("a", vec![]), File::new("b", vec![])])).ty();
+        let indexed = Value::Typed(Typed::new(
+            "x.ext@indexed",
+            vec![File::new(crate::RelPath::constant("a"), vec![]), File::new(crate::RelPath::constant("b"), vec![])],
+        ))
+        .ty();
         assert!(fits("bs_picture | indexed", &indexed) && fits("file<indexed>", &indexed));
         // What the host holds in memory is no file.
         assert!(fits("any", &Type::Table) && !fits("file", &Type::Table) && !fits("file<any>", &Type::Image));

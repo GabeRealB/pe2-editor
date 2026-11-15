@@ -1000,11 +1000,11 @@ mod tests {
             &self.fields
         }
 
-        fn file_sha1(&self, _: &str) -> Option<String> {
+        fn file_sha1(&self, _: &pe2_ext::RelPath) -> Option<String> {
             None
         }
 
-        fn read(&self, name: &str) -> pe2_ext::Result<Vec<u8>> {
+        fn read(&self, name: &pe2_ext::RelPath) -> pe2_ext::Result<Vec<u8>> {
             Err(pe2_ext::anyhow!("no file {name}"))
         }
     }
@@ -1030,7 +1030,7 @@ mod tests {
         let node = Texture { fields: declaration.parse().unwrap(), declaration };
         let native = Value::Typed(Typed {
             ty: "pe2.images@texels".into(),
-            files: vec![File::new("native.texels", texels)],
+            files: vec![File::new(pe2_ext::RelPath::constant("native.texels"), texels)],
             settings: node.fields.clone(),
             ..Typed::default()
         });
@@ -1053,7 +1053,7 @@ mod tests {
             let node = Texture { fields: declaration.parse().unwrap(), declaration: declaration.to_string() };
             let native = Value::Typed(Typed {
                 ty: "pe2.images@texels".into(),
-                files: vec![File::new("native.texels", vec![0; 4])],
+                files: vec![File::new(pe2_ext::RelPath::constant("native.texels"), vec![0; 4])],
                 settings: node.fields.clone(),
                 ..Typed::default()
             });
@@ -1132,7 +1132,7 @@ mod tests {
             .output(&engine, &index, &index.assets[tree("notes")], pe2_path::Asked::constant("text"), true)
             .unwrap();
         let project::graph::Value::Typed(typed) = &*given.value.unwrap() else { panic!("no file") };
-        assert_eq!(typed.files[0].name, "notes.txt");
+        assert_eq!(typed.files[0].name.as_str(), "notes.txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

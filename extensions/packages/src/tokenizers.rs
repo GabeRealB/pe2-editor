@@ -190,7 +190,7 @@ fn image_words(call: &Call, _: &Args) -> Result<String> {
         bail!("it is given no image")
     };
     let texels =
-        native.files.iter().find(|file| file.name == "native.texels").ok_or_else(|| anyhow!("it has no texels"))?;
+        native.files.iter().find(|file| *file.name == *"native.texels").ok_or_else(|| anyhow!("it has no texels"))?;
     let bytes = call.read(texels)?;
     let (words, rest) = bytes.as_chunks::<4>();
     if !rest.is_empty() {

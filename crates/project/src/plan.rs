@@ -533,12 +533,12 @@ enum Made {
     Clips(Arc<Vec<(u64, u64)>>),
     Bytes(Arc<Vec<u8>>),
     /// What an extension's operation made: its files, by name.
-    Files(Arc<BTreeMap<String, Arc<Vec<u8>>>>),
+    Files(Arc<BTreeMap<Arc<RelPath>, Arc<Vec<u8>>>>),
 }
 
 impl Made {
     /// What a bundle's file is given of it: bytes as they are, or its file of that name.
-    fn file(&self, name: &str) -> Result<Arc<Vec<u8>>> {
+    fn file(&self, name: &pe2_ext::RelPath) -> Result<Arc<Vec<u8>>> {
         match self {
             Made::Bytes(bytes) => Ok(bytes.clone()),
             Made::Files(files) => files.get(name).cloned().with_context(|| format!("it made no {name}")),
@@ -555,13 +555,14 @@ impl Made {
             let found: Vec<_> = files
                 .iter()
                 .filter_map(|(name, bytes)| {
-                    Some((format!("{}{}", given.name, name.strip_prefix(prefix)?), Some(bytes.clone())))
+                    Some((format!("{}{}", given.name, name.as_str().strip_prefix(prefix)?), Some(bytes.clone())))
                 })
                 .collect();
             anyhow::ensure!(!found.is_empty() || given.optional, "it made nothing under {prefix}");
             return Ok(found);
         }
         let name = given.prefix.as_deref().unwrap_or(&given.name);
+        let name = RelPath::new(name).with_context(|| format!("it gives {name}, which names no file"))?;
         match (self, given.optional) {
             (Made::Files(files), true) if !files.contains_key(name) => Ok(vec![(given.name.clone(), None)]),
             _ => Ok(vec![(given.name.clone(), Some(self.file(name)?))]),
@@ -571,7 +572,7 @@ impl Made {
     /// It as an extension's operation is given it: its bytes as one file, or its files.
     fn value(&self) -> Result<crate::graph::Value> {
         let files = match self {
-            Made::Bytes(bytes) => vec![pe2_ext::File::new("stored", bytes.to_vec())],
+            Made::Bytes(bytes) => vec![pe2_ext::File::new(RelPath::constant("stored"), bytes.to_vec())],
             Made::Files(files) => files.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.to_vec())).collect(),
             _ => bail!("it is no value an operation takes"),
         };
@@ -604,11 +605,11 @@ impl crate::graph::exec::Node for Planned {
         NONE.get_or_init(toml::Table::new)
     }
 
-    fn file_sha1(&self, _: &str) -> Option<String> {
+    fn file_sha1(&self, _: &RelPath) -> Option<String> {
         None
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
+    fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         bail!("{}: a plan's operation reads no file of a node ({name})", self.0)
     }
 }
@@ -1336,11 +1337,11 @@ impl RunState<'_> {
                 disc.slot_range(text("name")?, start * sector, usize::try_from((end - start) * sector)?)?
             }
             "inflate" => {
-                let given = self.taken(op, "bytes")?.file("")?;
+                let given = self.taken(op, "bytes")?.file(RelPath::root())?;
                 formats::lzss::decode_stream(&given, 0).0
             }
             "slice" => {
-                let given = self.taken(op, "bytes")?.file("")?;
+                let given = self.taken(op, "bytes")?.file(RelPath::root())?;
                 let (offset, size) = (usize::try_from(number("offset")?)?, usize::try_from(number("size")?)?);
                 let run =
                     given.get(offset..offset + size).with_context(|| format!("past the end, of {}", given.len()))?;

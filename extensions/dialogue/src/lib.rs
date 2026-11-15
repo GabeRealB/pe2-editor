@@ -120,7 +120,7 @@ fn glyphs_of(face: &str, pictures: &BTreeMap<String, Picture>) -> Vec<Glyph> {
 /// A face's UFO files, read into its glyphs.
 fn face_glyphs(call: &Call, face: &Data, what: &pe2_ext::Reference) -> Result<Vec<Glyph>> {
     let Data::Typed(typed) = face else { bail!("{what}: its native form is no files") };
-    let files = typed.files.iter().map(|file| Ok((file.name.clone(), call.read(file)?))).collect::<Result<_>>()?;
+    let files = typed.files.iter().map(|file| Ok((file.name.to_string(), call.read(file)?))).collect::<Result<_>>()?;
     let font = codecs::ufo::read(&files).map_err(|e| anyhow!("{what}: {e}"))?;
     typeface::face::from_ufo(&font, &typeface::raster::Raster::default()).map_err(|e| anyhow!("{what}: {e}"))
 }
@@ -163,10 +163,10 @@ fn make(call: &mut Call) -> Result<Typed> {
         })
         .collect();
     let (file, laid) = dialogue::make(&given, &strings, &cast_of(&tables[1]), &font, &flags).map_err(|e| anyhow!(e))?;
-    let mut atlas = call.writer("atlas.texels")?;
+    let mut atlas = call.writer(pe2_ext::RelPath::constant("atlas.texels"))?;
     std::io::Write::write_all(&mut atlas, &laid.atlas)?;
     call.make("atlas", Data::Typed(Typed::new(pe2_ext::data::BYTES, vec![atlas.finish()?])));
-    let mut writer = call.writer("native.cap")?;
+    let mut writer = call.writer(pe2_ext::RelPath::constant("native.cap"))?;
     std::io::Write::write_all(&mut writer, &file)?;
     Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
 }
@@ -232,13 +232,18 @@ fn recognition(args: &Table) -> Recognition {
     Recognition { glyphs, plates, cast, flags }
 }
 
+/// A node's settings file, by the node's path: what a plan lays into its bundle.
+fn settings_of(node: &pe2_ext::TreePath) -> std::sync::Arc<pe2_ext::RelPath> {
+    node.rel().join_path(pe2_ext::RelPath::constant("settings.toml"))
+}
+
 /// What extraction writes of every dialogue, by node path: each dialogue's `settings.toml` (its structure), each string
 /// table's, and each face's UFO. `chunks` are what the plan read, which `args` names by position: each dialogue's
 /// bundle and resource, and its atlas image and column where it generates one.
 ///
 /// # Errors
 /// A chunk is not what it is said to be, or a dialogue is not read exactly.
-pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String, Vec<u8>)>> {
+pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<pe2_ext::Made> {
     let Recognition { glyphs, plates, cast, flags } = recognition(args);
     let mut font = Font::default();
     let mut tables: BTreeMap<String, Table> = BTreeMap::new();
@@ -256,7 +261,7 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| anyhow!("no {key}"))
         };
-        let path = text("path")?;
+        let path = pe2_ext::TreePath::new(&text("path")?)?.to_owned();
         let bundle = index("bundle")?;
         let held = match bundles.entry(bundle) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
@@ -303,7 +308,7 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
             Err(why) => {
                 let mut failed = Table::new();
                 failed.insert("failed".into(), Value::String(why));
-                out.push((format!("{path}/settings.toml"), toml_text(&failed)?));
+                out.push((settings_of(&path), toml_text(&failed)?));
                 continue;
             }
         };
@@ -311,7 +316,7 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
         if !decoded.notes.is_empty() {
             settings.insert("unsettled".into(), Value::Array(decoded.notes.into_iter().map(Value::String).collect()));
         }
-        out.push((format!("{path}/settings.toml"), toml_text(&settings)?));
+        out.push((settings_of(&path), toml_text(&settings)?));
         let strings = tables.entry(text("strings")?).or_default();
         for (key, value) in decoded.strings {
             strings.insert(key, Value::String(value));
@@ -320,20 +325,25 @@ pub fn extract_dialogues(chunks: &[Vec<u8>], args: &Table) -> Result<Vec<(String
     for (path, strings) in tables {
         let mut table = Table::new();
         table.insert("strings".into(), Value::Table(strings));
-        out.push((format!("{path}/settings.toml"), toml_text(&table)?));
+        out.push((settings_of(pe2_ext::TreePath::new(&path)?), toml_text(&table)?));
     }
     let faces = args.get("faces").and_then(Value::as_table).cloned().unwrap_or_default();
     for face in FACES {
         let path = faces.get(face).and_then(Value::as_str).ok_or_else(|| anyhow!("no {face} face"))?;
+        let path = pe2_ext::TreePath::new(path)?;
         let pictures = font.faces.get(face).cloned().unwrap_or_default();
         let family = if face == "speakers" { "Parasite Eve II Speakers" } else { "Parasite Eve II Dialogue" };
         let style = if face == "bold" { "Bold" } else { "Regular" };
         let files = typeface::face::ufo_files(&glyphs_of(face, &pictures), family, style, 0);
         // In a folder named after the face's node, as its stack reads it.
-        let node = path.rsplit('/').next().unwrap_or(path);
-        out.extend(files.into_iter().map(|(name, bytes)| (format!("{path}/{node}.ufo/{name}"), bytes)));
+        let node = path.name().unwrap_or_default();
+        let ufo = path.rel().join_path(pe2_ext::RelPath::new(&format!("{node}.ufo"))?);
+        for (name, bytes) in files {
+            // A UFO's files, named as the codec names them: each a path within the face's folder.
+            out.push((ufo.join_path(pe2_ext::RelPath::new(&name)?), bytes));
+        }
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -393,7 +403,7 @@ fn register(r: &mut Registry) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let files = extract_dialogues(&chunks, call.settings)?
                 .into_iter()
-                .map(|(name, bytes)| pe2_ext::File::new(&name, bytes))
+                .map(|(name, bytes)| pe2_ext::File { name, content: pe2_ext::Content::Inline(bytes) })
                 .collect();
             Ok(Data::Typed(Typed::new("bytes", files)))
         });
