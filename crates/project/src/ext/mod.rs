@@ -9,6 +9,7 @@
 //! entry point it calls - the built-ins' fallback while developing.
 
 pub mod component;
+pub mod files;
 pub mod folder;
 pub mod requests;
 /// What extensions fetch (`pe2_setup`), an extension's own files - its patches - read where they are: a held one's

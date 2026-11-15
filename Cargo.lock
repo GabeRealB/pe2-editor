@@ -4536,6 +4536,7 @@ dependencies = [
  "codecs",
  "fastcdc",
  "formats",
+ "libc",
  "memmap2",
  "pe2-ext",
  "pe2-io",

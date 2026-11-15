@@ -113,11 +113,19 @@ pub trait Filesystem: Send + Sync {
     /// The system cannot, there.
     fn hard_link(&self, from: &HostPath, to: &HostPath) -> io::Result<()>;
 
-    /// Make `at` a link to `target`, where the system makes links (on Unix; elsewhere `Unsupported`).
+    /// Make `at` a link to `target`, written as the link holds it: a place, or one relative to the link's folder. On
+    /// Windows a link is to a file or to a folder, as what `target` names is now.
     ///
     /// # Errors
-    /// The system makes no links, or not there.
-    fn symlink(&self, target: &HostPath, at: &HostPath) -> io::Result<()>;
+    /// The system makes no links there, or this process may not.
+    fn symlink(&self, target: &std::path::Path, at: &HostPath) -> io::Result<()>;
+
+    /// Say it was last read at `accessed` and last changed at `modified`, each where given: a file or a folder, a
+    /// link followed.
+    ///
+    /// # Errors
+    /// It is not there, or its times may not be changed.
+    fn set_times(&self, at: &HostPath, accessed: Option<SystemTime>, modified: Option<SystemTime>) -> io::Result<()>;
 
     /// Where a link leads, as it says.
     ///
@@ -273,6 +281,14 @@ pub struct Stat {
     pub readonly: bool,
     /// It runs as a program (a permission on Unix; never elsewhere).
     pub executable: bool,
+    pub accessed: Option<SystemTime>,
+    /// When what is said of it last changed (Unix's `ctime`; none elsewhere).
+    pub changed: Option<SystemTime>,
+    /// How many names it has (one where the system does not say).
+    pub links: u64,
+    /// What tells it from every other file of the system: its device and its number on it, where the system says
+    /// (Unix).
+    pub identity: Option<(u64, u64)>,
 }
 
 /// A folder's entry: its name as the system gives it - checked by who takes it as a name - and what it is.
@@ -370,7 +386,15 @@ pub trait Descriptor: Send + Sync + fmt::Debug {
     ///
     /// # Errors
     /// It cannot be changed.
-    fn set_modified(&self, modified: SystemTime) -> io::Result<()>;
+    fn set_modified(&self, modified: SystemTime) -> io::Result<()> {
+        self.set_times(None, Some(modified))
+    }
+
+    /// Say it was last read at `accessed` and last changed at `modified`, each where given.
+    ///
+    /// # Errors
+    /// It cannot be changed.
+    fn set_times(&self, accessed: Option<SystemTime>, modified: Option<SystemTime>) -> io::Result<()>;
 
     /// Have what was written of it on the disk, its length and times with it - of a folder, what it holds (where the
     /// system has a folder synced: not on Windows, where what a folder holds is on the disk as it changes).
@@ -569,16 +593,29 @@ impl Filesystem for SystemFilesystem {
         std::fs::read_link(at)
     }
 
-    fn symlink(&self, target: &HostPath, at: &HostPath) -> io::Result<()> {
+    fn symlink(&self, target: &std::path::Path, at: &HostPath) -> io::Result<()> {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(target, at)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let named = at.parent().map_or_else(|| target.to_path_buf(), |folder| folder.as_path().join(target));
+            if named.is_dir() {
+                std::os::windows::fs::symlink_dir(target, at)
+            } else {
+                std::os::windows::fs::symlink_file(target, at)
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (target, at);
-            Err(io::Error::new(io::ErrorKind::Unsupported, "links are made on Unix"))
+            Err(io::Error::new(io::ErrorKind::Unsupported, "links are made on Unix and Windows"))
         }
+    }
+
+    fn set_times(&self, at: &HostPath, accessed: Option<SystemTime>, modified: Option<SystemTime>) -> io::Result<()> {
+        SystemDescriptor::Folder(at.clone()).set_times(accessed, modified)
     }
 
     fn set_readonly(&self, at: &HostPath, readonly: bool) -> io::Result<()> {
@@ -695,12 +732,27 @@ fn stat_of(metadata: &std::fs::Metadata) -> Stat {
     };
     #[cfg(not(unix))]
     let executable = false;
+    #[cfg(unix)]
+    let (changed, links, identity) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let changed = u64::try_from(metadata.ctime()).ok().map(|seconds| {
+            let nanos = u32::try_from(metadata.ctime_nsec()).unwrap_or_default();
+            SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)
+        });
+        (changed, metadata.nlink(), Some((metadata.dev(), metadata.ino())))
+    };
+    #[cfg(not(unix))]
+    let (changed, links, identity) = (None, 1, None);
     Stat {
         kind: kind_of(metadata.file_type()),
         size: metadata.len(),
         modified: metadata.modified().ok(),
         readonly: metadata.permissions().readonly(),
         executable,
+        accessed: metadata.accessed().ok(),
+        changed,
+        links,
+        identity,
     }
 }
 
@@ -776,11 +828,29 @@ impl Descriptor for SystemDescriptor {
         self.file()?.set_len(size)
     }
 
-    fn set_modified(&self, modified: SystemTime) -> io::Result<()> {
+    fn set_times(&self, accessed: Option<SystemTime>, modified: Option<SystemTime>) -> io::Result<()> {
+        let mut times = std::fs::FileTimes::new();
+        if let Some(accessed) = accessed {
+            times = times.set_accessed(accessed);
+        }
+        if let Some(modified) = modified {
+            times = times.set_modified(modified);
+        }
         match self {
-            SystemDescriptor::File(_, file) => file.set_modified(modified),
-            // A folder's time is set through a handle to it, opened as the system opens one to write its times.
-            SystemDescriptor::Folder(at) => std::fs::File::open(at)?.set_modified(modified),
+            SystemDescriptor::File(_, file) => file.set_times(times),
+            // A folder's times are set through a handle to it, opened to write its times alone (Windows refuses them
+            // through one opened only to read).
+            SystemDescriptor::Folder(at) => {
+                #[cfg(windows)]
+                let handle = {
+                    use std::os::windows::fs::OpenOptionsExt as _;
+                    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+                    std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(at)?
+                };
+                #[cfg(not(windows))]
+                let handle = std::fs::File::open(at)?;
+                handle.set_times(times)
+            }
         }
     }
 

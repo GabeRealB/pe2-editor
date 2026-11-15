@@ -46,5 +46,9 @@ blake3 = "1"
 # Spans on a timeline: Tracy's viewer connects to the running program (project::profile).
 tracy = ["dep:tracing-tracy"]
 
+[target.'cfg(unix)'.dependencies]
+# What the system says went wrong, told to components as WASI's error codes (`ext::files`).
+libc = "0.2"
+
 [dev-dependencies]
 sfs = { workspace = true, features = ["testing"] }

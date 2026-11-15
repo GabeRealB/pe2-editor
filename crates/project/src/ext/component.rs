@@ -371,6 +371,9 @@ pub struct State {
     unsandboxed: Option<Arc<Unsandboxed>>,
     /// The host's I/O.
     io: Arc<dyn pe2_io::Io>,
+    /// The folders `wasi:filesystem` gives it, each with the name it knows it by: the disk's, where it is
+    /// unsandboxed; none in the sandbox.
+    preopens: Vec<(super::files::Opened, String)>,
 }
 
 impl WasiView for State {
@@ -1893,6 +1896,7 @@ impl Shared {
         let _span = tracing::info_span!("instantiate", of = %self.id).entered();
         let stderr = MemoryOutputPipe::new(64 << 10);
         let mut wasi = WasiCtx::builder();
+        let mut preopens = Vec::new();
         wasi.stderr(stderr.clone());
         if self.unsandboxed.is_some() {
             // It sees the system as a program does: the host's clocks, randomness and environment - WASI's is text, so a
@@ -1923,17 +1927,22 @@ impl Shared {
                 Box::pin(async move { allowed })
             })
             .allow_blocking_current_thread(true);
+            // The disk, through the host's I/O: on Windows each drive a root of its own (`/D:`), what the host's paths
+            // are told as (`guest_path`).
+            let fs = io.filesystem();
+            let mut root = |at: &str, named: String| {
+                if let Ok(place) = HostPath::new(Path::new(at))
+                    && fs.is_folder(&place)
+                {
+                    preopens.push((super::files::Opened::folder(place, true, io.clone()), named));
+                }
+            };
             if cfg!(windows) {
-                // Each drive a root of its own (`/D:`): what the host's paths are told as (`guest_path`).
-                #[allow(clippy::disallowed_methods, reason = "the drives the system has, each a root of what it sees")]
                 for letter in 'A'..='Z' {
-                    let root = format!("{letter}:\\");
-                    if Path::new(&root).is_dir() {
-                        wasi.preopened_dir(&root, format!("/{letter}:"), wasmtime_wasi::FsPerms::ReadWrite)?;
-                    }
+                    root(&format!("{letter}:\\"), format!("/{letter}:"));
                 }
             } else {
-                wasi.preopened_dir("/", "/", wasmtime_wasi::FsPerms::ReadWrite)?;
+                root("/", "/".to_string());
             }
         } else {
             wasi.wall_clock(Still)
@@ -1959,6 +1968,7 @@ impl Shared {
             settings: self.settings.clone(),
             unsandboxed: self.unsandboxed.clone(),
             io: self.io.clone(),
+            preopens,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -3583,7 +3593,15 @@ fn start(
     let engine = new_engine()?;
     let component = compile(&engine, bytes, &*io).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
-    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    // WASI as wasmtime gives it, but its files: the host's own, through its I/O.
+    wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
+    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
+    wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
+    wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
+    super::files::add_to_linker(&mut linker, |state| super::files::FilesView {
+        table: &mut state.table,
+        preopens: &state.preopens,
+    })?;
     bindings::Linked::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
     if let Some(link) = GPU.get() {
         link(&mut linker)?;
