@@ -58,15 +58,21 @@ counting, as that is what it is.
   goes unused or grows, one for views. An instance that traps is dropped.
 - **Lending.** Host objects (an asset, the project, a UI frame) are put in the resource table for the length of one
   call and taken out before it returns, so a guest can never keep one.
-- **A content crosses as what it is:** a few bytes in itself (`inline`, a `list<u8, 30>` and how many), bytes
-  (`memory`), or a stored blob by its SHA-1 (`stored`, a `list<u8, 20>` and its size) - fixed-length lists, which the
-  engine is set to take (`Config::wasm_component_model_fixed_length_lists`). A hash is a `Sha1` on both sides and in
-  the project's records, the store and the model: text only where it is written out.
+- **A content crosses as what it is:** a few bytes in itself (`inline`, a `list<u8, 30>` and how many), bytes the
+  host holds by a handle (`memory`, a `buffer`), or a stored blob by its SHA-1 (`stored`, a `list<u8, 20>` and its
+  size) - fixed-length lists, which the engine is set to take (`Config::wasm_component_model_fixed_length_lists`). A
+  list is copied whole into whoever receives it, so bytes cross by handle: an operation is given its inputs' contents
+  without their bytes and copies in what it reads (`buffer.read`, `read-stored-range`); what a component makes it
+  hands over once (`buffer`'s constructor). One `buffer` serves contents and media alike (`HostBuffer`, an
+  `Arc<[u8]>` shared by every handle). A hash is a `Sha1` on both sides and in the project's records, the store and the
+  model: text only where it is written out.
+- **A content is placed for a program** (`place-content`, `PlacedContent`): a stored blob where it is kept (a chunked
+  one served or assembled, `content::for_program`); one held in itself or in memory written to a file of its own,
+  removed when the handle is dropped - which the guard holding it does once the program is done (`exec::Written`).
 - **Names are types on both sides, text between.** The contract carries an asset's path, a reference, an output's
   address and a file's name (`RelPath`, within an asset or a value) as strings; the SDK and the host check each into
-  its `pe2-path` type where it arrives. An operation's lent asset reads a stored content by its hash where a name
-  goes, and the host takes it as one (`component.rs`, `Node::content`). What a
-  guest sends that is no path or reference is refused as the call's error (`component.rs`, `tree_of`, `reference_of`);
+  its `pe2-path` type where it arrives. An operation's lent asset holds no files by name: its values' contents are
+  read by their hashes (`read-stored`). What a guest sends that is no path or reference is refused as the call's error (`component.rs`, `tree_of`, `reference_of`);
   what the host sends that is none is a broken host, and the guest traps (`guest.rs`, `told_path`).
 - Calls block their thread. They must not be made from an async runtime's thread.
 
@@ -95,7 +101,7 @@ An unsandboxed extension gets the whole system and may start programs. It runs o
 - **Programs** are looked for in the extension's folder (per platform first), then its downloads, then the system.
   Programs given files from a sealed extension get them through the served filesystem.
 - **Places on disk** cross the boundary as handles, never as text: the `host-path` resource, given by the calls that
-  name a place (`temp`, `keep`, `path-of`, `serve`, `place`, a build's folder), offers the form the component opens
+  name a place (`temp`, `keep`, `place-content`, `serve`, `place`, a build's folder), offers the form the component opens
   (`guest`), the form a program is told (`native`), and a place within it (`join`). `spawn` takes its arguments as
   `arg`s - text, a place, or parts joined into one - and the host writes each place as the program reads it, so no
   extension writes a path for another system's programs.

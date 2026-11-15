@@ -16,6 +16,36 @@ use crate::Result;
 #[derive(Clone)]
 pub struct HostPath(Arc<dyn Place>);
 
+/// A content where a program can read it, for as long as this is held (`Call::place_content`): a stored blob's file,
+/// or a file written for a content held in itself or in memory, removed when this is dropped. Held until the program
+/// it is given to is done with it - waited for, not only started.
+pub struct PlacedContent {
+    path: HostPath,
+    /// What keeps it: in the host, what removes what was written for it; in a component, the host's handle.
+    _keeps: Box<dyn Any + Send>,
+}
+
+impl PlacedContent {
+    /// A place, and what keeps it: what removes it when dropped, or nothing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(path: HostPath, keeps: impl Any + Send) -> PlacedContent {
+        PlacedContent { path, _keeps: Box::new(keeps) }
+    }
+
+    /// Where it is.
+    #[must_use]
+    pub fn path(&self) -> &HostPath {
+        &self.path
+    }
+}
+
+impl fmt::Debug for PlacedContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PlacedContent({})", self.path.native())
+    }
+}
+
 /// What gives a place its forms: the host's own path, where the host runs the operation itself, or the handle a
 /// component holds.
 #[doc(hidden)]

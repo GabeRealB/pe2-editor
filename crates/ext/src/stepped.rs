@@ -831,8 +831,8 @@ impl crate::data::CallHost for Replaying<'_> {
         self.inner.build_config()
     }
 
-    fn path_of(&self, content: &crate::Content) -> Option<crate::HostPath> {
-        self.inner.path_of(content)
+    fn place_content(&self, content: &crate::Content) -> Result<crate::PlacedContent> {
+        self.inner.place_content(content)
     }
 
     fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<crate::HostPath> {

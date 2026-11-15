@@ -2687,14 +2687,18 @@ impl pe2_ext::CallHost for StreamHost {
         &self.path
     }
 
-    fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
-        match content {
+    fn place_content(&self, content: &pe2_ext::Content) -> Result<pe2_ext::PlacedContent> {
+        let (path, written) = match content {
             // A program is given a file: a chunked content assembled for it.
             pe2_ext::Content::Stored { sha1, .. } => {
-                StreamHost::path_of(self, sha1).ok().and_then(|p| crate::content::for_program(p).ok()).map(given)
+                (crate::content::for_program(StreamHost::path_of(self, sha1)?)?, None)
             }
-            _ => None,
-        }
+            held => {
+                let folder = HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?;
+                graph::exec::written_for_program(&folder, held.held().unwrap_or_default())?
+            }
+        };
+        Ok(pe2_ext::PlacedContent::new(given(path), written))
     }
 
     fn node_type(&self) -> Option<&str> {
@@ -2826,14 +2830,9 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.serve(files, how).map(given)
     }
 
-    fn path_of(&self, content: &pe2_ext::Content) -> Option<pe2_ext::HostPath> {
-        match content {
-            // A program is given a file: a chunked content assembled for it.
-            pe2_ext::Content::Stored { sha1, .. } => {
-                self.call.content_path(sha1).and_then(|p| crate::content::for_program(&p).ok()).map(given)
-            }
-            _ => None,
-        }
+    fn place_content(&self, content: &pe2_ext::Content) -> Result<pe2_ext::PlacedContent> {
+        let (path, written) = self.call.place_content(content)?;
+        Ok(pe2_ext::PlacedContent::new(given(path), written))
     }
 }
 

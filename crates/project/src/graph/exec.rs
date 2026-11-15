@@ -827,7 +827,7 @@ impl<'a> Call<'a> {
         for file in files {
             // Where its content is; one with no place on disk (a node holding it otherwise), read and held.
             let content = match &file.content {
-                super::Content::Memory(bytes) => Given::Bytes(bytes.clone()),
+                super::Content::Memory(buffer) => Given::Bytes(buffer.bytes().clone()),
                 super::Content::Inline { .. } => Given::Bytes(Arc::from(file.content.held().unwrap_or_default())),
                 super::Content::Stored { sha1, .. } => match self.content_path(sha1) {
                     Some(disk) => Given::Disk(disk),
@@ -881,6 +881,24 @@ impl<'a> Call<'a> {
             at += bytes.len() as u64;
         }
         Ok(())
+    }
+
+    /// A content where a program can read it, and what keeps it there: a stored one's file (a chunked one served or
+    /// assembled, as `content::for_program` gives it); one held in itself or in memory written to a file in the store's
+    /// folder of temporary files, or the system's where there is no store - removed when what keeps it is dropped.
+    ///
+    /// # Errors
+    /// It is stored where it cannot be found, or it cannot be written.
+    pub fn place_content(&self, content: &Content) -> Result<(HostPath, Option<Written>)> {
+        if let Content::Stored { sha1, .. } = content {
+            let path = self.content_path(sha1).with_context(|| format!("no content {sha1}"))?;
+            return Ok((crate::content::for_program(&path)?, None));
+        }
+        let folder = match self.store {
+            Some(store) => store.tmp(),
+            None => HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?,
+        };
+        written_for_program(&folder, content.held().unwrap_or_default())
     }
 
     /// Where a stored content is: in the store, or among its node's files.
@@ -1024,6 +1042,29 @@ impl Writer {
         }
         kept
     }
+}
+
+/// A file written for a program, removed when this is dropped.
+pub struct Written(HostPath);
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Bytes written to a file of their own in a folder, for a program to read, and what removes it.
+///
+/// # Errors
+/// It cannot be written.
+pub fn written_for_program(folder: &HostPath, bytes: &[u8]) -> Result<(HostPath, Option<Written>)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITTEN: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(folder).with_context(|| folder.to_string())?;
+    let name = format!("placed-{}-{}", std::process::id(), WRITTEN.fetch_add(1, Ordering::Relaxed));
+    let path = folder.join(pe2_path::Name::new(&name)?);
+    std::fs::write(&path, bytes).with_context(|| path.to_string())?;
+    Ok((path.clone(), Some(Written(path))))
 }
 
 /// A writer dropped unfinished - its operation failed, stopped to read what was not made yet, or was cancelled - leaves

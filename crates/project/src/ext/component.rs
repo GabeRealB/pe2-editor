@@ -54,7 +54,8 @@ mod bindings {
             "pe2:extension/host.ui": super::Frame,
             "pe2:extension/host.texture": super::HostTexture,
             "pe2:extension/host.writer": super::HostWriter,
-            "pe2:extension/media.media-buffer": super::HostMediaBuffer,
+            "pe2:extension/buffers.buffer": super::HostBuffer,
+            "pe2:extension/host.placed-content": super::HostPlacedContent,
             "pe2:extension/types.stream-reader": super::HostStreamReader,
             "pe2:extension/unsandboxed.process": super::HostProcess,
             "pe2:extension/unsandboxed.host-path": super::GivenPath,
@@ -63,7 +64,7 @@ mod bindings {
 }
 
 use bindings::exports::pe2::extension::guest as g;
-use bindings::pe2::extension::{host, media, types, unsandboxed};
+use bindings::pe2::extension::{buffers, host, media, types, unsandboxed};
 
 /// The engine's epoch ticks this often: deadlines are counted in its ticks.
 const TICK: Duration = Duration::from_millis(10);
@@ -224,8 +225,12 @@ const SAID: usize = 4 << 10;
 /// A stream given to a component's operation.
 pub struct HostStreamReader(pe2_ext::StreamInput);
 
-/// Bytes the host holds for a component: a frame's planes, a stretch of sound - shared by every handle to them.
-pub struct HostMediaBuffer(Arc<Vec<u8>>);
+/// Bytes the host holds for a component: a content in memory, a frame's planes, a stretch of sound - shared by every
+/// handle to them.
+pub struct HostBuffer(Arc<[u8]>);
+
+/// A content placed where a program reads it, for a component: what it made removed when the component drops it.
+pub struct HostPlacedContent(pe2_ext::PlacedContent);
 
 /// A file an operation makes, held for the component writing it: the host's writer (`CallHost::writer`) until it is
 /// finished.
@@ -561,17 +566,42 @@ impl host::HostAsset for State {
             Err(why) => return Ok(Err(why)),
         };
         let kept = self.lent(&asset)?.keep(&path, name).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
-        Ok(kept.map(file_to_wit).map_err(|e| format!("{e:#}")))
+        Ok(kept.and_then(|file| file_to_wit(file, &mut self.table)).map_err(|e| format!("{e:#}")))
     }
 
-    fn path_of(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<Resource<GivenPath>>> {
+    fn read_stored(&mut self, asset: Resource<LentAsset>, sha1: [u8; 20]) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        let read = self.lent(&asset)?.read_stored(&pe2_ext::Sha1::from_bytes(sha1));
+        Ok(read.unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    }
+
+    fn read_stored_range(
+        &mut self,
+        asset: Resource<LentAsset>,
+        sha1: [u8; 20],
+        offset: u64,
+        len: u32,
+    ) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        let read = self.lent(&asset)?.read_stored_range(&pe2_ext::Sha1::from_bytes(sha1), offset, len as usize);
+        Ok(read.unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    }
+
+    fn place_content(
+        &mut self,
+        asset: Resource<LentAsset>,
+        content: types::Content,
+    ) -> wasmtime::Result<Result<Resource<HostPlacedContent>, String>> {
+        let content = match content_from_wit(content, "a content placed", &mut self.table) {
+            Ok(content) => content,
+            Err(why) => return Ok(Err(format!("{why:#}"))),
+        };
         if self.unsandboxed.is_none() {
-            return Ok(None);
+            return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        // What is no name is no file of any asset.
-        let Ok(name) = name_of(&name) else { return Ok(None) };
-        let found = self.lent(&asset)?.path_of(name);
-        found.map(|at| self.give(&at)).transpose()
+        let placed = self.lent(&asset)?.place_content(&content);
+        match placed.unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))) {
+            Ok(placed) => Ok(Ok(self.table.push(HostPlacedContent(placed))?)),
+            Err(e) => Ok(Err(format!("{e:#}"))),
+        }
     }
 
     fn serve(
@@ -583,7 +613,7 @@ impl host::HostAsset for State {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        let files: Vec<pe2_ext::File> = match files.into_iter().map(file_from_wit).collect() {
+        let files: Vec<pe2_ext::File> = match files.into_iter().map(|f| file_from_wit(f, &mut self.table)).collect() {
             Ok(files) => files,
             Err(why) => return Ok(Err(format!("{why:#}"))),
         };
@@ -611,7 +641,7 @@ impl host::HostWriter for State {
 
     fn finish(&mut self, writer: Resource<HostWriter>) -> wasmtime::Result<Result<types::File, String>> {
         let Some(inner) = self.table.get_mut(&writer)?.0.take() else { return Ok(Err("finished".into())) };
-        Ok(inner.finish().map(file_to_wit).map_err(|e| format!("{e:#}")))
+        Ok(inner.finish().and_then(|file| file_to_wit(file, &mut self.table)).map_err(|e| format!("{e:#}")))
     }
 
     fn drop(&mut self, writer: Resource<HostWriter>) -> wasmtime::Result<()> {
@@ -1053,7 +1083,7 @@ impl unsandboxed::HostProcess for State {
     fn write_buffer(
         &mut self,
         process: Resource<HostProcess>,
-        buffer: Resource<HostMediaBuffer>,
+        buffer: Resource<HostBuffer>,
     ) -> wasmtime::Result<Result<(), String>> {
         use std::io::Write;
         let bytes = self.table.get(&buffer)?.0.clone();
@@ -1138,26 +1168,47 @@ impl media::Host for State {
     }
 }
 
-impl media::HostMediaBuffer for State {
-    fn new(&mut self, data: Vec<u8>) -> wasmtime::Result<Resource<HostMediaBuffer>> {
-        Ok(self.table.push(HostMediaBuffer(Arc::new(data)))?)
+impl buffers::Host for State {}
+
+impl buffers::HostBuffer for State {
+    fn new(&mut self, bytes: Vec<u8>) -> wasmtime::Result<Resource<HostBuffer>> {
+        Ok(self.table.push(HostBuffer(Arc::from(bytes)))?)
     }
 
-    fn size(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<u64> {
+    fn size(&mut self, buffer: Resource<HostBuffer>) -> wasmtime::Result<u64> {
         Ok(self.table.get(&buffer)?.0.len() as u64)
     }
 
-    fn bytes(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<Vec<u8>> {
+    fn read(&mut self, buffer: Resource<HostBuffer>, offset: u64, len: u32) -> wasmtime::Result<Vec<u8>> {
+        let bytes = &self.table.get(&buffer)?.0;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+        Ok(bytes[start..start.saturating_add(len as usize).min(bytes.len())].to_vec())
+    }
+
+    fn bytes(&mut self, buffer: Resource<HostBuffer>) -> wasmtime::Result<Vec<u8>> {
         Ok(self.table.get(&buffer)?.0.to_vec())
     }
 
-    fn share(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<Resource<HostMediaBuffer>> {
+    fn share(&mut self, buffer: Resource<HostBuffer>) -> wasmtime::Result<Resource<HostBuffer>> {
         let bytes = self.table.get(&buffer)?.0.clone();
-        Ok(self.table.push(HostMediaBuffer(bytes))?)
+        Ok(self.table.push(HostBuffer(bytes))?)
     }
 
-    fn drop(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<()> {
+    fn drop(&mut self, buffer: Resource<HostBuffer>) -> wasmtime::Result<()> {
         self.table.delete(buffer)?;
+        Ok(())
+    }
+}
+
+impl host::HostPlacedContent for State {
+    fn path(&mut self, placed: Resource<HostPlacedContent>) -> wasmtime::Result<Resource<GivenPath>> {
+        let path = self.table.get(&placed)?.0.path().clone();
+        self.give(&path)
+    }
+
+    fn drop(&mut self, placed: Resource<HostPlacedContent>) -> wasmtime::Result<()> {
+        // What was written for it goes with it.
+        self.table.delete(placed)?;
         Ok(())
     }
 }
@@ -2614,8 +2665,8 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
     }
 }
 
-/// A node as an operation's run lends it to a component: its path, type and declared settings; its files the
-/// contents its values hold, named by their hashes.
+/// A node as an operation's run lends it to a component: its path, type and declared settings. It holds no files by
+/// name: the contents its values hold are read by their hashes (`read_stored`).
 struct Node<'a> {
     host: &'a dyn pe2_ext::CallHost,
     declaration: String,
@@ -2626,12 +2677,9 @@ impl<'a> Node<'a> {
         Node { host, declaration: String::new() }
     }
 
-    /// What an operation's asset reads by name: a content, by its hash, which the contract sends where it sends a name.
-    ///
-    /// # Errors
-    /// It is no hash.
-    fn content(name: &pe2_ext::RelPath) -> Result<pe2_ext::Content> {
-        Ok(pe2_ext::Content::Stored { sha1: pe2_ext::Sha1::from_hex(name.as_str())?, size: 0 })
+    /// A stored content, by its hash, as its host reads it.
+    fn stored(sha1: &pe2_ext::Sha1) -> pe2_ext::Content {
+        pe2_ext::Content::Stored { sha1: *sha1, size: 0 }
     }
 }
 
@@ -2654,19 +2702,19 @@ impl Source for Node<'_> {
     }
 
     fn has_file(&self, _: &pe2_ext::RelPath) -> bool {
-        true
+        false
     }
 
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
-        self.host.read(&Node::content(name)?)
+        anyhow::bail!("{}: an operation's node holds no file by name ({name})", self.host.path())
     }
 
     fn size(&self, _: &pe2_ext::RelPath) -> Option<u64> {
         None
     }
 
-    fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.host.read_range(&Node::content(name)?, offset, len)
+    fn read_range(&self, name: &pe2_ext::RelPath, _: u64, _: usize) -> Result<Vec<u8>> {
+        anyhow::bail!("{}: an operation's node holds no file by name ({name})", self.host.path())
     }
 
     fn writer(&self, name: &pe2_ext::RelPath) -> Option<Result<Box<dyn pe2_ext::FileWriter>>> {
@@ -2709,9 +2757,16 @@ impl Source for Node<'_> {
         Some(self.host.keep(path, name))
     }
 
-    fn path_of(&self, name: &pe2_ext::RelPath) -> Option<pe2_ext::HostPath> {
-        // What is no hash names no content of an operation's.
-        self.host.path_of(&Node::content(name).ok()?)
+    fn read_stored(&self, sha1: &pe2_ext::Sha1) -> Option<Result<Vec<u8>>> {
+        Some(self.host.read(&Node::stored(sha1)))
+    }
+
+    fn read_stored_range(&self, sha1: &pe2_ext::Sha1, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
+        Some(self.host.read_range(&Node::stored(sha1), offset, len))
+    }
+
+    fn place_content(&self, content: &pe2_ext::Content) -> Option<Result<pe2_ext::PlacedContent>> {
+        Some(self.host.place_content(content))
     }
 
     fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Option<Result<pe2_ext::HostPath>> {
@@ -2746,9 +2801,9 @@ fn values_to_wit(ports: Vec<Vec<pe2_ext::Data>>, table: &mut ResourceTable) -> R
     ports.into_iter().map(|port| port.into_iter().map(|v| value_to_wit(v, table)).collect()).collect()
 }
 
-/// A media buffer the host holds, handed to an instance.
-fn buffer_to_wit(buffer: &pe2_ext::media::MediaBuffer, table: &mut ResourceTable) -> Result<Resource<HostMediaBuffer>> {
-    Ok(table.push(HostMediaBuffer(buffer.bytes().clone()))?)
+/// A buffer the host holds, handed to an instance: another handle to the same bytes.
+fn buffer_to_wit(buffer: &pe2_ext::Buffer, table: &mut ResourceTable) -> Result<Resource<HostBuffer>> {
+    Ok(table.push(HostBuffer(buffer.bytes().clone()))?)
 }
 
 /// A value as the contract carries it: a list's items that are lists themselves are dropped (it carries one level).
@@ -2768,7 +2823,7 @@ fn value_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<types
         Data::Typed(t) => types::Value::Typed(types::Typed {
             ty: t.ty,
             also: t.also,
-            files: t.files.into_iter().map(file_to_wit).collect(),
+            files: t.files.into_iter().map(|f| file_to_wit(f, table)).collect::<Result<_>>()?,
             settings: toml::to_string(&t.settings).unwrap_or_default(),
             notes: t.notes,
         }),
@@ -2816,13 +2871,17 @@ fn item_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<Option
     }))
 }
 
-fn file_to_wit(f: pe2_ext::File) -> types::File {
-    let content = match f.content {
+fn file_to_wit(f: pe2_ext::File, table: &mut ResourceTable) -> Result<types::File> {
+    Ok(types::File { name: f.name.to_string(), content: content_to_wit(f.content, table)? })
+}
+
+/// A content as the contract carries it: in memory, by a handle to the bytes the host holds.
+fn content_to_wit(content: pe2_ext::Content, table: &mut ResourceTable) -> Result<types::Content> {
+    Ok(match content {
         pe2_ext::Content::Inline { bytes, len } => types::Content::Inline((bytes, len)),
-        pe2_ext::Content::Memory(bytes) => types::Content::Memory(bytes.to_vec()),
+        pe2_ext::Content::Memory(buffer) => types::Content::Memory(buffer_to_wit(&buffer, table)?),
         pe2_ext::Content::Stored { sha1, size } => types::Content::Stored((*sha1.bytes(), size)),
-    };
-    types::File { name: f.name.to_string(), content }
+    })
 }
 
 /// A value as the contract carried it.
@@ -2842,12 +2901,9 @@ fn value_from_wit(value: types::Value, table: &mut ResourceTable) -> Result<pe2_
     }
 }
 
-/// A media buffer an instance hands over: its handle taken back, the bytes it names kept.
-fn buffer_from_wit(
-    buffer: Resource<HostMediaBuffer>,
-    table: &mut ResourceTable,
-) -> Result<pe2_ext::media::MediaBuffer> {
-    Ok(pe2_ext::media::MediaBuffer::shared(table.delete(buffer)?.0))
+/// A buffer an instance hands over: its handle taken back, the bytes it names kept.
+fn buffer_from_wit(buffer: Resource<HostBuffer>, table: &mut ResourceTable) -> Result<pe2_ext::Buffer> {
+    Ok(pe2_ext::Buffer::shared(table.delete(buffer)?.0))
 }
 
 fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext::Data> {
@@ -2861,7 +2917,7 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
         types::Item::Typed(t) => Data::Typed(pe2_ext::Typed {
             ty: t.ty,
             also: t.also,
-            files: t.files.into_iter().map(file_from_wit).collect::<Result<_>>()?,
+            files: t.files.into_iter().map(|f| file_from_wit(f, table)).collect::<Result<_>>()?,
             settings: toml::from_str(&t.settings).unwrap_or_default(),
             notes: t.notes,
         }),
@@ -2889,20 +2945,25 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
 }
 
 /// A file as a component gives it: its name checked as it comes in.
-fn file_from_wit(f: types::File) -> Result<pe2_ext::File> {
-    let content = match f.content {
+fn file_from_wit(f: types::File, table: &mut ResourceTable) -> Result<pe2_ext::File> {
+    let content = content_from_wit(f.content, &f.name, table)?;
+    let name = pe2_path::RelPath::new(&f.name).with_context(|| format!("a file named {}", f.name))?;
+    Ok(pe2_ext::File { name: name.to_owned(), content })
+}
+
+/// A content as a component gives it: in memory, the bytes its handle names, the handle taken back.
+fn content_from_wit(content: types::Content, what: &str, table: &mut ResourceTable) -> Result<pe2_ext::Content> {
+    Ok(match content {
         // A length past what is held in itself is a component's mistake: refused, never cut.
         types::Content::Inline((bytes, len)) if usize::from(len) <= pe2_ext::INLINE => {
             pe2_ext::Content::Inline { bytes, len }
         }
-        types::Content::Inline((_, len)) => anyhow::bail!("a file named {} holds {len} bytes in itself", f.name),
-        types::Content::Memory(bytes) => pe2_ext::Content::owning(bytes),
+        types::Content::Inline((_, len)) => anyhow::bail!("{what} holds {len} bytes in itself"),
+        types::Content::Memory(buffer) => pe2_ext::Content::Memory(buffer_from_wit(buffer, table)?),
         types::Content::Stored((sha1, size)) => {
             pe2_ext::Content::Stored { sha1: pe2_ext::Sha1::from_bytes(sha1), size }
         }
-    };
-    let name = pe2_path::RelPath::new(&f.name).with_context(|| format!("a file named {}", f.name))?;
-    Ok(pe2_ext::File { name: name.to_owned(), content })
+    })
 }
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.

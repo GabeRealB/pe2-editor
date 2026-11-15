@@ -75,8 +75,20 @@ pub trait Source {
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
         None
     }
-    fn path_of(&self, name: &crate::RelPath) -> Option<crate::HostPath> {
-        let _ = name;
+    /// For an operation's run: a stored content, whole, by its hash (`CallHost::read`).
+    fn read_stored(&self, sha1: &crate::Sha1) -> Option<Result<Vec<u8>>> {
+        let _ = sha1;
+        None
+    }
+    /// For an operation's run: up to `len` bytes of a stored content from `offset`.
+    fn read_stored_range(&self, sha1: &crate::Sha1, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
+        let _ = (sha1, offset, len);
+        None
+    }
+    /// For an unsandboxed extension's operation: a content where a program can read it, until what this gives is
+    /// dropped (`CallHost::place_content`).
+    fn place_content(&self, content: &crate::Content) -> Option<Result<crate::PlacedContent>> {
+        let _ = content;
         None
     }
     fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<Result<crate::HostPath>> {

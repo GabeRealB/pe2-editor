@@ -285,9 +285,8 @@ impl<'de> serde::Deserialize<'de> for Sha1 {
 /// hash and size.
 pub const INLINE: usize = 30;
 
-/// A file's content: a few bytes held in itself, bytes held in memory and shared, or a blob the host keeps by its hash,
-/// read on asking (`Call::read`). Made of bytes by `Content::of`, which holds what fits in itself; contents of the same
-/// bytes are equal however they are held.
+/// A file's content: a few bytes held in itself, bytes the host holds (`Buffer`, passed by handle), or a blob the host
+/// keeps by its hash, read on asking (`Call::read`). Made of bytes by `Content::of`, which holds what fits in itself.
 #[derive(Clone)]
 pub enum Content {
     /// Up to `INLINE` bytes, the first `len` of `bytes`, the rest zero.
@@ -295,7 +294,7 @@ pub enum Content {
         bytes: [u8; INLINE],
         len: u8,
     },
-    Memory(Arc<[u8]>),
+    Memory(crate::Buffer),
     Stored {
         sha1: Sha1,
         size: u64,
@@ -303,7 +302,7 @@ pub enum Content {
 }
 
 impl Content {
-    /// Bytes as a content: in itself where they fit, else in memory.
+    /// Bytes as a content: in itself where they fit, else in memory (in a component, handed to the host).
     #[must_use]
     pub fn of(bytes: &[u8]) -> Content {
         match u8::try_from(bytes.len()) {
@@ -312,39 +311,66 @@ impl Content {
                 inline[..bytes.len()].copy_from_slice(bytes);
                 Content::Inline { bytes: inline, len }
             }
-            _ => Content::Memory(Arc::from(bytes)),
+            _ => Content::Memory(crate::Buffer::new(bytes.to_vec())),
         }
     }
 
     /// Bytes made as a content, kept without a copy where they do not fit in itself.
     #[must_use]
     pub fn owning(bytes: Vec<u8>) -> Content {
-        if bytes.len() <= INLINE { Content::of(&bytes) } else { Content::Memory(Arc::from(bytes)) }
+        if bytes.len() <= INLINE { Content::of(&bytes) } else { Content::Memory(crate::Buffer::new(bytes)) }
     }
 
-    /// The bytes it holds, where it holds them: none for a stored one, which is read on asking.
+    /// The few bytes it holds in itself; none for one in memory or stored.
+    #[must_use]
+    pub fn inline(&self) -> Option<&[u8]> {
+        match self {
+            Content::Inline { bytes, len } => Some(&bytes[..usize::from(*len).min(INLINE)]),
+            _ => None,
+        }
+    }
+
+    /// The bytes it holds, where the host holds them: none for a stored one, which is read on asking.
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub fn held(&self) -> Option<&[u8]> {
         match self {
-            Content::Inline { bytes, len } => Some(&bytes[..usize::from(*len).min(INLINE)]),
-            Content::Memory(bytes) => Some(bytes),
+            Content::Memory(buffer) => Some(buffer.bytes()),
+            held => held.inline(),
+        }
+    }
+
+    /// A copy of what it holds, in itself or in memory (in a component, copied in); none for a stored one.
+    #[must_use]
+    pub fn local(&self) -> Option<Vec<u8>> {
+        match self {
+            Content::Inline { .. } => self.inline().map(<[u8]>::to_vec),
+            Content::Memory(buffer) => Some(buffer.read()),
             Content::Stored { .. } => None,
         }
     }
 
-    /// Up to `len` bytes of what it holds from `offset`, fewer at its end; none for a stored one.
+    /// Up to `len` bytes of what it holds from `offset`, fewer at its end - in a component, only those copied in; none
+    /// for a stored one.
     #[must_use]
     pub fn held_range(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        let bytes = self.held()?;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-        Some(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+        match self {
+            Content::Inline { .. } => {
+                let bytes = self.inline()?;
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+                Some(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+            }
+            Content::Memory(buffer) => Some(buffer.read_range(offset, len)),
+            Content::Stored { .. } => None,
+        }
     }
 
     #[must_use]
     pub fn size(&self) -> u64 {
         match self {
             Content::Stored { size, .. } => *size,
-            held => held.held().map_or(0, |bytes| bytes.len() as u64),
+            Content::Memory(buffer) => buffer.size(),
+            Content::Inline { len, .. } => u64::from(*len),
         }
     }
 }
@@ -355,8 +381,9 @@ impl PartialEq for Content {
             (Content::Stored { sha1, size }, Content::Stored { sha1: theirs, size: their_size }) => {
                 sha1 == theirs && size == their_size
             }
-            (Content::Stored { .. }, _) | (_, Content::Stored { .. }) => false,
-            (held, theirs) => held.held() == theirs.held(),
+            (Content::Memory(buffer), Content::Memory(theirs)) => buffer == theirs,
+            (Content::Inline { .. }, Content::Inline { .. }) => self.inline() == other.inline(),
+            _ => false,
         }
     }
 }
@@ -703,10 +730,14 @@ pub trait CallHost {
     fn build_config(&self) -> Option<BuildConfig> {
         None
     }
-    /// Where a content is on disk, for an unsandboxed extension's operation to point a program at.
-    fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
+    /// A content where a program can read it, for an unsandboxed extension's operation: until what this gives is
+    /// dropped.
+    ///
+    /// # Errors
+    /// The host places no contents here, or it cannot be found or written.
+    fn place_content(&self, content: &Content) -> Result<crate::PlacedContent> {
         let _ = content;
-        None
+        bail!("{}: no content is placed here", self.path())
     }
     /// A read-only folder holding these files by their names, for an unsandboxed extension's operation to point a
     /// program at, until its run is done.
@@ -994,10 +1025,13 @@ impl Call<'_> {
         self.host.build_config()
     }
 
-    /// Where a file is on disk, for this extension to point a program at; none where it is held in memory.
-    #[must_use]
-    pub fn path_of(&self, file: &File) -> Option<crate::HostPath> {
-        self.host.path_of(&file.content)
+    /// A file's content where a program can read it, for this extension to point one at: held until the program is done
+    /// with it - for a content held in itself or in memory, a file written for it, removed when this is dropped.
+    ///
+    /// # Errors
+    /// The host places no contents here (in the sandbox), or it cannot be found or written.
+    pub fn place_content(&self, file: &File) -> Result<crate::PlacedContent> {
+        self.host.place_content(&file.content)
     }
 
     /// A file's content, whole.
@@ -1005,9 +1039,20 @@ impl Call<'_> {
     /// # Errors
     /// It cannot be read.
     pub fn read(&self, file: &File) -> Result<Vec<u8>> {
-        match file.content.held() {
-            Some(bytes) => Ok(bytes.to_vec()),
+        match file.content.local() {
+            Some(bytes) => Ok(bytes),
             None => self.host.read(&file.content),
+        }
+    }
+
+    /// Up to `len` bytes of a file's content from `offset`, fewer at its end: only those read, wherever it is held.
+    ///
+    /// # Errors
+    /// It cannot be read.
+    pub fn read_range(&self, file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
+        match file.content.held_range(offset, len) {
+            Some(bytes) => Ok(bytes),
+            None => self.host.read_range(&file.content, offset, len),
         }
     }
 
@@ -1121,8 +1166,8 @@ impl Source for Lent<'_> {
 
     fn read(&self, name: &crate::RelPath) -> Result<Vec<u8>> {
         let content = &self.file(name)?.content;
-        match content.held() {
-            Some(bytes) => Ok(bytes.to_vec()),
+        match content.local() {
+            Some(bytes) => Ok(bytes),
             None => self.host.read(content),
         }
     }

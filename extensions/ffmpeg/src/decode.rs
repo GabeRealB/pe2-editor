@@ -2,7 +2,8 @@
 //! full range. What the file holds is asked of ffprobe. Its frames and its sound come from two runs of ffmpeg, a pipe
 //! each, so neither waits on the other being read.
 
-use pe2_ext::media::{AudioData, MediaBuffer, PixelFormat, SampleFormat, VideoFrame};
+use pe2_ext::Buffer;
+use pe2_ext::media::{AudioData, PixelFormat, SampleFormat, VideoFrame};
 use pe2_ext::process::{Process, spawn};
 use pe2_ext::{Arg, Call, Data, Generator, HostPath, Result, Table, Typed, Value, anyhow};
 
@@ -74,6 +75,8 @@ pub struct Reading {
     rate: f64,
     /// The next frame.
     at: u64,
+    /// Where the file is for ffmpeg, held while it reads it: a file written for it goes once it is done.
+    _placed: pe2_ext::PlacedContent,
 }
 
 impl Reading {
@@ -82,7 +85,8 @@ impl Reading {
     /// # Errors
     /// It is on no path a program can read, or ffprobe or ffmpeg will not read it.
     pub fn start(call: &Call<'_>, file: &Typed) -> Result<Reading> {
-        let path = call.path_of(file.file()?).ok_or_else(|| anyhow!("the file is on no path"))?;
+        let placed = call.place_content(file.file()?)?;
+        let path = placed.path().clone();
         let video = probed(&path, "v:0", "width,height,avg_frame_rate,nb_read_packets")?;
         let (width, height, count) =
             (number(&video, "width")?, number(&video, "height")?, number(&video, "nb_read_packets")?);
@@ -131,6 +135,7 @@ impl Reading {
             count: count.try_into()?,
             rate: frames,
             at: 0,
+            _placed: placed,
         })
     }
 
@@ -157,7 +162,7 @@ impl Reading {
         let timestamp = (sound.given as f64 / f64::from(sound.rate) * 1e6) as u64;
         sound.given += samples.len() as u64 / bytes;
         Ok(Some(AudioData {
-            buffer: MediaBuffer::new(samples),
+            buffer: Buffer::new(samples),
             format: SampleFormat::S16Interleaved,
             sample_rate: sound.rate,
             channels: sound.channels,
@@ -189,7 +194,7 @@ impl Generator for Reading {
             let timestamp = (self.at as f64 / self.rate * 1e6) as u64;
             let (width, height) = (self.width, self.height);
             let picture =
-                VideoFrame { buffer: MediaBuffer::new(bytes), format: PixelFormat::Yuv420p, width, height, timestamp };
+                VideoFrame { buffer: Buffer::new(bytes), format: PixelFormat::Yuv420p, width, height, timestamp };
             let mut item = vec![Data::Video(picture)];
             item.extend(self.heard()?.map(Data::Audio));
             items.push(Data::List(item));

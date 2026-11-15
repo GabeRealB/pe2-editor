@@ -3,7 +3,8 @@
 //! reads through its references: a bank's instruments, scripts and samples, an instrument's samples, a script's
 //! instruments, each its native output and the references that came with it.
 
-use pe2_ext::media::{AudioData, MediaBuffer, SampleFormat};
+use pe2_ext::Buffer;
+use pe2_ext::media::{AudioData, SampleFormat};
 use pe2_ext::{Asset, Call, ContentRow, Contents, Data, Generator, Icon, Result, Table, Tint, Typed, Value, anyhow};
 
 use formats::spk::Bank;
@@ -264,7 +265,7 @@ impl Generator for Played {
             let timestamp = self.since * 1_000_000 / u64::from(crate::spu::RATE);
             self.since += (samples.len() / 2) as u64;
             items.push(Data::Audio(AudioData {
-                buffer: MediaBuffer::new(samples.iter().flat_map(|s| s.to_le_bytes()).collect()),
+                buffer: Buffer::new(samples.iter().flat_map(|s| s.to_le_bytes()).collect()),
                 format: SampleFormat::S16Interleaved,
                 sample_rate: crate::spu::RATE,
                 channels: 2,

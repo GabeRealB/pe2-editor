@@ -1,9 +1,9 @@
 //! Starting programs, for an unsandboxed extension (`project::ext::unsandboxed`) alone: the host refuses any other, and
 //! WASI has nothing for it. What uses one calls its operations, and never sees them.
 
+use crate::Buffer;
 #[cfg(target_family = "wasm")]
 use crate::guest::bindings::pe2::extension::unsandboxed as host;
-use crate::media::MediaBuffer;
 use crate::{Result, anyhow};
 
 /// A program running: what is written goes to its standard input, what it writes to its standard output is read.
@@ -99,7 +99,7 @@ impl Process {
     ///
     /// # Errors
     /// It stopped reading.
-    pub fn write_buffer(&mut self, buffer: &MediaBuffer) -> Result<()> {
+    pub fn write_buffer(&mut self, buffer: &Buffer) -> Result<()> {
         #[cfg(target_family = "wasm")]
         return self.process.write_buffer(buffer.handle()).map_err(|e| anyhow!(e));
         #[cfg(not(target_family = "wasm"))]

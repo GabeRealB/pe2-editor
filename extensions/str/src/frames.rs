@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 
 use formats::str::{Form, Sector};
-use pe2_ext::media::{AudioData, MediaBuffer, PixelFormat, SampleFormat, VideoFrame};
+use pe2_ext::Buffer;
+use pe2_ext::media::{AudioData, PixelFormat, SampleFormat, VideoFrame};
 use pe2_ext::{Call, Data, Generator, Result, Table, Typed, Value, anyhow};
 
 use crate::{NATIVE, chunk_at, read_sectors};
@@ -117,8 +118,7 @@ impl Frames {
                     _ => decoded.rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
                 };
                 let (width, height) = (u32::from(first.width), u32::from(first.height));
-                let picture =
-                    VideoFrame { buffer: MediaBuffer::new(bytes), format: self.format, width, height, timestamp };
+                let picture = VideoFrame { buffer: Buffer::new(bytes), format: self.format, width, height, timestamp };
                 let mut items = vec![Data::Video(picture)];
                 if let Some(coding) = self.coding {
                     let channels = if coding.stereo { 2 } else { 1 };
@@ -136,7 +136,7 @@ impl Frames {
                     #[expect(clippy::cast_possible_truncation, reason = "one or two channels")]
                     let channels = channels as u32;
                     let sound = AudioData {
-                        buffer: MediaBuffer::new(bytes),
+                        buffer: Buffer::new(bytes),
                         format: SampleFormat::S16Interleaved,
                         sample_rate: coding.rate,
                         channels,

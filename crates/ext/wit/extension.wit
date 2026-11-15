@@ -13,10 +13,28 @@
 /// 0.1.0, changing freely.
 package pe2:extension@0.1.0;
 
+/// Bytes the host holds, passed by handle: what crosses is the handle, and only what is read of them is copied - an
+/// operation is given its inputs' contents without their bytes, and reads of them what it needs.
+interface buffers {
+    resource buffer {
+        /// Bytes made in the component, handed to the host: the one copy out.
+        constructor(bytes: list<u8>);
+        size: func() -> u64;
+        /// Up to `len` bytes from `offset`, fewer at its end: only those copied in.
+        read: func(offset: u64, len: u32) -> list<u8>;
+        /// A copy of all of them.
+        bytes: func() -> list<u8>;
+        /// Another handle to the same bytes.
+        share: func() -> buffer;
+    }
+}
+
 /// Media as the host holds it, shaped after the `wasi:media` draft's `types` (WebAssembly/WASI#917), to become it if it
-/// is standardized: frames and sound in buffers the host keeps, made from the guest's bytes once and passed by handle,
-/// in the formats the host says it takes.
+/// is standardized: frames and sound in buffers the host keeps (`buffers`), made from the guest's bytes once and passed
+/// by handle, in the formats the host says it takes.
 interface media {
+    use buffers.{buffer};
+
     /// A frame's layout. `yuv420p`: three planes back to back - Y at full size, then Cb and Cr at half each way.
     /// `nv12`: Y, then Cb and Cr interleaved at half each way. `rgba8888` and `bgra8888`: one plane, row by row.
     enum pixel-format { rgba8888, bgra8888, yuv420p, nv12 }
@@ -25,19 +43,9 @@ interface media {
     /// `f32-planar`, 32-bit float samples, each channel's in turn.
     enum sample-format { s16-interleaved, f32-planar }
 
-    /// Bytes the host holds: a frame's planes, a stretch of sound.
-    resource media-buffer {
-        constructor(data: list<u8>);
-        size: func() -> u64;
-        /// A copy of its bytes.
-        bytes: func() -> list<u8>;
-        /// Another handle to the same bytes.
-        share: func() -> media-buffer;
-    }
-
     /// A frame: its buffer, its layout and size, when it is shown (in microseconds from its stream's start).
     record video-frame {
-        buffer: media-buffer,
+        buffer: buffer,
         format: pixel-format,
         width: u32,
         height: u32,
@@ -46,7 +54,7 @@ interface media {
 
     /// A stretch of sound: its buffer, its layout, rate and channels, when it begins (in microseconds).
     record audio-data {
-        buffer: media-buffer,
+        buffer: buffer,
         format: sample-format,
         sample-rate: u32,
         channels: u32,
@@ -63,13 +71,13 @@ interface media {
 /// is outside any sandbox; a command line goes no further than this component, what uses it depending on it and calling
 /// its operations, not knowing what is behind them.
 interface unsandboxed {
-    use media.{media-buffer};
+    use buffers.{buffer};
 
     /// A program running: what is written goes to its standard input, what it writes to its standard output is read.
     resource process {
         write: func(bytes: list<u8>) -> result<_, string>;
         /// A buffer's bytes written straight to its input: they pass through no component's memory.
-        write-buffer: func(buffer: borrow<media-buffer>) -> result<_, string>;
+        write-buffer: func(buffer: borrow<buffer>) -> result<_, string>;
         /// Its input ends.
         close-input: func();
         /// Up to `len` bytes of its output: none at its end.
@@ -118,6 +126,7 @@ interface unsandboxed {
 }
 
 interface types {
+    use buffers.{buffer};
     use media.{video-frame, audio-data};
 
     /// Pixels as unmultiplied RGBA, row by row.
@@ -140,11 +149,12 @@ interface types {
 
     enum style { normal, weak, note, strong, error }
 
-    /// A file's content: up to 30 bytes held in itself, and how many; bytes held in memory; or a blob the host keeps,
-    /// by its SHA-1 and its size - read through the node an operation is lent, as its file named by the hash.
+    /// A file's content: up to 30 bytes held in itself, and how many; bytes the host holds (`buffer`), passed by
+    /// handle; or a blob the host keeps, by its SHA-1 and its size - read through the node an operation is lent
+    /// (`read-stored`).
     variant content {
         inline(tuple<list<u8, 30>, u8>),
-        memory(list<u8>),
+        memory(buffer),
         stored(tuple<list<u8, 20>, u64>),
     }
 
@@ -241,7 +251,13 @@ interface host {
         properties: string,
     }
 
-    use types.{image, rect, style, icon, file, serve-use, value};
+    use types.{image, rect, style, icon, file, content, serve-use, value};
+
+    /// A content where a program can read it, for as long as this is held: a stored blob's file, or a file written
+    /// for one held in itself or in memory - removed when this is dropped.
+    resource placed-content {
+        path: func() -> host-path;
+    }
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
@@ -265,8 +281,13 @@ interface host {
         temp: func() -> result<host-path, string>;
         /// For an unsandboxed extension's operation: a file it made kept as a content, moved rather than read, named `name`.
         keep: func(path: borrow<host-path>, name: string) -> result<file, string>;
-        /// For an unsandboxed extension's operation: where a content is on disk, to point a program at it.
-        path-of: func(name: string) -> option<host-path>;
+        /// For an operation's run: a stored content, whole, by its SHA-1.
+        read-stored: func(sha1: list<u8, 20>) -> result<list<u8>, string>;
+        /// For an operation's run: up to `len` bytes of a stored content from `offset`, fewer at its end.
+        read-stored-range: func(sha1: list<u8, 20>, offset: u64, len: u32) -> result<list<u8>, string>;
+        /// For an unsandboxed extension's operation: a content where a program can read it, for as long as what this
+        /// gives is held - which is until the program is done with it.
+        place-content: func(content: content) -> result<placed-content, string>;
         /// For an unsandboxed extension's operation: a read-only folder holding these files by their names (a name's
         /// folders made), for a program to read, until the operation's run is done; its path. Each is served where its
         /// content is, nothing written where the host has a filesystem to serve it with - chosen by how they will be

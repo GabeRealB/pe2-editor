@@ -443,7 +443,7 @@ impl Store {
             Kept::Video { format, width, height, timestamp, blob } => Value::Video(pe2_ext::media::VideoFrame {
                 format: pe2_ext::media::PixelFormat::named(&format)
                     .with_context(|| format!("{hash}: no layout {format}"))?,
-                buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
+                buffer: pe2_ext::Buffer::new(self.read_blob(&blob)?),
                 width,
                 height,
                 timestamp,
@@ -451,7 +451,7 @@ impl Store {
             Kept::Audio { format, sample_rate, channels, timestamp, blob } => Value::Audio(pe2_ext::media::AudioData {
                 format: pe2_ext::media::SampleFormat::named(&format)
                     .with_context(|| format!("{hash}: no layout {format}"))?,
-                buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
+                buffer: pe2_ext::Buffer::new(self.read_blob(&blob)?),
                 sample_rate,
                 channels,
                 timestamp,

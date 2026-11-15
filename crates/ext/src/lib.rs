@@ -13,6 +13,7 @@
 //! handle a view draws through, never the host's own types.
 
 mod asset;
+mod buffer;
 pub mod cbor;
 pub mod data;
 pub mod events;
@@ -35,6 +36,7 @@ mod ui;
 
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
+pub use buffer::Buffer;
 pub use data::{
     BuildConfig, Call, CallHost, Content, Export, File, FileWriter, Generator, INLINE, Lent, Members, Micro,
     MicroInput, Need, NodeNamed, NotSha1, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp,
@@ -49,7 +51,7 @@ pub use pe2_path::{Address, Asked, Query, Reference, RelPath, ResourcePath, Uid}
 pub type TreePath = pe2_path::VfsPath<pe2_path::Tree>;
 /// The assets of a type, each by its path with its declaration's text (`CallHost::assets_of`).
 pub type AssetsOf = Box<[(std::sync::Arc<TreePath>, Box<str>)]>;
-pub use place::{Arg, ArgPart, HostPath, Place};
+pub use place::{Arg, ArgPart, HostPath, Place, PlacedContent};
 pub use project::{Project, Requested};
 pub use registry::{
     ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow,

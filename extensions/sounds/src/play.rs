@@ -2,7 +2,8 @@
 //! instrument, script or bank that play it in the game: a stream of sound only, a sixtieth of a second an item, as the
 //! player takes it.
 
-use pe2_ext::media::{AudioData, MediaBuffer, SampleFormat};
+use pe2_ext::Buffer;
+use pe2_ext::media::{AudioData, SampleFormat};
 use pe2_ext::{Call, Generator, Result, Table, Value};
 
 /// Items a second.
@@ -41,7 +42,7 @@ impl Generator for Played {
             let bytes = self.pcm[self.at..end].iter().flat_map(|s| s.to_le_bytes()).collect();
             let timestamp = u64::try_from(self.at).unwrap_or(0) * 1_000_000 / u64::from(self.rate);
             items.push(pe2_ext::Data::Audio(AudioData {
-                buffer: MediaBuffer::new(bytes),
+                buffer: Buffer::new(bytes),
                 format: SampleFormat::S16Interleaved,
                 sample_rate: self.rate,
                 channels: 1,

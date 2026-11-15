@@ -309,14 +309,16 @@ impl Source for Lent<'_> {
         Some(self.resource().keep(path, name.as_str()).map(file_from_wit).map_err(crate::Error::msg))
     }
 
-    fn path_of(&self, name: &crate::RelPath) -> Option<crate::HostPath> {
-        self.resource().path_of(name.as_str()).map(given)
+    fn place_content(&self, content: &Content) -> Option<crate::Result<crate::PlacedContent>> {
+        // The content is given by a handle of its own: what it is held by here stays.
+        let placed = self.resource().place_content(content_to_wit(content.clone())).map_err(crate::Error::msg);
+        Some(placed.map(|placed| crate::PlacedContent::new(given(placed.path()), placed)))
     }
 
     fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<crate::Result<crate::HostPath>> {
         let files: Vec<types::File> = files.iter().cloned().map(file_to_wit).collect();
         let how = types::ServeUse { often: how.often, ranges: how.ranges };
-        Some(self.resource().serve(&files, how).map(given).map_err(crate::Error::msg))
+        Some(self.resource().serve(files, how).map(given).map_err(crate::Error::msg))
     }
 }
 
@@ -1292,9 +1294,8 @@ impl CallHost for NodeHost<'_> {
 
     fn read(&self, content: &Content) -> crate::Result<Vec<u8>> {
         match content {
-            // A stored content is read by its hash, which the contract sends where it sends a file's name.
-            Content::Stored { sha1, .. } => self.0.resource().read(&sha1.to_string()).map_err(crate::Error::msg),
-            held => Ok(held.held().unwrap_or_default().to_vec()),
+            Content::Stored { sha1, .. } => self.0.resource().read_stored(*sha1.bytes()).map_err(crate::Error::msg),
+            held => Ok(held.local().unwrap_or_default()),
         }
     }
 
@@ -1302,7 +1303,7 @@ impl CallHost for NodeHost<'_> {
         match content {
             Content::Stored { sha1, .. } => {
                 let len = u32::try_from(len).unwrap_or(u32::MAX);
-                self.0.resource().read_range(&sha1.to_string(), offset, len).map_err(crate::Error::msg)
+                self.0.resource().read_stored_range(*sha1.bytes(), offset, len).map_err(crate::Error::msg)
             }
             held => Ok(held.held_range(offset, len).unwrap_or_default()),
         }
@@ -1348,11 +1349,9 @@ impl CallHost for NodeHost<'_> {
         Source::keep(self.0, path, name).ok_or_else(|| crate::anyhow!("the host keeps nothing for this call"))?
     }
 
-    fn path_of(&self, content: &Content) -> Option<crate::HostPath> {
-        match content {
-            Content::Stored { sha1, .. } => self.0.resource().path_of(&sha1.to_string()).map(given),
-            _ => None,
-        }
+    fn place_content(&self, content: &Content) -> crate::Result<crate::PlacedContent> {
+        Source::place_content(self.0, content)
+            .ok_or_else(|| crate::anyhow!("the host places no contents for this call"))?
     }
 
     fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<crate::HostPath> {
@@ -1458,7 +1457,7 @@ fn file_to_wit(f: crate::File) -> types::File {
 fn content_to_wit(content: Content) -> types::Content {
     match content {
         Content::Inline { bytes, len } => types::Content::Inline((bytes, len)),
-        Content::Memory(bytes) => types::Content::Memory(bytes.to_vec()),
+        Content::Memory(buffer) => types::Content::Memory(buffer.into_host()),
         Content::Stored { sha1, size } => types::Content::Stored((*sha1.bytes(), size)),
     }
 }
@@ -1503,14 +1502,14 @@ fn item_from_wit(item: types::Item) -> Data {
             notes: t.notes,
         }),
         types::Item::Video(v) => Data::Video(crate::media::VideoFrame {
-            buffer: crate::media::MediaBuffer::from_host(v.buffer),
+            buffer: crate::Buffer::from_host(v.buffer),
             format: pixel_format_from_wit(v.format),
             width: v.width,
             height: v.height,
             timestamp: v.timestamp,
         }),
         types::Item::Audio(a) => Data::Audio(crate::media::AudioData {
-            buffer: crate::media::MediaBuffer::from_host(a.buffer),
+            buffer: crate::Buffer::from_host(a.buffer),
             format: sample_format_from_wit(a.format),
             sample_rate: a.sample_rate,
             channels: a.channels,
@@ -1544,7 +1543,7 @@ const INLINE_LEN: u8 = crate::INLINE as u8;
 fn content_from_wit(content: types::Content) -> Content {
     match content {
         types::Content::Inline((bytes, len)) => Content::Inline { bytes, len: len.min(INLINE_LEN) },
-        types::Content::Memory(bytes) => Content::owning(bytes),
+        types::Content::Memory(buffer) => Content::Memory(crate::Buffer::from_host(buffer)),
         types::Content::Stored((sha1, size)) => Content::Stored { sha1: crate::Sha1::from_bytes(sha1), size },
     }
 }

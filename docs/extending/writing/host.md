@@ -25,10 +25,12 @@ code, `RelPath::new(text)?` for one made or read, so `objects/a.o` is a path, no
 extraction makes is `Made`, its files each by that name; a reference written with its bundle's path
 (`{ uid, path = "res://<path>.node" }`) is read with `declared_path`.
 
-A file's content (`File::content`) is a few bytes held in itself (`Content::Inline`, up to 30), bytes held in memory
-and shared (`Content::Memory`), or a blob the editor keeps by its SHA-1 (`Content::Stored`, a `Sha1`: twenty bytes,
-written as forty hex digits). `Content::of(bytes)` and `Content::owning(vec)` make one of bytes, holding in itself what
-fits; `held()` gives the bytes a content holds, none for a stored one, which `call.read(file)` reads on asking.
+A file's content (`File::content`) is a few bytes held in itself (`Content::Inline`, up to 30), bytes the editor
+holds in memory (`Content::Memory`, a `Buffer`), or a blob the editor keeps by its SHA-1 (`Content::Stored`, a `Sha1`:
+twenty bytes, written as forty hex digits). `Content::of(bytes)` and `Content::owning(vec)` make one of bytes,
+holding in itself what fits. An extension is given its inputs' contents without their bytes: `call.read(file)` reads
+one whole, `call.read_range(file, offset, len)` only part of it, and `local()` gives what a content holds in itself
+or in memory - none for a stored one. A `Buffer` an extension makes hands its bytes to the editor once.
 
 An output is asked for by an `Asked`: its path and, after `?`, its query - `pe2_ext::NATIVE` and `pe2_ext::SETTINGS`,
 which every asset has, `Asked::constant("page")` for a name written in the code, or `Asked::new(text)?` for one read
@@ -38,8 +40,9 @@ no reference, an error where it names nothing an asset can be named by; `target_
 written as text or as a table.
 
 Only outside the sandbox: `temp()` gives a place a program can write to, `keep(place)` takes that file back into the
-project, `path_of(file)` says where a stored file is on disk, and `serve(files)` hands a program a read-only folder
-of files. A place is a `HostPath`: `guest()` is how the extension opens it, `native()` how a program is told it, and
+project, `place_content(file)` puts a file where a program can read it - a stored one where it is kept, one held in
+itself or in memory written to a file, removed when what it gives (a `PlacedContent`) is dropped, so hold it until
+the program is done - and `serve(files)` hands a program a read-only folder of files. A place is a `HostPath`: `guest()` is how the extension opens it, `native()` how a program is told it, and
 `join(path)` a place within it. See [Running programs](unsandboxed.md).
 
 ## In views, tools and services

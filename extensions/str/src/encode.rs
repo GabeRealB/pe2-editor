@@ -104,10 +104,11 @@ pub fn encode(call: &Call<'_>, stream: &StreamInput, original: &Typed) -> Result
 #[cfg(test)]
 mod tests {
     use super::Differences;
-    use pe2_ext::media::{AudioData, MediaBuffer, SampleFormat};
+    use pe2_ext::Buffer;
+    use pe2_ext::media::{AudioData, SampleFormat};
 
     fn sound(bytes: &[u8]) -> AudioData {
-        let buffer = MediaBuffer::new(bytes.to_vec());
+        let buffer = Buffer::new(bytes.to_vec());
         AudioData { buffer, format: SampleFormat::S16Interleaved, sample_rate: 37800, channels: 2, timestamp: 0 }
     }
 

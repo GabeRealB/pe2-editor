@@ -1084,6 +1084,35 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
 }
 
 #[test]
+fn a_content_placed_for_a_program_is_where_it_is_kept_or_written_until_let_go_of() {
+    let dir = crate::testing::scratch("graph-placed");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut ops = ops();
+    let store = Store::at(dir.clone()).unwrap();
+    let big: Vec<u8> = (0..100u8).collect();
+    let blob = store.keep(&big).unwrap();
+    // Each content placed: a stored one is its blob; one held in itself or in memory is written, then gone once let go.
+    ops.add(OpDef::new("t.place", "Place", "1").makes(Type::Table, move |call| {
+        for content in [Content::of(b"few"), Content::owning(big.clone())] {
+            let (path, written) = call.place_content(&content)?;
+            anyhow::ensure!(std::fs::read(&path)? == content.held().unwrap(), "{path}: not what it holds");
+            anyhow::ensure!(written.is_some(), "{path}: nothing removes it");
+            drop(written);
+            anyhow::ensure!(!path.exists(), "{path}: left once let go of");
+        }
+        let (path, written) = call.place_content(&Content::Stored { sha1: blob.sha1, size: blob.size })?;
+        anyhow::ensure!(written.is_none() && std::fs::read(&path)? == big, "{path}: not the blob");
+        Ok(Value::Table(toml::Table::new()))
+    }));
+    let engine = Engine::new(ops, Some(store));
+    let node = Bundle::new("[[stack]]\nop = \"t.place\"\n\n[[stack]]\nop = \"output\"\nname = \"out\"\n", &[]);
+    let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
+    engine.output(&plan, &node, pe2_path::Asked::constant("out"), false).unwrap();
+    assert_eq!(left_in_tmp(&dir), Vec::<String>::new(), "a file written for a program");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
     let dir = crate::testing::scratch("graph-stale");
     let _ = std::fs::remove_dir_all(&dir);
