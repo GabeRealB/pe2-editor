@@ -31,6 +31,7 @@ pub mod storage;
 pub mod testing;
 pub mod tree;
 
+
 pub use content::Content;
 pub use header::Header;
 pub use log::{Log, Record};
@@ -38,3 +39,25 @@ pub use ops::Op;
 pub use pe2_io::{HostPath, NotWithin};
 pub use space::Space;
 pub use storage::Stored;
+
+/// In this crate's tests, a process is started only while no space or log asks whether another has it attached. A
+/// child holds what its parent has open from when it is made until it runs its program - the locks a space is attached
+/// by with it - so a test asserting a space alone would else fail by what another test started at that moment. The
+/// program asks as it does: where a process is being started, a space is attached elsewhere, and is not said clean.
+#[cfg(test)]
+pub(crate) mod forks {
+    use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+
+    static STARTING: RwLock<()> = RwLock::new(());
+
+    /// Start a process, nothing asking meanwhile: `spawn` returns once it runs its program.
+    pub(crate) fn start(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+        let _starting = STARTING.write().unwrap_or_else(PoisonError::into_inner);
+        command.spawn()
+    }
+
+    /// Held while asking whether another has a space or log attached.
+    pub(crate) fn asking() -> RwLockReadGuard<'static, ()> {
+        STARTING.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}

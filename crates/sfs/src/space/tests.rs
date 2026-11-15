@@ -298,7 +298,7 @@ fn run_beside(space: &Space, prefix: &str, made: u64, keys: u64) -> Model {
 fn two_processes_write_one_space() {
     let dir = folder("processes");
     let space = Space::open(&dir).unwrap();
-    let mut second = process("the_second_writer", "PE2_SFS_SPACE_SECOND", &dir).spawn().unwrap();
+    let mut second = crate::forks::start(&mut process("the_second_writer", "PE2_SFS_SPACE_SECOND", &dir)).unwrap();
     let mut model = run_beside(&space, "first", 400, 200);
     assert!(second.wait().unwrap().success());
     after("second", 400, 200, &mut model);
@@ -403,7 +403,9 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             let mut model = Model::new();
             run(&space, "stays", 0..40, 150, &mut model);
             let mut writer = process("the_writer_that_stops", "PE2_SFS_SPACE_STOPS", &dir);
-            let status = writer.env("PE2_SFS_SPACE_AT", format!("{step}#{nth}")).status().unwrap();
+            let status = crate::forks::start(writer.env("PE2_SFS_SPACE_AT", format!("{step}#{nth}")))
+                .and_then(|mut child| child.wait())
+                .unwrap();
             assert!(status.success() || status.code() == Some(3), "{step} #{nth}: {status}");
             stopped += usize::from(!status.success());
             // Beside a process that has it attached, it is as its last commit left it: all of every transaction
@@ -506,7 +508,8 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
     let space = Space::open(&dir).unwrap();
     let mut model = Model::new();
     run(&space, "p", 0..60, 100, &mut model);
-    let mut reader = process("the_reader_that_is_killed", "PE2_SFS_SPACE_PINS", &dir).spawn().unwrap();
+    let mut reader =
+        crate::forks::start(&mut process("the_reader_that_is_killed", "PE2_SFS_SPACE_PINS", &dir)).unwrap();
     while !dir.at("pinned").exists() {
         std::thread::sleep(Duration::from_millis(5));
     }

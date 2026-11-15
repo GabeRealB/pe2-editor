@@ -551,13 +551,15 @@ mod tests {
             let key = Key { number: n, version: 1, page: 0 };
             ring.put(&key, &page_of(&key, PAGE));
         }
-        let second = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "ring::tests::the_second_process"])
-            .env("PE2_SFS_RING_SECOND", path.as_os_str())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
+        let second = crate::forks::start(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "ring::tests::the_second_process"])
+                .env("PE2_SFS_RING_SECOND", path.as_os_str())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .and_then(|mut child| child.wait())
+        .unwrap();
         assert!(second.success());
         let mut out = [0u8; PAGE];
         for n in 0..50 {
@@ -600,13 +602,15 @@ mod tests {
         };
         let key = Key { number: 1, version: 1, page: 0 };
         ring.put(&key, &page_of(&key, PAGE));
-        let second = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "ring::tests::the_second_process_of_a_name"])
-            .env("PE2_SFS_RING_NAMED", &name)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
+        let second = crate::forks::start(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "ring::tests::the_second_process_of_a_name"])
+                .env("PE2_SFS_RING_NAMED", &name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .and_then(|mut child| child.wait())
+        .unwrap();
         assert!(second.success());
         let mut out = [0u8; PAGE];
         let key = Key { number: 2, version: 1, page: 0 };

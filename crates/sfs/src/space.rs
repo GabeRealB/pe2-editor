@@ -585,6 +585,8 @@ impl Space {
         let parts = (|| {
             // Alone with it - asked a few times: a process starting another holds, for a moment, what its threads
             // have open, the locks on it with it.
+            #[cfg(test)]
+            let asking = crate::forks::asking();
             let alone = (0..5).any(|again| {
                 if again > 0 {
                     #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
@@ -592,6 +594,8 @@ impl Space {
                 }
                 attached.try_lock().is_ok()
             });
+            #[cfg(test)]
+            drop(asking);
             let trusted = !alone || is_clean(dir);
             if !trusted {
                 Space::set_aside(dir)?;
@@ -1388,7 +1392,11 @@ impl Space {
         }
         // Whether any other has it attached: asked by holding alone what each holds shared, for a moment.
         attached.unlock()?;
+        #[cfg(test)]
+        let asking = crate::forks::asking();
         let alone = attached.try_lock().is_ok();
+        #[cfg(test)]
+        drop(asking);
         if alone {
             attached.unlock()?;
         }

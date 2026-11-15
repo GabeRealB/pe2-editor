@@ -182,6 +182,8 @@ impl Log {
         let checked = (|| {
             // Alone with it - asked a few times: a process starting another holds, for a moment, what its threads
             // have open, the locks on it with it.
+            #[cfg(test)]
+            let asking = crate::forks::asking();
             let alone = (0..5).any(|again| {
                 if again > 0 {
                     #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
@@ -189,6 +191,8 @@ impl Log {
                 }
                 log.attached.try_lock().is_ok()
             });
+            #[cfg(test)]
+            drop(asking);
             if alone {
                 log.header.set_tail(log.end_of_whole()?);
                 log.attached.unlock()?;
@@ -658,12 +662,13 @@ mod tests {
     fn two_processes_append_to_one_log() {
         let dir = folder("processes");
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
-        let mut second = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "log::tests::the_second_process"])
-            .env("PE2_SFS_SECOND", dir.as_os_str())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut second = crate::forks::start(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "log::tests::the_second_process"])
+                .env("PE2_SFS_SECOND", dir.as_os_str())
+                .stdout(std::process::Stdio::null()),
+        )
+        .unwrap();
         for n in 0..2000u32 {
             log.append(1, &[&n.to_le_bytes(), b" from the first"]).unwrap();
         }
