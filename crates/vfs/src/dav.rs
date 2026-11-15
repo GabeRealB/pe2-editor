@@ -412,7 +412,13 @@ impl Drop for DavServer {
 /// The address cannot be listened on, or the server's thread cannot start.
 pub fn serve(served: &Served, writes: Option<Writes>, addr: SocketAddr) -> std::io::Result<DavServer> {
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let listener = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
+    // The socket the I/O opens, served by the runtime: which takes it to wait on without blocking.
+    let listener = served.io().sockets().listen_tcp(addr)?;
+    listener.set_nonblocking(true)?;
+    let listener = {
+        let _within = runtime.enter();
+        tokio::net::TcpListener::from_std(listener)?
+    };
     let addr = listener.local_addr()?;
     let handler = DavHandler::builder()
         .filesystem(Box::new(Dav { served: served.clone(), writes }))

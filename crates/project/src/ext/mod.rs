@@ -29,9 +29,10 @@ pub mod setup {
         folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
+        io: &dyn pe2_io::Io,
     ) -> anyhow::Result<()> {
         pe2_setup::read_folder_files_with(read_through_content);
-        pe2_setup::fetch(setup, store, folder.map(HostPath::as_path), progress, cancel)
+        pe2_setup::fetch(setup, store, folder.map(HostPath::as_path), progress, cancel, io.http())
     }
 
     /// `pe2_setup::hashes`, what the extension's folder holds read through the project's content.
@@ -44,9 +45,10 @@ pub mod setup {
         folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
+        io: &dyn pe2_io::Io,
     ) -> anyhow::Result<(String, Vec<String>)> {
         pe2_setup::read_folder_files_with(read_through_content);
-        pe2_setup::hashes(setup, scratch, folder.map(HostPath::as_path), progress, cancel)
+        pe2_setup::hashes(setup, scratch, folder.map(HostPath::as_path), progress, cancel, io.http())
     }
 
     /// A file of an extension's folder as the project's content has it - one a layer holds as records is on no disk.
@@ -2015,6 +2017,12 @@ impl Extensions {
     #[must_use]
     pub fn io(&self) -> &Arc<dyn pe2_io::Io> {
         &self.io.0
+    }
+
+    /// None loaded, working through `io`: what a caller fills itself.
+    #[must_use]
+    pub fn none_through(io: Arc<dyn pe2_io::Io>) -> Extensions {
+        Extensions { io: pe2_io::Held(io), ..Extensions::default() }
     }
 
     /// The operations stacks are made of: the host's (a stored file - typed by the formats it is recognized as -

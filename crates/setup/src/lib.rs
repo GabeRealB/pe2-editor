@@ -369,14 +369,6 @@ pub fn as_fetched(setup: &Setup, store: &Path) {
     checked().remove(&place);
 }
 
-/// Downloads are off for this process: what tests run, which never reach the network.
-static FORBIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// Turn downloads off for this process: a fetch of what is not there fails, saying so.
-pub fn forbid_downloads() {
-    FORBIDDEN.store(true, Ordering::Relaxed);
-}
-
 /// Remove what was fetched of an entry from a store.
 ///
 /// # Errors
@@ -424,6 +416,7 @@ pub fn fetch(
     folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
+    http: &dyn pe2_io::Http,
 ) -> Result<()> {
     setup.declared()?;
     let key = setup.key();
@@ -433,11 +426,10 @@ pub fn fetch(
     if setup.fetched(store) {
         return Ok(());
     }
-    ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     // What another process makes at the same time is its own until it is whole.
     let own = std::process::id();
     let partial = store.join(own_name(&format!("{key}.{own}.part"))?);
-    made(setup, store, &partial, folder, progress, cancel)?;
+    made(setup, store, &partial, folder, progress, cancel, http)?;
     let done = held(setup, &partial).and_then(|()| record(setup, &partial));
     if let Err(e) = done {
         let _ = std::fs::remove_dir_all(&partial);
@@ -463,9 +455,14 @@ pub fn fetch(
 /// left as it is.
 ///
 /// # Errors
-/// It declares no hashes, cannot be downloaded or is not what it declares, downloads are off, or the folder cannot be
-/// written.
-pub fn fetch_into(setup: &Setup, into: &Path, progress: Progress, cancel: &AtomicBool) -> Result<()> {
+/// It declares no hashes, cannot be downloaded or is not what it declares, or the folder cannot be written.
+pub fn fetch_into(
+    setup: &Setup,
+    into: &Path,
+    progress: Progress,
+    cancel: &AtomicBool,
+    http: &dyn pe2_io::Http,
+) -> Result<()> {
     setup.declared()?;
     let places: Vec<(PathBuf, &str)> = setup
         .take
@@ -480,13 +477,13 @@ pub fn fetch_into(setup: &Setup, into: &Path, progress: Progress, cancel: &Atomi
     if places.iter().all(there) {
         return Ok(());
     }
-    ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     std::fs::create_dir_all(into).with_context(|| into.display().to_string())?;
     // Made apart, in a folder of this process's own beside them, and checked whole before any of it moves in.
     let scratch = into.join(own_name(&format!(".{}.{}.part", setup.key(), std::process::id()))?);
     let partial = scratch.join("taken");
-    let moved =
-        made(setup, &scratch, &partial, None, progress, cancel).and_then(|_| held(setup, &partial)).and_then(|()| {
+    let moved = made(setup, &scratch, &partial, None, progress, cancel, http)
+        .and_then(|_| held(setup, &partial))
+        .and_then(|()| {
             for (at, _) in &places {
                 let to = into.join(at);
                 if to.is_dir() {
@@ -514,13 +511,14 @@ fn made(
     folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
+    http: &dyn pe2_io::Http,
 ) -> Result<String> {
     let own = std::process::id();
     let downloads = store.join(DOWNLOADS_FOLDER);
     std::fs::create_dir_all(&downloads).with_context(|| downloads.display().to_string())?;
     let n = DOWNLOADS.fetch_add(1, Ordering::Relaxed);
     let file = downloads.join(own_name(&format!("{}.{own}.{n}", setup.key()))?);
-    let sha256 = download(setup, &file, progress, cancel)?;
+    let sha256 = download(setup, &file, progress, cancel, http)?;
     let _ = std::fs::remove_dir_all(into);
     let unpacked = unpack(setup, &file, into, cancel).and_then(|()| patch_all(setup, folder, into));
     let _ = std::fs::remove_file(&file);
@@ -547,11 +545,11 @@ pub fn hashes(
     folder: Option<&Path>,
     progress: Progress,
     cancel: &AtomicBool,
+    http: &dyn pe2_io::Http,
 ) -> Result<(String, Vec<String>)> {
-    ensure!(!FORBIDDEN.load(Ordering::Relaxed), "{}: downloads are off in this run", setup.name);
     let into =
         scratch.join(own_name(&format!("hashing.{}.{}", std::process::id(), DOWNLOADS.load(Ordering::Relaxed)))?);
-    let sha256 = made(setup, scratch, &into, folder, progress, cancel)?;
+    let sha256 = made(setup, scratch, &into, folder, progress, cancel, http)?;
     let found = setup.take.places().into_iter().map(|(place, _)| {
         let at =
             parts(place).as_deref().and_then(place_of).with_context(|| format!("{place}: not a place within it"))?;
@@ -581,7 +579,7 @@ fn hashed(value: &mut toml_edit::Value, key: &str, sha256: &str) {
 ///
 /// # Errors
 /// The manifest cannot be read.
-pub fn check_pins(manifest: &Path) -> Result<Vec<String>> {
+pub fn check_pins(manifest: &Path, http: &dyn pe2_io::Http) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
     let doc: toml_edit::DocumentMut = text.parse().with_context(|| manifest.display().to_string())?;
     let setups: Setups = toml::from_str(&unhashed(&doc).to_string()).with_context(|| manifest.display().to_string())?;
@@ -591,7 +589,7 @@ pub fn check_pins(manifest: &Path) -> Result<Vec<String>> {
         println!("{} ({platform})", setup.name);
         let mut answered = false;
         for url in setup.sources() {
-            match answers(url) {
+            match answers(url, http) {
                 Ok(()) => {
                     answered = true;
                     println!("  ok    {url}");
@@ -607,14 +605,13 @@ pub fn check_pins(manifest: &Path) -> Result<Vec<String>> {
 }
 
 /// Whether a source answers with what it holds: its first byte asked for, and nothing more read.
-fn answers(url: &str) -> std::result::Result<(), String> {
+fn answers(url: &str, http: &dyn pe2_io::Http) -> std::result::Result<(), String> {
     if !url.starts_with("https://") {
         return Err("only HTTPS is fetched".to_string());
     }
-    match ureq::get(url).set("Range", "bytes=0-0").call() {
-        Ok(response) if matches!(response.status(), 200 | 206) => Ok(()),
-        Ok(response) => Err(format!("it answers {}", response.status())),
-        Err(ureq::Error::Status(code, _)) => Err(format!("it answers {code}")),
+    match http.send(&pe2_io::Request::get(url).header("Range", "bytes=0-0")) {
+        Ok(response) if matches!(response.status, 200 | 206) => Ok(()),
+        Ok(response) => Err(format!("it answers {}", response.status)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -657,7 +654,7 @@ fn unhashed(doc: &toml_edit::DocumentMut) -> toml_edit::DocumentMut {
 ///
 /// # Errors
 /// The manifest cannot be read or written, or an entry cannot be fetched.
-pub fn hash_manifest(manifest: &Path, write: bool) -> Result<()> {
+pub fn hash_manifest(manifest: &Path, write: bool, http: &dyn pe2_io::Http) -> Result<()> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
     let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| manifest.display().to_string())?;
     let read = unhashed(&doc);
@@ -674,7 +671,7 @@ pub fn hash_manifest(manifest: &Path, write: bool) -> Result<()> {
             let of = total.map_or_default(|total| format!(" of {}", total >> 20));
             eprint!("\r  {}{of} MB   ", done >> 20);
         };
-        let found = hashes(setup, &scratch, Some(folder), &mut shown, &cancel);
+        let found = hashes(setup, &scratch, Some(folder), &mut shown, &cancel, http);
         eprint!("\r{}\r", " ".repeat(40));
         let (download, places) = found.with_context(|| setup.name.clone())?;
         let mut said = |what: &str, was: &str, is: &str| {
@@ -722,10 +719,16 @@ pub fn hash_manifest(manifest: &Path, write: bool) -> Result<()> {
 /// Download an entry's package to a file, from its URL or else its mirrors in order, checked against its SHA-256 as it
 /// comes where it declares one: its SHA-256. A source that fails, or gives other bytes, gives way to the next; where all
 /// do, each says why.
-fn download(setup: &Setup, to: &Path, progress: Progress, cancel: &AtomicBool) -> Result<String> {
+fn download(
+    setup: &Setup,
+    to: &Path,
+    progress: Progress,
+    cancel: &AtomicBool,
+    http: &dyn pe2_io::Http,
+) -> Result<String> {
     let mut failed = Vec::new();
     for url in setup.sources() {
-        match download_from(setup, url, to, progress, cancel) {
+        match download_from(setup, url, to, (progress, cancel), http) {
             Ok(got) => return Ok(got),
             Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
             Err(e) => failed.push(format!("{e:#}")),
@@ -738,11 +741,18 @@ fn download(setup: &Setup, to: &Path, progress: Progress, cancel: &AtomicBool) -
 }
 
 /// Download from one of an entry's sources, as `download` does.
-fn download_from(setup: &Setup, url: &str, to: &Path, progress: Progress, cancel: &AtomicBool) -> Result<String> {
+fn download_from(
+    setup: &Setup,
+    url: &str,
+    to: &Path,
+    (progress, cancel): (Progress, &AtomicBool),
+    http: &dyn pe2_io::Http,
+) -> Result<String> {
     ensure!(url.starts_with("https://"), "{url}: only HTTPS is fetched");
-    let response = ureq::get(url).call().map_err(|e| anyhow!("{url}: {e}"))?;
+    let response = http.send(&pe2_io::Request::get(url)).map_err(|e| anyhow!("{url}: {e}"))?;
+    ensure!(response.status == 200, "{url}: it answers {}", response.status);
     let total = response.header("Content-Length").and_then(|n| n.parse().ok());
-    let mut reader = response.into_reader();
+    let mut reader = response.body;
     let partial = to.with_extension("download");
     let mut out = std::fs::File::create(&partial).with_context(|| partial.display().to_string())?;
     let mut hasher = Sha256::new();
@@ -1140,6 +1150,10 @@ fn unpack_zip(setup: &Setup, members: &BTreeMap<String, String>, file: &Path, in
     reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
 )]
 mod tests {
+    /// A run's network, which reaches nothing: what is not fetched yet is not fetched.
+    fn off() -> pe2_io::Served {
+        pe2_io::Served::default()
+    }
     use super::{One, Setup, Take, Taken, fetch, unpack};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
@@ -1291,18 +1305,25 @@ mod tests {
     fn each_source_is_tried_in_turn_and_each_failure_said() {
         let dir = scratch("sources");
         let mut entry = setup(one("cc1", ""));
-        // None reachable: nothing here answers, and no network is reached.
-        entry.url = "https://127.0.0.1:1/first".into();
-        entry.mirrors = vec!["https://127.0.0.1:1/second".into(), "http://127.0.0.1:1/plain".into()];
+        // None reachable: nothing answers, and each source says so.
+        entry.url = "https://example.com/first".into();
+        entry.mirrors = vec!["https://example.com/second".into(), "http://example.com/plain".into()];
         assert_eq!(entry.sources().collect::<Vec<_>>().len(), 3);
+        let got = dir.join("got");
         let why = format!(
             "{:#}",
-            super::download(&entry, &dir.join("got"), &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err()
+            super::download(&entry, &got, &mut |_, _| {}, &AtomicBool::new(false), &off()).unwrap_err()
         );
         assert!(why.contains("none of its sources gave it"), "{why}");
         let said: Vec<&str> = ["first", "second", "only HTTPS"].into_iter().filter(|s| why.contains(s)).collect();
         assert_eq!(said.len(), 3, "{why}");
-        assert!(!dir.join("got").exists());
+        assert!(!got.exists());
+        // A mirror serving it gives it, where the first source does not - held to its hash.
+        let served = pe2_io::Served::default().with("https://example.com/second", b"the tool");
+        entry.sha256 = super::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"the tool"));
+        let sha256 = super::download(&entry, &got, &mut |_, _| {}, &AtomicBool::new(false), &served).unwrap();
+        assert_eq!(sha256, entry.sha256);
+        assert_eq!(std::fs::read(&got).unwrap(), b"the tool");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1362,16 +1383,16 @@ mod tests {
         // Already there: nothing is downloaded.
         let store = scratch("store");
         super::as_fetched(&a, &store);
-        fetch(&a, &store, None, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false)).unwrap();
+        fetch(&a, &store, None, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false), &off()).unwrap();
         // Removed, it is to fetch again: here, where downloads are off, it says so.
         super::remove(&a, &store).unwrap();
         assert!(!a.fetched(&store));
-        super::forbid_downloads();
-        let why = fetch(&a, &store, None, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false)).unwrap_err();
+        let why =
+            fetch(&a, &store, None, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false), &off()).unwrap_err();
         assert!(format!("{why:#}").contains("downloads are off"), "{why:#}");
         // What declares no hash is never fetched.
         let unhashed = setup(one("cc1", ""));
-        let why = fetch(&unhashed, &store, None, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err();
+        let why = fetch(&unhashed, &store, None, &mut |_, _| {}, &AtomicBool::new(false), &off()).unwrap_err();
         assert!(format!("{why:#}").contains("declares no SHA-256 for cc1"), "{why:#}");
         let _ = std::fs::remove_dir_all(&store);
     }
@@ -1389,11 +1410,10 @@ mod tests {
         for taken in places.values_mut() {
             taken.sha256 = sha(b"a compiler");
         }
-        super::fetch_into(&entry, &into, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false)).unwrap();
+        super::fetch_into(&entry, &into, &mut |_, _| panic!("downloaded"), &AtomicBool::new(false), &off()).unwrap();
         // Changed: fetched again - here, where downloads are off, it says so, and what is beside it is as it was.
         std::fs::write(into.join("dxcompiler.dll"), "changed").unwrap();
-        super::forbid_downloads();
-        let why = super::fetch_into(&entry, &into, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err();
+        let why = super::fetch_into(&entry, &into, &mut |_, _| {}, &AtomicBool::new(false), &off()).unwrap_err();
         assert!(format!("{why:#}").contains("downloads are off"), "{why:#}");
         assert_eq!(std::fs::read_to_string(into.join("other.dll")).unwrap(), "another entry's");
         let _ = std::fs::remove_dir_all(&into);

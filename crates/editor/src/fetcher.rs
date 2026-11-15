@@ -87,6 +87,7 @@ impl Fetcher {
         let state = Arc::new(Mutex::new(State::Fetching(0, None)));
         let done = Arc::new(AtomicBool::new(false));
         let (shared, finished, ctx, fetched) = (state.clone(), done.clone(), ctx.clone(), setup.clone());
+        let io = extensions.io().clone();
         std::thread::spawn(move || {
             let set = |next: State| {
                 if let Ok(mut state) = shared.lock() {
@@ -96,7 +97,8 @@ impl Fetcher {
             };
             let mut progress = |done, total| set(State::Fetching(done, total));
             let cancel = AtomicBool::new(false);
-            if let Err(e) = project::ext::setup::fetch(&fetched, &store, folder.as_ref(), &mut progress, &cancel) {
+            if let Err(e) = project::ext::setup::fetch(&fetched, &store, folder.as_ref(), &mut progress, &cancel, &*io)
+            {
                 set(State::Failed(format!("{e:#}")));
             }
             finished.store(true, std::sync::atomic::Ordering::Relaxed);

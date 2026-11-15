@@ -122,9 +122,16 @@ fn isolate() {
         extensions::use_data_folder(data.into_path_buf());
         extensions::test_mode(host::extension);
         project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
-        // A test reaches no network: what an extension would fetch, it is told is not there.
-        project::ext::setup::forbid_downloads();
     });
+}
+
+/// The system's I/O but its network: a test reaches none - what an extension would fetch, it is told is not there.
+pub(crate) fn offline() -> Arc<dyn pe2_io::Io> {
+    Arc::new(pe2_io::Composed {
+        http: Arc::new(pe2_io::Served::default()),
+        sockets: Arc::new(pe2_io::Closed),
+        ..pe2_io::Composed::system()
+    })
 }
 
 /// Bytes as they cross as text.
@@ -304,6 +311,7 @@ impl Scenario {
                 agents_drive: false,
                 unattended,
                 monitors: Vec::new(),
+                io: offline(),
             };
             Editor::new(cc, start)
         });

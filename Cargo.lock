@@ -4137,6 +4137,7 @@ dependencies = [
  "pe2-path",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -4218,13 +4219,13 @@ dependencies = [
  "codecs",
  "flate2",
  "lzma-rust2",
+ "pe2-io",
  "serde",
  "sfs",
  "sha2 0.10.9",
  "tar",
  "toml 0.8.23",
  "toml_edit 0.22.27",
- "ureq",
 ]
 
 [[package]]
@@ -7359,6 +7360,7 @@ dependencies = [
  "licenses",
  "lzma-rust2",
  "minisign-verify",
+ "pe2-io",
  "pe2-setup",
  "serde",
  "serde_json",

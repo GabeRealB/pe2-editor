@@ -1273,7 +1273,7 @@ fn set_up(p: &project::Project, only: Option<&str>, enable: &[String], disable: 
                 let of = total.map_or_default(|total| format!(" of {}", mb(total)));
                 eprint!("\r  {}{of} MB   ", mb(done));
             };
-            match project::ext::setup::fetch(&setup, &store, present.origin.folder(), &mut shown, &cancel) {
+            match project::ext::setup::fetch(&setup, &store, present.origin.folder(), &mut shown, &cancel, &*p.io) {
                 Ok(()) => eprintln!("\r  fetched{}", " ".repeat(30)),
                 Err(e) => {
                     eprintln!("\r  {e:#}");
@@ -2194,12 +2194,12 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Extension { command: AuthorCommand::Pins { manifests } } => {
             let mut gone = Vec::new();
             for manifest in &manifests {
-                gone.extend(project::ext::setup::check_pins(manifest)?);
+                gone.extend(project::ext::setup::check_pins(manifest, io.http())?);
             }
             anyhow::ensure!(gone.is_empty(), "no source answers for:\n  {}", gone.join("\n  "));
         }
         Tool::Extension { command: AuthorCommand::Hash { manifest, write } } => {
-            project::ext::setup::hash_manifest(&manifest, write)?;
+            project::ext::setup::hash_manifest(&manifest, write, io.http())?;
         }
         Tool::Mcp { project } => {
             let p = project::Project::load(&project)?;

@@ -324,6 +324,7 @@ pub fn run() -> Result {
                 agents_drive,
                 unattended: false,
                 monitors,
+                io: pe2_io::system(),
             };
             Ok(Box::new(app::Editor::new(cc, start)) as Box<dyn eframe::App>)
         }),

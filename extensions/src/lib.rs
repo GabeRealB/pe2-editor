@@ -365,7 +365,9 @@ pub fn fetch_required(extensions: &Extensions, said: Said) -> Vec<(String, Strin
         for setup in required(present) {
             let mut progress = |done, total| said(&present.id, setup, done, total);
             let folder = present.origin.folder();
-            if let Err(e) = project::ext::setup::fetch(setup, &store, folder, &mut progress, &cancel) {
+            if let Err(e) =
+                project::ext::setup::fetch(setup, &store, folder, &mut progress, &cancel, &**extensions.io())
+            {
                 failed.push((format!("{}: {}", present.id, setup.name), format!("{e:#}")));
             }
         }

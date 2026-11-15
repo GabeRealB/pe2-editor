@@ -1,13 +1,14 @@
 //! The host's I/O, given rather than reached for. What code reads of the outside world - the time, randomness, the
-//! environment, files - and does in it - watching files, starting programs, talking to other processes - it does
-//! through an [`Io`] it is given, never with the system directly, so that any part of it can be another: the system's
-//! ([`system`]), one a test drives ([`Standing`], [`Seeded`], [`Fixed`], [`Telling`], [`Scripted`], [`InMemory`]),
-//! or any other, mixed ([`Composed`]).
+//! environment, files - and does in it - watching files, starting programs, talking to other processes and over the
+//! network - it does through an [`Io`] it is given, never with the system directly, so that any part of it can be
+//! another: the system's ([`system`]), one a test drives ([`Standing`], [`Seeded`], [`Fixed`], [`Telling`],
+//! [`Scripted`], [`InMemory`], [`Served`], [`Closed`]), or any other, mixed ([`Composed`]).
 //!
 //! Each part is a trait shaped like the WASI interface for it - [`Clock`] like `wasi:clocks`, [`Random`] like
-//! `wasi:random`, [`Environment`] like `wasi:cli`'s, [`Filesystem`] and its [`Descriptor`]s like `wasi:filesystem` -
-//! its model and operations, not its types: names are this workspace's checked paths, calls are synchronous, errors
-//! are `std::io`'s. What WASI has no interface for is the host's own: [`Watch`], [`Processes`], [`Channels`]. The traits are object-safe: owners hold an
+//! `wasi:random`, [`Environment`] like `wasi:cli`'s, [`Filesystem`] and its [`Descriptor`]s like `wasi:filesystem`,
+//! [`Http`] like `wasi:http`'s outgoing handler, [`Sockets`] like `wasi:sockets` - its model and operations, not its
+//! types: names are this workspace's checked paths, calls are synchronous, errors are `std::io`'s. What WASI has no
+//! interface for is the host's own: [`Watch`], [`Processes`], [`Channels`]. The traits are object-safe: owners hold an
 //! `Arc<dyn Io>`, and a call costs one virtual call.
 //!
 //! A place on disk is a [`HostPath`].
@@ -17,8 +18,10 @@ mod clock;
 mod environment;
 mod filesystem;
 mod host;
+mod http;
 mod processes;
 mod random;
+mod sockets;
 mod watch;
 
 pub use channels::{Channel, ChannelListener, ChannelName, Channels, InMemory, SystemChannels};
@@ -31,8 +34,10 @@ pub use filesystem::{
     sync_all, sync_file, write_all_at, write_file_at,
 };
 pub use host::{HostPath, NotWithin};
+pub use http::{Http, Request, Response, Served, SystemHttp};
 pub use processes::{Exit, Output, Process, Processes, Program, Scripted, Stream, SystemProcesses};
 pub use random::{Random, Seeded, SystemRandom};
+pub use sockets::{Closed, SocketUse, Sockets, SystemSockets};
 pub use watch::{Change, ChangeKind, Depth, SystemWatch, Tell, Telling, Watch, Watching};
 
 use std::sync::Arc;
@@ -53,6 +58,10 @@ pub trait Io: Send + Sync + std::fmt::Debug {
     fn processes(&self) -> &dyn Processes;
     /// What connects the processes of the machine.
     fn channels(&self) -> &dyn Channels;
+    /// What asks over HTTP.
+    fn http(&self) -> &dyn Http;
+    /// What opens sockets, and says where a component's may go.
+    fn sockets(&self) -> &dyn Sockets;
 }
 
 /// The system's I/O, every part of it.
@@ -86,6 +95,14 @@ impl Io for System {
 
     fn channels(&self) -> &dyn Channels {
         &SystemChannels
+    }
+
+    fn http(&self) -> &dyn Http {
+        &SystemHttp
+    }
+
+    fn sockets(&self) -> &dyn Sockets {
+        &SystemSockets
     }
 }
 
@@ -123,6 +140,8 @@ pub struct Composed {
     pub watch: Arc<dyn Watch>,
     pub processes: Arc<dyn Processes>,
     pub channels: Arc<dyn Channels>,
+    pub http: Arc<dyn Http>,
+    pub sockets: Arc<dyn Sockets>,
 }
 
 impl std::fmt::Debug for Composed {
@@ -143,6 +162,8 @@ impl Composed {
             watch: Arc::new(SystemWatch),
             processes: Arc::new(SystemProcesses),
             channels: Arc::new(SystemChannels),
+            http: Arc::new(SystemHttp),
+            sockets: Arc::new(SystemSockets),
         }
     }
 }
@@ -174,5 +195,13 @@ impl Io for Composed {
 
     fn channels(&self) -> &dyn Channels {
         &*self.channels
+    }
+
+    fn http(&self) -> &dyn Http {
+        &*self.http
+    }
+
+    fn sockets(&self) -> &dyn Sockets {
+        &*self.sockets
     }
 }

@@ -850,6 +850,12 @@ impl Served {
         served
     }
 
+    /// The I/O what is served is read through, and what serves it works through.
+    #[must_use]
+    pub fn io(&self) -> std::sync::Arc<dyn pe2_io::Io> {
+        self.tree().io.0.clone()
+    }
+
     /// The tree is a view of the shared filesystem, and that changed: what tells others of it is told what did.
     pub fn told(&self, changes: Changes) {
         self.changed(changes);

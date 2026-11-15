@@ -17,6 +17,7 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 pe2-setup.workspace = true
+pe2-io.workspace = true
 licenses.workspace = true
 ureq.workspace = true
 tar.workspace = true

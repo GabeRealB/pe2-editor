@@ -1,6 +1,6 @@
 [package]
 name = "pe2-io"
-description = "The host's I/O, given rather than reached for: a trait per capability, shaped like WASI's interfaces where WASI has one - clocks, randomness, the environment, files - and the host's own - watching files, starting programs, channels between processes - each with the system's implementation and simulated ones, mixed into one `Io`; and a place on disk (`HostPath`)"
+description = "The host's I/O, given rather than reached for: a trait per capability, shaped like WASI's interfaces where WASI has one - clocks, randomness, the environment, files, HTTP, sockets - and the host's own - watching files, starting programs, channels between processes - each with the system's implementation and simulated ones, mixed into one `Io`; and a place on disk (`HostPath`)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ getrandom = { version = "0.3", features = ["std"] }
 memmap2 = "0.9"
 notify.workspace = true
 interprocess.workspace = true
+ureq.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

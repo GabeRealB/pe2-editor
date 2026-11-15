@@ -21,7 +21,10 @@ what the processes on a machine find each other by (the project lock, roles, pre
 the program's own files (its settings, what it keeps beside it), and what only the system's own calls reach (a
 backend's mount points, what is touched through a mount for the kernel to hear). Files are watched through its
 `Watch`, programs started through its `Processes` - the build refuses `Command::new` - and the processes of a machine
-talk through its `Channels`; `notify` and `interprocess` are `pe2-io`'s dependencies alone.
+talk through its `Channels`; `notify` and `interprocess` are `pe2-io`'s dependencies alone. What is downloaded comes
+through its `Http`, a listener (the WebDAV server's) from its `Sockets`, which also say where an unsandboxed
+component's sockets may go; a test's `Io` reaches no network (`Served`, `Closed`), and `ureq` is `pe2-io`'s and
+`xtask`'s alone.
 
 What a build needs that is no crate is pinned in `prepare.toml`, as an extension's `[[setup]]` entries are, and fetched
 by `cargo xtask prepare` into `prepared/<platform>/`; the editor crate's build script fails by name until it is there

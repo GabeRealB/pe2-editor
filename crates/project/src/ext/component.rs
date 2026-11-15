@@ -993,7 +993,8 @@ impl unsandboxed::Host for State {
             )));
         }
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let fetched = super::setup::fetch(setup, store, unsandboxed.folder.as_ref(), &mut |_, _| {}, &cancel);
+        let fetched =
+            super::setup::fetch(setup, store, unsandboxed.folder.as_ref(), &mut |_, _| {}, &cancel, &*unsandboxed.io);
         Ok(fetched.map_err(|e| format!("{id}: {name}: {e:#}")))
     }
 
@@ -1907,7 +1908,21 @@ impl Shared {
                     wasi.env(name, value);
                 }
             }
-            wasi.inherit_network().allow_blocking_current_thread(true);
+            // Its sockets go where the host's may: each address it binds, connects or sends to asked of them.
+            let sockets = io.clone();
+            wasi.socket_addr_check(move |at, how| {
+                use wasmtime_wasi::sockets::SocketAddrUse;
+                let how = match how {
+                    SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => pe2_io::SocketUse::Bind,
+                    SocketAddrUse::TcpListen => pe2_io::SocketUse::Listen,
+                    SocketAddrUse::TcpAccept => pe2_io::SocketUse::Accept,
+                    SocketAddrUse::TcpConnect => pe2_io::SocketUse::Connect,
+                    SocketAddrUse::UdpSend | SocketAddrUse::UdpReceive => pe2_io::SocketUse::Datagram,
+                };
+                let allowed = sockets.sockets().allows(at, how);
+                Box::pin(async move { allowed })
+            })
+            .allow_blocking_current_thread(true);
             if cfg!(windows) {
                 // Each drive a root of its own (`/D:`): what the host's paths are told as (`guest_path`).
                 #[allow(clippy::disallowed_methods, reason = "the drives the system has, each a root of what it sees")]
@@ -3336,7 +3351,7 @@ impl Unsandboxed {
         let Some(store) = &self.store else { return Ok(()) };
         let cancel = std::sync::atomic::AtomicBool::new(false);
         for setup in self.setup.iter().filter(|setup| !setup.lazy && !setup.fetched(store)) {
-            super::setup::fetch(setup, store, self.folder.as_ref(), &mut |_, _| {}, &cancel)
+            super::setup::fetch(setup, store, self.folder.as_ref(), &mut |_, _| {}, &cancel, &*self.io)
                 .with_context(|| format!("fetching {}, which it requires", setup.name))?;
         }
         Ok(())

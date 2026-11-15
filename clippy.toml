@@ -65,4 +65,10 @@ disallowed-methods = [
     { path = "std::path::Path::read_link", reason = "what is on disk is the Io's to say (pe2_io::Filesystem)" },
     # Programs are started through the Io's `Processes`, which starts none with a window of its own on Windows.
     { path = "std::process::Command::new", reason = "programs are started by the Io (pe2_io::Processes)" },
+    # The network, through the Io's `Http` and `Sockets`: a run reaching none is one whose Io has none.
+    { path = "std::net::TcpListener::bind", reason = "a listener is the Io's (pe2_io::Sockets::listen_tcp)" },
+    { path = "std::net::TcpStream::connect", reason = "the network is the Io's (pe2_io::Http, pe2_io::Sockets)" },
+    { path = "std::net::UdpSocket::bind", reason = "the network is the Io's (pe2_io::Sockets)" },
+    { path = "tokio::net::TcpListener::bind", reason = "a listener is the Io's (pe2_io::Sockets::listen_tcp)" },
+    { path = "tokio::net::TcpStream::connect", reason = "the network is the Io's (pe2_io::Http, pe2_io::Sockets)" },
 ]

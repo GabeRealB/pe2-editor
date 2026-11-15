@@ -39,7 +39,7 @@ fn requiring() -> (Extensions, Setup, Setup) {
         described: project::ext::component::Described::default(),
         setup: vec![required.clone(), optional.clone()],
     };
-    let mut extensions = Extensions::default();
+    let mut extensions = Extensions::none_through(super::offline());
     extensions.present.push(present);
     (extensions, required, optional)
 }

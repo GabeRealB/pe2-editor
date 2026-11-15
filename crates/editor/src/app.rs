@@ -207,6 +207,8 @@ pub struct Start {
     pub unattended: bool,
     /// The monitors, in pixels of the desktop: what a window's place is judged by.
     pub monitors: Vec<egui::Rect>,
+    /// The I/O everything the editor does goes through: the program's, made once.
+    pub io: Arc<dyn pe2_io::Io>,
 }
 
 /// How long a project takes to open before the window says so over its panes.
@@ -287,7 +289,7 @@ impl Editor {
         theme::apply(&cc.egui_ctx, &settings.appearance);
         let last = settings.startup.reopen_last_project.then(|| settings.last_project.clone()).flatten();
         let project = start.project.or(last);
-        let io = pe2_io::system();
+        let io = start.io.clone();
         let mut editor = Editor {
             io: io.clone(),
             workspace: None,

@@ -66,7 +66,7 @@ fn main() -> Result<()> {
             Some("--write") => true,
             Some(other) => bail!("no option {other}\n{USAGE}"),
         };
-        return pe2_setup::hash_manifest(Path::new(&manifest), write);
+        return pe2_setup::hash_manifest(Path::new(&manifest), write, &pe2_io::SystemHttp);
     }
     if task == "prepare" {
         let platform = match (args.next().as_deref(), args.next()) {
@@ -145,7 +145,9 @@ fn pins(manifests: Vec<PathBuf>) -> Result<()> {
         }
         println!("== {}", manifest.display());
         gone.extend(
-            pe2_setup::check_pins(&manifest)?.into_iter().map(|entry| format!("{}: {entry}", manifest.display())),
+            pe2_setup::check_pins(&manifest, &pe2_io::SystemHttp)?
+                .into_iter()
+                .map(|entry| format!("{}: {entry}", manifest.display())),
         );
     }
     ensure!(gone.is_empty(), "no source answers for:\n  {}", gone.join("\n  "));
@@ -215,7 +217,8 @@ fn prepare(workspace: &Path, platform: &str) -> Result<Vec<String>> {
         let into = workspace.join(PREPARED).join(folder);
         std::fs::create_dir_all(&into).with_context(|| into.display().to_string())?;
         println!("{} ({folder})", setup.name);
-        pe2_setup::fetch_into(setup, &into, &mut |_, _| {}, &cancel).with_context(|| setup.name.clone())?;
+        pe2_setup::fetch_into(setup, &into, &mut |_, _| {}, &cancel, &pe2_io::SystemHttp)
+            .with_context(|| setup.name.clone())?;
         if setup.platform.is_some() {
             names.extend(setup.take.places().into_iter().map(|(to, _)| to.to_string()));
         }
