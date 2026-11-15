@@ -51,7 +51,9 @@ pub mod setup {
 
     /// A file of an extension's folder as the project's content has it - one a layer holds as records is on no disk.
     fn read_through_content(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-        crate::content::read(&HostPath::new(path)?)
+        // A hook of the machine's store of fetched tools, which can hold nothing: the system's I/O, as that store is.
+        static SYSTEM: std::sync::LazyLock<std::sync::Arc<dyn pe2_io::Io>> = std::sync::LazyLock::new(pe2_io::system);
+        crate::content::read(&SYSTEM, &HostPath::new(path)?)
     }
 }
 pub mod run;
@@ -355,21 +357,11 @@ impl Origin {
     }
 }
 
-/// The host's I/O the extensions run with: the system's where none is given (`Extensions::load_with`).
-#[derive(Clone)]
-struct HostIo(Arc<dyn pe2_io::Io>);
-
-impl Default for HostIo {
-    fn default() -> HostIo {
-        HostIo(pe2_io::system())
-    }
-}
-
 /// The extensions loaded, and what they registered.
 #[derive(Default)]
 pub struct Extensions {
     /// The host's I/O, which what runs is given.
-    io: HostIo,
+    io: pe2_io::Held,
     /// The config being built.
     config: std::sync::RwLock<Option<pe2_ext::data::BuildConfig>>,
     /// The assets it leaves out.
@@ -572,7 +564,7 @@ impl Extensions {
         disabled: &[String],
         io: Arc<dyn pe2_io::Io>,
     ) -> Extensions {
-        let mut out = Extensions { io: HostIo(io), ..Extensions::default() };
+        let mut out = Extensions { io: pe2_io::Held(io), ..Extensions::default() };
         // One an id: the nearest (the project's, the user's, a built-in), its place taken from the others; two from
         // the same place, the first.
         let mut extensions = extensions;
@@ -1588,7 +1580,7 @@ impl Extensions {
                 Some(store) if store.blob_path(sha1).is_ok_and(|path| path.exists()) => {
                     Ok(std::fs::read(store.blob_path(sha1)?)?)
                 }
-                _ => graph::exec::Node::read_content(asset, sha1),
+                _ => graph::exec::Node::read_content(asset, &asset.io, sha1),
             },
             held => Ok(held.held().unwrap_or_default().to_vec()),
         }
@@ -2019,6 +2011,12 @@ impl Extensions {
         self.ops.get(name)
     }
 
+    /// The host's I/O, which what runs is given.
+    #[must_use]
+    pub fn io(&self) -> &Arc<dyn pe2_io::Io> {
+        &self.io.0
+    }
+
     /// The operations stacks are made of: the host's (a stored file - typed by the formats it is recognized as -
     /// constants, outputs, the thumbnail) and the extensions', each lent its node as it runs.
     #[must_use]
@@ -2333,7 +2331,7 @@ impl Extensions {
     }
 
     fn recognize_now(&self, file: &index::BundleFile) -> Vec<(usize, Recognized)> {
-        let head = crate::content::head(&file.path, HEAD);
+        let head = crate::content::head(&self.io.0, &file.path, HEAD);
         recognize_head(&self.recognizers, file.name.as_str(), file.size, &head)
     }
 }
@@ -2718,7 +2716,7 @@ impl pe2_ext::CallHost for StreamHost {
         let (path, written) = match content {
             // A program is given a file: a chunked content assembled for it.
             pe2_ext::Content::Stored { sha1, .. } => {
-                (crate::content::for_program(StreamHost::path_of(self, sha1)?)?, None)
+                (crate::content::for_program(&self.io, StreamHost::path_of(self, sha1)?)?, None)
             }
             held => {
                 let folder = self.io.environment().temp_dir().context("the system's folder of temporary files")?;
@@ -2736,7 +2734,9 @@ impl pe2_ext::CallHost for StreamHost {
         match content {
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                crate::content::read(path).map(Vec::into_boxed_slice).with_context(|| path.display().to_string())
+                crate::content::read(&self.io, path)
+                    .map(Vec::into_boxed_slice)
+                    .with_context(|| path.display().to_string())
             }
             held => Ok(held.held().unwrap_or_default().into()),
         }
@@ -2746,7 +2746,7 @@ impl pe2_ext::CallHost for StreamHost {
         match content {
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                let read = crate::content::read_range(path, offset, len);
+                let read = crate::content::read_range(&self.io, path, offset, len);
                 read.map(Vec::into_boxed_slice).with_context(|| path.display().to_string())
             }
             held => Ok(held.held_range(offset, len).unwrap_or_default()),
@@ -2888,7 +2888,9 @@ impl Source for index::Asset {
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Box<[u8]>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
-        crate::content::read(&file.path).map(Vec::into_boxed_slice).with_context(|| file.path.display().to_string())
+        crate::content::read(&self.io, &file.path)
+            .map(Vec::into_boxed_slice)
+            .with_context(|| file.path.display().to_string())
     }
 
     fn size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
@@ -2898,7 +2900,7 @@ impl Source for index::Asset {
     fn read_range(&self, name: &pe2_ext::RelPath, offset: u64, len: usize) -> Result<Box<[u8]>> {
         let file =
             self.files.iter().find(|f| *f.name == *name).with_context(|| format!("{}: no file {name}", self.path))?;
-        let read = crate::content::read_range(&file.path, offset, len);
+        let read = crate::content::read_range(&self.io, &file.path, offset, len);
         read.map(Vec::into_boxed_slice).with_context(|| file.path.display().to_string())
     }
 }

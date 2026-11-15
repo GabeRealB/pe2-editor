@@ -161,7 +161,7 @@ mod tests {
     fn what_is_appended_is_read_as_it_was() {
         let dir = crate::testing::scratch("sfs-ops");
         let _ = std::fs::remove_dir_all(&dir);
-        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 20 }).unwrap();
+        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 20 }, &pe2_io::SystemFilesystem).unwrap();
         let ops = [
             Op::Began { path: p("a/b.txt"), emptied: true },
             Op::Began { path: p("c"), emptied: false },

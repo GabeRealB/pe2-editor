@@ -354,7 +354,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     assert!(undone && said.contains("b.txt"), "{said}");
     assert_eq!(folder.read("b.txt"), None, "taken back, it is gone from the folder");
     // And the filesystem the project's processes share says the same of what is served, to whoever attaches.
-    let shared = project::shared::space(&tried.project()).expect("the shared space");
+    let shared = project::shared::space(&tried.project(), &pe2_io::SystemFilesystem).expect("the shared space");
     let said = project::shared::listed(&shared.read().expect("read")).expect("listed");
     assert!(
         matches!(

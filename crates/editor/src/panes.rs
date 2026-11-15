@@ -2774,7 +2774,7 @@ fn project_settings_ui(
     let file = p.root.join(&project::FILE);
     ui.horizontal(|ui| {
         if ui.small_button(format!("{}  Open project.toml", icons::ARROW_SQUARE_OUT)).clicked() {
-            *message = Some(external::open(&file, "project.toml", tools).unwrap_or_else(|e| e));
+            *message = Some(external::open(&file, "project.toml", tools, &ws.project.io).unwrap_or_else(|e| e));
         }
         theme::short(ui, RichText::new(file.display().to_string()).small().color(theme::weak()));
     });

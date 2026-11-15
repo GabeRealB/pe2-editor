@@ -3132,7 +3132,7 @@ fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Compone
             let _ = std::fs::create_dir_all(&dir);
             sweep(&dir, io.clock());
         }
-        let _ = crate::cache::write_atomic(&file, &kept);
+        let _ = crate::cache::write_atomic(io.filesystem(), &file, &kept);
     }
     Ok(component)
 }
@@ -3142,7 +3142,7 @@ fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Compone
 /// # Errors
 /// It cannot be read, compiled or instantiated, or its registration fails.
 pub fn load(path: &HostPath, io: Arc<dyn pe2_io::Io>) -> Result<Loadable> {
-    let bytes = crate::content::read(path).with_context(|| path.display().to_string())?;
+    let bytes = crate::content::read(&io, path).with_context(|| path.display().to_string())?;
     load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.clone()), io)
 }
 
@@ -3321,6 +3321,8 @@ pub struct Unsandboxed {
     pub programs: Vec<super::unsandboxed::Program>,
     /// What every extension loaded beside it offers: where `<extension>:<name>` is found.
     pub offered: super::unsandboxed::Offered,
+    /// The host's I/O, which what it runs is found and laid out through.
+    pub io: Arc<dyn pe2_io::Io>,
 }
 
 impl Unsandboxed {
@@ -3362,7 +3364,9 @@ impl Unsandboxed {
         }
         match self.programs.iter().find(|program| program.name == tool) {
             Some(program) => self.started(program, 0),
-            None => Ok((super::unsandboxed::program(self.folder.as_ref(), &self.fetched(), tool), Vec::new())),
+            None => {
+                Ok((super::unsandboxed::program(self.folder.as_ref(), &self.fetched(), tool, &self.io), Vec::new()))
+            }
         }
     }
 
@@ -3400,7 +3404,7 @@ impl Unsandboxed {
                 self.other(id)?.offered_as(name, depth + 1)?
             } else {
                 let place = program.program.strip_prefix('@').unwrap_or(&program.program);
-                (super::unsandboxed::program(folder, &fetched, place), Vec::new())
+                (super::unsandboxed::program(folder, &fetched, place, &self.io), Vec::new())
             };
         for arg in &program.args {
             let Some(place) = arg.strip_prefix('@') else {
@@ -3419,7 +3423,7 @@ impl Unsandboxed {
                     args.push(other.to_string());
                 }
                 None => args.push(
-                    super::unsandboxed::in_tree(folder, &fetched, place)
+                    super::unsandboxed::in_tree(folder, &fetched, place, &self.io)
                         .map_or_else(|| place.to_string(), |p| p.to_string()),
                 ),
             }

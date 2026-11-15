@@ -166,9 +166,9 @@ fn which(program: &str) -> bool {
 ///
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.
-pub fn open(file: &HostPath, name: &str, tools: &Tools) -> Result<String, String> {
+pub fn open(file: &HostPath, name: &str, tools: &Tools, io: &std::sync::Arc<dyn pe2_io::Io>) -> Result<String, String> {
     // A large file a layer holds as chunks is opened as assembled for it.
-    let file = project::content::for_program(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let file = project::content::for_program(io, file).map_err(|e| format!("{}: {e}", file.display()))?;
     open_as(&file, name, Category::of(&file), tools)
 }
 

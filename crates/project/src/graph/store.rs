@@ -254,7 +254,7 @@ impl Store {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
             }
-            write_atomic(&path, bytes)?;
+            write_atomic(self.io.filesystem(), &path, bytes)?;
         }
         Ok(Blob { sha1, size: bytes.len() as u64 })
     }
@@ -334,7 +334,7 @@ impl Store {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
                     }
-                    write_atomic(&path, &bytes)?;
+                    write_atomic(self.io.filesystem(), &path, &bytes)?;
                 }
                 Ok(Blob { sha1: *sha1, size: *size })
             }
@@ -405,7 +405,7 @@ impl Store {
                 Kept::List { items: hashes }
             }
         };
-        write_atomic(&path, &encode(&kept)?)
+        write_atomic(self.io.filesystem(), &path, &encode(&kept)?)
     }
 
     /// Whether a value is kept. (One this store cannot read - written otherwise - is found when it is read, and made
@@ -489,7 +489,7 @@ impl Store {
     /// # Errors
     /// It cannot be written.
     pub fn put_trace(&self, key: &str, trace: &Trace) -> Result<()> {
-        write_atomic(&self.trace_path(key)?, &encode(trace)?)
+        write_atomic(self.io.filesystem(), &self.trace_path(key)?, &encode(trace)?)
     }
 
     /// Forget a trace: what it was the trace of is made again when next asked for, though its value stays.

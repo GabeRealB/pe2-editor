@@ -59,7 +59,7 @@ impl Node for Bundle {
         self.files.lock().unwrap().keys().cloned().collect()
     }
 
-    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
+    fn read_content(&self, _io: &std::sync::Arc<dyn pe2_io::Io>, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let files = self.files.lock().unwrap();
         files.values().find(|b| crate::extract::sha1_of(b) == *sha1).cloned().context("no such content")
     }
@@ -69,7 +69,7 @@ impl Node for Bundle {
 fn data(node: &Bundle, value: &Value) -> Vec<u8> {
     let Value::Typed(typed) = value else { panic!("not a file") };
     match &typed.file().unwrap().content {
-        Content::Stored { sha1, .. } => node.read_content(sha1).unwrap(),
+        Content::Stored { sha1, .. } => node.read_content(&pe2_io::system(), sha1).unwrap(),
         held => held.held().unwrap().to_vec(),
     }
 }

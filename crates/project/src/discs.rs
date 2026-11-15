@@ -28,7 +28,7 @@ pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &pe2_ext::
     others.sort();
     candidates.extend(others);
     for p in candidates {
-        if fs::metadata(&p)?.len() == size && sha1_file(&p)? == *sha1 {
+        if fs::metadata(&p)?.len() == size && sha1_file(&pe2_io::SystemFilesystem, &p)? == *sha1 {
             return Ok(p);
         }
     }

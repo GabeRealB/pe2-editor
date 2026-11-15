@@ -56,13 +56,13 @@ fn of_extensions(path: &HostPath) -> bool {
 
 /// A file an override merged over the one below, in the cache (`.cache/merged/<sha1>/<name>`), written where it is not
 /// yet: its folder is named by its content's SHA-1.
-fn merged_file(dir: &HostPath, name: &str, bytes: &[u8]) -> std::io::Result<HostPath> {
+fn merged_file(fs: &dyn pe2_io::Filesystem, dir: &HostPath, name: &str, bytes: &[u8]) -> std::io::Result<HostPath> {
     let at = dir
         .join(&Name::new(&sha1_hex(bytes)).map_err(std::io::Error::other)?)
         .join(&RelPath::new(name).map_err(std::io::Error::other)?);
-    if !at.is_file() {
-        std::fs::create_dir_all(at.parent().expect("in a folder"))?;
-        crate::cache::write_atomic(&at, bytes).map_err(std::io::Error::other)?;
+    if !fs.is_file(&at) {
+        fs.create_folder_all(&at.parent().expect("in a folder"))?;
+        crate::cache::write_atomic(fs, &at, bytes).map_err(std::io::Error::other)?;
     }
     Ok(at)
 }
@@ -112,6 +112,8 @@ pub struct Asset {
     /// Why its `node.toml` could not be parsed; its fields are then empty.
     pub error: Option<String>,
     text: Arc<str>,
+    /// The project's I/O, which its files are read through.
+    pub(crate) io: Arc<dyn pe2_io::Io>,
     /// Its `settings.toml`, where a generated layer holds one.
     generated: Option<Arc<str>>,
     fields: OnceLock<pe2_value::Table>,
@@ -156,6 +158,12 @@ pub struct Imported {
 }
 
 impl Asset {
+    /// The project's I/O, which its files are read through.
+    #[must_use]
+    pub fn io(&self) -> &Arc<dyn pe2_io::Io> {
+        &self.io
+    }
+
     /// It as its files are on disk: itself, where nothing of it is unsaved.
     #[must_use]
     pub fn on_disk(&self) -> &Asset {
@@ -697,7 +705,7 @@ struct Pending {
 
 /// A file's record, read now; none when it vanished meanwhile. A file that cannot be parsed is a record with its
 /// error, not a failure: a user may save a half-written `node.toml`.
-fn read(file: &Pending) -> Option<Record> {
+fn read(io: &Arc<dyn pe2_io::Io>, file: &Pending) -> Option<Record> {
     #[allow(
         clippy::disallowed_methods,
         reason = "compared with the times the system stamps files with: the system's own clock"
@@ -705,10 +713,10 @@ fn read(file: &Pending) -> Option<Record> {
     let recorded = stamp(SystemTime::now());
     // A declaration is read whole, to be parsed; any other file is only hashed, a piece at a time.
     let (sha1, declaration) = if file.declaration {
-        let bytes = crate::content::read(&file.path).ok()?;
+        let bytes = crate::content::read(io, &file.path).ok()?;
         (crate::extract::sha1_of(&bytes), Some(declaration(&bytes)))
     } else {
-        (crate::content::sha1(&file.path).ok()?, None)
+        (crate::content::sha1(io, &file.path).ok()?, None)
     };
     Some(Record { size: file.size, modified: file.modified, recorded, sha1, declaration })
 }
@@ -746,8 +754,8 @@ fn declaration(bytes: &[u8]) -> Declaration {
 }
 
 /// Stat the files on every core: each one's size (none when it is gone) and modification time.
-fn stat_all(files: &[HostPath]) -> Vec<(Option<u64>, Stamp)> {
-    let stat = |file: &HostPath| match crate::content::stat(file) {
+fn stat_all(io: &Arc<dyn pe2_io::Io>, files: &[HostPath]) -> Vec<(Option<u64>, Stamp)> {
+    let stat = |file: &HostPath| match crate::content::stat(io, file) {
         Ok((len, modified)) => (Some(len), stamp(modified)),
         Err(_) => (None, (0, 0)),
     };
@@ -765,7 +773,7 @@ fn stat_all(files: &[HostPath]) -> Vec<(Option<u64>, Stamp)> {
 }
 
 /// Read the files on every core.
-fn read_all(files: &[Pending]) -> Vec<Option<Record>> {
+fn read_all(io: &Arc<dyn pe2_io::Io>, files: &[Pending]) -> Vec<Option<Record>> {
     if files.is_empty() {
         return vec![];
     }
@@ -773,7 +781,7 @@ fn read_all(files: &[Pending]) -> Vec<Option<Record>> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = files
             .chunks(files.len().div_ceil(threads))
-            .map(|part| scope.spawn(move || part.iter().map(read).collect::<Vec<_>>()))
+            .map(|part| scope.spawn(move || part.iter().map(|file| read(io, file)).collect::<Vec<_>>()))
             .collect();
         workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
     })
@@ -800,6 +808,8 @@ struct Place {
     at: Arc<TreePath>,
     ignore: Vec<String>,
     assets: bool,
+    /// The project's I/O, which its layer is read through.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Place {
@@ -872,14 +882,14 @@ impl Scan {
             if name.starts_with('.') || place.ignores(&rel) {
                 return;
             }
-            if crate::pack::is_dir(&start) {
+            if crate::pack::is_dir(&place.io, &start) {
                 if place.assets && name.ends_with(BUNDLE_SUFFIX) {
-                    self.bundle(&rel, &start);
+                    self.bundle(&place.io, &rel, &start);
                     return;
                 }
                 self.folders.insert(rel.clone());
             } else {
-                if crate::pack::is_file(&start) {
+                if crate::pack::is_file(&place.io, &start) {
                     self.files.insert(rel, start);
                 }
                 return;
@@ -924,7 +934,7 @@ impl Scan {
     ) {
         // On disk, or in a packed layer's listing.
         let mut listing = Vec::new();
-        for (name, path, is_dir) in crate::pack::read_dir(dir) {
+        for (name, path, is_dir) in crate::pack::read_dir(&place.io, dir) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
@@ -955,7 +965,7 @@ impl Scan {
             let child = dir_rel.join(&name);
             if is_dir {
                 if place.assets && name.as_str().ends_with(BUNDLE_SUFFIX) {
-                    self.bundle(&child, &path);
+                    self.bundle(&place.io, &child, &path);
                 } else {
                     self.folders.insert(child.clone());
                     folders.push((path, child));
@@ -968,12 +978,12 @@ impl Scan {
 
     /// A bundle it holds: its files, and what in it is named so no path takes it. One whose asset's name is none -
     /// `CON.node`, an asset `CON` - is refused whole.
-    fn bundle(&mut self, at: &TreePath, folder: &HostPath) {
+    fn bundle(&mut self, io: &Arc<dyn pe2_io::Io>, at: &TreePath, folder: &HostPath) {
         if let Err(why) = asset_named(at) {
             self.refused.insert(at.to_string(), format!("its asset's name: {why}").into());
             return;
         }
-        let (files, refused) = bundle_files(folder);
+        let (files, refused) = bundle_files(io, folder);
         for refusal in refused {
             self.refused.insert(format!("{at}/{}", refusal.text), refusal.why);
         }
@@ -1057,7 +1067,8 @@ impl Scan {
         let mut above = rel.parent();
         while let Some(folder) = above.filter(|folder| !folder.is_root() && place.at != **folder) {
             let name = folder.name().unwrap_or_default();
-            let there = !name.starts_with('.') && !place.ignores(folder) && crate::pack::is_dir(&place.disk(folder));
+            let there =
+                !name.starts_with('.') && !place.ignores(folder) && crate::pack::is_dir(&place.io, &place.disk(folder));
             let was = self.folders.contains(folder);
             if there && !was {
                 self.folders.insert(folder.to_owned());
@@ -1149,7 +1160,10 @@ fn shown_within(shown: &str, at: &TreePath) -> bool {
 ///
 /// What in it is named so no path takes it is handed back apart, each refused with its path within the bundle as it
 /// shows: nothing of the bundle's, for whoever walks it to say so.
-pub(crate) fn bundle_files(dir: &HostPath) -> (BTreeMap<Arc<RelPath>, HostPath>, Vec<Refusal>) {
+pub(crate) fn bundle_files(
+    io: &Arc<dyn pe2_io::Io>,
+    dir: &HostPath,
+) -> (BTreeMap<Arc<RelPath>, HostPath>, Vec<Refusal>) {
     let mut files = BTreeMap::new();
     let mut refused = Vec::new();
     let mut pending = vec![(dir.clone(), RelPath::root().to_owned())];
@@ -1158,7 +1172,7 @@ pub(crate) fn bundle_files(dir: &HostPath) -> (BTreeMap<Arc<RelPath>, HostPath>,
             |text: &str| -> Box<str> { if prefix.is_root() { text.into() } else { format!("{prefix}/{text}").into() } };
         // On disk, or in a packed layer's listing.
         let mut listing = Vec::new();
-        for (name, path, is_dir) in crate::pack::read_dir(&folder) {
+        for (name, path, is_dir) in crate::pack::read_dir(io, &folder) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
@@ -1358,14 +1372,19 @@ impl LayerState {
     /// A layer as the project has it. What it holds is as `known` says - what the project's model kept of it -
     /// where that is to be `taken` so and was made by the same place and names left out; else as a walk of it
     /// finds it now, and what was known is given back with it, to tell what differs.
-    fn new(layer: &Layer, known: Option<(String, Scan)>, taken: bool) -> Result<(LayerState, Option<Scan>)> {
+    fn new(
+        layer: &Layer,
+        known: Option<(String, Scan)>,
+        taken: bool,
+        io: &Arc<dyn pe2_io::Io>,
+    ) -> Result<(LayerState, Option<Scan>)> {
         let records = crate::records::is_records(&layer.path);
         let changeset = LayerState::changeset_of(layer)?;
         let tree_ignore = if layer.mounted { tree_ignores(&layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
         ignore.extend(tree_ignore.iter().cloned());
         let assets = layer.kind != LayerKind::Files;
-        let place = Place { root: layer.path.clone(), at: layer.at.clone(), ignore, assets };
+        let place = Place { root: layer.path.clone(), at: layer.at.clone(), ignore, assets, io: io.clone() };
         let (scan, walked) = match known {
             Some((made_by, scan)) if taken && made_by == place.made_by() => (scan, None),
             known => {
@@ -1889,7 +1908,7 @@ impl Index {
     pub fn open_reporting(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
         report("Reading what is known of the files", 0, 0);
-        Index::over(crate::model::known(&project.root), true, project, report)
+        Index::over(crate::model::known(&project.root, project.io.filesystem()), true, project, report)
     }
 
     /// Open the index as `open_reporting` does, but taking the files to be as the model has them: none is looked
@@ -1901,7 +1920,7 @@ impl Index {
     pub fn open_behind(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
         report("Reading what is known of the files", 0, 0);
-        Index::over(crate::model::known(&project.root), false, project, report)
+        Index::over(crate::model::known(&project.root, project.io.filesystem()), false, project, report)
     }
 
     /// Open the index over nothing known: every file read. What an index is held to, and what one opens as where
@@ -1994,6 +2013,7 @@ impl Index {
     /// returns is taken in as a change of those files (`refresh`).
     pub fn verification(&self) -> impl FnOnce() -> Vec<HostPath> + Send + 'static {
         let records = self.records.clone();
+        let io = self.io.clone();
         let files: Vec<HostPath> = self.layers.iter().flat_map(|layer| layer.scan.all_files().cloned()).collect();
         let layers: Vec<(Place, Arc<Scan>)> =
             self.layers.iter().map(|layer| (layer.place.clone(), layer.scan.clone())).collect();
@@ -2029,7 +2049,7 @@ impl Index {
                     differing.collect::<Vec<HostPath>>()
                 });
                 let _span = tracing::info_span!("index: the files held to their records").entered();
-                let stale = files.iter().zip(stat_all(&files)).filter(|(file, (size, modified))| {
+                let stale = files.iter().zip(stat_all(&io, &files)).filter(|(file, (size, modified))| {
                     match (size, records.get(*file)) {
                         (Some(size), Some(record)) => {
                             !(record.size == *size && record.modified == *modified && *modified < record.recorded)
@@ -2104,7 +2124,7 @@ impl Index {
             let was = known_layers.remove(&layer.name).map(|(made_by, holds)| (made_by, Scan::of_held(holds)));
             let was_made_by = was.as_ref().map(|(made_by, _)| made_by.clone());
             // Held to the layer, it is walked whatever is known of it; else what is known is what it holds.
-            let (state, walked) = LayerState::new(layer, was, !held)?;
+            let (state, walked) = LayerState::new(layer, was, !held, &project.io)?;
             let made_by = state.place.made_by();
             if was_made_by.as_deref() != Some(made_by.as_str()) {
                 opened.layer(&layer.name, Some(&made_by));
@@ -2142,7 +2162,7 @@ impl Index {
             layers,
             records: Shared::default(),
             merged: project.root.join(&crate::cache::DIR).join(&Name::constant("merged")),
-            objects: crate::chunks::Store::at(&project.root),
+            objects: crate::chunks::Store::at(&project.root, project.io.clone()),
             opened,
             root: project.root.clone(),
             io: project.io.clone(),
@@ -2367,7 +2387,7 @@ impl Index {
     /// A file as it is served: where a layer holds it, its length, when it changed, and where its content lives.
     fn serve_file(&self, disk: HostPath, of_files: bool) -> crate::server::Shown {
         let (size, modified) =
-            self.file_stat(&disk).or_else(|| crate::content::stat(&disk).ok()).unwrap_or((0, UNIX_EPOCH));
+            self.file_stat(&disk).or_else(|| crate::content::stat(&self.io, &disk).ok()).unwrap_or((0, UNIX_EPOCH));
         let time = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
         let source = crate::records::Set::source(&disk).unwrap_or_default();
         let modified = (time.as_secs(), time.subsec_nanos());
@@ -3016,7 +3036,7 @@ impl Index {
         mut known: impl FnMut(&HostPath, u64, Stamp) -> Option<Record>,
     ) -> Vec<HostPath> {
         let mut pending = Vec::new();
-        for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
+        for (file, (size, modified)) in files.iter().zip(stat_all(&self.io, files)) {
             let Some(size) = size else { continue };
             if let Some(record) = known(file, size, modified) {
                 Shared::make_mut(&mut self.records).insert(file.clone(), Arc::new(record));
@@ -3027,7 +3047,7 @@ impl Index {
             }
         }
         let mut read = Vec::new();
-        for (file, record) in pending.iter().zip(read_all(&pending)) {
+        for (file, record) in pending.iter().zip(read_all(&self.io, &pending)) {
             if let Some(record) = record {
                 Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
@@ -3040,7 +3060,7 @@ impl Index {
     /// gone since they were scanned.
     fn reload(&mut self, files: &[HostPath], reported: &HashSet<&HostPath>) -> (Vec<HostPath>, Vec<HostPath>) {
         let (mut pending, mut vanished) = (Vec::new(), Vec::new());
-        for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
+        for (file, (size, modified)) in files.iter().zip(stat_all(&self.io, files)) {
             let Some(size) = size else {
                 Shared::make_mut(&mut self.records).remove(file);
                 vanished.push(file.clone());
@@ -3055,7 +3075,7 @@ impl Index {
             }
         }
         let mut read = Vec::new();
-        for (file, record) in pending.iter().zip(read_all(&pending)) {
+        for (file, record) in pending.iter().zip(read_all(&self.io, &pending)) {
             if let Some(record) = record {
                 Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
@@ -3277,16 +3297,19 @@ impl Index {
             return Some((at(&remembered.sha1), remembered.conflicts));
         }
         let base = self.objects.get_file(was).ok()?;
-        let theirs = crate::content::read(now).ok()?;
-        let ours = crate::content::read(mine).ok()?;
+        let theirs = crate::content::read(&self.io, now).ok()?;
+        let ours = crate::content::read(&self.io, mine).ok()?;
         let merged = crate::merge::merge(name, &base, &theirs, &ours);
         let sha1 = crate::extract::sha1_of(&merged.bytes);
-        let path =
-            if sha1 == mine_sha1 { mine.clone() } else { merged_file(&self.merged, name, &merged.bytes).ok()? };
+        let path = if sha1 == mine_sha1 {
+            mine.clone()
+        } else {
+            merged_file(self.io.filesystem(), &self.merged, name, &merged.bytes).ok()?
+        };
         let remembered = Memo { sha1, conflicts: merged.conflicts };
         if let Ok(text) = serde_json::to_string(&remembered) {
             let _ = std::fs::create_dir_all(memo.parent().expect("in a folder"));
-            let _ = crate::cache::write_atomic(&memo, text.as_bytes());
+            let _ = crate::cache::write_atomic(self.io.filesystem(), &memo, text.as_bytes());
         }
         Some((path, remembered.conflicts))
     }
@@ -3768,12 +3791,12 @@ impl Index {
             .filter_map(|(name, file)| Some((name, file.as_ref()?)))
             .filter(|(_, file)| !self.records.contains_key(&file.path))
             .filter_map(|(name, file)| {
-                let (size, modified) = crate::content::stat(&file.path).ok()?;
+                let (size, modified) = crate::content::stat(&self.io, &file.path).ok()?;
                 let declaration = name == NODE_FILE || name == SETTINGS_FILE;
                 Some(Pending { path: file.path.clone(), size, modified: stamp(modified), declaration })
             })
             .collect();
-        for (file, record) in unread.iter().zip(read_all(&unread)) {
+        for (file, record) in unread.iter().zip(read_all(&self.io, &unread)) {
             if let Some(record) = record {
                 Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
             }
@@ -3899,7 +3922,7 @@ impl Index {
                 continue;
             }
             layer.changeset.entries.extend(listing);
-            layer.changeset.save(&layer.changeset_path)?;
+            layer.changeset.save(self.io.filesystem(), &layer.changeset_path)?;
         }
         Ok(())
     }
@@ -4077,7 +4100,7 @@ impl Index {
                 .iter()
                 .filter(|(_, file, _)| !self.records.contains_key(file))
                 .filter_map(|(name, file, _)| {
-                    let (size, modified) = crate::content::stat(file).ok()?;
+                    let (size, modified) = crate::content::stat(&self.io, file).ok()?;
                     let declaration = name == NODE_FILE || name == SETTINGS_FILE;
                     Some(Pending { path: file.clone(), size, modified: stamp(modified), declaration })
                 })
@@ -4090,7 +4113,7 @@ impl Index {
         if !unread.is_empty() {
             let unread: Vec<Pending> =
                 unread.into_iter().map(|file| Pending { path: file.path.clone(), ..*file }).collect();
-            for (file, record) in unread.iter().zip(read_all(&unread)) {
+            for (file, record) in unread.iter().zip(read_all(&self.io, &unread)) {
                 if let Some(record) = record {
                     Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 }
@@ -4118,6 +4141,7 @@ impl Index {
     fn asset_made(&self, path: &TreePath, node: &Node, files: &[(Arc<RelPath>, HostPath, usize)]) -> Asset {
         let layers = std::iter::once(node.home).chain(node.overrides.iter().copied());
         let mut asset = Asset {
+            io: self.io.clone(),
             path: asset_of(path),
             uid: Some(node.uid),
             named: Some(node.uid.to_string().into()),
@@ -4175,6 +4199,7 @@ impl Index {
             let mut name = format!("{BELOW}{uid}");
             while let Some(below) = self.below(&layer, uid) {
                 let mut asset = Asset {
+                    io: self.io.clone(),
                     path: at.clone(),
                     uid: None,
                     named: Some(name.as_str().into()),
@@ -4359,12 +4384,14 @@ mod tests {
     /// The top layer's override of an entry, changing these files of it: each made from the version below now, kept.
     fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
         let below = index.below(pe2_path::Name::constant("top"), crate::testing::uid(uid)).expect("below top");
-        let store =
-            crate::chunks::Store::at(&index.merged.parent().and_then(|cache| cache.parent()).expect("a project"));
+        let store = crate::chunks::Store::at(
+            &index.merged.parent().and_then(|cache| cache.parent()).expect("a project"),
+            crate::testing::io(),
+        );
         let files = files.iter().map(|name| {
             let name = rel(name);
             let (_, file) = below.files.iter().find(|(n, _)| *n == name).expect("a file below");
-            store.put_file(&crate::content::read(file).expect("read"), index.io().clock().wall()).expect("kept");
+            store.put_file(&crate::content::read(&crate::testing::io(), file).expect("read")).expect("kept");
             let was = below.sha1s.get(&name).copied();
             (name, Base { was, removed: false })
         });
@@ -4421,7 +4448,7 @@ mod tests {
         // As whoever holds a project does: what the opening read is said in the project's model, and the space
         // it is in left in order.
         crate::model::took(root, &mut index).unwrap();
-        crate::shared::space(root).unwrap().rest().unwrap();
+        crate::shared::space(root, &pe2_io::SystemFilesystem).unwrap().rest().unwrap();
         (project, index)
     }
 
@@ -4472,7 +4499,7 @@ mod tests {
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml", "native.texels"]));
         top.ops.insert(uid_of("b.node"), Op::Move { to: tree("c.node") });
         top.ops.insert(uid_of("f.node"), Op::Delete);
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         write(&root, ".layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
@@ -4506,7 +4533,7 @@ mod tests {
         let mut top = Changeset::default();
         top.entries.insert(uid("uid://again"), tree("g"));
         top.entries.insert(uid("uid://beside"), tree("g/beside.node"));
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
@@ -4591,7 +4618,7 @@ mod tests {
         let mut top = Changeset { read_only: true, ..Changeset::default() };
         top.entries.insert(uid("uid://gone"), tree("nowhere"));
         top.ops.insert(uid("uid://unknown"), Op::Delete);
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/b.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         write(&root, ".layers/top/new.node/node.toml", "kind = [unclosed\n");
         let (_, index) = open(&root);
@@ -4627,7 +4654,7 @@ mod tests {
         assert!(adopted.contains(&(folder, tree("h"))), "{adopted:?}");
         let mut base = changeset(&root, "base");
         base.entries.extend(adopted);
-        base.save(&root.at(".layers/base.toml")).unwrap();
+        base.save(&pe2_io::SystemFilesystem, &root.at(".layers/base.toml")).unwrap();
         index.refresh(&project, &[root.at(".layers/base.toml")]).unwrap();
         assert_eq!(index.assets[&tree("h/a")].uid, Some(uid("uid://a")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
@@ -4680,7 +4707,7 @@ mod tests {
         // An override of the node's declaration sees the files the plan makes, and what it makes otherwise reaches it.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let below = index.below(pe2_path::Name::constant("top"), uid("uid://a")).unwrap();
         assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
@@ -4727,7 +4754,7 @@ mod tests {
         // An override in top, then what is below it changed: merged again, though only contents changed.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         check(
             &mut index,
@@ -4783,7 +4810,7 @@ mod tests {
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
         top.ops.insert(uid("uid://nothing"), Op::Delete);
-        top.save(&root.at(".layers/top.toml")).unwrap();
+        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let (_, mut index) = open(&root);
         let info = index.layers();

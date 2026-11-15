@@ -36,8 +36,8 @@ impl Says {
     /// In the space the project's processes share, attached here where it is not yet.
     #[must_use]
     pub fn of(project: &project::Project) -> Says {
-        let shared =
-            project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
+        let shared = project::shared::space(&project.root, project.io.filesystem())
+            .map_err(|e| format!("the space the project's processes share: {e}"));
         Says { shared, current: Mutex::default(), io: project.io.clone() }
     }
 

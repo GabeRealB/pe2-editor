@@ -51,11 +51,11 @@ impl Written {
     ///
     /// # Errors
     /// Its file, or the log, cannot be read.
-    pub fn read(&self) -> std::io::Result<Vec<u8>> {
+    pub fn read(&self, filesystem: &dyn pe2_io::Filesystem) -> std::io::Result<Vec<u8>> {
         match self {
             Written::File(file) => std::fs::read(file),
             Written::Logged { log, len, ranges } => {
-                let log = sfs::Log::shared(log, sfs::log::Config::default())?;
+                let log = sfs::Log::shared(log, sfs::log::Config::default(), filesystem)?;
                 let mut bytes = Vec::with_capacity(usize::try_from(*len).unwrap_or(0));
                 sfs::Content::of_ranges(*len, ranges).write_to(&log, &mut bytes)?;
                 Ok(bytes)
@@ -74,10 +74,10 @@ impl Written {
 
 /// The logs whoever applies changes has read from: kept open, since opening one beside another process that has
 /// it takes a moment.
-fn keep_open(written: &Written) {
+fn keep_open(written: &Written, filesystem: &dyn pe2_io::Filesystem) {
     static KEPT: std::sync::Mutex<Vec<std::sync::Arc<sfs::Log>>> = std::sync::Mutex::new(Vec::new());
     let Written::Logged { log, .. } = written else { return };
-    let Ok(log) = sfs::Log::shared(log, sfs::log::Config::default()) else { return };
+    let Ok(log) = sfs::Log::shared(log, sfs::log::Config::default(), filesystem) else { return };
     let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !kept.iter().any(|open| std::sync::Arc::ptr_eq(open, &log)) {
         kept.push(log);
@@ -314,8 +314,8 @@ pub fn apply(
     let label = change.label();
     match change {
         Change::Write { path, staged } => {
-            keep_open(staged);
-            let bytes = staged.read().with_context(|| staged.shown())?;
+            keep_open(staged, project.io.filesystem());
+            let bytes = staged.read(project.io.filesystem()).with_context(|| staged.shown())?;
             write(project, index, layer, path, &bytes, label, history)
         }
         Change::Remove { path } => match place(index, path) {
@@ -407,7 +407,7 @@ fn rename(
             let disk = asset
                 .and_then(|a| a.on_disk().files.iter().find(|f| f.name == file).map(|f| f.path.clone()))
                 .with_context(|| format!("{from}: not there"))?;
-            let bytes = project::content::read(&disk).with_context(|| disk.display().to_string())?;
+            let bytes = project::content::read(&project.io, &disk).with_context(|| disk.display().to_string())?;
             let files = [(new, Some(bytes)), (file, None)];
             edit::save(project, index, layer, node.uid, &files, label, history)
         }

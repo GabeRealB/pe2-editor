@@ -515,7 +515,7 @@ fn read_record(path: &HostPath) -> Record {
     record
 }
 
-fn write_record(path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
+fn write_record(fs: &dyn pe2_io::Filesystem, path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
     let mut text = json!({"record": 1, "plan": plan.sha1, "releases": record.releases}).to_string();
     text.push('\n');
     for ((node, file), written) in &record.files {
@@ -530,7 +530,7 @@ fn write_record(path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
         text.push_str(&json!({"check": check, "key": key}).to_string());
         text.push('\n');
     }
-    crate::cache::write_atomic(path, text.as_bytes())
+    crate::cache::write_atomic(fs, path, text.as_bytes())
 }
 
 /// What an operation made.
@@ -824,7 +824,7 @@ fn on_disk(plan: &Plan, layer: &HostPath, node: &str, file: &str, written: &Writ
 
 /// Keep no release's own file that is the same as what the releases share: each removed, recorded as the shared one.
 /// How many.
-fn share_alike(plan: &Plan, layer: &HostPath, record: &mut Record) -> usize {
+fn share_alike(io: &std::sync::Arc<dyn pe2_io::Io>, plan: &Plan, layer: &HostPath, record: &mut Record) -> usize {
     let alike: Vec<(String, String)> = record
         .files
         .iter()
@@ -840,7 +840,7 @@ fn share_alike(plan: &Plan, layer: &HostPath, record: &mut Record) -> usize {
         .collect();
     for (node, file) in &alike {
         let path = file_path(layer, node, file);
-        let _ = crate::content::remove(&path);
+        let _ = crate::content::remove(io, &path);
         if let Some(folder) = path.parent() {
             let _ = std::fs::remove_dir(folder);
         }
@@ -864,6 +864,7 @@ fn file_path(layer: &HostPath, node: &str, file: &str) -> HostPath {
 /// What a run is to make: each file whose key changed, or which is not there as written - a folder's, any of its
 /// files; what is as written goes into the new record as it was.
 fn wanted(
+    io: &std::sync::Arc<dyn pe2_io::Io>,
     plan: &Plan,
     keys: &[String],
     layer: &HostPath,
@@ -886,7 +887,7 @@ fn wanted(
                 })
                 .collect();
             let as_written = |((node, file), written): &(&(String, String), &Written)| {
-                let there = crate::content::len(&on_disk(plan, layer, node, file, written)).ok();
+                let there = crate::content::len(io, &on_disk(plan, layer, node, file, written)).ok();
                 // What a release's own file was the same as is so still.
                 let alike = !written.shared
                     || plan.plain_of(file).is_some_and(|plain| {
@@ -973,7 +974,7 @@ pub fn run(
     let mut record = Record::default();
     let in_order = plan.releases().into_iter().filter(|r| available.contains(r)).collect();
     let mut ran = Ran { releases: in_order, ..Ran::default() };
-    let wanted = wanted(&plan, &keys, layer, &old, &mut record, &mut ran);
+    let wanted = wanted(&project.io, &plan, &keys, layer, &old, &mut record, &mut ran);
     // Each check whose key changed; a check of what was written, after everything is.
     let mut checked = vec![false; plan.ops.len()];
     let mut last = Vec::new();
@@ -1027,7 +1028,7 @@ pub fn run(
             .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
             .collect::<Result<_>>()?,
         found,
-        layer: Some((layer, project.io.clock())),
+        layer: Some((layer, &project.io)),
         engine,
         extensions,
         checked,
@@ -1057,7 +1058,7 @@ pub fn run(
     if let Some(why) = failed {
         record.releases = Some(available.iter().cloned().chain(old.releases.clone().unwrap_or_default()).collect());
         // What was written is kept as made: a run stopped or failed goes on from there next time.
-        write_record(&layer.join(&RECORD), &plan, &record)?;
+        write_record(project.io.filesystem(), &layer.join(&RECORD), &plan, &record)?;
         return Err(why);
     }
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
@@ -1071,18 +1072,18 @@ pub fn run(
     } else {
         available.clone()
     });
-    ran.shared = share_alike(&plan, layer, &mut record);
-    ran.removed = remove_left(layer, &old, &record);
-    write_record(&layer.join(&RECORD), &plan, &record)?;
+    ran.shared = share_alike(&project.io, &plan, layer, &mut record);
+    ran.removed = remove_left(&project.io, layer, &old, &record);
+    write_record(project.io.filesystem(), &layer.join(&RECORD), &plan, &record)?;
     Ok(ran)
 }
 
 /// Remove what no bundle is given any more: what the last run recorded and this one did not. How many went.
-fn remove_left(layer: &HostPath, old: &Record, record: &Record) -> usize {
+fn remove_left(io: &std::sync::Arc<dyn pe2_io::Io>, layer: &HostPath, old: &Record, record: &Record) -> usize {
     let left = old.files.keys().filter(|entry| !record.files.contains_key(*entry));
     left.filter(|(node, file)| {
         let path = file_path(layer, node, file);
-        crate::content::exists(&path) && crate::content::remove(&path).is_ok()
+        crate::content::exists(io, &path) && crate::content::remove(io, &path).is_ok()
     })
     .count()
 }
@@ -1107,7 +1108,7 @@ struct RunState<'a> {
     inputs: HashMap<String, HostPath>,
     found: HashMap<pe2_ext::Sha1, HostPath>,
     /// The layer it writes, and the clock its files are written by; none where it only observes.
-    layer: Option<(&'a HostPath, &'a dyn pe2_io::Clock)>,
+    layer: Option<(&'a HostPath, &'a std::sync::Arc<dyn pe2_io::Io>)>,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
     /// The checks to run.
@@ -1132,9 +1133,9 @@ impl RunState<'_> {
         self.layer.map(|(layer, _)| layer).context("observing what a plan reads writes nothing")
     }
 
-    /// The time it writes at.
-    fn now(&self) -> Result<std::time::SystemTime> {
-        self.layer.map(|(_, clock)| clock.wall()).context("observing what a plan reads writes nothing")
+    /// The I/O it writes through.
+    fn io(&self) -> Result<&std::sync::Arc<dyn pe2_io::Io>> {
+        self.layer.map(|(_, io)| io).context("observing what a plan reads writes nothing")
     }
 
     fn run(&self, at: usize, add: &dyn Fn(usize)) {
@@ -1164,13 +1165,13 @@ impl RunState<'_> {
                     let key = Plan::file_key(self.keys, given);
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
-                        let _ = crate::content::remove(&file_path(self.layer()?, node, &file));
+                        let _ = crate::content::remove(self.io()?, &file_path(self.layer()?, node, &file));
                         self.lock_written()
                             .push(((node.clone(), file), Written { key, sha1: None, size: 0, shared: false }));
                         continue;
                     };
                     let path = file_path(self.layer()?, node, &file);
-                    crate::content::write(&path, bytes.as_slice(), self.now()?)
+                    crate::content::write(self.io()?, &path, bytes.as_slice())
                         .with_context(|| path.display().to_string())?;
                     let written = Written {
                         key,
@@ -1467,7 +1468,9 @@ pub fn state(plan_file: &HostPath, layer: &HostPath, extensions: &crate::ext::Ex
             for ((node, file), written) in held {
                 if written.key != key {
                     other += 1;
-                } else if written.present() && !crate::content::exists(&on_disk(&plan, layer, node, file, written)) {
+                } else if written.present()
+                    && !crate::content::exists(extensions.io(), &on_disk(&plan, layer, node, file, written))
+                {
                     gone += 1;
                 }
             }
@@ -1520,7 +1523,12 @@ impl Checked {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn verify(plan_file: &HostPath, layer: &HostPath, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
+pub fn verify(
+    plan_file: &HostPath,
+    layer: &HostPath,
+    versions: &dyn Fn(&str) -> String,
+    io: &std::sync::Arc<dyn pe2_io::Io>,
+) -> Result<Checked> {
     let mut plan = Plan::read(plan_file)?;
     let keys = plan.keys(versions);
     let record = read_record(&layer.join(&RECORD));
@@ -1554,9 +1562,9 @@ pub fn verify(plan_file: &HostPath, layer: &HostPath, versions: &dyn Fn(&str) ->
         }
         let path = on_disk(&plan, layer, node, file, written);
         if !written.present() {
-            return crate::content::exists(&path).then_some((2, name));
+            return crate::content::exists(io, &path).then_some((2, name));
         }
-        match crate::content::sha1(&path) {
+        match crate::content::sha1(io, &path) {
             Err(_) => Some((0, name)),
             Ok(sha1) if Some(sha1) != written.sha1 => Some((2, name)),
             Ok(_) => None,
@@ -1664,7 +1672,7 @@ mod tests {
             record.files.insert(("n".into(), name.into()), written);
         }
         let parsed = Plan::parse(&text).unwrap();
-        super::write_record(&layer.join(&super::RECORD), &parsed, &record).unwrap();
+        super::write_record(&pe2_io::SystemFilesystem, &layer.join(&super::RECORD), &parsed, &record).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
         // A release's own file the same as what the releases share is not kept: the shared one is it.
@@ -1676,7 +1684,7 @@ mod tests {
                 super::Written { key: "k".into(), sha1: Some(sha1_of(bytes.as_bytes())), size: 4, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
-        assert_eq!(super::share_alike(&parsed, &layer, &mut record), 1);
+        assert_eq!(super::share_alike(&pe2_io::system(), &parsed, &layer, &mut record), 1);
         assert!(!layer.at("n.node/EUR/own.bin").exists() && layer.at("n.node/EUR/inflated").exists());
         let own = &record.files[&("n".to_string(), "EUR/own.bin".to_string())];
         assert!(own.shared);

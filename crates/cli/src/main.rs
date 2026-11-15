@@ -1192,8 +1192,7 @@ fn add_from(
     label: String,
 ) -> Result<project::ext::component::About> {
     if extensions::archive::is_archive(from) {
-        let unpacked =
-            extensions::archive::unpack(from, p.io.environment()).with_context(|| from.display().to_string())?;
+        let unpacked = extensions::archive::unpack(from, &p.io).with_context(|| from.display().to_string())?;
         return project::switches::add_extension(p, &unpacked.folder, into, history, label);
     }
     project::switches::add_extension(p, from, into, history, label)
@@ -1277,7 +1276,7 @@ fn added(p: &project::Project, about: &project::ext::component::About) {
     let install = about.described.install.as_ref().zip(held.as_ref());
     if let Some((page, text)) = install.and_then(|(page, held)| {
         let within = pe2_path::RelPath::new(page).ok()?;
-        Some((page, project::content::read_to_string(&held.join(&within)).ok()?))
+        Some((page, project::content::read_to_string(&p.io, &held.join(&within)).ok()?))
     }) {
         println!("What it needs on this machine, fetched or installed ({page}):\n");
         for line in text.lines() {
@@ -1353,7 +1352,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
             let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(id.as_str()));
             let held =
                 held.with_context(|| format!("the project holds no {id}: `pe2-cli project extension add {id}`"))?;
-            let was = project::ext::folder::manifest(&held).map_or_default(|about| about.version);
+            let was = project::ext::folder::manifest(&held, &p.io).map_or_default(|about| about.version);
             let from = match from {
                 Some(from) => from,
                 None => kept_folder(&p, &id)?,
@@ -2032,7 +2031,7 @@ fn verify_layer(project: &Path, only: Option<&pe2_path::Name>) -> Result<()> {
     let extensions = project_extensions(&p);
     let mut whole = true;
     for layer in generated_layers(&p, only)? {
-        let checked = project::plan::verify(&layer.plan(), &layer.path, &|id| extensions.version_of(id))?;
+        let checked = project::plan::verify(&layer.plan(), &layer.path, &|id| extensions.version_of(id), &p.io)?;
         for (what, files) in [("missing", &checked.missing), ("stale", &checked.stale), ("changed", &checked.changed)] {
             for file in files.iter().take(20) {
                 println!("{}: {what}: {file}", layer.name);

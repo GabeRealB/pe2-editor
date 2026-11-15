@@ -60,7 +60,7 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
 fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
     let root = editor.workspace().project.root.clone();
-    let space = project::shared::space(&root).expect("the shared space");
+    let space = project::shared::space(&root, &pe2_io::SystemFilesystem).expect("the shared space");
     // What a serving would say due: a folder, one in it, and a removal of what is not there - so already.
     let folder = |path: &str| vfs::ops::Op::Folder { path: tree(path) };
     let ops = [folder("made"), folder("made/inside"), vfs::ops::Op::Remove { path: tree("never") }];
@@ -93,7 +93,7 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
 fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
     let root = editor.workspace().project.root.clone();
-    let space = project::shared::space(&root).expect("the shared space");
+    let space = project::shared::space(&root, &pe2_io::SystemFilesystem).expect("the shared space");
     let outside = editor.workspace().outside();
     let folder = |path: &str| vfs::ops::Op::Folder { path: tree(path) };
     let edit =

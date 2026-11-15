@@ -69,8 +69,12 @@ impl Fixture {
     pub fn notes_under_records() -> Fixture {
         let fixture = Fixture::notes();
         fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"top\"\n"));
-        project::records::mark(&fixture.root.at(".layers/top"), &project::records::Settings::default())
-            .expect("a records layer");
+        project::records::mark(
+            &pe2_io::SystemFilesystem,
+            &fixture.root.at(".layers/top"),
+            &project::records::Settings::default(),
+        )
+        .expect("a records layer");
         fixture
     }
 

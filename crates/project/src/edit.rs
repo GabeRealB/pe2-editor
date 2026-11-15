@@ -83,8 +83,8 @@ fn shown_free(index: &Index, changeset: &Changeset, path: &TreePath, going: &[&T
 }
 
 /// Whether a layer holds a file or a folder at a path: on disk, or as its store or records keep it.
-fn holds(path: &HostPath) -> bool {
-    path.exists() || crate::content::exists(path) || crate::pack::is_dir(path)
+fn holds(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
+    io.filesystem().exists(path) || crate::content::exists(io, path) || crate::pack::is_dir(io, path)
 }
 
 /// What an edit does to a layer's files and its list, through its step: on a layer stored as a tree, at once; on a
@@ -172,7 +172,7 @@ impl<'a, 'h> Out<'a, 'h> {
             return bytes.is_some();
         }
         // A tree layer's files are as the step's changes so far leave them: none of them is on disk yet.
-        self.tx.pending(path).unwrap_or_else(|| holds(&self.tx.on_disk(path)))
+        self.tx.pending(path).unwrap_or_else(|| holds(&self.project.io, &self.tx.on_disk(path)))
     }
 
     /// Done with the layer: what was written of a records layer's files must be in its records, or it would be lost.
@@ -241,12 +241,12 @@ fn own_copy(
     let mut files = BTreeMap::new();
     // Code is edited where it is, with its own tools: a files layer holds a copy of what it overrides at once.
     if layer.kind == crate::LayerKind::Files {
-        let store = crate::chunks::Store::at(&project_root(layer));
+        let store = crate::chunks::Store::at(&project_root(layer), index.io().clone());
         for (file, source) in &below.files {
-            let bytes = crate::content::read(source).with_context(|| source.display().to_string())?;
+            let bytes = crate::content::read(index.io(), source).with_context(|| source.display().to_string())?;
             let disk = if file.is_root() { layer.disk(&at) } else { layer.disk(&at).join(file) };
             out.write(&disk, &bytes)?;
-            let was = store.put_file(&bytes, index.io().clock().wall())?;
+            let was = store.put_file(&bytes)?;
             files.insert(file.clone(), Base { was: Some(was), removed: false });
         }
     }
@@ -337,7 +337,7 @@ fn put_files(
     };
     let below =
         at.index.below(at.layer_name, at.uid).with_context(|| format!("{} is gone below {}", at.uid, at.layer_name))?;
-    let store = crate::chunks::Store::at(&at.project.root);
+    let store = crate::chunks::Store::at(&at.project.root, at.project.io.clone());
     for (file, bytes) in files {
         let disk = at.disk(file);
         let now = below.files.iter().find(|(name, _)| name == *file).map(|(_, path)| path);
@@ -354,7 +354,7 @@ fn put_files(
             Some(bytes) => {
                 out.write(&disk, bytes)?;
                 if let Some(now) = now {
-                    store.put_file(&crate::content::read(now)?, at.project.io.clock().wall())?;
+                    store.put_file(&crate::content::read(&at.project.io, now)?)?;
                 }
                 bases.insert((*file).to_owned(), Base { was: now_sha1, removed: false });
             }
@@ -666,7 +666,7 @@ pub fn forget(
     let path = changeset.entries.get(&uid).cloned().with_context(|| format!("{layer_name} does not list {uid}"))?;
     // What the index leaves out is no entry, whatever is on disk: an extension's folder, listed by an older editor.
     anyhow::ensure!(
-        index.leaves_out(layer_name, &path) || !holds(&layer.disk(&path)),
+        index.leaves_out(layer_name, &path) || !holds(index.io(), &layer.disk(&path)),
         "{layer_name} still holds {path}"
     );
     let mut tx = history.begin(format!("Forget {}", name(&path)));
@@ -844,7 +844,7 @@ pub fn resolve(
         (Resolution::KeepMine, Op::Override { files, to }) => {
             let below = below.with_context(|| format!("{uid} is gone below {layer_name}"))?;
             let at = at.unwrap_or_else(|| below.path.clone());
-            let store = crate::chunks::Store::at(&project.root);
+            let store = crate::chunks::Store::at(&project.root, project.io.clone());
             let mut tx = history.begin(format!("Keep my version of {shown}"));
             let mut out = Out::new(&mut tx, project, index, layer);
             let place = Place { project, index, layer, layer_name, uid, path: &at };
@@ -858,13 +858,13 @@ pub fn resolve(
                     && let (Some(was), Some(now)) = (&base.was, now)
                     && let Ok(old) = store.get_file(was)
                 {
-                    let mine = crate::content::read(&place.disk(file))?;
+                    let mine = crate::content::read(&project.io, &place.disk(file))?;
                     let shown = if file.is_root() { name(&at) } else { file.to_string() };
-                    let merged = crate::merge::merge(&shown, &old, &crate::content::read(now)?, &mine);
+                    let merged = crate::merge::merge(&shown, &old, &crate::content::read(&project.io, now)?, &mine);
                     out.write(&place.disk(file), &merged.bytes)?;
                 }
                 if let Some(now) = now {
-                    store.put_file(&crate::content::read(now)?, project.io.clock().wall())?;
+                    store.put_file(&crate::content::read(&project.io, now)?)?;
                 }
                 kept.insert(file.clone(), Base { was: now_sha1, removed: base.removed });
             }
@@ -1418,7 +1418,8 @@ mod tests {
     #[test]
     fn an_edit_to_a_records_layer_refreshes_what_it_changed_alone() {
         let root = project("records-refresh");
-        crate::records::mark(&root.at(".layers/top"), &crate::records::Settings::default()).unwrap();
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+            .unwrap();
         let mut o = open(&root);
         let declaration = "stack = [{ op = \"t.file\" }]\n";
         for (uid, path) in [("uid://one1", "h/one"), ("uid://two2", "h/two")] {
@@ -1451,7 +1452,7 @@ mod tests {
         assert_eq!(refreshed.assets.iter().map(|path| path.as_str()).collect::<Vec<_>>(), ["h/one"]);
         assert!(!refreshed.restacked, "a content changed applies the stack again");
         let extra = o.index.assets[&tree("h/one")].files.iter().find(|f| *f.name == *"extra.txt").unwrap().path.clone();
-        assert_eq!(crate::content::read(&extra).unwrap(), b"again");
+        assert_eq!(crate::content::read(&crate::testing::io(), &extra).unwrap(), b"again");
         // Renamed: the stack applied again, both places taken in.
         let paths = super::rename(
             &o.project,
@@ -1478,7 +1479,8 @@ mod tests {
             "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n",
         )
         .unwrap();
-        crate::records::mark(&root.at(".layers/top"), &crate::records::Settings::default()).unwrap();
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+            .unwrap();
         let mut o = open(&root);
         let node = |text: &str| format!("stack = [{{ op = \"t.file\" }}]\n{text}");
         let make = |o: &mut Open, uid: &str, path: &str, text: &str| {
@@ -1553,7 +1555,8 @@ mod tests {
     #[test]
     fn a_long_text_in_a_records_layer_is_read_back() {
         let root = project("long");
-        crate::records::mark(&root.at(".layers/top"), &crate::records::Settings::default()).unwrap();
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+            .unwrap();
         let mut o = open(&root);
         // Text is kept in its record whatever its length: here longer than what a layer keeps as chunks.
         let long = "a line of a long text\n".repeat(60_000);
@@ -1569,12 +1572,12 @@ mod tests {
         .unwrap();
         o.refresh(&paths);
         let entry = o.index.entries.get(&tree("long.txt")).expect("the file is an entry of the project");
-        assert_eq!(crate::content::read(&entry.disk).unwrap(), long.as_bytes());
+        assert_eq!(crate::content::read(&crate::testing::io(), &entry.disk).unwrap(), long.as_bytes());
         // And by a reading afresh, as the next process to take the project reads it.
         drop(o);
         let o = open(&root);
         let entry = o.index.entries.get(&tree("long.txt")).expect("read again, it is there");
-        assert_eq!(crate::content::read(&entry.disk).unwrap().len(), long.len());
+        assert_eq!(crate::content::read(&crate::testing::io(), &entry.disk).unwrap().len(), long.len());
         drop(o);
         crate::cache::remove_all(&root);
     }
@@ -1582,7 +1585,8 @@ mod tests {
     #[test]
     fn a_records_layer_is_edited_as_a_tree_is() {
         let root = project("records");
-        crate::records::mark(&root.at(".layers/top"), &crate::records::Settings::default()).unwrap();
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+            .unwrap();
         let mut o = open(&root);
         let only_records = |root: &HostPath| {
             let held: Vec<String> = std::fs::read_dir(root.at(".layers/top"))
@@ -1607,7 +1611,7 @@ mod tests {
         let made = &o.index.assets[&tree("h/made")];
         assert_eq!((made.layers.as_slice(), made.text()), ([crate::testing::name("top")].as_slice(), declaration));
         let extra = made.files.iter().find(|f| *f.name == *"extra.txt").unwrap();
-        assert_eq!(crate::content::read(&extra.path).unwrap(), b"hi");
+        assert_eq!(crate::content::read(&crate::testing::io(), &extra.path).unwrap(), b"hi");
         assert!(o.index.entries.contains_key(&tree("h")), "the folder it is in, made with it");
         // One of its files written again: its own record.
         let paths = super::write_file(
@@ -1625,7 +1629,7 @@ mod tests {
         o.refresh(&paths);
         let extra =
             o.index.assets[&tree("h/made")].files.iter().find(|f| *f.name == *"extra.txt").unwrap().path.clone();
-        assert_eq!(crate::content::read(&extra).unwrap(), b"again");
+        assert_eq!(crate::content::read(&crate::testing::io(), &extra).unwrap(), b"again");
         only_records(&root);
         // An override of a node below: what it writes held whole, merged over a change below.
         let a = o.uid("g/a.node");

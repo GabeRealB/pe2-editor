@@ -76,7 +76,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let p = Project::load(directory)?;
     let (serving, address) = serving_of(&p, backend, address)?;
     let _one = ROLE.claim(&p.root)?;
-    let shared = project::shared::space(&p.root).context("the space the project's processes share")?;
+    let shared =
+        project::shared::space(&p.root, p.io.filesystem()).context("the space the project's processes share")?;
     // What a serving before this one said due it says again itself - from the log, or as it finds the folder.
     vfs::due::clear(&shared).context("what is due, where the project's processes share it")?;
     // What is read of its files is kept in a ring of pages, in memory every process of the project can name.
@@ -94,7 +95,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let server = Arc::new(Server {
         project: p.clone(),
         // The tree it serves is the shared filesystem itself, read as it is asked: nothing of it is kept here.
-        served: vfs::Served::shared(shared.clone(), ring.clone()),
+        served: vfs::Served::shared(shared.clone(), ring.clone(), p.io.clone()),
         shared,
         serving,
         address,

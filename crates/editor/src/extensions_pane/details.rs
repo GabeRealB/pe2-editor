@@ -41,7 +41,8 @@ pub(super) fn details_ui(
     cards.card(ui, |ui| settings_ui(ui, ws, p, user));
     cards.card(ui, |ui| requires_ui(ui, p, present, state));
     cards.card(ui, |ui| required_by_ui(ui, p, present, state));
-    cards.card(ui, |ui| documents_ui(ui, p, message));
+    let io = ws.project.io.clone();
+    cards.card(ui, |ui| documents_ui(ui, p, message, &io));
     cards.card(ui, |ui| registers_ui(ui, p));
     cards.finish(ui);
 }
@@ -102,7 +103,7 @@ fn about_ui(ui: &mut egui::Ui, ws: &Workspace, all: &[Present], p: &Present) {
             }
             match &p.origin {
                 // Held by a layer: kept whole as a tree, laid out where it runs from.
-                Origin::Project(path) if let Some(held) = project::records::held(path) => {
+                Origin::Project(path) if let Some(held) = project::records::held(&ws.project.io, path) => {
                     row("Held by", held.layer.file_name().map_or_default(|n| n.to_string_lossy().into_owned()));
                     row("Tree", held.tree.to_string());
                 }
@@ -425,15 +426,16 @@ const LINKED: &str = "licenses/LINKED.txt";
 
 /// What an extension's folder holds to be read: its guides, what to install first, the licenses of what it ships and
 /// what its component is built with, each opened as it is.
-fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
+fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>, io: &std::sync::Arc<dyn pe2_io::Io>) {
     // An archive's are read once it is added and unpacked.
-    let Some(folder) = p.origin.folder().filter(|folder| project::pack::is_dir(folder)) else { return };
+    let Some(folder) = p.origin.folder().filter(|folder| project::pack::is_dir(io, folder)) else { return };
     let described = &p.described;
     let pages = [("Guides", described.docs.as_deref()), ("Installation", described.install.as_deref())];
     let pages: Vec<(&str, &str)> = pages.into_iter().filter_map(|(label, page)| Some((label, page?))).collect();
     // What its component is built with, each license's text with it: written into its folder as it is laid out to
     // ship (`cargo xtask dist`). A built-in one's is the editor's own (Settings, Licenses).
-    let linked = Some(LINKED).filter(|file| project::pack::is_file(&folder.join(&pe2_path::RelPath::constant(file))));
+    let linked =
+        Some(LINKED).filter(|file| project::pack::is_file(io, &folder.join(&pe2_path::RelPath::constant(file))));
     if pages.is_empty() && described.bundled.is_empty() && linked.is_none() {
         return;
     }
@@ -442,7 +444,7 @@ fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
         let file = folder.join(&page);
         if ui.link(label).on_hover_text(file.display().to_string()).clicked() {
             // Handed to a program as a file: one a project holds, through the filesystem it is served as.
-            let opened = project::content::for_program(&file).map_err(|e| format!("{}: {e}", file.display()));
+            let opened = project::content::for_program(io, &file).map_err(|e| format!("{}: {e}", file.display()));
             if let Err(e) = opened.and_then(|file| crate::external::open_default(&file)) {
                 *message = Some(e);
             }
@@ -595,7 +597,7 @@ fn adding_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
             let work = move |w: &mut crate::takein::Worker| {
                 // An archive is unpacked first, and copied in as its folder.
                 let unpacked = extensions::archive::is_archive(&folder)
-                    .then(|| extensions::archive::unpack(&folder, w.core.project.io.environment()));
+                    .then(|| extensions::archive::unpack(&folder, &w.core.project.io));
                 let unpacked = unpacked.transpose()?;
                 let from = unpacked.as_ref().map_or(&folder, |unpacked| &unpacked.folder);
                 let about = project::switches::add_extension(&w.core.project, from, None, &mut w.history, to)?;

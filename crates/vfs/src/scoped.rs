@@ -73,11 +73,12 @@ impl Scopes {
     pub fn install(machine: impl Fn() -> Machine + Send + 'static) -> Scopes {
         let scopes = Arc::new(Mutex::new(Held { scopes: BTreeMap::new(), machine: Box::new(machine) }));
         let held = Arc::clone(&scopes);
-        let exposing = project::content::expose_with(None, move |disk| {
-            expose(&mut held.lock().unwrap_or_else(std::sync::PoisonError::into_inner), disk)
+        let exposing = project::content::expose_with(None, move |io, disk| {
+            expose(&mut held.lock().unwrap_or_else(std::sync::PoisonError::into_inner), io, disk)
         });
         let held = Arc::clone(&scopes);
-        let serving = project::content::serve_folders_with(move |root, files, how| serve(&held, root, files, how));
+        let serving =
+            project::content::serve_folders_with(move |io, root, files, how| serve(&held, io, root, files, how));
         Scopes { held: scopes, _exposing: exposing, _serving: serving }
     }
 
@@ -111,22 +112,22 @@ fn project_of(disk: &HostPath) -> Option<HostPath> {
 }
 
 /// Serve a layer's file in its project's scope, mounting it first where it is not: its path there.
-fn expose(held: &mut Held, disk: &HostPath) -> io::Result<HostPath> {
+fn expose(held: &mut Held, io: &std::sync::Arc<dyn pe2_io::Io>, disk: &HostPath) -> io::Result<HostPath> {
     let root =
         project_of(disk).ok_or_else(|| io::Error::other(format!("{}: in no project's layers", disk.display())))?;
     let machine = (held.machine)();
     // One file of a layer given to a program: read in ranges as often as whole, and nothing else of the scope. A
     // small one is as well copied.
     let how = Use { ranges: true, often: false };
-    let written = project::content::len(disk).unwrap_or(u64::MAX);
+    let written = project::content::len(io, disk).unwrap_or(u64::MAX);
     let backend = chosen(&root, &machine, &how, written)?;
     let scope = scope_of(&mut held.scopes, &root);
-    let sha1 = project::content::sha1(disk)?;
+    let sha1 = project::content::sha1(io, disk)?;
     let name = disk.file_name().map_or_else(|| "content".into(), |n| n.to_string_lossy().into_owned());
     let path = RelPath::new(&format!("{sha1}/{name}")).map_err(io::Error::other)?.to_owned();
     if !scope.files.contains_key(&*path) {
         scope.files.insert(path.clone(), Given::Disk(disk.clone()));
-        scope.served.set_files(&scope.files);
+        scope.served.set_files(&scope.files, io);
     }
     mount(scope, &root, backend)?;
     scope.placed(&path);
@@ -150,6 +151,7 @@ fn scope_of<'a>(scopes: &'a mut BTreeMap<HostPath, Scope>, root: &HostPath) -> &
 /// is dropped.
 fn serve(
     held: &Arc<Mutex<Held>>,
+    io: &std::sync::Arc<dyn pe2_io::Io>,
     root: Option<&HostPath>,
     files: &BTreeMap<Arc<GivenPath>, Given>,
     how: &Use,
@@ -159,14 +161,14 @@ fn serve(
     let mut scopes = held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let machine = (scopes.machine)();
     // Laid out instead where that suits better: nothing is served, and whoever asked lays them out.
-    let backend = chosen(&root, &machine, how, project::content::written_to_lay_out(files))?;
+    let backend = chosen(&root, &machine, how, project::content::written_to_lay_out(io, files))?;
     let run = Name::new(&format!("run-{}", RUN.fetch_add(1, Ordering::Relaxed))).map_err(io::Error::other)?.to_owned();
     let scope = scope_of(&mut scopes.scopes, &root);
     for (name, given) in files {
         scope.files.insert(run.as_rel().join_path(name.rel()), given.clone());
     }
-    scope.served.set_files(&scope.files);
-    let unserve = Unserve { held: Arc::clone(held), root: root.clone(), run: run.clone() };
+    scope.served.set_files(&scope.files, io);
+    let unserve = Unserve { held: Arc::clone(held), root: root.clone(), run: run.clone(), io: io.clone() };
     if let Err(e) = mount(scope, &root, backend) {
         drop(scopes);
         drop(unserve);
@@ -203,6 +205,8 @@ struct Unserve {
     held: Arc<Mutex<Held>>,
     root: HostPath,
     run: Arc<Name>,
+    /// The I/O what is served of it is read through.
+    io: std::sync::Arc<dyn pe2_io::Io>,
 }
 
 impl Drop for Unserve {
@@ -215,7 +219,7 @@ impl Drop for Unserve {
             mount.released(run);
         }
         scope.files.retain(|path, _| !path.starts_with(run));
-        scope.served.set_files(&scope.files);
+        scope.served.set_files(&scope.files, &self.io);
         scope.served.forget(run);
     }
 }
@@ -387,9 +391,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let file = root.at(".layers/top/a.node/movie.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        project::content::write(&file, &bytes, std::time::SystemTime::now()).expect("written");
+        project::content::write(&pe2_io::system(), &file, &bytes).expect("written");
         let scopes = scopes();
-        let given = project::content::for_program(&file).expect("given");
+        let given = project::content::for_program(&pe2_io::system(), &file).expect("given");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.
         let fuse = cfg!(windows) || std::path::Path::new("/dev/fuse").exists();
         assert_eq!(given.starts_with(&Scopes::at(&root)), fuse, "{}", given.display());
@@ -424,7 +428,8 @@ mod tests {
         ]);
         let scopes = scopes();
         let folder =
-            project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served");
+            project::content::serve_folder(&pe2_io::system(), Some(&root), &files, &once(), &root.at("fallback"))
+                .expect("served");
         if folder.at.starts_with(&Scopes::at(&root)) {
             // As another program would: this process's own removals are how a scope lets go of what it served.
             let run = |command: String| {
@@ -462,7 +467,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let chunked = root.at(".layers/top/a.node/big.bin");
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        project::content::write(&chunked, &big, std::time::SystemTime::now()).expect("written");
+        project::content::write(&pe2_io::system(), &chunked, &big).expect("written");
         let plain = root.at("plain.h");
         std::fs::write(&plain, "#define A 1\n").unwrap();
         let files = std::collections::BTreeMap::from([
@@ -475,7 +480,8 @@ mod tests {
         ]);
         let scopes = scopes();
         let fallback = root.at("fallback");
-        let folder = project::content::serve_folder(Some(&root), &files, &once(), &fallback).expect("served");
+        let folder =
+            project::content::serve_folder(&pe2_io::system(), Some(&root), &files, &once(), &fallback).expect("served");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.
         let fuse = cfg!(windows) || std::path::Path::new("/dev/fuse").exists();
         assert_eq!(folder.at.starts_with(&Scopes::at(&root)), fuse, "{}", folder.at.display());

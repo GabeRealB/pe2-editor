@@ -4135,6 +4135,8 @@ name = "pe2-io"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "libc",
+ "memmap2",
  "pe2-path",
  "serde",
  "serde_json",

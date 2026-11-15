@@ -582,7 +582,7 @@ pub fn create(directory: &Path) -> Result<()> {
     let own = directory.join(&LAYERS).join(&OWN);
     std::fs::create_dir_all(&own).with_context(|| directory.to_string())?;
     // Its own layer is records (`records`).
-    records::mark(&own, &records::Settings::default())?;
+    records::mark(&pe2_io::SystemFilesystem, &own, &records::Settings::default())?;
     std::fs::write(&file, EMPTY).with_context(|| file.to_string())?;
     // Where it is served is no part of it, nor what was set aside from there.
     let ignore = directory.join(&IGNORE);
@@ -607,7 +607,14 @@ pub enum Storage {
 }
 
 /// How a layer says it is stored, its pack opened where it is packed.
-fn storage_of(root: &HostPath, layer: &Name, said: Option<&str>, generated: bool, path: &HostPath) -> Result<Storage> {
+fn storage_of(
+    root: &HostPath,
+    layer: &Name,
+    said: Option<&str>,
+    generated: bool,
+    path: &HostPath,
+    io: &Arc<dyn pe2_io::Io>,
+) -> Result<Storage> {
     let file = root.join(&FILE);
     let storage = match said {
         None | Some("text") => Storage::Text,
@@ -616,7 +623,7 @@ fn storage_of(root: &HostPath, layer: &Name, said: Option<&str>, generated: bool
         Some(other) => bail!("{}: the layer {layer}: no storage {other} (text, packed)", file.display()),
     };
     if storage == Storage::Packed {
-        pack::Pack::open(path).with_context(|| format!("{}: its pack", path.display()))?;
+        pack::Pack::open(path, io).with_context(|| format!("{}: its pack", path.display()))?;
     }
     Ok(storage)
 }
@@ -699,7 +706,7 @@ impl Project {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
             let read_only = l.read_only || generated;
-            let storage = storage_of(&root, &name, l.storage.as_deref(), generated, &path)?;
+            let storage = storage_of(&root, &name, l.storage.as_deref(), generated, &path, &io)?;
             let fills = l.fills.as_deref().map(layer_name).transpose()?;
             layers.push(Layer {
                 name,
@@ -792,7 +799,7 @@ impl Project {
                             return None;
                         }
                     };
-                    if records::held(&folder).is_none() {
+                    if records::held(&self.io, &folder).is_none() {
                         eprintln!("{}: {id}: its tree {tree} is not in the store", layer.name);
                         return None;
                     }
@@ -843,6 +850,12 @@ impl Project {
 /// What tests of a project share.
 #[cfg(test)]
 pub(crate) mod testing {
+    /// The system's I/O, as every test that is given none reads and writes with.
+    pub(crate) fn io() -> std::sync::Arc<dyn pe2_io::Io> {
+        static IO: std::sync::LazyLock<std::sync::Arc<dyn pe2_io::Io>> = std::sync::LazyLock::new(pe2_io::system);
+        IO.clone()
+    }
+
     use sfs::HostPath;
     pub use sfs::testing::{At, scratch};
     use std::sync::Arc;

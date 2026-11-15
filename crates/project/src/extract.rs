@@ -8,8 +8,6 @@ use sfs::HostPath;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::fs;
-use std::io::Read;
 use std::sync::Arc;
 
 use crate::changeset::Changeset;
@@ -33,15 +31,16 @@ pub fn sha1_of(bytes: &[u8]) -> pe2_ext::Sha1 {
     pe2_ext::Sha1::from_bytes(Sha1::digest(bytes).into())
 }
 
-pub(crate) fn sha1_file(path: &HostPath) -> Result<pe2_ext::Sha1> {
-    let mut f = fs::File::open(path)?;
-    let (mut h, mut buf) = (Sha1::new(), vec![0; 1 << 22]);
+pub(crate) fn sha1_file(files: &dyn pe2_io::Filesystem, path: &HostPath) -> Result<pe2_ext::Sha1> {
+    let file = files.open(path, pe2_io::Open::READ)?;
+    let (mut h, mut buf, mut at) = (Sha1::new(), vec![0; 1 << 22], 0);
     loop {
-        let n = f.read(&mut buf)?;
+        let n = file.read_at(&mut buf, at)?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
+        at += n as u64;
     }
     Ok(pe2_ext::Sha1::from_bytes(h.finalize().into()))
 }
@@ -120,7 +119,7 @@ impl crate::graph::exec::Node for Lent<'_> {
         self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
     }
 
-    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
+    fn read_content(&self, _io: &std::sync::Arc<dyn pe2_io::Io>, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let found = self.files.values().find(|bytes| sha1_of(bytes) == *sha1);
         found.cloned().with_context(|| format!("{}: no content {sha1}", self.path))
     }
@@ -250,14 +249,16 @@ struct Written {
     declaration: String,
     fields: toml::Table,
     sha1s: std::sync::Mutex<HashMap<Arc<RelPath>, pe2_ext::Sha1>>,
+    /// The project's I/O, which its files are read through.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Written {
-    fn open(layers: [&HostPath; 2], path: &str, uid: &str) -> Result<Written> {
+    fn open(layers: [&HostPath; 2], path: &str, uid: &str, io: &Arc<dyn pe2_io::Io>) -> Result<Written> {
         let bundle = format!("{path}{}", crate::index::BUNDLE_SUFFIX);
         let bundle = RelPath::new(&bundle)?;
         let dirs = layers.map(|layer| layer.join(&bundle));
-        let declaration = crate::content::read_to_string(&dirs[0].join(&crate::index::NODE_FILE))
+        let declaration = crate::content::read_to_string(io, &dirs[0].join(&crate::index::NODE_FILE))
             .with_context(|| format!("{path}: its node.toml"))?;
         let fields =
             crate::graph::with_settings(&declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
@@ -268,13 +269,14 @@ impl Written {
             declaration,
             fields,
             sha1s: std::sync::Mutex::default(),
+            io: io.clone(),
         })
     }
 
     /// A file's place: in the layer of its files, else beside the node.
     fn at(&self, name: &RelPath) -> HostPath {
         let filled = self.dirs[1].join(name);
-        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(name) }
+        if crate::content::exists(&self.io, &filled) { filled } else { self.dirs[0].join(name) }
     }
 }
 
@@ -300,29 +302,29 @@ impl crate::graph::exec::Node for Written {
         if let Some(sha1) = sha1s.get(name) {
             return Some(*sha1);
         }
-        let sha1 = crate::content::sha1(&self.at(name)).ok()?;
+        let sha1 = crate::content::sha1(&self.io, &self.at(name)).ok()?;
         sha1s.insert(name.to_owned(), sha1);
         Some(sha1)
     }
 
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let path = self.at(name);
-        crate::content::read(&path).with_context(|| path.display().to_string())
+        crate::content::read(&self.io, &path).with_context(|| path.display().to_string())
     }
 
     fn file_names(&self) -> Box<[Arc<pe2_ext::RelPath>]> {
         // What a bundle holds by a name no path takes is none of its files: the index says so (`Problem::Refused`).
         let names: BTreeSet<Arc<RelPath>> =
-            self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).0.into_keys()).collect();
+            self.dirs.iter().flat_map(|d| crate::index::bundle_files(&self.io, d).0.into_keys()).collect();
         names.into_iter().collect()
     }
 
     fn file_size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
-        crate::content::len(&self.at(name)).ok()
+        crate::content::len(&self.io, &self.at(name)).ok()
     }
 
     fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
-        crate::content::head(&self.at(name), len)
+        crate::content::head(&self.io, &self.at(name), len)
     }
 
     fn content_path(&self, sha1: &pe2_ext::Sha1) -> Option<HostPath> {
@@ -363,7 +365,7 @@ impl crate::graph::exec::World for Layer<'_> {
             None => self.uids.get(&crate::index::reference(reference)?.0.ok()?.to_string())?.as_str(),
         };
         let (path, (uid, slot)) = self.nodes.get_key_value(path)?;
-        let node = slot.get_or_init(|| Written::open(self.roots, path, uid).ok()).as_ref()?;
+        let node = slot.get_or_init(|| Written::open(self.roots, path, uid, &self.ops.io).ok()).as_ref()?;
         // Planned as the project plans it: its stack, then what its type offers beyond it (its settings among them).
         let tail = self.extensions.tail_of_shape(&std::sync::Arc::from(crate::graph::shape(&node.fields)));
         let (plan, _) = crate::graph::Plan::of(&node.fields, self.ops, &tail);

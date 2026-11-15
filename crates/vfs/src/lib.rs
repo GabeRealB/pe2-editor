@@ -73,6 +73,8 @@ pub struct Tree {
     of_files: bool,
     /// Where it holds no nodes of its own: what it reads them from.
     shared: Option<View>,
+    /// The I/O its files are read through.
+    io: pe2_io::Held,
 }
 
 /// An entry of a folder: its name as it is written, its number and its node.
@@ -191,7 +193,13 @@ impl View {
 
     /// Bytes of a file from `offset`, read into a buffer: page by page from the ring where it holds them, and
     /// where it does not, read where the file's content lives - all that is still asked for at once - and kept.
-    fn read_into(&self, ino: u64, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn read_into(
+        &self,
+        io: &std::sync::Arc<dyn pe2_io::Io>,
+        ino: u64,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> std::io::Result<usize> {
         use sfs::ring::{Key, PAGE};
         let path = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(ino).cloned();
         let found = path.and_then(|path| self.known(&path));
@@ -204,7 +212,7 @@ impl View {
         // A long file is read where it lives: read from one end to the other, the system has it there faster than
         // page by page from here, and it would take the place of very many short ones.
         let Some(ring) = self.ring.as_ref().filter(|_| node.size <= PAGED) else {
-            return project::content::read_range_into(disk, offset, buffer);
+            return project::content::read_range_into(io, disk, offset, buffer);
         };
         let end = node.size.min(offset.saturating_add(buffer.len() as u64));
         let mut at = offset;
@@ -223,7 +231,7 @@ impl View {
             // Not held: from this page on, all that is asked for, read where it lives at once.
             let ends = end.next_multiple_of(PAGE as u64).min(node.size.max(end));
             let mut read = vec![0u8; usize::try_from(ends - start).unwrap_or(0)];
-            let got = project::content::read_range_into(disk, start, &mut read)?;
+            let got = project::content::read_range_into(io, disk, start, &mut read)?;
             for (n, bytes) in read[..got].chunks(PAGE).enumerate() {
                 ring.put(&Key { number, version, page: key.page + n as u64 }, bytes);
             }
@@ -394,8 +402,12 @@ impl Tree {
 
     /// A tree of the files given, by their paths in it, each read where a layer stores it.
     #[must_use]
-    pub fn of_files(files: &BTreeMap<Arc<RelPath>, Given>, inodes: &mut Inodes) -> Tree {
-        let mut tree = Tree::default();
+    pub fn of_files(
+        files: &BTreeMap<Arc<RelPath>, Given>,
+        inodes: &mut Inodes,
+        io: &std::sync::Arc<dyn pe2_io::Io>,
+    ) -> Tree {
+        let mut tree = Tree { io: pe2_io::Held(io.clone()), ..Tree::default() };
         let root = Node {
             path: RelPath::root().to_owned(),
             parent: ROOT,
@@ -408,7 +420,7 @@ impl Tree {
         tree.nodes.insert(ROOT, Arc::new(root));
         for (path, given) in files {
             let (size, modified) = match given {
-                Given::Disk(disk) => project::content::stat(disk).unwrap_or((0, SystemTime::UNIX_EPOCH)),
+                Given::Disk(disk) => project::content::stat(io, disk).unwrap_or((0, SystemTime::UNIX_EPOCH)),
                 Given::Bytes(bytes) => (bytes.len() as u64, SystemTime::UNIX_EPOCH),
             };
             tree.file(path, given.clone(), size, modified, inodes);
@@ -628,10 +640,10 @@ impl Tree {
     /// It is no file of the tree, or it cannot be read.
     pub fn read_into(&self, ino: u64, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
         if let Some(view) = &self.shared {
-            return view.read_into(ino, offset, buffer);
+            return view.read_into(&self.io, ino, offset, buffer);
         }
         match self.node(ino).as_deref().map(|n| &n.what) {
-            Some(What::File(Given::Disk(disk))) => project::content::read_range_into(disk, offset, buffer),
+            Some(What::File(Given::Disk(disk))) => project::content::read_range_into(&self.io, disk, offset, buffer),
             Some(What::File(Given::Bytes(bytes))) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
                 let read = (bytes.len() - start).min(buffer.len());
@@ -652,12 +664,12 @@ impl Tree {
             // No more than the file has left: nothing is made for what it has not.
             let left = self.node(ino).map_or(0, |node| node.size.saturating_sub(offset));
             let mut read = vec![0u8; len.min(usize::try_from(left).unwrap_or(usize::MAX))];
-            let got = view.read_into(ino, offset, &mut read)?;
+            let got = view.read_into(&self.io, ino, offset, &mut read)?;
             read.truncate(got);
             return Ok(read);
         }
         match self.node(ino).as_deref().map(|n| &n.what) {
-            Some(What::File(Given::Disk(disk))) => project::content::read_range(disk, offset, len),
+            Some(What::File(Given::Disk(disk))) => project::content::read_range(&self.io, disk, offset, len),
             Some(What::File(Given::Bytes(bytes))) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
                 Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
@@ -830,11 +842,11 @@ impl Served {
     /// as it is asked, nothing of it held here - its files' content through a ring of pages, where one is given.
     /// What a project's server serves.
     #[must_use]
-    pub fn shared(space: Arc<sfs::Space>, ring: Option<Arc<sfs::ring::Ring>>) -> Served {
+    pub fn shared(space: Arc<sfs::Space>, ring: Option<Arc<sfs::ring::Ring>>, io: Arc<dyn pe2_io::Io>) -> Served {
         let served = Served::default();
         let view = View { space, inodes: served.inodes.clone(), found: Arc::default(), ring };
         *served.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Arc::new(Tree { shared: Some(view), ..Tree::default() });
+            Arc::new(Tree { shared: Some(view), io: pe2_io::Held(io), ..Tree::default() });
         served
     }
 
@@ -934,11 +946,11 @@ impl Served {
         }
     }
 
-    /// Serve a tree of the files given (`Tree::of_files`).
-    pub fn set_files(&self, files: &BTreeMap<Arc<RelPath>, Given>) {
+    /// Serve a tree of the files given (`Tree::of_files`), read through `io`.
+    pub fn set_files(&self, files: &BTreeMap<Arc<RelPath>, Given>, io: &Arc<dyn pe2_io::Io>) {
         let tree = {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            Tree::of_files(files, &mut inodes)
+            Tree::of_files(files, &mut inodes, io)
         };
         self.put(tree);
     }
@@ -1110,7 +1122,7 @@ mod tests {
     fn viewed(listing: &Listing) -> (std::sync::Arc<sfs::Space>, super::Served) {
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
         project::shared::say_whole(&space, listing, &pe2_io::SystemClock).unwrap();
-        let served = super::Served::shared(space.clone(), None);
+        let served = super::Served::shared(space.clone(), None, pe2_io::system());
         (space, served)
     }
 
@@ -1185,7 +1197,7 @@ mod tests {
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
         project::shared::say_whole(&space, &listing, &pe2_io::SystemClock).unwrap();
         let ring = std::sync::Arc::new(sfs::ring::Ring::private(1 << 20).unwrap());
-        let served = super::Served::shared(space.clone(), Some(ring));
+        let served = super::Served::shared(space.clone(), Some(ring), pe2_io::system());
         let (tree, a) = (served.tree(), served.ino(p("a.bin")));
         // Whatever is asked - within a page, across pages, past the end - is what the file holds there.
         for (offset, len) in
@@ -1290,7 +1302,10 @@ mod tests {
         let served = super::Served::default();
         let bytes = |text: &str| project::content::Given::Bytes(std::sync::Arc::from(text.as_bytes()));
         let files = [("a/x.txt", "x"), ("a/sub/y.txt", "y"), ("b.txt", "b"), ("c/x.txt", "old")];
-        served.set_files(&files.into_iter().map(|(path, text)| (p(path).to_owned(), bytes(text))).collect());
+        served.set_files(
+            &files.into_iter().map(|(path, text)| (p(path).to_owned(), bytes(text))).collect(),
+            &pe2_io::system(),
+        );
         let (x, y) = (served.ino(p("a/x.txt")), served.ino(p("a/sub/y.txt")));
         // Onto a folder that is there: what it held goes.
         assert!(served.moved(p("a"), p("c")));

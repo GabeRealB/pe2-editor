@@ -69,7 +69,7 @@ pub fn inspector_ui(
 ) {
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)).cloned() else {
         if let Some((path, entry)) = subject.and_then(|s| ws.entry_at(s)) {
-            entry_ui(ui, path, entry, tools, message);
+            entry_ui(ui, path, entry, tools, message, &ws.project.io);
         } else {
             ui.label(RichText::new("Select an asset").color(theme::weak()));
         }
@@ -805,7 +805,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
             .files
             .iter()
             .find(|f| f.name == file)
-            .and_then(|f| project::content::read(&f.path).ok())
+            .and_then(|f| project::content::read(asset.io(), &f.path).ok())
             .is_some_and(|now| now == *bytes);
         let uid = uid_to_edit(asset).map_err(|_| format!("{} has no uid to be edited by", asset.path))?;
         return Ok((!unchanged).then(|| EditRequest::Write {
@@ -2120,6 +2120,7 @@ fn entry_ui(
     entry: &project::index::Entry,
     tools: &Tools,
     message: &mut Option<String>,
+    io: &std::sync::Arc<dyn pe2_io::Io>,
 ) {
     let name = path.name().unwrap_or_default();
     let (icon, kind) = match entry.kind {
@@ -2151,7 +2152,7 @@ fn entry_ui(
         });
         if entry.kind == project::index::Kind::File && ui.button(format!("{}  Open", icons::ARROW_SQUARE_OUT)).clicked()
         {
-            *message = Some(external::open(&entry.disk, path.as_str(), tools).unwrap_or_else(|e| e));
+            *message = Some(external::open(&entry.disk, path.as_str(), tools, io).unwrap_or_else(|e| e));
         }
     });
 }
@@ -2193,7 +2194,8 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 };
                 let open = ui.add(egui::Button::new(RichText::new(icons::ARROW_SQUARE_OUT)).frame(false));
                 if open.on_hover_text(hint).clicked() {
-                    *message = Some(external::open(&f.path, asset.path.as_str(), tools).unwrap_or_else(|e| e));
+                    *message =
+                        Some(external::open(&f.path, asset.path.as_str(), tools, asset.io()).unwrap_or_else(|e| e));
                 }
                 ui.end_row();
             }

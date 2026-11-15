@@ -200,8 +200,8 @@ impl Changeset {
     ///
     /// # Errors
     /// The file cannot be written.
-    pub fn save(&self, path: &HostPath) -> Result<()> {
-        write_atomic(path, self.render().as_bytes())
+    pub fn save(&self, fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Result<()> {
+        write_atomic(fs, path, self.render().as_bytes())
     }
 
     /// Whether `ignore` leaves out a path relative to the layer (a pattern matches a name in it; `*` stands for any

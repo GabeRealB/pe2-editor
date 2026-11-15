@@ -329,7 +329,7 @@ mod tests {
     fn log(name: &str) -> (HostPath, Log) {
         let dir = crate::testing::scratch(&format!("sfs-content-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
-        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
+        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }, &pe2_io::SystemFilesystem).unwrap();
         (dir, log)
     }
 

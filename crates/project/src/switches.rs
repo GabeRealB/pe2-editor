@@ -76,12 +76,12 @@ pub fn add_extension(
 ) -> Result<About> {
     let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
     // One that is only its manifest - programs and what they are fetched from - is checked as loading checks it.
-    let about = if folder::alone(from) {
-        folder::checked_alone(from).with_context(|| from.display().to_string())?
+    let about = if folder::alone(from, &project.io) {
+        folder::checked_alone(from, &project.io).with_context(|| from.display().to_string())?
     } else {
         let component = from.join(&EXTENSION_COMPONENT);
         let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
-        folder::checked(from, &bytes).with_context(|| from.display().to_string())?
+        folder::checked(from, &bytes, &project.io).with_context(|| from.display().to_string())?
     };
     let holding =
         || project.layers.iter().rev().find(|l| !l.mounted && matches!(held_in(l, &about.id), Some(Says::Holds(_))));
@@ -96,7 +96,7 @@ pub fn add_extension(
         "{} cannot hold extensions: the project does not write it",
         layer.name
     );
-    let (tree, _) = crate::chunks::Store::at(&project.root).put_folder(from, project.io.clock().wall())?;
+    let (tree, _) = crate::chunks::Store::at(&project.root, project.io.clone()).put_folder(from)?;
     let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree));
     let mut document = read(&project.root)?;
     let before = document.to_string();

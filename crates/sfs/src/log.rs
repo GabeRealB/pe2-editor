@@ -14,9 +14,9 @@
 //! the header: after a power loss it ends where the last whole record does.
 
 use crate::HostPath;
+use pe2_io::{Descriptor, Filesystem, LockKind, Mapping, Open};
 use pe2_path::Name;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
@@ -56,16 +56,18 @@ impl Default for Config {
 /// The log of the project whose library folder this is given.
 pub struct Log {
     dir: HostPath,
+    /// The folder of its segments.
+    segments: Box<dyn Descriptor>,
     header: Header,
     config: Config,
     /// One of this process's threads appends at a time; with it, the segments it has open to write.
-    appending: Mutex<HashMap<u64, File>>,
+    appending: Mutex<HashMap<u64, Box<dyn Descriptor>>>,
     /// The segments mapped to read.
-    maps: RwLock<HashMap<u64, Arc<memmap2::Mmap>>>,
+    maps: RwLock<HashMap<u64, Arc<Mapping>>>,
     /// How far this process has flushed the log to disk.
     flushed: Mutex<u64>,
     /// Held shared for as long as the log is open here.
-    attached: File,
+    attached: Box<dyn Descriptor>,
 }
 
 impl std::fmt::Debug for Log {
@@ -77,7 +79,7 @@ impl std::fmt::Debug for Log {
 /// Bytes of the log, read where they are mapped.
 #[derive(Clone)]
 pub struct Bytes {
-    map: Arc<memmap2::Mmap>,
+    map: Arc<Mapping>,
     start: usize,
     len: usize,
 }
@@ -86,7 +88,7 @@ impl std::ops::Deref for Bytes {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.map[self.start..self.start + self.len]
+        &self.map.as_slice()[self.start..self.start + self.len]
     }
 }
 
@@ -133,22 +135,8 @@ fn head(kind: u8, position: u64, body: &[&[u8]]) -> [u8; HEAD_BYTES] {
     out
 }
 
-#[cfg(unix)]
-fn write_at(file: &File, bytes: &[u8], at: u64) -> io::Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(file, bytes, at)
-}
-
-#[cfg(windows)]
-fn write_at(file: &File, mut bytes: &[u8], mut at: u64) -> io::Result<()> {
-    while !bytes.is_empty() {
-        let wrote = std::os::windows::fs::FileExt::seek_write(file, bytes, at)?;
-        if wrote == 0 {
-            return Err(io::ErrorKind::WriteZero.into());
-        }
-        bytes = &bytes[wrote..];
-        at += wrote as u64;
-    }
-    Ok(())
+fn write_at(file: &dyn Descriptor, bytes: &[u8], at: u64) -> io::Result<()> {
+    pe2_io::write_all_at(file, bytes, at)
 }
 
 impl Log {
@@ -157,19 +145,16 @@ impl Log {
     ///
     /// # Errors
     /// Its folder, header or segments cannot be made, opened or read.
-    pub fn open(dir: &HostPath, config: Config) -> io::Result<Log> {
-        let header = Header::open(dir)?;
+    pub fn open(dir: &HostPath, config: Config, filesystem: &dyn Filesystem) -> io::Result<Log> {
+        let folder = filesystem.open_folder(dir, true)?;
+        let header = Header::open(&*folder)?;
         // Laid out as it was made: every process reads the segments at the same size.
         let config = Config { segment: header.segment_or(config.segment), ..config };
-        std::fs::create_dir_all(dir.join(&DIR))?;
-        let attached = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(&ATTACHED))?;
+        let segments = filesystem.open_folder(&dir.join(&DIR), true)?;
+        let attached = folder.open_at(ATTACHED.as_rel(), Open::KEEP)?;
         let log = Log {
             dir: dir.clone(),
+            segments,
             header,
             config,
             appending: Mutex::default(),
@@ -178,7 +163,7 @@ impl Log {
             attached,
         };
         // One process opens at a time: who has it alone checks it before another counts on its tail.
-        log.header.file().lock()?;
+        log.header.file().lock(LockKind::Exclusive)?;
         let checked = (|| {
             // Alone with it - asked a few times: a process starting another holds, for a moment, what its threads
             // have open, the locks on it with it.
@@ -189,7 +174,7 @@ impl Log {
                     #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                log.attached.try_lock().is_ok()
+                log.attached.try_lock(LockKind::Exclusive).is_ok_and(|taken| taken)
             });
             #[cfg(test)]
             drop(asking);
@@ -197,7 +182,7 @@ impl Log {
                 log.header.set_tail(log.end_of_whole()?);
                 log.attached.unlock()?;
             }
-            log.attached.lock_shared()
+            log.attached.lock(LockKind::Shared)
         })();
         log.header.file().unlock()?;
         checked?;
@@ -210,16 +195,15 @@ impl Log {
     ///
     /// # Errors
     /// As `open`.
-    pub fn shared(dir: &crate::HostPath, config: Config) -> io::Result<Arc<Log>> {
+    pub fn shared(dir: &crate::HostPath, config: Config, filesystem: &dyn Filesystem) -> io::Result<Arc<Log>> {
         static OPEN: Mutex<Vec<(crate::HostPath, Weak<Log>)>> = Mutex::new(Vec::new());
-        std::fs::create_dir_all(dir)?;
         let dir = dir.clone();
         let mut open = lock(&OPEN);
         open.retain(|(_, log)| log.strong_count() > 0);
         if let Some(log) = open.iter().find(|(at, _)| *at == dir).and_then(|(_, log)| log.upgrade()) {
             return Ok(log);
         }
-        let log = Arc::new(Log::open(&dir, config)?);
+        let log = Arc::new(Log::open(&dir, config, filesystem)?);
         open.push((dir, Arc::downgrade(&log)));
         Ok(log)
     }
@@ -241,18 +225,18 @@ impl Log {
         self.config
     }
 
-    fn segment_path(&self, number: u64) -> HostPath {
+    fn segment_name(number: u64) -> Arc<Name> {
         let text = format!("{number:016x}.seg");
-        let segment = Name::new(&text).expect("a number's digits and `.seg` are a name");
-        self.dir.join(&DIR).join(&segment)
+        Name::new(&text).expect("a number's digits and `.seg` are a name").to_owned()
     }
 
     /// The segments there are, by number, lowest first.
     fn segments(&self) -> Vec<u64> {
-        let names =
-            std::fs::read_dir(self.dir.join(&DIR)).into_iter().flatten().flatten().map(|entry| entry.file_name());
-        let mut found: Vec<u64> =
-            names.filter_map(|name| u64::from_str_radix(name.to_str()?.strip_suffix(".seg")?, 16).ok()).collect();
+        let entries = self.segments.read_directory().unwrap_or_default();
+        let mut found: Vec<u64> = entries
+            .iter()
+            .filter_map(|entry| u64::from_str_radix(entry.name.to_str()?.strip_suffix(".seg")?, 16).ok())
+            .collect();
         found.sort_unstable();
         found
     }
@@ -288,13 +272,19 @@ impl Log {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a record larger than a segment"));
         }
         let mut files = lock(&self.appending);
-        self.header.file().lock()?;
+        self.header.file().lock(LockKind::Exclusive)?;
         let appended = self.append_locked(&mut files, kind, body, need);
         self.header.file().unlock()?;
         appended
     }
 
-    fn append_locked(&self, files: &mut HashMap<u64, File>, kind: u8, body: &[&[u8]], need: u64) -> io::Result<u64> {
+    fn append_locked(
+        &self,
+        files: &mut HashMap<u64, Box<dyn Descriptor>>,
+        kind: u8,
+        body: &[&[u8]],
+        need: u64,
+    ) -> io::Result<u64> {
         let size = self.config.segment;
         let mut tail = self.header.tail();
         // What does not fit the rest of a segment starts the next: the rest says so, where a head fits there.
@@ -331,35 +321,40 @@ impl Log {
     }
 
     /// The file of a segment, open to write: made, of a segment's whole length, where it is not there.
-    fn segment_file<'a>(&self, files: &'a mut HashMap<u64, File>, number: u64) -> io::Result<&'a File> {
+    fn segment_file<'a>(
+        &self,
+        files: &'a mut HashMap<u64, Box<dyn Descriptor>>,
+        number: u64,
+    ) -> io::Result<&'a dyn Descriptor> {
         if !files.contains_key(&number) {
-            let path = self.segment_path(number);
-            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
-            if file.metadata()?.len() < self.config.segment {
+            let file = self.segments.open_at(Log::segment_name(number).as_rel(), Open::KEEP)?;
+            if file.stat()?.size < self.config.segment {
                 // Of its whole length from the start, for who maps it. Not sparse: where that has to be asked for,
                 // what is read of such a file through a mapping right after it was written is read a hundred
                 // times slower (measured: 4.1 s where it took 26 ms).
-                file.set_len(self.config.segment)?;
+                file.set_size(self.config.segment)?;
             }
             // Those long behind are let go of: a process appends to one or two at a time.
             files.retain(|open, _| open + 2 > number);
             files.insert(number, file);
         }
-        Ok(&files[&number])
+        Ok(&*files[&number])
     }
 
     /// A segment mapped to read: whole, as its file is from the moment it is made.
-    fn map(&self, number: u64) -> io::Result<Arc<memmap2::Mmap>> {
+    fn map(&self, number: u64) -> io::Result<Arc<Mapping>> {
         if let Some(map) = self.maps.read().unwrap_or_else(PoisonError::into_inner).get(&number) {
             return Ok(map.clone());
         }
-        let file = File::open(self.segment_path(number))?;
-        if file.metadata()?.len() < self.config.segment {
+        let file = self.segments.open_at(Log::segment_name(number).as_rel(), Open::READ)?;
+        let len = file.stat()?.size;
+        if len < self.config.segment {
             return Err(io::Error::new(io::ErrorKind::NotFound, "a segment not whole yet"));
         }
+        let len = usize::try_from(len).map_err(io::Error::other)?;
         // SAFETY: a segment's file is only ever written by appends past the tail, and read only before it: what is
         // read does not change under the mapping. It is never made shorter while it is there.
-        let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        let map = Arc::new(unsafe { file.map(len, false)? });
         let mut maps = self.maps.write().unwrap_or_else(PoisonError::into_inner);
         // Those wholly before what the project has on disk are let go of: whoever lets go of the log can then
         // remove them, on a system that keeps a mapped file.
@@ -383,7 +378,7 @@ impl Log {
             }
             let map = self.map(position / size)?;
             let at = usize::try_from(position % size).unwrap_or(usize::MAX);
-            let head = &map[at..at + HEAD_BYTES];
+            let head = &map.as_slice()[at..at + HEAD_BYTES];
             let len = u64::from(u32::from_le_bytes(head[..4].try_into().unwrap_or_default()));
             let kind = head[4];
             let said = u64::from_le_bytes(head[8..16].try_into().unwrap_or_default());
@@ -480,7 +475,8 @@ impl Log {
         let upto = self.header.tail().max(upto);
         for number in *flushed / size..=(upto.saturating_sub(1)) / size {
             // Open to write: a system may flush only what could have been written through the handle.
-            match std::fs::OpenOptions::new().write(true).open(self.segment_path(number)) {
+            let open = Open { write: true, ..Open::default() };
+            match self.segments.open_at(Log::segment_name(number).as_rel(), open) {
                 Ok(file) => file.sync_data()?,
                 // Let go of: all it held is the project's, on disk.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -499,7 +495,9 @@ impl Log {
         let old: Vec<u64> = self.segments().into_iter().filter(|number| *number < keep_from).collect();
         lock(&self.appending).retain(|number, _| *number >= keep_from);
         self.maps.write().unwrap_or_else(PoisonError::into_inner).retain(|number, _| *number >= keep_from);
-        old.into_iter().filter(|number| std::fs::remove_file(self.segment_path(*number)).is_ok()).count()
+        old.into_iter()
+            .filter(|number| self.segments.unlink_file_at(Log::segment_name(*number).as_rel()).is_ok())
+            .count()
     }
 }
 
@@ -524,7 +522,7 @@ mod tests {
     #[test]
     fn what_is_appended_is_read_where_it_says_in_order() {
         let dir = folder("order");
-        let log = Log::open(&dir, SMALL).unwrap();
+        let log = Log::open(&dir, SMALL, &pe2_io::SystemFilesystem).unwrap();
         let first = log.append(1, &[b"one"]).unwrap();
         let second = log.append(2, &[b"two", b" parts"]).unwrap();
         assert_eq!((first, second), (0, HEAD + 8));
@@ -545,7 +543,7 @@ mod tests {
     #[test]
     fn a_record_that_does_not_fit_a_segments_rest_starts_the_next() {
         let dir = folder("segments");
-        let log = Log::open(&dir, SMALL).unwrap();
+        let log = Log::open(&dir, SMALL, &pe2_io::SystemFilesystem).unwrap();
         let body = [7u8; 1500];
         let at: Vec<u64> = (0..5).map(|_| log.append(3, &[&body]).unwrap()).collect();
         // Two fit a segment of 4096, the third starts the second segment.
@@ -561,7 +559,9 @@ mod tests {
     #[test]
     fn several_threads_append_and_none_is_lost_or_torn() {
         let dir = folder("threads");
-        let log = std::sync::Arc::new(Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap());
+        let log = std::sync::Arc::new(
+            Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }, &pe2_io::SystemFilesystem).unwrap(),
+        );
         let threads: Vec<_> = (0..8u8)
             .map(|thread| {
                 let log = log.clone();
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn the_log_ends_where_its_last_whole_record_does() {
         let dir = folder("torn");
-        let log = Log::open(&dir, SMALL).unwrap();
+        let log = Log::open(&dir, SMALL, &pe2_io::SystemFilesystem).unwrap();
         let first = log.append(1, &[b"whole"]).unwrap();
         let second = log.append(1, &[b"torn by a loss of power"]).unwrap();
         let after = log.read(second).unwrap().unwrap().next;
@@ -606,7 +606,7 @@ mod tests {
         let at = usize::try_from(after).unwrap();
         bytes[at..at + stale.len()].copy_from_slice(&stale);
         std::fs::write(&segment, bytes).unwrap();
-        let log = Log::open(&dir, SMALL).unwrap();
+        let log = Log::open(&dir, SMALL, &pe2_io::SystemFilesystem).unwrap();
         assert_eq!(log.header().tail(), second, "it ends before what is not whole");
         assert_eq!(log.records(0).map(|r| r.unwrap().position).collect::<Vec<_>>(), [first]);
         // And goes on from there.
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn a_full_log_refuses_until_what_it_holds_is_the_projects_on_disk() {
         let dir = folder("budget");
-        let log = Log::open(&dir, Config { segment: 4096, budget: 8192 }).unwrap();
+        let log = Log::open(&dir, Config { segment: 4096, budget: 8192 }, &pe2_io::SystemFilesystem).unwrap();
         let body = [1u8; 1000];
         let mut last = 0;
         let full = loop {
@@ -651,6 +651,7 @@ mod tests {
         let log = Log::open(
             &HostPath::new(std::path::Path::new(&dir)).unwrap(),
             Config { segment: 1 << 16, budget: 1 << 30 },
+            &pe2_io::SystemFilesystem,
         )
         .unwrap();
         for n in 0..2000u32 {
@@ -661,7 +662,7 @@ mod tests {
     #[test]
     fn two_processes_append_to_one_log() {
         let dir = folder("processes");
-        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
+        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }, &pe2_io::SystemFilesystem).unwrap();
         let mut second = crate::forks::start(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--ignored", "--exact", "log::tests::the_second_process"])
@@ -692,7 +693,7 @@ mod tests {
     #[ignore = "a measurement"]
     fn bench_append() {
         let dir = folder("bench");
-        let log = Log::open(&dir, Config::default()).unwrap();
+        let log = Log::open(&dir, Config::default(), &pe2_io::SystemFilesystem).unwrap();
         for size in [64usize, 4096, 128 << 10] {
             let body = vec![5u8; size];
             let count = if size > 4096 { 2000 } else { 20000 };

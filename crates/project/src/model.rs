@@ -736,7 +736,7 @@ pub fn fill_files<'a>(
 /// anew - a process died, the power went - kept beside it (`sfs::Space::left_behind`), where that reads whole;
 /// else nothing. Whoever opens over it holds it to the files.
 #[must_use]
-pub fn known(root: &HostPath) -> Known {
+pub fn known(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Known {
     let _span = tracing::info_span!("model: what is known of the files read").entered();
     // All of it at one commit, each part read on a thread of its own.
     let all = |space: &sfs::Space| -> Option<Known> {
@@ -753,11 +753,11 @@ pub fn known(root: &HostPath) -> Known {
             Some(Known { files: files.ok()?, layers: layers.ok()?, records: records.ok()?, stack: stack.ok()? })
         })
     };
-    let Ok(space) = crate::shared::space(root) else { return Known::default() };
+    let Ok(space) = crate::shared::space(root, filesystem) else { return Known::default() };
     if let Some(held) = all(&space) {
         return held;
     }
-    let left = sfs::Space::left_behind(&crate::shared::space_at(root)).ok().flatten();
+    let left = sfs::Space::left_behind(&crate::shared::space_at(root), filesystem).ok().flatten();
     left.and_then(|left| all(&left)).unwrap_or_default()
 }
 
@@ -878,7 +878,7 @@ pub fn layers(pages: &impl Pages, root: &HostPath) -> Result<Layers> {
 pub fn took(root: &HostPath, index: &mut crate::index::Index) -> std::io::Result<()> {
     let _span = tracing::info_span!("model: what the opening read said").entered();
     let opened = index.take_opened();
-    let space = crate::shared::space(root)?;
+    let space = crate::shared::space(root, index.io().filesystem())?;
     let mut txn = space.write()?;
     if is_begun(&txn)? {
         opened.apply(&mut txn)?;
@@ -890,7 +890,7 @@ pub fn took(root: &HostPath, index: &mut crate::index::Index) -> std::io::Result
     }
     txn.commit()?;
     // What a space begun anew kept beside it is no longer what is known of the files.
-    sfs::Space::forget_left(&crate::shared::space_at(root));
+    sfs::Space::forget_left(&crate::shared::space_at(root), index.io().filesystem());
     Ok(())
 }
 
@@ -1247,7 +1247,7 @@ mod tests {
     fn the_model_a_project_was_left_is_what_its_files_say() {
         let Ok(root) = std::env::var("PE2_MODEL_OF") else { return };
         let project = crate::Project::load(std::path::Path::new(&root)).unwrap();
-        let space = crate::shared::space(&project.root).unwrap();
+        let space = crate::shared::space(&project.root, project.io.filesystem()).unwrap();
         assert!(!space.fresh(), "its space was begun anew: nothing left it in order");
         let unread = |mut records: HashMap<HostPath, Record>| {
             for record in records.values_mut() {
@@ -1374,25 +1374,25 @@ mod tests {
         let now = files_of(&root, 300);
         {
             // As a holder that is killed: its model said, the space never left in order.
-            let space = sfs::Space::open(&at).unwrap();
+            let space = sfs::Space::open(&at, &pe2_io::SystemFilesystem).unwrap();
             let mut txn = space.write().unwrap();
             fill_files(&mut txn, &root, now.iter()).unwrap();
             holds(&root).apply(&mut txn).unwrap();
             txn.commit().unwrap();
         }
         // Who attaches next finds the space begun anew - and what it held beside it, read whole.
-        let left = known(&root);
+        let left = known(&root, &pe2_io::SystemFilesystem);
         assert_eq!(left.files, now);
         assert_eq!(left.layers, held_by(&root));
-        let space = crate::shared::space(&root).unwrap();
+        let space = crate::shared::space(&root, &pe2_io::SystemFilesystem).unwrap();
         assert!(space.fresh() && at.at("left").is_dir());
         assert!(files(&space.read().unwrap(), &root).unwrap().is_empty());
         // Said again in the space as it is now, it is known from there, and what was kept beside it goes.
         let mut txn = space.write().unwrap();
         fill_files(&mut txn, &root, now.iter()).unwrap();
         txn.commit().unwrap();
-        sfs::Space::forget_left(&at);
-        let said = known(&root);
+        sfs::Space::forget_left(&at, &pe2_io::SystemFilesystem);
+        let said = known(&root, &pe2_io::SystemFilesystem);
         assert_eq!(said.files, now);
         assert!(said.layers.is_empty());
         let _ = std::fs::remove_dir_all(&root);

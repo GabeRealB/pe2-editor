@@ -901,6 +901,7 @@ impl Workspace {
         reason = "the window's pace: when it looks again or shows something, never what the project becomes"
     )]
     pub fn from_opened(opened: Opened, requests: mpsc::Receiver<AgentRequest>) -> Workspace {
+        let viewer_io = opened.project.io.clone();
         let Opened {
             project,
             lock,
@@ -1051,7 +1052,7 @@ impl Workspace {
             tapped: None,
             chosen: project::ext::Chosen::new(),
             field_edit: None,
-            viewer: crate::viewer::Viewer::default(),
+            viewer: crate::viewer::Viewer::new(viewer_io),
             viewed_file: HashMap::new(),
             declaration_draft: None,
         };
@@ -1955,11 +1956,13 @@ impl Workspace {
     fn save_layer_view(&self) -> Result<()> {
         let path = self.cache_dir.join(&LAYER_VIEW);
         let text = toml::to_string(&self.layer_view)?;
+        let io = self.project.io.clone();
         self.takein.aside(move || {
-            let written = path.parent().map_or(Ok(()), std::fs::create_dir_all);
+            let fs = io.filesystem();
+            let written = path.parent().map_or(Ok(()), |folder| fs.create_folder_all(&folder));
             let written = written
                 .map_err(anyhow::Error::from)
-                .and_then(|()| project::cache::write_atomic(&path, text.as_bytes()));
+                .and_then(|()| project::cache::write_atomic(fs, &path, text.as_bytes()));
             if let Err(e) = written {
                 eprintln!("the view of the layers is not kept: {e:#}");
             }

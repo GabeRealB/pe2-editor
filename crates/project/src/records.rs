@@ -194,7 +194,7 @@ static HELD_TREES: std::sync::RwLock<Option<HeldRead>> = std::sync::RwLock::new(
 /// The extension a layer holds at a folder (`held_folder`): none where the folder is no held extension's, or the layer
 /// leaves it off.
 #[must_use]
-pub fn held(folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
+pub fn held(io: &Arc<dyn pe2_io::Io>, folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
     let id = crate::ext::folder::id_of(folder)?;
     let parent = folder.parent()?;
     if parent.file_name()? != crate::ext::folder::HELD {
@@ -203,8 +203,8 @@ pub fn held(folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
     let layer = parent.parent()?;
     // Its id is a folder's name: the name of its record too.
     let record = extension_path(&layer, id).ok()?;
-    let meta = std::fs::metadata(&record).ok()?;
-    let stamp = (meta.modified().ok()?, meta.len());
+    let stat = io.filesystem().stat(&record).ok()?;
+    let stamp = (stat.modified?, stat.size);
     if let Some(found) =
         HELD_TREES.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|h| h.get(&record))
         && (found.0, found.1) == stamp
@@ -213,7 +213,7 @@ pub fn held(folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
     }
     let read = || -> Option<std::sync::Arc<HeldExtension>> {
         let tree = extensions_of(&layer).ok()?.remove(id)??;
-        let store = crate::chunks::Store::of(&layer)?;
+        let store = crate::chunks::Store::of(&layer, io)?;
         let files = std::sync::Arc::new(store.get_tree(&tree).ok()?);
         Some(std::sync::Arc::new(HeldExtension {
             layer: layer.clone(),
@@ -232,13 +232,13 @@ pub fn held(folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
 
 /// The held extension a path is in (`held`), and the path within its folder ("" for the folder).
 #[must_use]
-pub fn held_at(path: &HostPath) -> Option<(std::sync::Arc<HeldExtension>, String)> {
+pub fn held_at(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> Option<(std::sync::Arc<HeldExtension>, String)> {
     // Its folder is the nearest ancestor named `<id>.extension` in a layer's `extensions/`.
     let folder = path.ancestors().find(|a| {
         crate::ext::folder::id_of(a).is_some()
             && a.parent().is_some_and(|layer| layer.file_name().is_some_and(|name| name == crate::ext::folder::HELD))
     })?;
-    let held = held(&folder)?;
+    let held = held(io, &folder)?;
     // Its files are its tree's, held by names: a place within by one no path takes is none of them.
     let within = path.within(&folder).ok()?.as_str().to_owned();
     Some((held, within))
@@ -285,19 +285,20 @@ impl HeldExtension {
 /// # Errors
 /// A folder cannot be read or kept, or its record written.
 pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usize> {
+    let fs = project.io.filesystem();
     let held = layer.join(&crate::ext::folder::HELD);
-    let store = crate::chunks::Store::at(&project.root);
+    let store = crate::chunks::Store::at(&project.root, project.io.clone());
     let mut count = 0;
-    for entry in std::fs::read_dir(&held).into_iter().flatten().flatten() {
-        let folder = held.entry(&entry.file_name());
+    for entry in fs.read_directory(&held).unwrap_or_default() {
+        let folder = held.entry(&entry.name);
         let Some(id) = crate::ext::folder::id_of(&folder).map(str::to_string) else { continue };
-        if !folder.is_dir() {
+        if entry.kind != pe2_io::Kind::Folder {
             continue;
         }
-        let (tree, _) = store.put_folder(&folder, project.io.clock().wall())?;
+        let (tree, _) = store.put_folder(&folder)?;
         let at = extension_path(layer, &id)?;
-        std::fs::create_dir_all(layer.join(&DIR).join(&EXTENSIONS))?;
-        crate::cache::write_atomic(&at, extension_record(Some(&tree)).as_bytes())?;
+        fs.create_folder_all(&layer.join(&DIR).join(&EXTENSIONS))?;
+        crate::cache::write_atomic(fs, &at, extension_record(Some(&tree)).as_bytes())?;
         std::fs::remove_dir_all(&folder)?;
         count += 1;
     }
@@ -347,7 +348,7 @@ pub struct Settings {
 ///
 /// # Errors
 /// The marker cannot be written.
-pub fn mark(layer: &HostPath, settings: &Settings) -> Result<()> {
+pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) -> Result<()> {
     let mut doc = toml_edit::DocumentMut::new();
     doc["format"] = toml_edit::value(FORMAT);
     if settings.read_only {
@@ -356,9 +357,9 @@ pub fn mark(layer: &HostPath, settings: &Settings) -> Result<()> {
     if !settings.ignore.is_empty() {
         doc["ignore"] = toml_edit::value(settings.ignore.iter().map(String::as_str).collect::<toml_edit::Array>());
     }
-    std::fs::create_dir_all(layer.join(&DIR))?;
+    fs.create_folder_all(&layer.join(&DIR))?;
     let at = layer.join(&DIR).join(&MARKER);
-    crate::cache::write_atomic(&at, doc.to_string().as_bytes())
+    crate::cache::write_atomic(fs, &at, doc.to_string().as_bytes())
 }
 
 /// A records layer's settings, its format checked: one this program knows.
@@ -404,22 +405,19 @@ impl Kind {
     }
 }
 
-/// Where what is not text is kept, and when: the store, and the time its writes stamp.
-pub type Keeping<'a> = (&'a crate::chunks::Store, std::time::SystemTime);
-
 impl Content {
     /// A file's content as a record keeps it: text inline whatever its length, so a layer's history always reads as
     /// text, anything else (bytes that are not UTF-8, or hold a NUL, as git tells binary files) kept in the store.
     ///
     /// # Errors
     /// It cannot be kept.
-    pub fn of(bytes: &[u8], (store, at): Keeping<'_>) -> Result<Content> {
+    pub fn of(bytes: &[u8], store: &crate::chunks::Store) -> Result<Content> {
         if !bytes.contains(&0)
             && let Ok(text) = std::str::from_utf8(bytes)
         {
             return Ok(Content::Text(text.to_string()));
         }
-        let sha1 = store.put_file(bytes, at)?;
+        let sha1 = store.put_file(bytes)?;
         Ok(Content::Stored { sha1, size: bytes.len() as u64 })
     }
 
@@ -1011,7 +1009,7 @@ impl Set {
         let problems = views.iter().flat_map(|view| view.problems.iter().cloned()).collect();
         let set = std::sync::Arc::new(Set {
             root: project.root.clone(),
-            store: crate::chunks::Store::at(&project.root),
+            store: crate::chunks::Store::at(&project.root, project.io.clone()),
             views,
             problems,
         });
@@ -1293,7 +1291,7 @@ fn records_of_tree(
     changeset: &crate::changeset::Changeset,
 ) -> Result<BTreeMap<Uid, Record>> {
     use crate::changeset::Op as Did;
-    let store = crate::chunks::Store::at(&project.root);
+    let store = crate::chunks::Store::at(&project.root, project.io.clone());
     let below = index.entries_below(layer);
     // Who is where: what the layer places, then what is below it.
     let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> =
@@ -1319,20 +1317,20 @@ fn records_of_tree(
     let kind_at = |path: &TreePath| -> Kind {
         if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
             Kind::Node
-        } else if crate::pack::is_dir(&disk(path)) {
+        } else if crate::pack::is_dir(&project.io, &disk(path)) {
             Kind::Folder
         } else {
             Kind::File
         }
     };
     let content = |disk: &HostPath| -> Result<Content> {
-        let bytes = crate::content::read(disk).with_context(|| disk.display().to_string())?;
-        Content::of(&bytes, (&store, project.io.clock().wall()))
+        let bytes = crate::content::read(&project.io, disk).with_context(|| disk.display().to_string())?;
+        Content::of(&bytes, &store)
     };
     // A bundle's files, by name, as its folder holds them.
     let bundle = |path: &TreePath| -> Result<BTreeMap<Arc<RelPath>, File>> {
         let mut files = BTreeMap::new();
-        let (held, refused) = crate::index::bundle_files(&disk(path));
+        let (held, refused) = crate::index::bundle_files(&project.io, &disk(path));
         // Every file of it is the record's, or none is: one named so no path takes it is renamed first.
         if let Some(why) = refused.first() {
             bail!("{path}: {why}");
@@ -1418,7 +1416,7 @@ pub fn import(
     // Written beside, as a layer of its own, then in the place of what was there.
     let fresh = layer.path.join(&Name::constant(".import"));
     let _ = std::fs::remove_dir_all(&fresh);
-    write_all(&fresh, &settings, &records)?;
+    write_all(project.io.filesystem(), &fresh, &settings, &records)?;
     // The extensions it holds are no entries of the tree: kept as they are.
     let held = layer.path.join(&DIR).join(&EXTENSIONS);
     if held.is_dir() {
@@ -1456,6 +1454,7 @@ pub fn import(
 /// # Errors
 /// The layer is no records layer read, or a file cannot be read or written.
 pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Result<usize> {
+    let fs = project.io.filesystem();
     let to = &HostPath::new(to).with_context(|| to.display().to_string())?;
     let layer = project.layer(name)?;
     Set::open(project)?;
@@ -1464,8 +1463,8 @@ pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Re
     for path in changeset.entries.values() {
         let (from, out) = (layer.path.join(path), to.join(path));
         if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
-            std::fs::create_dir_all(&out)?;
-            let (held, refused) = crate::index::bundle_files(&from);
+            fs.create_folder_all(&out)?;
+            let (held, refused) = crate::index::bundle_files(&project.io, &from);
             // Every file of it goes, or none does: one named so no path takes it is renamed first.
             if let Some(why) = refused.first() {
                 bail!("{path}: {why}");
@@ -1473,20 +1472,20 @@ pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Re
             for (file, at) in held {
                 let target = out.join(&file);
                 if let Some(folder) = target.parent() {
-                    std::fs::create_dir_all(&folder)?;
+                    fs.create_folder_all(&folder)?;
                 }
-                std::fs::write(&target, crate::content::read(&at)?)?;
+                fs.write(&target, &crate::content::read(&project.io, &at)?)?;
             }
-        } else if crate::content::exists(&from) {
+        } else if crate::content::exists(&project.io, &from) {
             if let Some(folder) = out.parent() {
-                std::fs::create_dir_all(&folder)?;
+                fs.create_folder_all(&folder)?;
             }
-            std::fs::write(&out, crate::content::read(&from)?)?;
+            fs.write(&out, &crate::content::read(&project.io, &from)?)?;
         } else {
-            std::fs::create_dir_all(&out)?;
+            fs.create_folder_all(&out)?;
         }
     }
-    changeset.save(&to.with_suffix(crate::CHANGESET_SUFFIX))?;
+    changeset.save(fs, &to.with_suffix(crate::CHANGESET_SUFFIX))?;
     Ok(changeset.entries.len())
 }
 
@@ -1494,15 +1493,20 @@ pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Re
 ///
 /// # Errors
 /// A record cannot be written.
-pub fn write_all(dir: &HostPath, settings: &Settings, records: &BTreeMap<Uid, Record>) -> Result<()> {
+pub fn write_all(
+    fs: &dyn pe2_io::Filesystem,
+    dir: &HostPath,
+    settings: &Settings,
+    records: &BTreeMap<Uid, Record>,
+) -> Result<()> {
     for (uid, record) in records {
         let at = path_of(dir, *uid).with_context(|| format!("{uid}: its record"))?;
         if let Some(shard) = at.parent() {
-            std::fs::create_dir_all(shard)?;
+            fs.create_folder_all(&shard)?;
         }
-        crate::cache::write_atomic(&at, record.render().as_bytes())?;
+        crate::cache::write_atomic(fs, &at, record.render().as_bytes())?;
     }
-    mark(dir, settings)
+    mark(fs, dir, settings)
 }
 
 /// The records a layer's changeset makes, with what an edit wrote of its files (`written`: by their path in the layer,
@@ -1520,8 +1524,7 @@ pub fn records_for(
     written: &BTreeMap<Arc<TreePath>, Option<Vec<u8>>>,
 ) -> Result<(BTreeMap<Uid, Record>, Vec<Uid>)> {
     use crate::changeset::Op as Did;
-    let store = crate::chunks::Store::at(&project.root);
-    let keeping = (&store, project.io.clock().wall());
+    let store = crate::chunks::Store::at(&project.root, project.io.clone());
     // What the layers below resolve is asked, entry by entry: the layer's own are few beside it.
     let below = index.under(&layer.name);
     let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> = std::collections::HashMap::new();
@@ -1582,7 +1585,7 @@ pub fn records_for(
         let mut files = before.map_or_else(BTreeMap::new, |r| r.files.clone());
         for (name, bytes) in written_at(path, kind) {
             match bytes {
-                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, keeping)?), was: None }),
+                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), was: None }),
                 None => files.remove(&name),
             };
         }
@@ -1606,7 +1609,7 @@ pub fn records_for(
                 };
                 let now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
                 let held = old.get(uid).filter(|r| r.op == Op::Override).map(|r| &r.files);
-                Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, keeping)? }
+                Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, &store)? }
             }
         };
         new.insert(*uid, record);
@@ -1625,7 +1628,7 @@ fn override_files(
     bases: &BTreeMap<Arc<RelPath>, crate::changeset::Base>,
     mut now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>>,
     held: Option<&BTreeMap<Arc<RelPath>, File>>,
-    keeping: Keeping<'_>,
+    store: &crate::chunks::Store,
 ) -> Result<BTreeMap<Arc<RelPath>, File>> {
     let mut files = BTreeMap::new();
     for (file, base) in bases {
@@ -1633,7 +1636,7 @@ fn override_files(
             None
         } else {
             match now.remove(file) {
-                Some(Some(bytes)) => Some(Content::of(&bytes, keeping)?),
+                Some(Some(bytes)) => Some(Content::of(&bytes, store)?),
                 _ => held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()),
             }
         };
@@ -1662,7 +1665,7 @@ fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
                 }
             }
             crate::index::Kind::File => {
-                let sha1 = crate::content::sha1(&entry.disk).map_or_default(|sha1| sha1.to_string());
+                let sha1 = crate::content::sha1(index.io(), &entry.disk).map_or_default(|sha1| sha1.to_string());
                 let _ = write!(said, " ={sha1}");
             }
             crate::index::Kind::Folder => {}
@@ -1726,7 +1729,7 @@ pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &Nam
         std::fs::remove_dir_all(&aside)?;
         Ok(())
     };
-    let written = write_all(&layer.path, &settings, &records)
+    let written = write_all(project.io.filesystem(), &layer.path, &settings, &records)
         .and_then(|()| Ok(shown(&crate::index::Index::open(project, cache)?)));
     let after = match written {
         Ok(after) => after,

@@ -52,8 +52,8 @@ pub const SPACE: &pe2_path::Name = pe2_path::Name::constant("space");
 ///
 /// # Errors
 /// As `sfs::space::shared`.
-pub fn space(root: &HostPath) -> std::io::Result<std::sync::Arc<sfs::Space>> {
-    sfs::space::shared(&space_at(root))
+pub fn space(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> std::io::Result<std::sync::Arc<sfs::Space>> {
+    sfs::space::shared(&space_at(root), filesystem)
 }
 
 /// Where a project's shared space is kept.
@@ -953,7 +953,9 @@ mod tests {
         let listing = index.served();
         let dir = crate::testing::scratch("shared-bench");
         let _ = std::fs::remove_dir_all(&dir);
-        for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
+        for (name, space) in
+            [("memory", Space::private().unwrap()), ("files", Space::open(&dir, &pe2_io::SystemFilesystem).unwrap())]
+        {
             let whole = std::time::Instant::now();
             say_whole(&space, &listing, &pe2_io::SystemClock).unwrap();
             let whole = whole.elapsed();

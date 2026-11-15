@@ -358,7 +358,7 @@ impl Writes {
             let path = dir.entry(&entry.file_name());
             let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         }
-        let log = sfs::Log::shared(&dir.join(&LOG), log)?;
+        let log = sfs::Log::shared(&dir.join(&LOG), log, io.filesystem())?;
         let waiter = io.clock().waiter();
         let writes = Writes(Arc::new(Inner {
             served: served.clone(),
@@ -2150,7 +2150,7 @@ mod tests {
             std::fs::create_dir_all(&at).unwrap();
             let space = Arc::new(sfs::Space::private().unwrap());
             let holder = Holder {
-                served: Served::shared(space.clone(), None),
+                served: Served::shared(space.clone(), None, pe2_io::system()),
                 space,
                 files: at,
                 listing: Mutex::default(),
@@ -2208,7 +2208,7 @@ mod tests {
             let none = |path: &project::TreePath| Refusal::Never(format!("{path}: nothing is there"));
             match change {
                 Change::Write { path, staged } => {
-                    let bytes = staged.read().map_err(|e| Refusal::Never(e.to_string()))?;
+                    let bytes = staged.read(&pe2_io::SystemFilesystem).map_err(|e| Refusal::Never(e.to_string()))?;
                     above(listing, path);
                     let file = self.file(&bytes);
                     project::server::put(listing, path, &file);

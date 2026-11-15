@@ -69,7 +69,7 @@ fn paths(root: &HostPath) -> (HostPath, HostPath) {
 
 fn open(root: &HostPath) -> Result<File> {
     let (lock, _) = paths(root);
-    crate::cache::make(root)?;
+    crate::cache::make(&pe2_io::SystemFilesystem, root)?;
     OpenOptions::new()
         .create(true)
         .truncate(false)

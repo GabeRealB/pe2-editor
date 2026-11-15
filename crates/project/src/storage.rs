@@ -261,7 +261,7 @@ impl Shared {
     fn space(&self) -> Option<&Arc<sfs::Space>> {
         let attach = || {
             let root = &self.root;
-            let space = crate::shared::space(root)
+            let space = crate::shared::space(root, self.io.filesystem())
                 .inspect_err(|e| {
                     eprintln!("{}: nothing is written behind, the shared space cannot be had: {e}", root.display());
                 })
@@ -431,11 +431,13 @@ impl Shared {
             return;
         }
         let done = match &file.after {
-            Some(bytes) => crate::cache::write_atomic(&file.path, bytes).map_err(|e| format!("{e:#}")).map(|()| {
-                if let Ok(written) = std::fs::File::options().write(true).open(&file.path) {
-                    let _ = written.set_modified(file.at);
-                }
-            }),
+            Some(bytes) => crate::cache::write_atomic(self.io.filesystem(), &file.path, bytes)
+                .map_err(|e| format!("{e:#}"))
+                .map(|()| {
+                    if let Ok(written) = std::fs::File::options().write(true).open(&file.path) {
+                        let _ = written.set_modified(file.at);
+                    }
+                }),
             None => match std::fs::remove_file(&file.path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
                 _ => Ok(()),
@@ -511,7 +513,7 @@ impl Storage {
     /// as it comes, with nothing to take it up from.
     #[must_use]
     pub fn open(root: &HostPath, io: Arc<dyn pe2_io::Io>) -> Option<Storage> {
-        let log = sfs::Log::shared(&log_dir(root), sfs::log::Config::default());
+        let log = sfs::Log::shared(&log_dir(root), sfs::log::Config::default(), io.filesystem());
         let log = log.inspect_err(|e| eprintln!("{}: no log to write through: {e}", root.display())).ok()?;
         let shared = Arc::new(Shared {
             root: root.clone(),
@@ -786,28 +788,30 @@ fn sync(paths: &BTreeSet<HostPath>) {
 ///
 /// # Errors
 /// The log cannot be read, or a file cannot be written.
-pub fn redo(root: &HostPath) -> Result<Option<String>> {
+pub fn redo(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Result<Option<String>> {
     let dir = log_dir(root);
     // No log, nothing was ever written through one: none is made to find that out.
     if !dir.join(&sfs::header::FILE).is_file() {
         return Ok(None);
     }
-    let log = sfs::Log::shared(&dir, sfs::log::Config::default()).with_context(|| dir.display().to_string())?;
+    let log =
+        sfs::Log::shared(&dir, sfs::log::Config::default(), filesystem).with_context(|| dir.display().to_string())?;
     let Some(from) = log.header().storage() else {
-        forget_waiting(root);
+        forget_waiting(root, filesystem);
         return Ok(None);
     };
     let sets = sfs::storage::whole(&log, from).context("reading what was written from the log")?;
     let mut written = BTreeSet::new();
     for (label, changes) in &sets {
         for change in changes {
-            again(root, change, &mut written).with_context(|| format!("writing again what `{label}` changed"))?;
+            again(filesystem, root, change, &mut written)
+                .with_context(|| format!("writing again what `{label}` changed"))?;
         }
     }
     sync(&written);
     log.header().set_storage(None);
     log.keep();
-    forget_waiting(root);
+    forget_waiting(root, filesystem);
     let said = match sets.as_slice() {
         [] => return Ok(None),
         [(label, _)] => format!("`{label}` was written again from the log: it may not have reached the files"),
@@ -822,12 +826,12 @@ pub fn redo(root: &HostPath) -> Result<Option<String>> {
 /// Nothing waits to be written of the project in `root` any more - whoever said it is gone, and what it said whole
 /// was written again from the log: what the shared space still keeps as waiting, where a process has it attached
 /// still, is taken out.
-fn forget_waiting(root: &HostPath) {
+fn forget_waiting(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) {
     let dir = root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&crate::shared::SPACE);
     if !dir.is_dir() {
         return;
     }
-    let forgotten = crate::shared::space(root).map_err(sfs::space::Error::Io).and_then(|space| {
+    let forgotten = crate::shared::space(root, filesystem).map_err(sfs::space::Error::Io).and_then(|space| {
         let mut txn = space.write()?;
         let mut waiting = Vec::new();
         sfs::tree::scan(&txn, WAITING, b"", &mut |key, _| {
@@ -845,7 +849,12 @@ fn forget_waiting(root: &HostPath) {
 }
 
 /// Make one change again: as it left the files, whatever of it they have already.
-fn again(root: &HostPath, change: &Stored, written: &mut BTreeSet<HostPath>) -> Result<()> {
+fn again(
+    fs: &dyn pe2_io::Filesystem,
+    root: &HostPath,
+    change: &Stored,
+    written: &mut BTreeSet<HostPath>,
+) -> Result<()> {
     // As `Storage::name` said it: within the project, or whole.
     let at = |name: &str| -> Result<HostPath> {
         if Path::new(name).is_absolute() {
@@ -861,7 +870,7 @@ fn again(root: &HostPath, change: &Stored, written: &mut BTreeSet<HostPath>) -> 
             if let Some(folder) = path.parent() {
                 std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
             }
-            crate::cache::write_atomic(&path, bytes)?;
+            crate::cache::write_atomic(fs, &path, bytes)?;
             written.insert(path);
         }
         Stored::Delete { path } => {
@@ -912,7 +921,7 @@ mod tests {
         let root = crate::testing::scratch("storage");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let log = sfs::Log::shared(&log_dir(&root), sfs::log::Config::default()).unwrap();
+        let log = sfs::Log::shared(&log_dir(&root), sfs::log::Config::default(), &pe2_io::SystemFilesystem).unwrap();
         let needed = || log.header().storage();
         let mut storage = Storage::open(&root, pe2_io::system()).unwrap();
         assert_eq!(needed(), None, "nothing written, nothing needed");
@@ -937,7 +946,7 @@ mod tests {
         // Let go of, what was written last is had on disk first.
         drop(storage);
         assert_eq!(needed(), None);
-        assert_eq!(super::redo(&root).unwrap(), None, "nothing is left to write again");
+        assert_eq!(super::redo(&root, &pe2_io::SystemFilesystem).unwrap(), None, "nothing is left to write again");
         drop(log);
         std::fs::remove_dir_all(&root).unwrap();
     }

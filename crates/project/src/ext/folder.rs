@@ -18,6 +18,7 @@
 
 use pe2_path::Name;
 use sfs::HostPath;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
@@ -66,9 +67,9 @@ pub fn id_named(name: &str) -> Option<&str> {
 ///
 /// # Errors
 /// It has none, or it cannot be read.
-pub fn manifest(folder: &HostPath) -> Result<About> {
+pub fn manifest(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     let file = folder.join(&MANIFEST);
-    let text = crate::content::read_to_string(&file).with_context(|| format!("it has no {MANIFEST}"))?;
+    let text = crate::content::read_to_string(io, &file).with_context(|| format!("it has no {MANIFEST}"))?;
     toml::from_str(&text).with_context(|| file.display().to_string())
 }
 
@@ -76,9 +77,9 @@ pub fn manifest(folder: &HostPath) -> Result<About> {
 ///
 /// # Errors
 /// It has no manifest, its component carries another or none, or its folder is named for another id.
-pub fn checked(folder: &HostPath, bytes: &[u8]) -> Result<About> {
+pub fn checked(folder: &HostPath, bytes: &[u8], io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     let text =
-        crate::content::read_to_string(&folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
+        crate::content::read_to_string(io, &folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
     let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
     checked_text(&text, &name, bytes)
 }
@@ -88,13 +89,13 @@ pub fn checked(folder: &HostPath, bytes: &[u8]) -> Result<About> {
 ///
 /// # Errors
 /// It has no manifest, or what it says is wrong (`pe2_manifest::check`), or its folder is named for another id.
-pub fn checked_alone(folder: &HostPath) -> Result<About> {
+pub fn checked_alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     let text =
-        crate::content::read_to_string(&folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
+        crate::content::read_to_string(io, &folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
     let table: toml::Table = text.parse().with_context(|| MANIFEST.to_string())?;
     let read = |name: &str| {
         let within = pe2_path::RelPath::new(name).map_err(|e| e.to_string())?;
-        crate::content::read(&folder.join(&within)).map_err(|e| e.to_string())
+        crate::content::read(io, &folder.join(&within)).map_err(|e| e.to_string())
     };
     pe2_manifest::check(&table, &read).map_err(|why| anyhow::anyhow!("{MANIFEST}: {why}"))?;
     let about: About = toml::from_str(&text).context(MANIFEST)?;
@@ -107,8 +108,9 @@ pub fn checked_alone(folder: &HostPath) -> Result<About> {
 
 /// Whether an extension's folder is only its manifest: no component beside it.
 #[must_use]
-pub fn alone(folder: &HostPath) -> bool {
-    !crate::pack::is_file(&folder.join(&super::EXTENSION_COMPONENT)) && crate::pack::is_file(&folder.join(&MANIFEST))
+pub fn alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> bool {
+    !crate::pack::is_file(io, &folder.join(&super::EXTENSION_COMPONENT))
+        && crate::pack::is_file(io, &folder.join(&MANIFEST))
 }
 
 /// An extension's manifest (`text`) checked: its component's (`bytes`), in a folder named (`name`) for its id - in its

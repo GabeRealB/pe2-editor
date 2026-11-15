@@ -198,7 +198,7 @@ mod tests {
     fn sets_that_are_whole_are_found_again_and_the_others_are_nothing() {
         let dir = crate::testing::scratch("sfs-storage");
         let _ = std::fs::remove_dir_all(&dir);
-        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 22 }).unwrap();
+        let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 22 }, &pe2_io::SystemFilesystem).unwrap();
         // One whole, with a file longer than a record and a record of another kind among it.
         let lengthy: Vec<u8> = (0..70_000u32).map(|n| (n % 251) as u8).collect();
         let first = began(&log).unwrap();

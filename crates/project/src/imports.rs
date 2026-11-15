@@ -96,7 +96,7 @@ fn listed_kept(at: &HostPath, builds: &str) -> HashMap<String, Listed> {
 }
 
 /// Keep the addresses listed in the cache, for the extensions that listed them.
-fn keep_listed(at: &HostPath, builds: &str, listed: &HashMap<String, Listed>) {
+fn keep_listed(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str, listed: &HashMap<String, Listed>) {
     let mut sorted: Vec<(&String, &Listed)> = listed.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut entries = serde_json::Map::new();
@@ -106,7 +106,7 @@ fn keep_listed(at: &HostPath, builds: &str, listed: &HashMap<String, Listed>) {
         entries.insert(target.clone(), serde_json::json!([digest, addresses]));
     }
     let kept = serde_json::json!({ "builds": builds, "listed": entries });
-    let _ = crate::cache::write_atomic(at, kept.to_string().as_bytes());
+    let _ = crate::cache::write_atomic(fs, at, kept.to_string().as_bytes());
 }
 
 /// What there is of an asset's import, found without making anything.
@@ -511,7 +511,7 @@ impl Imports {
             problems.extend(missing);
         }
         if new {
-            keep_listed(&self.listed_at, &builds, &known);
+            keep_listed(index.io().filesystem(), &self.listed_at, &builds, &known);
         }
         problems
     }

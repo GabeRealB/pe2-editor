@@ -36,7 +36,7 @@ pub fn elsewhere(platforms: &[String]) -> Option<String> {
 /// Where an extension's programs are: `tool` in what it ships, for this platform or any, then in what its setup fetched
 /// (`fetched`, each folder laid out as its tree is); else `tool` as it is, for the system to find.
 #[must_use]
-pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str) -> Runnable {
+pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str, io: &Arc<dyn pe2_io::Io>) -> Runnable {
     let Ok(within) = RelPath::new(tool) else { return Runnable::Named(tool.to_owned()) };
     let exe = format!("{}.{}", within.name().unwrap_or_default(), std::env::consts::EXE_EXTENSION);
     let exe = Name::new(&exe).ok();
@@ -44,8 +44,8 @@ pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str) -> R
         .filter(|_| !std::env::consts::EXE_EXTENSION.is_empty())
         .map(|exe| within.parent().unwrap_or_default().join(exe));
     let named: Vec<Arc<RelPath>> = with_exe.into_iter().chain([within.to_owned()]).collect();
-    let found = named.iter().flat_map(|name| places(folder, fetched, name)).find(crate::pack::is_file);
-    found.map_or_else(|| Runnable::Named(tool.to_owned()), |p| Runnable::At(runnable(&p)))
+    let found = named.iter().flat_map(|name| places(folder, fetched, name)).find(|path| crate::pack::is_file(io, path));
+    found.map_or_else(|| Runnable::Named(tool.to_owned()), |p| Runnable::At(runnable(&p, io)))
 }
 
 /// Where a place in an extension's tree may be, in order: in what it ships, for this platform then for any, then in
@@ -89,9 +89,9 @@ impl std::fmt::Display for Runnable {
 
 /// A path a program can be handed for a place in an extension's tree: itself on disk; one a project holds, through the
 /// filesystem the project is served as (`content::for_program`), its tree laid out nowhere.
-fn runnable(path: &HostPath) -> HostPath {
-    if crate::records::held_at(path).is_some() {
-        return crate::content::for_program(path).unwrap_or_else(|_| path.clone());
+fn runnable(path: &HostPath, io: &Arc<dyn pe2_io::Io>) -> HostPath {
+    if crate::records::held_at(io, path).is_some() {
+        return crate::content::for_program(io, path).unwrap_or_else(|_| path.clone());
     }
     path.clone()
 }
@@ -130,24 +130,37 @@ pub type Offered = std::sync::Arc<
 /// A place in an extension's tree, where it is: in what it ships, for this platform or any, then in what its setup
 /// fetched.
 #[must_use]
-pub fn in_tree(folder: Option<&HostPath>, fetched: &[HostPath], place: &str) -> Option<HostPath> {
+pub fn in_tree(
+    folder: Option<&HostPath>,
+    fetched: &[HostPath],
+    place: &str,
+    io: &Arc<dyn pe2_io::Io>,
+) -> Option<HostPath> {
     let within = RelPath::new(place).ok()?;
     let found = places(folder, fetched, within).into_iter();
-    found.into_iter().find(|path| crate::pack::is_file(path) || crate::pack::is_dir(path)).map(|path| runnable(&path))
+    found
+        .into_iter()
+        .find(|path| crate::pack::is_file(io, path) || crate::pack::is_dir(io, path))
+        .map(|path| runnable(&path, io))
 }
 
 /// The files in a folder - on disk, or an extension's a project holds (`records::held_at`) - by their paths within it,
 /// in order.
-fn files_in(folder: &HostPath, within: &RelPath, files: &mut Vec<(Arc<RelPath>, HostPath)>) -> Result<()> {
-    if !crate::pack::is_dir(folder) {
+fn files_in(
+    io: &Arc<dyn pe2_io::Io>,
+    folder: &HostPath,
+    within: &RelPath,
+    files: &mut Vec<(Arc<RelPath>, HostPath)>,
+) -> Result<()> {
+    if !crate::pack::is_dir(io, folder) {
         anyhow::bail!("{}: no such folder", folder.display());
     }
-    let mut entries = crate::pack::read_dir(folder);
+    let mut entries = crate::pack::read_dir(io, folder);
     entries.sort_by(|a, b| crate::pack::shown(&a.0).cmp(crate::pack::shown(&b.0)));
     for (name, path, is_folder) in entries {
         let name = within.join(&name.with_context(|| format!("{}: what it holds", folder.display()))?);
         if is_folder {
-            files_in(&path, &name, files)?;
+            files_in(io, &path, &name, files)?;
         } else {
             files.push((name, path));
         }
@@ -165,20 +178,25 @@ pub const TESTS: &str = "tests";
 ///
 /// # Errors
 /// What it holds cannot be read.
-pub fn trust(file: &HostPath, folder: Option<&HostPath>, about: &super::component::About) -> Result<String> {
+pub fn trust(
+    file: &HostPath,
+    folder: Option<&HostPath>,
+    about: &super::component::About,
+    io: &Arc<dyn pe2_io::Io>,
+) -> Result<String> {
     let Some(folder) = folder else {
         // What trust is kept as: the hash's text.
-        return crate::content::sha1(file).map(|sha1| sha1.to_string()).with_context(|| file.display().to_string());
+        return crate::content::sha1(io, file).map(|sha1| sha1.to_string()).with_context(|| file.display().to_string());
     };
     let mut files = Vec::new();
-    files_in(folder, RelPath::root(), &mut files)?;
+    files_in(io, folder, RelPath::root(), &mut files)?;
     let counts = |name: &RelPath| {
         file.file_name().is_some_and(|own| own == name.as_str()) || !super::folder::read_only(name, about)
     };
     let mut listing = String::new();
     for (name, path) in files.into_iter().filter(|(name, _)| counts(name)) {
         // A held one's from its tree, read from nothing.
-        let sha1 = crate::content::sha1(&path).with_context(|| path.display().to_string())?;
+        let sha1 = crate::content::sha1(io, &path).with_context(|| path.display().to_string())?;
         let _ = writeln!(listing, "{name} {sha1}");
     }
     Ok(crate::extract::sha1_hex(listing.as_bytes()))
@@ -216,15 +234,15 @@ mod tests {
     fn what_is_enabled_is_all_it_ships() {
         let dir = folder("trust");
         let component = dir.at("extension.wasm");
-        let whole = trust(&component, Some(&dir), &about()).unwrap();
-        assert_eq!(trust(&component, Some(&dir), &about()).unwrap(), whole);
+        let whole = trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap();
+        assert_eq!(trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap(), whole);
         // A program it ships, changed: another extension to the user, and what it made is made again.
         std::fs::write(dir.at("bin/tool"), b"another tool").unwrap();
-        assert_ne!(trust(&component, Some(&dir), &about()).unwrap(), whole);
+        assert_ne!(trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap(), whole);
         // Moved, too.
-        let changed = trust(&component, Some(&dir), &about()).unwrap();
+        let changed = trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap();
         std::fs::rename(dir.at("bin/tool"), dir.at("tool")).unwrap();
-        assert_ne!(trust(&component, Some(&dir), &about()).unwrap(), changed);
+        assert_ne!(trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap(), changed);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -232,20 +250,29 @@ mod tests {
     fn a_program_is_looked_for_in_what_it_ships_then_on_the_system() {
         let dir = folder("program");
         let named = |name: &str| super::Runnable::Named(name.to_string());
-        assert_eq!(program(None, &[], "tool"), named("tool"));
-        assert_eq!(program(Some(&dir), &[], "ffmpeg"), named("ffmpeg"));
-        assert_eq!(program(Some(&dir), &[], "bin/tool"), super::Runnable::At(dir.at("bin/tool")));
+        assert_eq!(program(None, &[], "tool", &crate::testing::io()), named("tool"));
+        assert_eq!(program(Some(&dir), &[], "ffmpeg", &crate::testing::io()), named("ffmpeg"));
+        assert_eq!(
+            program(Some(&dir), &[], "bin/tool", &crate::testing::io()),
+            super::Runnable::At(dir.at("bin/tool"))
+        );
         // What setup fetched, after what it ships.
         let fetched = dir.at("fetched");
         std::fs::create_dir_all(&fetched).unwrap();
         std::fs::write(fetched.at("tool"), b"fetched").unwrap();
         let at = super::Runnable::At;
-        assert_eq!(program(Some(&dir), std::slice::from_ref(&fetched), "tool"), at(fetched.at("tool")));
+        assert_eq!(
+            program(Some(&dir), std::slice::from_ref(&fetched), "tool", &crate::testing::io()),
+            at(fetched.at("tool"))
+        );
         std::fs::write(dir.at("tool"), b"any platform's").unwrap();
-        assert_eq!(program(Some(&dir), std::slice::from_ref(&fetched), "tool"), at(dir.at("tool")));
+        assert_eq!(
+            program(Some(&dir), std::slice::from_ref(&fetched), "tool", &crate::testing::io()),
+            at(dir.at("tool"))
+        );
         std::fs::create_dir(dir.at(&platform())).unwrap();
         std::fs::write(dir.at(&platform()).at("tool"), b"this platform's").unwrap();
-        assert_eq!(program(Some(&dir), &[], "tool"), at(dir.at(&platform()).at("tool")));
+        assert_eq!(program(Some(&dir), &[], "tool", &crate::testing::io()), at(dir.at(&platform()).at("tool")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -268,6 +295,7 @@ mod tests {
             off: std::collections::BTreeSet::new(),
             programs,
             offered: offered.clone(),
+            io: pe2_io::system(),
         })
     }
 
@@ -317,17 +345,17 @@ mod tests {
         let component = dir.at("extension.wasm");
         std::fs::write(&component, "component").unwrap();
         std::fs::write(dir.at("program"), "one").unwrap();
-        let whole = trust(&component, Some(&dir), &about()).unwrap();
+        let whole = trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap();
         // Tests come and go; guides, licenses and the manifest the component carries are only read.
         std::fs::write(dir.at("tests/tests.wasm"), "tests").unwrap();
         std::fs::create_dir_all(dir.at("docs")).unwrap();
         std::fs::write(dir.at("docs/install.md"), "install").unwrap();
         std::fs::write(dir.at("extension.toml"), "id = \"x\"").unwrap();
         std::fs::write(dir.at("LICENSE"), "free").unwrap();
-        assert_eq!(trust(&component, Some(&dir), &about()).unwrap(), whole);
+        assert_eq!(trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap(), whole);
         // A program is the extension, wherever it is.
         std::fs::write(dir.at("program"), "two").unwrap();
-        assert_ne!(trust(&component, Some(&dir), &about()).unwrap(), whole);
+        assert_ne!(trust(&component, Some(&dir), &about(), &pe2_io::system()).unwrap(), whole);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

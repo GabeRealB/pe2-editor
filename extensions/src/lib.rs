@@ -134,7 +134,7 @@ pub fn load_without(
         }
         // Only its manifest: what it offers to run, nothing registered.
         if found.file.file_name().is_some_and(|name| name == folder::MANIFEST) {
-            match manifest_alone(found, kept_apart, &enabled, &offered) {
+            match manifest_alone(found, kept_apart, &enabled, &offered, io) {
                 Ok(Alone::Loads(extension, unsandboxed)) => {
                     unsandboxed_loaded.extend(unsandboxed);
                     loadable.push(*extension);
@@ -150,13 +150,13 @@ pub fn load_without(
             continue;
         }
         let loaded =
-            project::content::read(&found.file).map_err(|e| format!("it cannot be read: {e}")).and_then(|bytes| {
+            project::content::read(io, &found.file).map_err(|e| format!("it cannot be read: {e}")).and_then(|bytes| {
                 if !bytes.starts_with(b"\0asm") {
                     return Err("it is not a WebAssembly component".to_string());
                 }
                 // In a folder of its own, its manifest is its component's: what says whether it needs trusting.
                 let about = match found.origin.folder() {
-                    Some(held) => Some(folder::checked(held, &bytes).map_err(|e| format!("{e:#}"))?),
+                    Some(held) => Some(folder::checked(held, &bytes, io).map_err(|e| format!("{e:#}"))?),
                     None => component::about(&bytes),
                 };
                 if let Some(why) = about.as_ref().and_then(|a| unsandboxed::elsewhere(&a.platforms)) {
@@ -170,14 +170,14 @@ pub fn load_without(
                 // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
                 let held = match about.filter(|a| a.unsandboxed) {
                     Some(about) => {
-                        let trust = unsandboxed::trust(&found.file, found.folder.as_ref(), &about)
+                        let trust = unsandboxed::trust(&found.file, found.folder.as_ref(), &about, io)
                             .map_err(|e| format!("{e:#}"))?;
                         if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
                             let changed = enabled.values().any(|id| *id == about.id);
                             unloadable.push(shown(about, found, &bytes, Status::NotEnabled { changed }, Some(trust)));
                             return Ok(None);
                         }
-                        let unsandboxed = unsandboxed_of(&about, found.folder.as_ref(), trust, &offered);
+                        let unsandboxed = unsandboxed_of(&about, found.folder.as_ref(), trust, &offered, io);
                         unsandboxed_loaded.push(unsandboxed.clone());
                         Some(unsandboxed)
                     }
@@ -225,6 +225,7 @@ fn unsandboxed_of(
     folder: Option<&HostPath>,
     trust: String,
     offered: &project::ext::unsandboxed::Offered,
+    io: &Arc<dyn pe2_io::Io>,
 ) -> Arc<Unsandboxed> {
     let install =
         about.described.install.as_ref().and_then(|page| Some(folder?.join(&pe2_path::RelPath::new(page).ok()?)));
@@ -238,6 +239,7 @@ fn unsandboxed_of(
         off: trust::optional_off(),
         programs: about.program.iter().filter(|p| p.here()).cloned().collect(),
         offered: offered.clone(),
+        io: io.clone(),
     })
 }
 
@@ -255,25 +257,26 @@ fn manifest_alone(
     kept_apart: bool,
     enabled: &BTreeMap<String, String>,
     offered: &project::ext::unsandboxed::Offered,
+    io: &Arc<dyn pe2_io::Io>,
 ) -> Result<Alone, String> {
     let held = found.folder.as_ref().ok_or("it is a manifest outside a folder of its own")?;
-    let about = folder::checked_alone(held).map_err(|e| format!("{e:#}"))?;
+    let about = folder::checked_alone(held, io).map_err(|e| format!("{e:#}"))?;
     if let Some(why) = unsandboxed::elsewhere(&about.platforms) {
         return Err(why);
     }
-    let text = project::content::read(&found.file).unwrap_or_default();
+    let text = project::content::read(io, &found.file).unwrap_or_default();
     if kept_apart {
         return Ok(Alone::Shown(Box::new(shown(about, found, &text, Status::Available, None))));
     }
     if !about.unsandboxed {
         return Ok(Alone::Loads(Box::new(component::load_manifest(about, found.origin.clone(), None)), None));
     }
-    let trust = unsandboxed::trust(&found.file, Some(held), &about).map_err(|e| format!("{e:#}"))?;
+    let trust = unsandboxed::trust(&found.file, Some(held), &about, io).map_err(|e| format!("{e:#}"))?;
     if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
         let changed = enabled.values().any(|id| *id == about.id);
         return Ok(Alone::Shown(Box::new(shown(about, found, &text, Status::NotEnabled { changed }, Some(trust)))));
     }
-    let unsandboxed = unsandboxed_of(&about, Some(held), trust, offered);
+    let unsandboxed = unsandboxed_of(&about, Some(held), trust, offered, io);
     let loadable = component::load_manifest(about, found.origin.clone(), Some(unsandboxed.clone()));
     Ok(Alone::Loads(Box::new(loadable), Some(unsandboxed)))
 }
@@ -569,11 +572,11 @@ pub fn user_settings() -> BTreeMap<String, Table> {
 }
 
 /// The tests in an extension's folder.
-fn tests_of(folder: &HostPath) -> Option<Found> {
+fn tests_of(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Option<Found> {
     let file = folder.join(&TESTS).join(&pe2_path::Name::constant("tests.wasm"));
-    project::pack::is_file(&file).then(|| Found {
+    project::pack::is_file(io, &file).then(|| Found {
         origin: Origin::Component(file.clone()),
-        stamp: file_stamp(&file),
+        stamp: file_stamp(&file, io),
         folder: file.parent(),
         file,
     })
@@ -582,7 +585,7 @@ fn tests_of(folder: &HostPath) -> Option<Found> {
 /// The extensions a project holds (`Project::held_extensions`).
 #[must_use]
 pub fn held_components(project: &Project) -> Vec<Found> {
-    project.held_extensions().into_iter().filter_map(|held| component_at(held, Origin::Project)).collect()
+    project.held_extensions().into_iter().filter_map(|held| component_at(held, Origin::Project, &project.io)).collect()
 }
 
 /// The extensions found beside the built-ins: those the project holds, those kept to be added (yours, beside the
@@ -591,12 +594,12 @@ pub fn held_components(project: &Project) -> Vec<Found> {
 #[must_use]
 pub fn found(project: &Project) -> Vec<Found> {
     let mut found = held_components(project);
-    found.extend(user_components());
-    found.extend(install_components());
+    found.extend(user_components(&project.io));
+    found.extend(install_components(&project.io));
     // In test mode, what each held carries of tests.
     if TEST_HOST.get().is_some() {
         let held = found.iter().filter(|found| matches!(found.origin, Origin::Project(_)));
-        let tests: Vec<Found> = held.filter_map(|found| tests_of(found.folder.as_ref()?)).collect();
+        let tests: Vec<Found> = held.filter_map(|found| tests_of(found.folder.as_ref()?, &project.io)).collect();
         found.extend(tests);
     }
     // What the user enabled - and turned off of what is fetched - changes what each runs as.
@@ -695,34 +698,36 @@ pub fn install_folder() -> Option<PathBuf> {
 }
 
 /// What tells a file's version from another: its size and time.
-fn file_stamp(file: &HostPath) -> String {
-    let stat = project::content::stat(file).ok();
+fn file_stamp(file: &HostPath, io: &Arc<dyn pe2_io::Io>) -> String {
+    let stat = project::content::stat(io, file).ok();
     let time = stat.and_then(|(_, t)| t.duration_since(std::time::UNIX_EPOCH).ok());
     format!("{} {}", stat.map_or(0, |(len, _)| len), time.map_or(0, |t| t.as_nanos()))
 }
 
 /// The stamps of what an extension's folder holds: its tests are not it. One a project holds is its tree, whose hash
 /// tells its versions apart.
-fn own_stamp(folder: &HostPath) -> String {
-    if let Some(held) = project::records::held(folder) {
+fn own_stamp(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> String {
+    if let Some(held) = project::records::held(io, folder) {
         return held.tree.to_string();
     }
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.retain(|entry| entry.file_name().is_none_or(|name| name != TESTS));
     entries.sort();
-    entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
+    let stamp = |e: &HostPath| if io.filesystem().is_folder(e) { folder_stamp(e, io) } else { file_stamp(e, io) };
+    entries.iter().map(stamp).collect::<Vec<_>>().join(" ")
 }
 
 /// The stamps of what a folder holds, below it too.
-fn folder_stamp(folder: &HostPath) -> String {
+fn folder_stamp(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> String {
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.sort();
-    entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
+    let stamp = |e: &HostPath| if io.filesystem().is_folder(e) { folder_stamp(e, io) } else { file_stamp(e, io) };
+    entries.iter().map(stamp).collect::<Vec<_>>().join(" ")
 }
 
 /// The extensions in a folder where they are kept, in name order: each a folder of its own (`<id>.extension`), or an
 /// archive of one (`<id>-<version>.extension.zip`).
-fn components_in(folder: &Path, origin: fn(HostPath) -> Origin) -> Vec<Found> {
+fn components_in(folder: &Path, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2_io::Io>) -> Vec<Found> {
     // What it holds, as places: the extensions' folders and archives are where their programs are found and what is
     // trusted of them. A folder the system cannot name holds none.
     let Ok(folder) = HostPath::new(folder) else { return Vec::new() };
@@ -731,35 +736,38 @@ fn components_in(folder: &Path, origin: fn(HostPath) -> Origin) -> Vec<Found> {
     let archived = |entry: HostPath| {
         archive::is_archive(&entry).then(|| Found {
             origin: origin(entry.clone()),
-            stamp: file_stamp(&entry),
+            stamp: file_stamp(&entry, io),
             file: entry,
             folder: None,
         })
     };
-    entries.into_iter().filter_map(|entry| component_at(entry.clone(), origin).or_else(|| archived(entry))).collect()
+    entries
+        .into_iter()
+        .filter_map(|entry| component_at(entry.clone(), origin, io).or_else(|| archived(entry)))
+        .collect()
 }
 
 /// The extension in a folder of its own (`<id>.extension`), holding its component and what it ships.
-fn component_at(entry: HostPath, origin: fn(HostPath) -> Origin) -> Option<Found> {
-    if !project::pack::is_dir(&entry) || folder::id_of(&entry).is_none() {
+fn component_at(entry: HostPath, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2_io::Io>) -> Option<Found> {
+    if !project::pack::is_dir(io, &entry) || folder::id_of(&entry).is_none() {
         return None;
     }
     // Its component; or, where it is only its manifest (programs and what they are fetched from), that.
-    let file = if folder::alone(&entry) { entry.join(&folder::MANIFEST) } else { entry.join(&EXTENSION_COMPONENT) };
-    let stamp = own_stamp(&entry);
-    project::pack::is_file(&file).then(|| Found { origin: origin(entry.clone()), file, folder: Some(entry), stamp })
+    let file = if folder::alone(&entry, io) { entry.join(&folder::MANIFEST) } else { entry.join(&EXTENSION_COMPONENT) };
+    let stamp = own_stamp(&entry, io);
+    project::pack::is_file(io, &file).then(|| Found { origin: origin(entry.clone()), file, folder: Some(entry), stamp })
 }
 
 /// The extensions in the user's folder, to be added to a project.
 #[must_use]
-pub fn user_components() -> Vec<Found> {
-    user_folder().map_or_default(|folder| components_in(&folder, Origin::User))
+pub fn user_components(io: &Arc<dyn pe2_io::Io>) -> Vec<Found> {
+    user_folder().map_or_default(|folder| components_in(&folder, Origin::User, io))
 }
 
 /// The extensions beside the editor, to be added to a project.
 #[must_use]
-pub fn install_components() -> Vec<Found> {
-    install_folder().map_or_default(|folder| components_in(&folder, Origin::Install))
+pub fn install_components(io: &Arc<dyn pe2_io::Io>) -> Vec<Found> {
+    install_folder().map_or_default(|folder| components_in(&folder, Origin::Install, io))
 }
 
 /// Where an extension of an id is kept to be added: your own extensions' first, then those beside the editor; in each
@@ -944,7 +952,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"game\"\n\n[[layer]]\nname = \"mine\"\n").unwrap();
         for layer in ["game", "mine"] {
-            project::records::mark(&root.at(".layers").at(layer), &project::records::Settings::default()).unwrap();
+            project::records::mark(
+                &pe2_io::SystemFilesystem,
+                &root.at(".layers").at(layer),
+                &project::records::Settings::default(),
+            )
+            .unwrap();
         }
         let project = project::Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
@@ -958,16 +971,17 @@ mod tests {
         let [held] = project.held_extensions().try_into().unwrap();
         assert_eq!(held, root.at(".layers/mine/extensions/pe2.events.extension"));
         assert!(record.is_file() && !held.exists() && !root.at(".cache/extensions").exists());
-        assert_eq!(project::records::held(&held).unwrap().layer, root.at(".layers/mine"));
+        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at(".layers/mine"));
         assert_eq!(project.requires, [project::Requirement { id: "pe2.events".into(), version: Some("^0.1".into()) }]);
         // Trusted as the folder it came from was: the hash read from its tree is the folder's.
         let trust = |folder: &HostPath| {
-            project::ext::unsandboxed::trust(&folder.at("extension.wasm"), Some(folder), &about).unwrap()
+            project::ext::unsandboxed::trust(&folder.at("extension.wasm"), Some(folder), &about, &pe2_io::system())
+                .unwrap()
         };
         assert_eq!(trust(&held), trust(&source));
         // A program it ships, handed over in place: its object, read-only, still a program.
         let project::ext::unsandboxed::Runnable::At(tool) =
-            project::ext::unsandboxed::program(Some(&held), &[], "tool")
+            project::ext::unsandboxed::program(Some(&held), &[], "tool", &pe2_io::system())
         else {
             panic!("no program found")
         };
@@ -990,7 +1004,7 @@ mod tests {
         assert_eq!(loaded.origin, project::ext::Origin::Project(held.clone()));
         // Updated: added again, in place of what was there; undone, what was there is back. As it is, it is no step.
         let tool = |project: &project::Project| {
-            project::content::read_to_string(&project.held_extensions()[0].at(&shipped_tool())).unwrap()
+            project::content::read_to_string(&project.io, &project.held_extensions()[0].at(&shipped_tool())).unwrap()
         };
         let steps = history.done().len();
         add_extension(&project, &source, None, &mut history, "again".into()).unwrap();

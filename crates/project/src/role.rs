@@ -61,7 +61,7 @@ impl Role {
     /// # Errors
     /// One runs already - a second one started in a race ends here, and its starter finds the first.
     pub fn claim(&self, root: &HostPath) -> Result<std::fs::File> {
-        crate::cache::make(root)?;
+        crate::cache::make(&pe2_io::SystemFilesystem, root)?;
         let one = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -102,7 +102,7 @@ impl Role {
         args: &[String],
         clock: &dyn pe2_io::Clock,
     ) -> Result<Link> {
-        crate::cache::make(root)?;
+        crate::cache::make(&pe2_io::SystemFilesystem, root)?;
         let log = std::fs::File::create(root.join(&DIR).join(&self.log))?;
         let mut command = std::process::Command::new(program.as_os_str());
         command.args(["project", self.command, "--project"]).arg(root.as_os_str()).args(args);

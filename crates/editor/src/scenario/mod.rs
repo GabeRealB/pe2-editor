@@ -644,7 +644,7 @@ impl Scenario {
             Some(project::ext::Origin::Component(file)) => file.parent().expect("in a folder").at("data").at(name),
             _ => return Err(format!("{id} has no folder")),
         };
-        project::content::read(&at).map_err(|e| format!("{}: {e}", at.display()))
+        project::content::read(&pe2_io::system(), &at).map_err(|e| format!("{}: {e}", at.display()))
     }
 
     /// A node a test asked for, as its template makes one, in the active layer: a step of the history, so that it can go.

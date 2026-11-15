@@ -44,9 +44,9 @@
 //!   or said damaged.
 
 use crate::HostPath;
+use pe2_io::{Descriptor, Filesystem, Kind, LockKind, Mapping, Open, read_file_at, remove_all_at, write_file_at};
 use pe2_path::Name;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -278,20 +278,24 @@ impl Drop for Mem {
     }
 }
 
+/// Mappings kept for as long as the space is.
+type Maps = Mutex<Vec<Mapping>>;
+
 /// Where the pages are: files of the project's cache, mapped and shared; or this process's own memory, for a space
 /// nothing else reads (`Space::private`).
 enum Backing {
     Files {
-        dir: HostPath,
+        /// Its folder.
+        folder: Box<dyn Descriptor>,
         /// Kept mapped for as long as the space is.
-        maps: Mutex<Vec<memmap2::MmapRaw>>,
-        head: memmap2::MmapRaw,
-        free: memmap2::MmapRaw,
-        pins: memmap2::MmapRaw,
-        writer: File,
+        maps: Maps,
+        head: Mapping,
+        free: Mapping,
+        pins: Mapping,
+        writer: Box<dyn Descriptor>,
         /// Held shared while the space is attached here; and this process's slot, held alone.
-        attached: File,
-        _reader: File,
+        attached: Box<dyn Descriptor>,
+        _reader: Box<dyn Descriptor>,
     },
     Memory {
         chunks: Mutex<Vec<Mem>>,
@@ -389,7 +393,7 @@ pub struct Space {
     /// It began empty: what it is to hold is put there again by whoever owns it.
     fresh: AtomicBool,
     /// Where the pages of a space left behind are, with those mapped here: read, never written.
-    left: Option<(HostPath, Mutex<Vec<memmap2::MmapRaw>>)>,
+    left: Option<(Box<dyn Descriptor>, Maps)>,
     #[cfg(test)]
     faults: Mutex<Option<Faults>>,
 }
@@ -405,51 +409,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A file of a space, opened to be read, written and locked: made where there is none.
-fn opened(path: &HostPath) -> io::Result<File> {
-    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+fn opened(folder: &dyn Descriptor, name: &Name) -> io::Result<Box<dyn Descriptor>> {
+    folder.open_at(name.as_rel(), Open::KEEP)
 }
 
 /// A file of a space, of at least this length, all of it the file's own on the disk - never a hole a full disk
-/// could refuse to who writes through a mapping: a full disk is an error here, to who asks for the room. Given
-/// by the system where it can give a file its blocks without writing them; written as zeros elsewhere.
-fn sized(path: &HostPath, len: u64) -> io::Result<File> {
-    let file = opened(path)?;
-    let has = file.metadata()?.len();
-    if has < len {
-        allocate(&file, has, len)?;
+/// could refuse to who writes through a mapping: a full disk is an error here, to who asks for the room.
+fn sized(folder: &dyn Descriptor, name: &Name, len: u64) -> io::Result<Box<dyn Descriptor>> {
+    let file = opened(folder, name)?;
+    if file.stat()?.size < len {
+        file.allocate(len)?;
     }
     Ok(file)
 }
 
-#[cfg(target_os = "linux")]
-fn allocate(file: &File, _has: u64, len: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let len = libc::off_t::try_from(len).map_err(io::Error::other)?;
-    // SAFETY: a file open here, for its whole length from its start.
-    match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
-        0 => Ok(()),
-        failed => Err(io::Error::from_raw_os_error(failed)),
-    }
-}
-
-/// On Windows a file made longer is given its clusters then, and reads as zeros until written.
-#[cfg(windows)]
-fn allocate(file: &File, _has: u64, len: u64) -> io::Result<()> {
-    file.set_len(len)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn allocate(mut file: &File, has: u64, len: u64) -> io::Result<()> {
-    use std::io::{Seek as _, Write as _};
-    file.seek(io::SeekFrom::Start(has))?;
-    let zeros = vec![0u8; 1 << 16];
-    let mut left = len - has;
-    while left > 0 {
-        let part = usize::try_from(left).unwrap_or(usize::MAX).min(zeros.len());
-        file.write_all(&zeros[..part])?;
-        left -= part as u64;
-    }
-    Ok(())
+/// The first `len` bytes of a space's file, mapped to be read and written.
+fn map_file(file: &dyn Descriptor, len: usize) -> io::Result<Mapping> {
+    // SAFETY: a space's file, which every process changes under the space's own protocol.
+    unsafe { file.map(len, true) }
 }
 
 /// Whether a file of a space's folder is one of its pages' - not one of its locks, nor what its readers say.
@@ -488,10 +465,9 @@ fn said_clean(generation: u64, lists: u32) -> [u8; 12] {
 
 /// Whether the files in `dir` are a space had on disk as it is: `clean` says the generation its header is at - which
 /// is whole, the last commit written, not damaged - and its lists of pages are those it was said with.
-fn is_clean(dir: &HostPath) -> bool {
-    let (Ok(said), Ok(head), Ok(free)) =
-        (std::fs::read(dir.join(&CLEAN)), std::fs::read(dir.join(&HEAD)), std::fs::read(dir.join(&FREE)))
-    else {
+fn is_clean(folder: &dyn Descriptor) -> bool {
+    let read = |name: &Name| read_file_at(folder, name.as_rel());
+    let (Ok(said), Ok(head), Ok(free)) = (read(CLEAN), read(HEAD), read(FREE)) else {
         return false;
     };
     if head.len() < 3 * PAGE || free.len() < LISTS {
@@ -500,9 +476,7 @@ fn is_clean(dir: &HostPath) -> bool {
     let header = Commit::of_header(&head);
     let latest =
         [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation);
-    let lists = lists_sum(&free, &mut |name, number| {
-        std::fs::read(dir.join(&named(&format!("{number:08}.{name}")).ok()?)).ok()
-    });
+    let lists = lists_sum(&free, &mut |name, number| read(&named(&format!("{number:08}.{name}")).ok()?).ok());
     number_at(&head, at::MAGIC) == MAGIC
         && number_at(&head, at::SEQ) % 2 == 0
         && number_at(&head, at::DAMAGED) == 0
@@ -513,26 +487,26 @@ fn is_clean(dir: &HostPath) -> bool {
 
 /// Make a chunk's file, whole, where there is none: by one process at a time, under a name of its own until it is
 /// whole - so that no process ever writes zeros into a chunk another is using.
-fn make_chunk(dir: &HostPath, number: usize) -> io::Result<File> {
-    let path = dir.join(&named(&format!("{number:08}.chunk"))?);
-    let whole = |path: &HostPath| {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
-        (file.metadata().ok()?.len() >= CHUNK as u64).then_some(file)
+fn make_chunk(folder: &dyn Descriptor, number: usize) -> io::Result<Box<dyn Descriptor>> {
+    let name = named(&format!("{number:08}.chunk"))?;
+    let whole = || {
+        let file = folder.open_at(name.as_rel(), Open::CHANGE).ok()?;
+        (file.stat().ok()?.size >= CHUNK as u64).then_some(file)
     };
-    if let Some(file) = whole(&path) {
+    if let Some(file) = whole() {
         return Ok(file);
     }
-    let grow = opened(&dir.join(&GROW))?;
-    grow.lock()?;
+    let grow = opened(folder, GROW)?;
+    grow.lock(LockKind::Exclusive)?;
     let made = (|| {
-        if let Some(file) = whole(&path) {
+        if let Some(file) = whole() {
             return Ok(file);
         }
-        let being_made = dir.join(&named(&format!("{number:08}.chunk.{}", std::process::id()))?);
-        let _ = std::fs::remove_file(&being_made);
-        drop(sized(&being_made, CHUNK as u64)?);
-        std::fs::rename(&being_made, &path)?;
-        std::fs::OpenOptions::new().read(true).write(true).open(&path)
+        let being_made = named(&format!("{number:08}.chunk.{}", std::process::id()))?;
+        let _ = folder.unlink_file_at(being_made.as_rel());
+        drop(sized(folder, &being_made, CHUNK as u64)?);
+        folder.rename_at(being_made.as_rel(), folder, name.as_rel())?;
+        folder.open_at(name.as_rel(), Open::CHANGE)
     })();
     let _ = grow.unlock();
     made
@@ -576,12 +550,12 @@ impl Space {
     ///
     /// # Errors
     /// Its files cannot be made or mapped, are of another format, or every slot is taken.
-    pub fn open(dir: &HostPath) -> io::Result<Space> {
-        std::fs::create_dir_all(dir)?;
-        let writer = opened(&dir.join(&WRITER))?;
-        let attached = opened(&dir.join(&ATTACHED_FILE))?;
+    pub fn open(dir: &HostPath, filesystem: &dyn Filesystem) -> io::Result<Space> {
+        let folder = filesystem.open_folder(dir, true)?;
+        let writer = opened(&*folder, WRITER)?;
+        let attached = opened(&*folder, ATTACHED_FILE)?;
         // One process attaches at a time: who has it alone decides whether it is trusted before another counts on it.
-        writer.lock()?;
+        writer.lock(LockKind::Exclusive)?;
         let parts = (|| {
             // Alone with it - asked a few times: a process starting another holds, for a moment, what its threads
             // have open, the locks on it with it.
@@ -592,27 +566,24 @@ impl Space {
                     #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                attached.try_lock().is_ok()
+                attached.try_lock(LockKind::Exclusive).is_ok_and(|taken| taken)
             });
             #[cfg(test)]
             drop(asking);
-            let trusted = !alone || is_clean(dir);
+            let trusted = !alone || is_clean(&*folder);
             if !trusted {
-                Space::set_aside(dir)?;
+                Space::set_aside(&*folder)?;
             }
             if alone {
                 attached.unlock()?;
             }
-            attached.lock_shared()?;
-            let head = sized(&dir.join(&HEAD), 3 * PAGE as u64)?;
-            let head = memmap2::MmapOptions::new().len(3 * PAGE).map_raw(&head)?;
-            let free = sized(&dir.join(&FREE), LISTS as u64)?;
-            let free = memmap2::MmapOptions::new().len(LISTS).map_raw(&free)?;
-            let pins = sized(&dir.join(&PINS_FILE), PINNED as u64)?;
-            let pins = memmap2::MmapOptions::new().len(PINNED).map_raw(&pins)?;
+            attached.lock(LockKind::Shared)?;
+            let head = map_file(&*sized(&*folder, HEAD, 3 * PAGE as u64)?, 3 * PAGE)?;
+            let free = map_file(&*sized(&*folder, FREE, LISTS as u64)?, LISTS)?;
+            let pins = map_file(&*sized(&*folder, PINS_FILE, PINNED as u64)?, PINNED)?;
             let reader = (0..READERS).find_map(|slot| {
-                let file = opened(&dir.join(&named(&format!("reader.{slot}")).ok()?)).ok()?;
-                file.try_lock().ok().map(|()| (slot, file))
+                let file = opened(&*folder, &named(&format!("reader.{slot}")).ok()?).ok()?;
+                matches!(file.try_lock(LockKind::Exclusive), Ok(true)).then_some((slot, file))
             });
             let (slot, reader) = reader.ok_or_else(|| io::Error::other("every slot of the space is taken"))?;
             Ok::<_, io::Error>((head, free, pins, slot, reader, alone))
@@ -624,16 +595,8 @@ impl Space {
                 return Err(e);
             }
         };
-        let backing = Backing::Files {
-            dir: dir.clone(),
-            maps: Mutex::default(),
-            head,
-            free,
-            pins,
-            writer,
-            attached,
-            _reader: reader,
-        };
+        let backing =
+            Backing::Files { folder, maps: Mutex::default(), head, free, pins, writer, attached, _reader: reader };
         let space = Space::with(backing, slot, false);
         let made = match space.atom(at::MAGIC).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(true),
@@ -661,23 +624,24 @@ impl Space {
     /// Take a space's pages out of its folder: nothing of it is trusted. Kept aside - in place of what was kept
     /// before - where it was found damaged (`damaged/`), and where it is of this format, as the processes that
     /// had it left it (`left/`, read by `left_behind`).
-    fn set_aside(dir: &HostPath) -> io::Result<()> {
-        let head = std::fs::read(dir.join(&HEAD)).ok();
+    fn set_aside(folder: &dyn Descriptor) -> io::Result<()> {
+        let head = read_file_at(folder, HEAD.as_rel()).ok();
         let damaged = head.as_ref().is_some_and(|head| number_at(head, at::DAMAGED) != 0);
         let ours = head.as_ref().is_some_and(|head| number_at(head, at::MAGIC) == MAGIC);
-        let aside = if damaged { Some(dir.join(&DAMAGED)) } else { ours.then(|| dir.join(&LEFT)) };
-        if let Some(aside) = &aside {
-            let _ = std::fs::remove_dir_all(aside);
-            std::fs::create_dir_all(aside)?;
+        let aside = if damaged { Some(DAMAGED) } else { ours.then_some(LEFT) };
+        if let Some(aside) = aside {
+            let _ = remove_all_at(folder, aside.as_rel());
+            folder.create_directory_at(aside.as_rel())?;
         }
-        for entry in std::fs::read_dir(dir)?.flatten() {
-            let name = entry.file_name();
-            if !name.to_str().is_some_and(of_pages) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        for entry in folder.read_directory()? {
+            // A space's own files are named as it names them; what else is there is left alone.
+            let Some(name) = entry.name.to_str().filter(|name| of_pages(name) && entry.kind == Kind::File) else {
                 continue;
-            }
-            match &aside {
-                Some(aside) => std::fs::rename(entry.path(), aside.entry(&name))?,
-                None => std::fs::remove_file(entry.path())?,
+            };
+            let name = named(name)?;
+            match aside {
+                Some(aside) => folder.rename_at(name.as_rel(), folder, &aside.as_rel().join(&name))?,
+                None => folder.unlink_file_at(name.as_rel())?,
             }
         }
         Ok(())
@@ -692,9 +656,9 @@ impl Space {
     ///
     /// # Errors
     /// There is no memory for it, or its files cannot be read.
-    pub fn left_behind(dir: &HostPath) -> io::Result<Option<Space>> {
-        let left = dir.join(&LEFT);
-        let Ok(head) = std::fs::read(left.join(&HEAD)) else { return Ok(None) };
+    pub fn left_behind(dir: &HostPath, filesystem: &dyn Filesystem) -> io::Result<Option<Space>> {
+        let Ok(left) = filesystem.open_folder(&dir.join(LEFT), false) else { return Ok(None) };
+        let Ok(head) = read_file_at(&*left, HEAD.as_rel()) else { return Ok(None) };
         if head.len() < 3 * PAGE || number_at(&head, at::MAGIC) != MAGIC || number_at(&head, at::DAMAGED) != 0 {
             return Ok(None);
         }
@@ -720,8 +684,10 @@ impl Space {
     }
 
     /// Let go of what was kept of a space begun anew (`left_behind`): read, or not wanted.
-    pub fn forget_left(dir: &HostPath) {
-        let _ = std::fs::remove_dir_all(dir.join(&LEFT));
+    pub fn forget_left(dir: &HostPath, filesystem: &dyn Filesystem) {
+        if let Ok(folder) = filesystem.open_folder(dir, false) {
+            let _ = remove_all_at(&*folder, LEFT.as_rel());
+        }
     }
 
     /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
@@ -802,7 +768,7 @@ impl Space {
 
     fn head(&self) -> *mut u8 {
         match &self.backing {
-            Backing::Files { head, .. } => head.as_mut_ptr(),
+            Backing::Files { head, .. } => head.as_ptr(),
             Backing::Memory { head, .. } => head.at,
         }
     }
@@ -827,7 +793,7 @@ impl Space {
     /// The header of the writer's lists of pages.
     fn lists(&self) -> *mut u8 {
         match &self.backing {
-            Backing::Files { free, .. } => free.as_mut_ptr(),
+            Backing::Files { free, .. } => free.as_ptr(),
             Backing::Memory { free, .. } => free.at,
         }
     }
@@ -865,15 +831,15 @@ impl Space {
                 known.store(first, Ordering::Release);
                 Ok(first)
             }
-            Backing::Files { dir, maps, .. } => {
+            Backing::Files { folder, maps, .. } => {
                 let mut maps = lock(maps);
                 let again = known.load(Ordering::Acquire);
                 if !again.is_null() {
                     return Ok(again);
                 }
-                let file = sized(&dir.join(&named(&format!("{number:08}.{}", list.name))?), PIECE as u64)?;
-                let map = memmap2::MmapOptions::new().len(PIECE).map_raw(&file)?;
-                let first = map.as_mut_ptr();
+                let file = sized(&**folder, &named(&format!("{number:08}.{}", list.name))?, PIECE as u64)?;
+                let map = map_file(&*file, PIECE)?;
+                let first = map.as_ptr();
                 maps.push(map);
                 known.store(first, Ordering::Release);
                 Ok(first)
@@ -893,7 +859,7 @@ impl Space {
     /// What the readers of every process say.
     fn pinned_at(&self) -> *mut u8 {
         match &self.backing {
-            Backing::Files { pins, .. } => pins.as_mut_ptr(),
+            Backing::Files { pins, .. } => pins.as_ptr(),
             Backing::Memory { pins, .. } => pins.at,
         }
     }
@@ -1030,13 +996,14 @@ impl Space {
                     return Ok(again);
                 }
                 // Of a space left behind: its file, mapped to be read.
-                if let Some((dir, maps)) = &self.left {
-                    let file = match File::open(dir.join(&named(&format!("{number:08}.chunk"))?)) {
-                        Ok(file) if file.metadata()?.len() >= CHUNK as u64 => file,
+                if let Some((left, maps)) = &self.left {
+                    let file = match left.open_at(named(&format!("{number:08}.chunk"))?.as_rel(), Open::READ) {
+                        Ok(file) if file.stat()?.size >= CHUNK as u64 => file,
                         _ => return Err(self.damaged(format!("a page in chunk {number}, which is not there whole"))),
                     };
-                    let map = memmap2::MmapOptions::new().len(CHUNK).map_raw_read_only(&file)?;
-                    let first = map.as_mut_ptr();
+                    // SAFETY: a space left behind, which no process writes.
+                    let map = unsafe { file.map(CHUNK, false)? };
+                    let first = map.as_ptr();
                     lock(maps).push(map);
                     known.store(first, Ordering::Release);
                     return Ok(first);
@@ -1050,18 +1017,17 @@ impl Space {
                 known.store(first, Ordering::Release);
                 Ok(first)
             }
-            Backing::Files { dir, maps, .. } => {
+            Backing::Files { folder, maps, .. } => {
                 let mut maps = lock(maps);
                 let again = known.load(Ordering::Acquire);
                 if !again.is_null() {
                     return Ok(again);
                 }
                 let file = if make {
-                    make_chunk(dir, number)?
+                    make_chunk(&**folder, number)?
                 } else {
-                    let path = dir.join(&named(&format!("{number:08}.chunk"))?);
-                    match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
-                        Ok(file) if file.metadata()?.len() >= CHUNK as u64 => file,
+                    match folder.open_at(named(&format!("{number:08}.chunk"))?.as_rel(), Open::CHANGE) {
+                        Ok(file) if file.stat()?.size >= CHUNK as u64 => file,
                         Ok(_) => return Err(self.damaged(format!("chunk {number} is not whole"))),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {
                             return Err(self.damaged(format!("a page in chunk {number}, which is not there")));
@@ -1069,8 +1035,8 @@ impl Space {
                         Err(e) => return Err(e.into()),
                     }
                 };
-                let map = memmap2::MmapOptions::new().len(CHUNK).map_raw(&file)?;
-                let first = map.as_mut_ptr();
+                let map = map_file(&*file, CHUNK)?;
+                let first = map.as_ptr();
                 maps.push(map);
                 known.store(first, Ordering::Release);
                 Ok(first)
@@ -1244,15 +1210,15 @@ impl Space {
 
     /// Whether the process a slot is of is gone: nobody holds the slot's file.
     fn gone(&self, slot: usize) -> bool {
-        let Backing::Files { dir, .. } = &self.backing else { return false };
+        let Backing::Files { folder, .. } = &self.backing else { return false };
         if slot == self.slot {
             return false;
         }
         let Ok(reader) = named(&format!("reader.{slot}")) else { return false };
-        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(&reader)) else {
+        let Ok(file) = folder.open_at(reader.as_rel(), Open::CHANGE) else {
             return false;
         };
-        let gone = file.try_lock().is_ok();
+        let gone = matches!(file.try_lock(LockKind::Exclusive), Ok(true));
         if gone {
             let _ = file.unlock();
         }
@@ -1280,7 +1246,7 @@ impl Space {
         }
         let writing = lock(&self.writing);
         if let Backing::Files { writer, .. } = &self.backing {
-            writer.lock()?;
+            writer.lock(LockKind::Exclusive)?;
         }
         let from = (|| {
             // A writer that died publishing left the header half said: said again from the page it wrote.
@@ -1394,7 +1360,7 @@ impl Space {
         attached.unlock()?;
         #[cfg(test)]
         let asking = crate::forks::asking();
-        let alone = attached.try_lock().is_ok();
+        let alone = attached.try_lock(LockKind::Exclusive).is_ok_and(|taken| taken);
         #[cfg(test)]
         drop(asking);
         if alone {
@@ -1402,14 +1368,14 @@ impl Space {
         }
         // Attached still - but for one that leaves beside another: it is gone to whoever asks next.
         if alone || !leaving {
-            attached.lock_shared()?;
+            attached.lock(LockKind::Shared)?;
         }
         if alone { self.synced(&held) } else { Ok(false) }
     }
 
     /// `sync`, by who has the writer's lock.
     fn synced(&self, held: &Txn<'_>) -> io::Result<bool> {
-        let Backing::Files { dir, .. } = &self.backing else { return Ok(true) };
+        let Backing::Files { folder, .. } = &self.backing else { return Ok(true) };
         self.flush()?;
         for slot in 0..READERS {
             if slot == self.slot || self.atom(at::WROTE + slot * 8).load(Ordering::SeqCst) == 0 {
@@ -1422,13 +1388,11 @@ impl Space {
                 return Ok(false);
             }
         }
-        for entry in std::fs::read_dir(dir)?.flatten() {
-            let name = entry.file_name();
-            if name.to_str().is_some_and(|name| of_pages(name) && name != "clean") {
-                std::fs::OpenOptions::new().read(true).write(true).open(entry.path())?.sync_all()?;
+        for entry in folder.read_directory()? {
+            if let Some(name) = entry.name.to_str().filter(|name| of_pages(name) && *name != "clean") {
+                folder.open_at(named(name)?.as_rel(), Open::CHANGE)?.sync()?;
             }
         }
-        let clean = dir.join(&CLEAN);
         // SAFETY: the lists' header, whole; nobody writes it but who has the writer's lock, held here.
         let header = unsafe { std::slice::from_raw_parts(self.lists(), LISTS) }.to_vec();
         let lists = lists_sum(&header, &mut |name, number| {
@@ -1437,11 +1401,9 @@ impl Space {
             self.piece(list, number).ok().map(|piece| unsafe { std::slice::from_raw_parts(piece, PIECE) }.to_vec())
         });
         let lists = lists.ok_or_else(|| io::Error::other("the lists of the shared space's pages cannot be read"))?;
-        std::fs::write(&clean, said_clean(held.from.generation, lists))?;
-        std::fs::OpenOptions::new().read(true).write(true).open(&clean)?.sync_all()?;
-        if cfg!(unix) {
-            File::open(dir)?.sync_all()?;
-        }
+        write_file_at(&**folder, CLEAN.as_rel(), &said_clean(held.from.generation, lists))?;
+        folder.open_at(CLEAN.as_rel(), Open::CHANGE)?.sync()?;
+        folder.sync()?;
         self.atom(at::CLEAN).store(1, Ordering::SeqCst);
         Ok(true)
     }
@@ -1452,14 +1414,12 @@ impl Space {
         if self.atom(at::CLEAN).load(Ordering::SeqCst) == 0 {
             return Ok(());
         }
-        if let Backing::Files { dir, .. } = &self.backing {
-            match std::fs::remove_file(dir.join(&CLEAN)) {
+        if let Backing::Files { folder, .. } = &self.backing {
+            match folder.unlink_file_at(CLEAN.as_rel()) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
-            if cfg!(unix) {
-                File::open(dir)?.sync_all()?;
-            }
+            folder.sync()?;
         }
         self.atom(at::CLEAN).store(0, Ordering::SeqCst);
         Ok(())
@@ -1987,14 +1947,13 @@ pub fn rest_all() -> io::Result<()> {
 ///
 /// # Errors
 /// As `Space::open`.
-pub fn shared(dir: &crate::HostPath) -> io::Result<Arc<Space>> {
-    std::fs::create_dir_all(dir)?;
+pub fn shared(dir: &crate::HostPath, filesystem: &dyn Filesystem) -> io::Result<Arc<Space>> {
     let dir = dir.clone();
     let mut open = lock(&OPEN);
     if let Some((_, space)) = open.iter().find(|(at, _)| *at == dir) {
         return Ok(space.clone());
     }
-    let space = Arc::new(Space::open(&dir)?);
+    let space = Arc::new(Space::open(&dir, filesystem)?);
     open.push((dir, space.clone()));
     Ok(space)
 }

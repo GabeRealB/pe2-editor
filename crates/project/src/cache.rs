@@ -61,12 +61,12 @@ impl Cache {
                     .with_context(|| format!("wiping {}", path.display()))?;
             }
         }
-        make(&project.root)?;
+        make(project.io.filesystem(), &project.root)?;
         if current.as_deref() != Some(version.as_str()) {
-            write_atomic(&dir.join(&VERSION), version.as_bytes())?;
+            write_atomic(project.io.filesystem(), &dir.join(&VERSION), version.as_bytes())?;
         }
         // Before anything reads the project's files: they are as the log says they are to be.
-        let recovered = crate::storage::redo(&project.root)?;
+        let recovered = crate::storage::redo(&project.root, project.io.filesystem())?;
         Ok(Cache { dir, io: project.io.clone(), recovered })
     }
 
@@ -83,12 +83,12 @@ impl Cache {
 ///
 /// # Errors
 /// The directory or its `.gitignore` cannot be written.
-pub fn make(root: &HostPath) -> Result<HostPath> {
+pub fn make(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<HostPath> {
     let dir = root.join(&DIR);
-    std::fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+    fs.create_folder_all(&dir).with_context(|| format!("{}", dir.display()))?;
     let ignore = dir.join(&GITIGNORE);
     if !ignore.exists() {
-        write_atomic(&ignore, b"*\n")?;
+        write_atomic(fs, &ignore, b"*\n")?;
     }
     Ok(dir)
 }
@@ -97,14 +97,16 @@ pub fn make(root: &HostPath) -> Result<HostPath> {
 ///
 /// # Errors
 /// The temporary file cannot be written or renamed.
-pub fn write_atomic(path: &HostPath, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(fs: &dyn pe2_io::Filesystem, path: &HostPath, bytes: &[u8]) -> Result<()> {
     // Each writer's own: two threads may be writing the same file, as two nodes making one value do.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temporary = path.with_file_name(format!(".{name}.{}.{write}.tmp", std::process::id()));
-    std::fs::write(&temporary, bytes).with_context(|| format!("{}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("{}", path.display()))
+    let aside = format!(".{name}.{}.{write}.tmp", std::process::id());
+    let aside = pe2_path::Name::new(&aside)?;
+    let temporary = path.parent().map(|folder| folder.join(aside)).with_context(|| path.display().to_string())?;
+    fs.write(&temporary, bytes).with_context(|| format!("{}", temporary.display()))?;
+    fs.rename(&temporary, path).with_context(|| format!("{}", path.display()))
 }
 
 /// Remove a test's project, whatever a history still alive in it is writing behind this moment: tried again
@@ -156,7 +158,9 @@ mod tests {
         let writers: Vec<_> = (0..8)
             .map(|_| {
                 let file = file.clone();
-                std::thread::spawn(move || (0..200).try_for_each(|_| super::write_atomic(&file, b"held")))
+                std::thread::spawn(move || {
+                    (0..200).try_for_each(|_| super::write_atomic(&pe2_io::SystemFilesystem, &file, b"held"))
+                })
             })
             .collect();
         for writer in writers {

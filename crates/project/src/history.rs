@@ -587,9 +587,9 @@ impl History {
             document.base.insert(edit.file.clone(), on_disk(index, edit.uid, &edit.file));
             // What it was on disk is kept: undone back to it, it is shown though the disk has changed since.
             if let Some(file) = disk_file(index, edit.uid, &edit.file)
-                && let Ok(bytes) = crate::content::read(&file.path)
+                && let Ok(bytes) = crate::content::read(&self.io, &file.path)
             {
-                let _ = keep_in(&self.view.dir, &bytes);
+                let _ = keep_in(self.io.filesystem(), &self.view.dir, &bytes);
             }
         }
         document.working.insert(edit.file.clone(), edit.after);
@@ -665,9 +665,9 @@ impl History {
             if stale.is_some() && stale != document.stale {
                 for file in now.keys() {
                     if let Some(file) = disk_file(index, *uid, file)
-                        && let Ok(bytes) = crate::content::read(&file.path)
+                        && let Ok(bytes) = crate::content::read(&self.io, &file.path)
                     {
-                        let _ = keep_in(&self.view.dir, &bytes);
+                        let _ = keep_in(self.io.filesystem(), &self.view.dir, &bytes);
                     }
                 }
             }
@@ -1049,7 +1049,7 @@ impl History {
         self.appended.set(None);
         if let Ok(mut text) = serde_json::to_string(&Journaled::Whole(session)) {
             text.push('\n');
-            if write_atomic(&self.view.dir.join(&SESSION), text.as_bytes()).is_ok() {
+            if write_atomic(self.io.filesystem(), &self.view.dir.join(&SESSION), text.as_bytes()).is_ok() {
                 self.appended.set(Some((self.view.done.len(), self.view.undone.len(), text.len() as u64)));
             }
         }
@@ -1093,7 +1093,9 @@ impl History {
 
     fn apply(&self, change: &Change) -> Result<()> {
         match change {
-            Change::Write { path, after: Some(hash), .. } => write_atomic(path, &self.blob(hash)?),
+            Change::Write { path, after: Some(hash), .. } => {
+                write_atomic(self.io.filesystem(), path, &self.blob(hash)?)
+            }
             Change::Write { path, after: None, .. } => match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context(path.display().to_string()),
                 _ => Ok(()),
@@ -1119,7 +1121,7 @@ impl History {
 
     /// Keep bytes in the history; their hash.
     fn keep(&self, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
-        keep_in(&self.view.dir, bytes)
+        keep_in(self.io.filesystem(), &self.view.dir, bytes)
     }
 
     /// Keep a file's current content; its hash, none where it is absent.
@@ -1380,7 +1382,7 @@ impl Transaction<'_> {
     pub fn write(&mut self, path: &HostPath, bytes: &[u8]) -> Result<()> {
         // A large content in a layer is stored as chunks: what the step keeps is its manifest, the other form gone.
         let manifest = crate::chunks::manifest_path(path);
-        if let Some(text) = crate::content::chunked(path, bytes, self.history.io.clock().wall())? {
+        if let Some(text) = crate::content::chunked(&self.history.io, path, bytes)? {
             self.write_stored(&manifest, text.as_bytes())?;
             self.drop_stored(path)
         } else {
@@ -1548,11 +1550,11 @@ fn copy_all(from: &HostPath, to: &HostPath) -> std::io::Result<()> {
 }
 
 /// Keep bytes in a history's folder, once: their hash.
-fn keep_in(dir: &HostPath, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
+fn keep_in(fs: &dyn pe2_io::Filesystem, dir: &HostPath, bytes: &[u8]) -> Result<pe2_ext::Sha1> {
     let hash = crate::extract::sha1_of(bytes);
     let path = dir.join(&BLOBS).join(&Name::new(&hash.to_string())?);
     if !path.exists() {
-        write_atomic(&path, bytes)?;
+        write_atomic(fs, &path, bytes)?;
     }
     Ok(hash)
 }
@@ -1646,17 +1648,17 @@ mod tests {
         tx.write(&file, &big).unwrap();
         tx.commit().unwrap();
         assert!(!file.exists() && manifest.is_file(), "a large content is stored as its manifest");
-        assert_eq!(crate::content::read(&file).unwrap(), big);
+        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
         history.undo(&index, None, false).unwrap();
         assert!(!manifest.exists() && read(&file).as_deref() == Some("small first"));
         history.redo(&index, None, false).unwrap();
-        assert_eq!(crate::content::read(&file).unwrap(), big);
+        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
         let mut tx = history.begin("remove");
         tx.remove(&file).unwrap();
         tx.commit().unwrap();
-        assert!(!crate::content::exists(&file));
+        assert!(!crate::content::exists(&crate::testing::io(), &file));
         history.undo(&index, None, false).unwrap();
-        assert_eq!(crate::content::read(&file).unwrap(), big);
+        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
         crate::cache::remove_all(&root);
     }
 
@@ -1731,7 +1733,12 @@ mod tests {
             storage.say("crashed", &changes).unwrap();
             // Another, cut short before it was whole: nothing.
             sfs::storage::began(
-                &sfs::Log::shared(&root.at(".cache/filesystem/sfs"), sfs::log::Config::default()).unwrap(),
+                &sfs::Log::shared(
+                    &root.at(".cache/filesystem/sfs"),
+                    sfs::log::Config::default(),
+                    &pe2_io::SystemFilesystem,
+                )
+                .unwrap(),
             )
             .unwrap();
             std::mem::forget(storage);

@@ -112,8 +112,10 @@ fn scope() {
         files.insert(given(&format!("wide/h{file:04}.h")), Given::Bytes(tiny.clone()));
     }
     let serving = scopes();
-    let (served, folder) =
-        timed(|| project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served"));
+    let (served, folder) = timed(|| {
+        project::content::serve_folder(&pe2_io::system(), Some(&root), &files, &once(), &root.at("fallback"))
+            .expect("served")
+    });
     let list = |dir: &HostPath| {
         let mut found = Vec::new();
         listed(dir, &mut found);
@@ -183,7 +185,8 @@ fn mounts() {
         let root = base.at(&format!("p{nth}"));
         std::fs::create_dir_all(&root).unwrap();
         let (served, folder) = timed(|| {
-            project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served")
+            project::content::serve_folder(&pe2_io::system(), Some(&root), &files, &once(), &root.at("fallback"))
+                .expect("served")
         });
         let (answered, read) = timed(|| std::fs::read(folder.at.at("a.h")).map(|bytes| bytes.len()));
         println!("BENCH mounts {}: mount {nth} served in {served:.1?}, read {read:?} in {answered:.1?}", backend());
@@ -313,8 +316,10 @@ fn tree() {
     let space = std::sync::Arc::new(sfs::Space::private().expect("a space"));
     project::shared::say_whole(&space, &listing, &pe2_io::SystemClock).expect("said");
     let ring = std::sync::Arc::new(sfs::ring::Ring::private(256 << 20).expect("a ring"));
-    tree_of("a view", indexed, &|| vfs::Served::shared(space.clone(), None));
-    tree_of("a view with pages kept", indexed, &|| vfs::Served::shared(space.clone(), Some(ring.clone())));
+    tree_of("a view", indexed, &|| vfs::Served::shared(space.clone(), None, pe2_io::system()));
+    tree_of("a view with pages kept", indexed, &|| {
+        vfs::Served::shared(space.clone(), Some(ring.clone()), pe2_io::system())
+    });
 }
 
 /// The times of one kind of tree: made, every path looked up, its small files and its largest read twice.

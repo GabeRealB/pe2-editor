@@ -62,9 +62,9 @@ pub trait Node: Sync {
     ///
     /// # Errors
     /// It has no such content, or it cannot be read.
-    fn read_content(&self, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
+    fn read_content(&self, io: &std::sync::Arc<dyn pe2_io::Io>, sha1: &pe2_ext::Sha1) -> Result<Vec<u8>> {
         let path = self.content_path(sha1).with_context(|| format!("{}: no content {sha1}", self.path()))?;
-        crate::content::read(&path).with_context(|| path.display().to_string())
+        crate::content::read(io, &path).with_context(|| path.display().to_string())
     }
 }
 
@@ -99,7 +99,7 @@ impl Node for crate::index::Asset {
     fn read(&self, name: &pe2_ext::RelPath) -> Result<Vec<u8>> {
         let file = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none());
         let file = file.with_context(|| format!("{}: no file {name}", self.path))?;
-        crate::content::read(&file.path).with_context(|| file.path.display().to_string())
+        crate::content::read(&self.io, &file.path).with_context(|| file.path.display().to_string())
     }
 
     fn file_size(&self, name: &pe2_ext::RelPath) -> Option<u64> {
@@ -112,7 +112,7 @@ impl Node for crate::index::Asset {
 
     fn read_head(&self, name: &pe2_ext::RelPath, len: usize) -> Vec<u8> {
         let Some(file) = self.files.iter().find(|f| *f.name == *name && f.made_by.is_none()) else { return Vec::new() };
-        crate::content::head(&file.path, len)
+        crate::content::head(&self.io, &file.path, len)
     }
 }
 
@@ -347,9 +347,11 @@ impl<'a> Reach<'a> {
                 let listed: Vec<&str> = files.iter().map(|file| file.as_str()).collect();
                 Some(list_hash(&listed))
             }
-            None => crate::content::sha1_known(&self.world.entry(crate::TreePath::new(read).ok()?)?)
-                .ok()
-                .map(|sha1| sha1.to_string()),
+            None => {
+                crate::content::sha1_known(&self.engine.ops.io, &self.world.entry(crate::TreePath::new(read).ok()?)?)
+                    .ok()
+                    .map(|sha1| sha1.to_string())
+            }
         }
     }
 
@@ -509,7 +511,9 @@ fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, asked: &pe2
             (_, Some(path)) => path,
             // What a node's own output made is in no file of its: the store has it already.
             (Some(store), None) if store.blob_path(&sha1).is_ok_and(|path| path.exists()) => store.blob_path(&sha1)?,
-            (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1)?,
+            (Some(store), None) => {
+                store.blob_path(&store.keep(&node.read_content(&reach.engine.ops.io, &sha1)?)?.sha1)?
+            }
             (None, None) => continue,
         };
         others.insert(sha1, path);
@@ -720,7 +724,7 @@ impl<'a> Call<'a> {
             .world
             .entry(path)
             .with_context(|| format!("{path}: no such file"))?;
-        let bytes = crate::content::read(&disk).with_context(|| disk.display().to_string())?;
+        let bytes = crate::content::read(self.io, &disk).with_context(|| disk.display().to_string())?;
         let hash = crate::extract::sha1_hex(&bytes);
         self.recorder
             .reads
@@ -852,7 +856,7 @@ impl<'a> Call<'a> {
             Some(store) => store.tmp(),
             None => self.io.environment().temp_dir().context("the system's folder of temporary files")?,
         };
-        let folder = crate::content::serve_folder(project.as_ref(), &given, how, &fallback)?;
+        let folder = crate::content::serve_folder(self.io, project.as_ref(), &given, how, &fallback)?;
         let at = folder.at.clone();
         self.served.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(folder);
         Ok(at)
@@ -864,7 +868,7 @@ impl<'a> Call<'a> {
     /// There is no store, or it cannot be read or moved.
     pub fn keep(&self, path: &HostPath, name: &pe2_ext::RelPath) -> Result<File> {
         let store = self.store.context("no store to keep it in")?;
-        let sha1 = crate::extract::sha1_file(path).with_context(|| path.display().to_string())?;
+        let sha1 = crate::extract::sha1_file(self.io.filesystem(), path).with_context(|| path.display().to_string())?;
         let size = std::fs::metadata(path).with_context(|| path.display().to_string())?.len();
         store.adopt(path, &sha1)?;
         Ok(File { name: name.to_owned(), content: Content::Stored { sha1, size } })
@@ -900,7 +904,7 @@ impl<'a> Call<'a> {
     pub fn place_content(&self, content: &Content) -> Result<(HostPath, Option<Written>)> {
         if let Content::Stored { sha1, .. } = content {
             let path = self.content_path(sha1).with_context(|| format!("no content {sha1}"))?;
-            return Ok((crate::content::for_program(&path)?, None));
+            return Ok((crate::content::for_program(self.io, &path)?, None));
         }
         let folder = match self.store {
             Some(store) => store.tmp(),
@@ -927,8 +931,8 @@ impl<'a> Call<'a> {
     pub fn read(&self, content: &Content) -> Result<Vec<u8>> {
         match content {
             Content::Stored { sha1, .. } => match self.content_path(sha1) {
-                Some(path) => crate::content::read(&path).with_context(|| path.display().to_string()),
-                None => self.recorder.node.read_content(sha1),
+                Some(path) => crate::content::read(self.io, &path).with_context(|| path.display().to_string()),
+                None => self.recorder.node.read_content(self.io, sha1),
             },
             held => Ok(held.held().unwrap_or_default().to_vec()),
         }
@@ -942,11 +946,11 @@ impl<'a> Call<'a> {
         match content {
             Content::Stored { sha1, .. } => {
                 let Some(path) = self.content_path(sha1) else {
-                    let bytes = self.recorder.node.read_content(sha1)?;
+                    let bytes = self.recorder.node.read_content(self.io, sha1)?;
                     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
                     return Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec());
                 };
-                crate::content::read_range(&path, offset, len).with_context(|| path.display().to_string())
+                crate::content::read_range(self.io, &path, offset, len).with_context(|| path.display().to_string())
             }
             held => Ok(held.held_range(offset, len).unwrap_or_default().into_vec()),
         }
@@ -1470,16 +1474,17 @@ impl Evaluation<'_> {
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let (Ok(value), Some(store)) = (&made, self.store) {
             let hash = super::hash(value);
-            let keep = store.put(&hash, value, &|sha1| self.node.read_content(sha1).ok()).and_then(|()| {
-                let trace = Trace {
-                    value: hash,
-                    reads: reads.clone(),
-                    node: id(self.node),
-                    output: format!("item/{n}"),
-                    made: FOR_EACH_MADE.to_string(),
-                };
-                store.put_trace(&key, &trace)
-            });
+            let keep =
+                store.put(&hash, value, &|sha1| self.node.read_content(&self.ops.io, sha1).ok()).and_then(|()| {
+                    let trace = Trace {
+                        value: hash,
+                        reads: reads.clone(),
+                        node: id(self.node),
+                        output: format!("item/{n}"),
+                        made: FOR_EACH_MADE.to_string(),
+                    };
+                    store.put_trace(&key, &trace)
+                });
             if let Err(why) = keep {
                 return Err(Arc::from(format!("{why:#}")));
             }
@@ -1870,16 +1875,17 @@ impl Evaluation<'_> {
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(store) = store {
             let hash = super::hash(&value);
-            let keep = store.put(&hash, &value, &|sha1| self.node.read_content(sha1).ok()).and_then(|()| {
-                let trace = Trace {
-                    value: hash,
-                    reads: reads.clone(),
-                    node: id(self.node),
-                    output: format!("micro/{}", micro.label),
-                    made: made.clone(),
-                };
-                store.put_trace(&key, &trace)
-            });
+            let keep =
+                store.put(&hash, &value, &|sha1| self.node.read_content(&self.ops.io, sha1).ok()).and_then(|()| {
+                    let trace = Trace {
+                        value: hash,
+                        reads: reads.clone(),
+                        node: id(self.node),
+                        output: format!("micro/{}", micro.label),
+                        made: made.clone(),
+                    };
+                    store.put_trace(&key, &trace)
+                });
             if let Err(why) = keep {
                 return Err(Arc::from(format!("{}: {why:#}", piece.at)));
             }
@@ -2157,7 +2163,7 @@ impl Engine {
         // What it is kept as, where it is; and what it was made of, kept or not: what read it asks its hash alone.
         if let Some(store) = &self.store {
             if retained {
-                store.put(&hash, &value, &|sha1| node.read_content(sha1).ok())?;
+                store.put(&hash, &value, &|sha1| node.read_content(&self.ops.io, sha1).ok())?;
             }
             let trace = Trace {
                 value: hash.clone(),

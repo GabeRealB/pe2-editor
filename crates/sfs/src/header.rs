@@ -1,8 +1,7 @@
 //! The shared header: one page (`state`) every process of a project maps, of positions in the log kept as atomics -
 //! read with no call to the system and no question to another process.
 
-use crate::HostPath;
-use std::fs::File;
+use pe2_io::{Descriptor, Mapping, Open};
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -25,9 +24,9 @@ mod at {
 
 /// The page, mapped: shared with every process that maps the same file.
 pub struct Header {
-    map: memmap2::MmapMut,
+    map: Mapping,
     /// Kept open: the lock appenders take is on this file.
-    file: File,
+    file: Box<dyn Descriptor>,
 }
 
 impl std::fmt::Debug for Header {
@@ -43,23 +42,20 @@ impl std::fmt::Debug for Header {
 }
 
 impl Header {
-    /// Map the header in `dir`, made - a page of zeros, then its mark - where it is not there.
+    /// Map the header in `folder`, made - a page of zeros, then its mark - where it is not there.
     ///
     /// # Errors
     /// The file cannot be made or mapped, or is no header of this format.
-    pub fn open(dir: &HostPath) -> io::Result<Header> {
-        std::fs::create_dir_all(dir)?;
-        let file =
-            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(&FILE))?;
-        if file.metadata()?.len() < SIZE as u64 {
+    pub fn open(folder: &dyn Descriptor) -> io::Result<Header> {
+        let file = folder.open_at(FILE.as_rel(), Open::KEEP)?;
+        if file.stat()?.size < SIZE as u64 {
             // Written, not only sized: the page is the file's own, never a hole that a full disk could refuse.
-            use std::io::Write as _;
-            (&file).write_all(&[0u8; SIZE])?;
-            file.sync_all()?;
+            pe2_io::write_all_at(&*file, &[0u8; SIZE], 0)?;
+            file.sync()?;
         }
         // SAFETY: the file is the library's own, of at least a page, and only ever changed through such mappings,
         // by atomic stores.
-        let map = unsafe { memmap2::MmapOptions::new().len(SIZE).map_mut(&file)? };
+        let map = unsafe { file.map(SIZE, true)? };
         let header = Header { map, file };
         match header.u64_at(at::MAGIC).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) | Err(MAGIC) => Ok(header),
@@ -69,8 +65,8 @@ impl Header {
 
     /// The header's own file: what appenders lock, across processes.
     #[must_use]
-    pub fn file(&self) -> &File {
-        &self.file
+    pub fn file(&self) -> &dyn Descriptor {
+        &*self.file
     }
 
     #[expect(clippy::cast_ptr_alignment, reason = "a mapping starts at a page, and `at` is a multiple of eight")]

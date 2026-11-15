@@ -228,7 +228,8 @@ impl Core {
             }
             (reply, Taken::default())
         };
-        let due = project::shared::space(&self.project.root).and_then(|space| vfs::due::due(&space.read()?));
+        let due = project::shared::space(&self.project.root, self.project.io.filesystem())
+            .and_then(|space| vfs::due::due(&space.read()?));
         let due = match due {
             Ok(due) => due,
             Err(e) => return answered(mcp::Reply::Error(format!("what is due could not be read: {e}")), then),

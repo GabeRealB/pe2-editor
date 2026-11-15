@@ -53,15 +53,15 @@ fn language(path: &HostPath) -> Option<&'static str> {
     })
 }
 
-fn stamp(path: &HostPath) -> Option<(u64, SystemTime)> {
-    project::content::stat(path).ok()
+fn stamp(path: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>) -> Option<(u64, SystemTime)> {
+    project::content::stat(io, path).ok()
 }
 
 impl Viewed {
-    fn read(path: &HostPath) -> Viewed {
-        let stamp = stamp(path);
+    fn read(path: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>) -> Viewed {
+        let stamp = stamp(path, io);
         let mut truncated = None;
-        let content = match project::content::read_range(path, 0, LIMIT) {
+        let content = match project::content::read_range(io, path, 0, LIMIT) {
             Ok(bytes) => {
                 if let Some((size, _)) = stamp.filter(|(size, _)| *size > LIMIT as u64) {
                     truncated = Some(size);
@@ -134,15 +134,23 @@ fn split_lines(whole: &egui::text::LayoutJob) -> Vec<egui::text::LayoutJob> {
 #[derive(Default)]
 pub struct Viewer {
     files: std::collections::HashMap<HostPath, Viewed>,
+    /// The project's I/O, which what it shows is read through.
+    io: pe2_io::Held,
 }
 
 impl Viewer {
+    /// A viewer of the files of a project whose I/O is `io`.
+    #[must_use]
+    pub fn new(io: std::sync::Arc<dyn pe2_io::Io>) -> Viewer {
+        Viewer { files: std::collections::HashMap::new(), io: pe2_io::Held(io) }
+    }
+
     /// A file's view.
     fn get(&mut self, path: &HostPath) -> &mut Viewed {
-        let now = stamp(path);
+        let now = stamp(path, &self.io);
         let stale = self.files.get(path).is_none_or(|v| v.stamp != now);
         if stale {
-            self.files.insert(path.clone(), Viewed::read(path));
+            self.files.insert(path.clone(), Viewed::read(path, &self.io));
         }
         self.files.get_mut(path).expect("just read")
     }
@@ -239,7 +247,7 @@ mod tests {
         let write = |name: &str, bytes: &[u8]| {
             let path = sfs::testing::At::at(&dir, name);
             std::fs::write(&path, bytes).unwrap();
-            Viewed::read(&path)
+            Viewed::read(&path, &pe2_io::system())
         };
         assert!(matches!(write("a.c", "int main; /* é */\n".as_bytes()).content, Content::Text(_)));
         assert!(matches!(write("b.bin", b"ab\0cd").content, Content::Binary(_)));

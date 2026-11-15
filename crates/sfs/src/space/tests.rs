@@ -199,7 +199,7 @@ fn churn(space: &Space) {
 fn a_tree_is_what_a_map_kept_beside_it_holds() {
     churn(&Space::private().unwrap());
     let dir = folder("churn");
-    churn(&Space::open(&dir).unwrap());
+    churn(&Space::open(&dir, &pe2_io::SystemFilesystem).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -218,7 +218,7 @@ fn pages_freed_are_taken_again_and_the_space_stays_as_small() {
 #[test]
 fn readers_on_other_threads_read_one_commit_whole() {
     let dir = folder("threads");
-    for space in [Space::private().unwrap(), Space::open(&dir).unwrap()] {
+    for space in [Space::private().unwrap(), Space::open(&dir, &pe2_io::SystemFilesystem).unwrap()] {
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..3 {
@@ -273,7 +273,7 @@ fn process(test: &str, variable: &str, dir: &HostPath) -> std::process::Command 
 #[ignore = "run by two_processes_write_one_space, as its second process"]
 fn the_second_writer() {
     let Ok(dir) = std::env::var("PE2_SFS_SPACE_SECOND") else { return };
-    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap();
+    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap(), &pe2_io::SystemFilesystem).unwrap();
     run_beside(&space, "second", 400, 200);
     // Leaving in order, beside the one that goes on: what it wrote is on disk, and nothing is said clean.
     assert!(!space.rest().unwrap());
@@ -297,7 +297,7 @@ fn run_beside(space: &Space, prefix: &str, made: u64, keys: u64) -> Model {
 #[test]
 fn two_processes_write_one_space() {
     let dir = folder("processes");
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     let mut second = crate::forks::start(&mut process("the_second_writer", "PE2_SFS_SPACE_SECOND", &dir)).unwrap();
     let mut model = run_beside(&space, "first", 400, 200);
     assert!(second.wait().unwrap().success());
@@ -307,7 +307,7 @@ fn two_processes_write_one_space() {
     // The last to leave in order has all of it on disk: whoever attaches next, alone, has it as both left it.
     assert!(space.rest().unwrap());
     drop(space);
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     assert!(!space.fresh());
     same(&space.read().unwrap(), &model);
     lists_hold(&space, &[]);
@@ -371,7 +371,7 @@ fn the_writer_that_stops() {
     let (Ok(dir), Ok(at)) = (std::env::var("PE2_SFS_SPACE_STOPS"), std::env::var("PE2_SFS_SPACE_AT")) else { return };
     let (step, nth) = at.split_once('#').unwrap();
     let (step, nth) = (step.to_owned(), nth.parse::<usize>().unwrap());
-    let space = Arc::new(Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap());
+    let space = Arc::new(Space::open(&HostPath::new(Path::new(&dir)).unwrap(), &pe2_io::SystemFilesystem).unwrap());
     let hits = AtomicUsize::new(0);
     space.set_faults(Arc::new(move |point| {
         if point == step && hits.fetch_add(1, Ordering::AcqRel) + 1 == nth {
@@ -399,7 +399,7 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
     for (i, step) in STEPS.iter().enumerate() {
         for nth in [1usize, 4, 60, 700] {
             let dir = folder(&format!("stops-{i}-{nth}"));
-            let space = Space::open(&dir).unwrap();
+            let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
             let mut model = Model::new();
             run(&space, "stays", 0..40, 150, &mut model);
             let mut writer = process("the_writer_that_stops", "PE2_SFS_SPACE_STOPS", &dir);
@@ -428,19 +428,20 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             assert_eq!(space.usage().unwrap().held, 0, "{step} #{nth}: pages are held for views that are gone");
             drop(space);
             // Alone, and never had on disk: nothing of it is trusted.
-            let alone = Space::open(&dir).unwrap();
+            let alone = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
             assert!(alone.fresh());
             assert_eq!(alone.read().unwrap().root(0), 0);
             // What it held is kept beside it, as its processes left it: read, it is what the last commit held.
-            let left = Space::left_behind(&dir).unwrap().expect("what the space held is kept");
+            let left =
+                Space::left_behind(&dir, &pe2_io::SystemFilesystem).unwrap().expect("what the space held is kept");
             same(&left.read().unwrap(), &model);
             assert!(left.write().is_err(), "a space left behind was to be written");
             drop(left);
             // Begun anew once more, what is kept is what was there then: nothing was committed to it.
             drop(alone);
-            let alone = Space::open(&dir).unwrap();
-            assert!(alone.fresh() && Space::left_behind(&dir).unwrap().is_none());
-            Space::forget_left(&dir);
+            let alone = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
+            assert!(alone.fresh() && Space::left_behind(&dir, &pe2_io::SystemFilesystem).unwrap().is_none());
+            Space::forget_left(&dir, &pe2_io::SystemFilesystem);
             assert!(!dir.at("left").exists());
             drop(alone);
             std::fs::remove_dir_all(&dir).unwrap();
@@ -496,7 +497,7 @@ fn a_reader_stopped_about_its_pin_reads_what_is_there_when_it_goes_on() {
 #[ignore = "run by a_reader_killed_while_pinned_holds_no_page_back, as the reader"]
 fn the_reader_that_is_killed() {
     let Ok(dir) = std::env::var("PE2_SFS_SPACE_PINS") else { return };
-    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap();
+    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap(), &pe2_io::SystemFilesystem).unwrap();
     let _pinned = space.read().unwrap();
     std::fs::write(HostPath::new(Path::new(&dir)).unwrap().at("pinned"), b"").unwrap();
     std::thread::sleep(Duration::from_secs(60));
@@ -505,7 +506,7 @@ fn the_reader_that_is_killed() {
 #[test]
 fn a_reader_killed_while_pinned_holds_no_page_back() {
     let dir = folder("pinned");
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     let mut model = Model::new();
     run(&space, "p", 0..60, 100, &mut model);
     let mut reader =
@@ -544,8 +545,8 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
 #[test]
 fn a_page_that_is_not_the_one_pointed_to_is_said_to_everyone_and_kept_aside() {
     let dir = folder("damaged");
-    let space = Space::open(&dir).unwrap();
-    let beside = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
+    let beside = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     let mut model = Model::new();
     run(&space, "p", 0..40, 100, &mut model);
     let root = space.read().unwrap().root(0);
@@ -562,7 +563,7 @@ fn a_page_that_is_not_the_one_pointed_to_is_said_to_everyone_and_kept_aside() {
     assert!(matches!(space.write(), Err(Error::Damaged(_))));
     drop((space, beside));
     // The next to have it alone begins anew, the damaged one kept aside.
-    let anew = Space::open(&dir).unwrap();
+    let anew = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     assert!(anew.fresh());
     assert!(dir.at("damaged/head").is_file() && dir.at("damaged/00000000.chunk").is_file());
     let mut model = Model::new();
@@ -597,29 +598,29 @@ fn attached_to_alone_it_is_trusted_only_as_it_was_had_on_disk() {
     let dir = folder("trusted");
     let mut model = Model::new();
     {
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(space.fresh());
         run(&space, "p", 0..60, 100, &mut model);
         assert!(space.sync().unwrap());
     }
     for _ in 0..2 {
         // Had on disk and not changed since: as it was, however often.
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(!space.fresh());
         same(&space.read().unwrap(), &model);
     }
     {
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(dir.at("clean").exists());
         run(&space, "p", 60..61, 100, &mut model);
         assert!(!dir.at("clean").exists(), "said clean after a change");
         // Another that attaches meanwhile has it as it is.
-        let beside = Space::open(&dir).unwrap();
+        let beside = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(!beside.fresh());
         same(&beside.read().unwrap(), &model);
     }
     // Changed since it was had on disk, and nobody has it: nothing of it is trusted.
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     assert!(space.fresh());
     same(&space.read().unwrap(), &Model::new());
     drop(space);
@@ -631,7 +632,10 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
     let dir = folder("rest");
     let mut model = Model::new();
     {
-        let (first, second) = (Arc::new(Space::open(&dir).unwrap()), Space::open(&dir).unwrap());
+        let (first, second) = (
+            Arc::new(Space::open(&dir, &pe2_io::SystemFilesystem).unwrap()),
+            Space::open(&dir, &pe2_io::SystemFilesystem).unwrap(),
+        );
         run(&first, "p", 0..40, 100, &mut model);
         run(&second, "p", 40..80, 100, &mut model);
         // A view held as it is left holds nothing back for who comes after.
@@ -649,7 +653,7 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
         assert!(second.rest().unwrap());
     }
     {
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(!space.fresh());
         same(&space.read().unwrap(), &model);
         lists_hold(&space, &[]);
@@ -663,27 +667,30 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
     {
         // Two that end at once, each finding the other there as it leaves: the second to ask is the last, and
         // has all of it on disk - where each would have left that to the other.
-        let (first, second) = (Space::open(&dir).unwrap(), Space::open(&dir).unwrap());
+        let (first, second) = (
+            Space::open(&dir, &pe2_io::SystemFilesystem).unwrap(),
+            Space::open(&dir, &pe2_io::SystemFilesystem).unwrap(),
+        );
         run(&first, "p", 400..420, 100, &mut model);
         run(&second, "p", 420..440, 100, &mut model);
         assert!(!first.leave().unwrap());
         assert!(second.leave().unwrap(), "of two that leave at once neither had it on disk");
         assert!(dir.at("clean").exists());
         drop((first, second));
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(!space.fresh());
         same(&space.read().unwrap(), &model);
         assert!(space.rest().unwrap());
     }
     {
         // One that makes ready to write says so ahead of its first change - and ends without resting.
-        let space = Space::open(&dir).unwrap();
+        let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
         assert!(!space.fresh() && dir.at("clean").exists());
         space.ready();
         assert!(!dir.at("clean").exists(), "said clean by one that is to write");
         same(&space.read().unwrap(), &model);
     }
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     assert!(space.fresh(), "trusted, and nobody left it in order");
     drop(space);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -701,7 +708,7 @@ fn pages_of(dir: &HostPath) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
     let dir = folder("disk");
-    let space = Space::open(&dir).unwrap();
+    let space = Space::open(&dir, &pe2_io::SystemFilesystem).unwrap();
     let mut model = Model::new();
     run(&space, "p", 0..80, 100, &mut model);
     assert!(space.sync().unwrap());
@@ -750,9 +757,10 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
         for entry in std::fs::read_dir(&mixed).unwrap().flatten() {
             std::fs::copy(entry.path(), unclean.entry(&entry.file_name())).unwrap();
         }
-        let begun = Space::open(&unclean).unwrap();
+        let begun = Space::open(&unclean, &pe2_io::SystemFilesystem).unwrap();
         assert!(begun.fresh());
-        let left = Space::left_behind(&unclean).unwrap().expect("what the disk kept is kept");
+        let left =
+            Space::left_behind(&unclean, &pe2_io::SystemFilesystem).unwrap().expect("what the disk kept is kept");
         match left.read().and_then(|read| listed(&read)) {
             Ok(all) => {
                 assert!(commits.contains(&all), "seed {seed}: read of what was left as something it never held");
@@ -765,7 +773,7 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
         std::fs::remove_dir_all(&unclean).unwrap();
         // And said clean all the same, as it was when that was true.
         std::fs::write(mixed.at("clean"), &before["clean"]).unwrap();
-        let space = Space::open(&mixed).unwrap();
+        let space = Space::open(&mixed, &pe2_io::SystemFilesystem).unwrap();
         if space.fresh() {
             anew += 1;
         } else {
@@ -1068,7 +1076,9 @@ fn the_lists_of_pages_grow_by_pieces_and_what_they_list_is_taken_again() {
 #[ignore = "a measurement"]
 fn bench_tree() {
     let dir = folder("bench");
-    for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
+    for (name, space) in
+        [("memory", Space::private().unwrap()), ("files", Space::open(&dir, &pe2_io::SystemFilesystem).unwrap())]
+    {
         // Keys as a folder's names are: its number, then a name.
         let name_of = |n: u64| {
             let mut key = (n / 40).to_be_bytes().to_vec();
@@ -1159,7 +1169,9 @@ fn bench_model() {
         (took[took.len() / 2].as_secs_f64() * 1e6, took[took.len() * 99 / 100].as_secs_f64() * 1e6)
     };
     let dir = folder("bench-model");
-    for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
+    for (name, space) in
+        [("memory", Space::private().unwrap()), ("files", Space::open(&dir, &pe2_io::SystemFilesystem).unwrap())]
+    {
         for trees in [4usize, 12] {
             // 40,000 keys a tree, of 120 bytes each: what the stack of a project of that many entries is.
             let filled = Instant::now();

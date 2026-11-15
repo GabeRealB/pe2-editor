@@ -8,9 +8,9 @@
 //! The listing is a journal - each file put or removed appended as a line - read again in order, so a write is one
 //! line and a crash loses nothing written; it is written anew, compacted, when it holds far more lines than files.
 
+use pe2_io::{Descriptor, Filesystem, Open};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Write as _};
+use std::io;
 
 use pe2_path::{Name, RelPath};
 use sfs::HostPath;
@@ -43,7 +43,7 @@ pub struct Pack {
 
 #[derive(Debug, Default)]
 struct Journal {
-    file: Option<File>,
+    file: Option<Box<dyn Descriptor>>,
     lines: usize,
 }
 
@@ -109,14 +109,14 @@ impl Pack {
     ///
     /// # Errors
     /// Its listing cannot be read, or the folder is in no project's layers.
-    pub fn open(root: &HostPath) -> io::Result<Arc<Pack>> {
+    pub fn open(root: &HostPath, io: &Arc<dyn pe2_io::Io>) -> io::Result<Arc<Pack>> {
         if let Some(open) =
             PACKS.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|p| p.root == *root)
         {
             return Ok(open.clone());
         }
-        let store = Store::of(&root.join(&FILE)).ok_or_else(|| bad("not in a project's layers"))?;
-        let (entries, lines) = match std::fs::read_to_string(root.join(&FILE)) {
+        let store = Store::of(&root.join(&FILE), io).ok_or_else(|| bad("not in a project's layers"))?;
+        let (entries, lines) = match io.filesystem().read_to_string(&root.join(&FILE)) {
             Ok(text) => replay(&text)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => return Err(e),
@@ -140,7 +140,7 @@ impl Pack {
     /// # Errors
     /// Its listing cannot be read.
     pub fn reread(&self) -> io::Result<()> {
-        let (entries, lines) = match std::fs::read_to_string(self.root.join(&FILE)) {
+        let (entries, lines) = match self.fs().read_to_string(&self.root.join(&FILE)) {
             Ok(text) => replay(&text)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => return Err(e),
@@ -164,6 +164,10 @@ impl Pack {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    fn fs(&self) -> &dyn Filesystem {
+        self.store.io.filesystem()
     }
 
     /// A file of it.
@@ -195,16 +199,16 @@ impl Pack {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.file.is_none() {
             let at = self.root.join(&FILE);
-            std::fs::create_dir_all(&self.root)?;
-            let new = !at.exists();
-            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&at)?;
+            self.fs().create_folder_all(&self.root)?;
+            let new = !self.fs().exists(&at);
+            let file = self.fs().open(&at, Open::APPEND)?;
             if new {
-                writeln!(file, "{HEADER}")?;
+                file.append(format!("{HEADER}\n").as_bytes())?;
             }
             journal.file = Some(file);
         }
-        let file = journal.file.as_mut().expect("opened");
-        writeln!(file, "{line}")?;
+        let file = journal.file.as_ref().expect("opened");
+        file.append(format!("{line}\n").as_bytes())?;
         journal.lines += 1;
         Ok(())
     }
@@ -213,8 +217,8 @@ impl Pack {
     ///
     /// # Errors
     /// Its chunks or its line cannot be written.
-    pub fn put(&self, rel: &str, bytes: &[u8], at: SystemTime) -> io::Result<()> {
-        let entry = Entry { manifest: Arc::new(self.store.put(bytes, at)?), modified: at };
+    pub fn put(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
+        let entry = Entry { manifest: Arc::new(self.store.put(bytes)?), modified: self.store.io.clock().wall() };
         self.append(&put_line(rel, &entry))?;
         self.entries.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rel.to_string(), entry);
         self.compact_if_due()
@@ -254,7 +258,7 @@ impl Pack {
             text.push_str(&put_line(rel, entry));
             text.push('\n');
         }
-        crate::cache::write_atomic(&self.root.join(&FILE), text.as_bytes()).map_err(io::Error::other)?;
+        crate::cache::write_atomic(self.fs(), &self.root.join(&FILE), text.as_bytes()).map_err(io::Error::other)?;
         *journal = Journal { file: None, lines: entries.len() };
         Ok(())
     }
@@ -319,23 +323,24 @@ pub fn shown(listed: &Listed) -> &str {
 /// or read otherwise than it is - its path and whether it is a folder; a file really there before one the pack holds
 /// alike.
 #[must_use]
-pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
+pub fn read_dir(io: &Arc<dyn pe2_io::Io>, dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
+    let fs = io.filesystem();
     let mut out: Vec<(Listed, HostPath, bool)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() || kind.is_file() {
-            let raw = entry.file_name();
+    for entry in fs.read_directory(dir).unwrap_or_default() {
+        let folder = entry.kind == pe2_io::Kind::Folder;
+        if folder || entry.kind == pe2_io::Kind::File {
+            let raw = entry.name;
             let name = match raw.to_str() {
                 Some(text) => Name::new(text).map(ToOwned::to_owned),
                 None => Err(pe2_path::PathError { text: raw.to_string_lossy().into(), why: pe2_path::Why::NotText }),
             };
             seen.insert(shown(&name).to_owned());
-            out.push((name, dir.entry(&raw), kind.is_dir()));
+            out.push((name, dir.entry(&raw), folder));
         }
     }
     // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
-    let held = crate::records::held_at(dir).map(|(held, within)| held.list(&within));
+    let held = crate::records::held_at(io, dir).map(|(held, within)| held.list(&within));
     let held = held.into_iter().flatten().map(|(name, folder)| (Name::new(&name).map(ToOwned::to_owned), folder));
     let recorded = crate::records::Set::list(dir).into_iter().flatten().map(|(name, folder)| (Ok(name), folder));
     for (name, folder) in held.chain(recorded) {
@@ -359,26 +364,27 @@ pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
 
 /// Whether a path is a folder, on disk or in a packed layer.
 #[must_use]
-pub fn is_dir(path: &HostPath) -> bool {
+pub fn is_dir(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
     Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
-        || crate::records::held_at(path).is_some_and(|(held, within)| held.is_folder(&within))
+        || crate::records::held_at(io, path).is_some_and(|(held, within)| held.is_folder(&within))
         || crate::records::Set::is_folder(path) == Some(true)
-        || path.is_dir()
+        || io.filesystem().is_folder(path)
 }
 
 /// Whether a path is a file, on disk or in a packed layer.
 #[must_use]
-pub fn is_file(path: &HostPath) -> bool {
+pub fn is_file(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
     Pack::of(path).is_some_and(|(pack, rel)| pack.stat(&rel).is_some())
-        || crate::records::held_at(path).is_some_and(|(held, within)| held.file(&within).is_some())
+        || crate::records::held_at(io, path).is_some_and(|(held, within)| held.file(&within).is_some())
         || crate::records::Set::is_file(path) == Some(true)
-        || path.is_file()
+        || io.filesystem().is_file(path)
 }
 
 /// Set how a layer is stored in `project.toml` (`storage`): none for the default, its files as files.
 fn set_storage(project: &crate::Project, layer: &Name, storage: Option<&str>) -> io::Result<()> {
+    let fs = project.io.filesystem();
     let at = project.root.join(&crate::FILE);
-    let text = std::fs::read_to_string(&at)?;
+    let text = fs.read_to_string(&at)?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(io::Error::other)?;
     let layers = doc.get_mut("layer").and_then(toml_edit::Item::as_array_of_tables_mut);
     let table = layers
@@ -394,7 +400,7 @@ fn set_storage(project: &crate::Project, layer: &Name, storage: Option<&str>) ->
             table.remove("storage");
         }
     }
-    crate::cache::write_atomic(&at, doc.to_string().as_bytes()).map_err(io::Error::other)
+    crate::cache::write_atomic(fs, &at, doc.to_string().as_bytes()).map_err(io::Error::other)
 }
 
 /// The layer of a project to pack or unpack: a generated one, as only those are packed so far.
@@ -411,16 +417,16 @@ fn generated<'a>(project: &'a crate::Project, name: &Name) -> io::Result<&'a cra
 }
 
 /// Every file of a folder, recursively, but what is hidden (its listing, its record's companions starting with `.`).
-fn files_in(dir: &HostPath, rel: &str, out: &mut Vec<(String, HostPath)>) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+fn files_in(fs: &dyn Filesystem, dir: &HostPath, rel: &str, out: &mut Vec<(String, HostPath)>) {
+    for entry in fs.read_directory(dir).unwrap_or_default() {
+        let name = entry.name.to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
         let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => files_in(&dir.entry(&entry.file_name()), &child, out),
-            Ok(t) if t.is_file() => out.push((child, dir.entry(&entry.file_name()))),
+        match entry.kind {
+            pe2_io::Kind::Folder => files_in(fs, &dir.entry(&entry.name), &child, out),
+            pe2_io::Kind::File => out.push((child, dir.entry(&entry.name))),
             _ => {}
         }
     }
@@ -433,10 +439,11 @@ fn files_in(dir: &HostPath, rel: &str, out: &mut Vec<(String, HostPath)>) {
 /// # Errors
 /// It is no generated layer, or a file cannot be read, stored or removed.
 pub fn pack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
+    let fs = project.io.filesystem();
     let layer = generated(project, name)?;
-    let pack = Pack::open(&layer.path)?;
+    let pack = Pack::open(&layer.path, &project.io)?;
     let mut found = Vec::new();
-    files_in(&layer.path, "", &mut found);
+    files_in(fs, &layer.path, "", &mut found);
     let mut count = 0;
     for (rel, path) in found.into_iter().filter(|(rel, _)| rel != crate::plan::RECORD) {
         let logical = crate::chunks::logical(&path).unwrap_or_else(|| path.clone());
@@ -444,12 +451,12 @@ pub fn pack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
             Some(logical) if !logical.is_empty() => logical.to_owned(),
             _ => rel,
         };
-        let bytes = crate::content::read(&logical)?;
-        pack.put(&rel, &bytes, project.io.clock().wall())?;
-        std::fs::remove_file(&path)?;
+        let bytes = crate::content::read(&project.io, &logical)?;
+        pack.put(&rel, &bytes)?;
+        fs.remove_file(&path)?;
         count += 1;
     }
-    remove_empty(&layer.path);
+    remove_empty(fs, &layer.path);
     set_storage(project, name, Some("packed"))?;
     Ok(count)
 }
@@ -460,33 +467,34 @@ pub fn pack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
 /// # Errors
 /// It is no generated layer, or a file cannot be read or written.
 pub fn unpack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
+    let fs = project.io.filesystem();
     let layer = generated(project, name)?;
-    let pack = Pack::open(&layer.path)?;
+    let pack = Pack::open(&layer.path, &project.io)?;
     let entries = pack.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     for (rel, entry) in &entries {
         let bytes =
             entry.manifest.read_range(&pack.store, 0, usize::try_from(entry.manifest.size).unwrap_or(usize::MAX))?;
         let at = layer.path.join(&RelPath::new(rel).map_err(io::Error::other)?);
-        std::fs::create_dir_all(at.parent().unwrap_or_else(|| layer.path.clone()))?;
-        match crate::content::chunked(&at, &bytes, project.io.clock().wall())? {
-            Some(manifest) => crate::cache::write_atomic(&crate::chunks::manifest_path(&at), manifest.as_bytes()),
-            None => crate::cache::write_atomic(&at, &bytes),
+        fs.create_folder_all(&at.parent().unwrap_or_else(|| layer.path.clone()))?;
+        match crate::content::chunked(&project.io, &at, &bytes)? {
+            Some(manifest) => crate::cache::write_atomic(fs, &crate::chunks::manifest_path(&at), manifest.as_bytes()),
+            None => crate::cache::write_atomic(fs, &at, &bytes),
         }
         .map_err(io::Error::other)?;
     }
-    std::fs::remove_file(layer.path.join(&FILE))?;
+    fs.remove_file(&layer.path.join(&FILE))?;
     PACKS.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| p.root != layer.path);
     set_storage(project, name, None)?;
     Ok(entries.len())
 }
 
 /// Remove the empty folders under a folder, it kept.
-fn remove_empty(dir: &HostPath) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let folder = dir.entry(&entry.file_name());
-            remove_empty(&folder);
-            let _ = std::fs::remove_dir(&folder);
+fn remove_empty(fs: &dyn Filesystem, dir: &HostPath) {
+    for entry in fs.read_directory(dir).unwrap_or_default() {
+        if entry.kind == pe2_io::Kind::Folder {
+            let folder = dir.entry(&entry.name);
+            remove_empty(fs, &folder);
+            let _ = fs.remove_folder(&folder);
         }
     }
 }
@@ -499,22 +507,28 @@ fn remove_empty(dir: &HostPath) {
 mod tests {
     use super::{Pack, is_dir, is_file, read_dir};
     use crate::testing::At as _;
-    use std::time::SystemTime;
 
     #[test]
     fn a_packed_layer_holds_its_files_and_reads_back_after_a_restart_of_its_journal() {
         let root = crate::testing::scratch("pack");
         let _ = std::fs::remove_dir_all(&root);
         let layer = root.at(".layers/gen");
-        let pack = Pack::open(&layer).unwrap();
-        pack.put("a.node/native.bin", b"native", SystemTime::now()).unwrap();
-        pack.put("a.node/node.toml", b"x = 1\n", SystemTime::now()).unwrap();
-        pack.put("b/c.bin", b"c", SystemTime::now()).unwrap();
+        let pack = Pack::open(&layer, &crate::testing::io()).unwrap();
+        pack.put("a.node/native.bin", b"native").unwrap();
+        pack.put("a.node/node.toml", b"x = 1\n").unwrap();
+        pack.put("b/c.bin", b"c").unwrap();
         pack.remove("b/c.bin").unwrap();
-        assert!(is_dir(&layer.at("a.node")) && is_file(&layer.at("a.node/native.bin")));
-        assert!(!is_file(&layer.at("b/c.bin")) && !is_dir(&layer.at("b")));
-        let listed: Vec<(String, bool)> =
-            read_dir(&layer).into_iter().map(|(n, _, d)| (super::shown(&n).to_owned(), d)).collect();
+        assert!(
+            is_dir(&crate::testing::io(), &layer.at("a.node"))
+                && is_file(&crate::testing::io(), &layer.at("a.node/native.bin"))
+        );
+        assert!(
+            !is_file(&crate::testing::io(), &layer.at("b/c.bin")) && !is_dir(&crate::testing::io(), &layer.at("b"))
+        );
+        let listed: Vec<(String, bool)> = read_dir(&crate::testing::io(), &layer)
+            .into_iter()
+            .map(|(n, _, d)| (super::shown(&n).to_owned(), d))
+            .collect();
         assert!(listed.contains(&("a.node".into(), true)), "{listed:?}");
         let text = std::fs::read_to_string(layer.join(&super::FILE)).unwrap();
         let (entries, lines) = super::replay(&text).unwrap();
