@@ -88,10 +88,10 @@ impl std::fmt::Display for Runnable {
     }
 }
 
-/// A path a program can be handed for a place in an extension's tree: itself on disk; one a project holds, through the
-/// filesystem the project is served as (`content::for_program`), its tree laid out nowhere.
+/// A path a program can be handed for a place in an extension's tree: itself on disk; one a project holds - a records
+/// layer's, on no disk - through the filesystem the project is served as (`content::for_program`).
 fn runnable(path: &HostPath, io: &Arc<dyn pe2_io::Io>) -> HostPath {
-    if crate::records::held_at(io, path).is_some() {
+    if crate::records::Set::is_file(path).is_some() {
         return crate::content::for_program(io, path).unwrap_or_else(|_| path.clone());
     }
     path.clone()
@@ -145,7 +145,7 @@ pub fn in_tree(
         .map(|path| runnable(&path, io))
 }
 
-/// The files in a folder - on disk, or an extension's a project holds (`records::held_at`) - by their paths within it,
+/// The files in a folder - on disk, or an extension's a project holds, in a records layer - by their paths within it,
 /// in order.
 fn files_in(
     io: &Arc<dyn pe2_io::Io>,

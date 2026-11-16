@@ -347,6 +347,10 @@ fn put_files(
     changeset: &mut Changeset,
     files: &[(&RelPath, Option<&[u8]>)],
 ) -> Result<()> {
+    // A sealed node - an extension, kept whole - is replaced or deleted, never written into.
+    if crate::records::Set::current(&at.project.root).is_some_and(|set| set.is_sealed(at.uid)) {
+        bail!("{} is sealed - kept whole, as an extension is - and only read", at.path);
+    }
     let Some(Op::Override { files: mut bases, to }) = changeset.ops.get(&at.uid).cloned() else {
         for (file, bytes) in files {
             match bytes {
@@ -1898,6 +1902,121 @@ mod tests {
             }
         }
         found
+    }
+
+    /// A sealed node of `files` (by name and text) kept in the project's store: its tree.
+    fn sealed_tree(root: &HostPath, files: &[(&str, &str)]) -> pe2_ext::Sha1 {
+        let folder = root.at(&format!("sealed-{}", files.len()));
+        let _ = std::fs::remove_dir_all(&folder);
+        for (name, text) in files {
+            let path = folder.at(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = crate::chunks::Store::at(root, crate::testing::io());
+        let (tree, _) = store.put_folder(&sfs::HostPath::new(folder.as_path()).unwrap()).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        tree
+    }
+
+    /// Write a layer's record, as another program would; where it is.
+    fn recorded(root: &HostPath, layer: &str, uid: Uid, record: &crate::records::Record) -> HostPath {
+        let path = crate::records::path_of(&root.at("layers").at(layer), uid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, record.render()).unwrap();
+        path
+    }
+
+    const MANIFEST: &str = "id = \"my.tool\"\nversion = \"0.1.0\"\n";
+
+    #[test]
+    fn an_extension_is_found_by_what_it_holds_wherever_it_is_and_never_written_into() {
+        use crate::records::{Kind, Op as Did, Record};
+        let root = project("sealed");
+        // Placed deep, named anything: imported as a sealed node, by its manifest.
+        let tool = root.at("layers/base/tools/deep/anything.node");
+        std::fs::create_dir_all(tool.at("docs")).unwrap();
+        std::fs::write(tool.at("extension.toml"), MANIFEST).unwrap();
+        std::fs::write(tool.at("docs/a.md"), "# A\n").unwrap();
+        let mut o = open(&root);
+        let held = o.project.held_extensions();
+        assert_eq!(held, [root.at("layers/base/tree/tools/deep/anything.node")]);
+        assert_eq!(crate::content::read_to_string(&o.project.io, &held[0].at("docs/a.md")).unwrap(), "# A\n");
+        let uid = o.uid("tools/deep/anything.node");
+        // Another sealed node, holding no manifest: a node, no extension.
+        let plain = Record {
+            op: Did::Create,
+            kind: Kind::Node,
+            parent: None,
+            name: Some(pe2_path::Name::constant("plain").to_owned()),
+            files: std::collections::BTreeMap::new(),
+            tree: Some(sealed_tree(&root, &[("readme.txt", "just text")])),
+        };
+        let written = recorded(&root, "base", crate::testing::uid("uid://p1a1n"), &plain);
+        o.refresh(&[written]);
+        assert!(o.index.entries.contains_key(&tree("plain.node")));
+        assert_eq!(o.project.held_extensions().len(), 1, "no manifest, no extension");
+        // Written into, from its own layer or one above: refused, and nothing changed.
+        let before = o.history.done().len();
+        for layer in ["base", "top"] {
+            let wrote = super::write_file(
+                &o.project,
+                &o.index,
+                pe2_path::Name::constant(layer),
+                uid,
+                pe2_path::RelPath::new("docs/a.md").unwrap(),
+                b"changed",
+                "Write".into(),
+                None,
+                &mut o.history,
+            );
+            assert!(wrote.unwrap_err().to_string().contains("sealed"), "{layer}");
+        }
+        assert_eq!(o.history.done().len(), before);
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn an_extension_overridden_above_is_its_tree_and_deleted_is_none() {
+        use crate::records::{File, Kind, Op as Did, Record};
+        let root = project("sealed-stacked");
+        let tool = root.at("layers/base/tools/my.tool.node");
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(tool.at("extension.toml"), MANIFEST).unwrap();
+        std::fs::write(tool.at("old.md"), "old").unwrap();
+        let mut o = open(&root);
+        let uid = o.uid("tools/my.tool.node");
+        // Overridden above by another tree whole: what the one below had and it has not is removed.
+        let newer = sealed_tree(&root, &[("extension.toml", MANIFEST), ("new.md", "new")]);
+        let removed = std::collections::BTreeMap::from([(
+            pe2_path::RelPath::new("old.md").unwrap().to_owned(),
+            File { content: None, base: None },
+        )]);
+        let over =
+            Record { op: Did::Override, kind: Kind::Node, parent: None, name: None, files: removed, tree: Some(newer) };
+        let written = recorded(&root, "top", uid, &over);
+        o.refresh(std::slice::from_ref(&written));
+        let held = o.project.held_extensions();
+        assert_eq!(held, [root.at("layers/top/tree/tools/my.tool.node")]);
+        let files: Vec<String> =
+            o.index.assets[&tree("tools/my.tool")].files.iter().map(|file| file.name.to_string()).collect();
+        assert!(files.iter().any(|f| f == "new.md") && !files.iter().any(|f| f == "old.md"), "{files:?}");
+        // Deleted above: no extension, no entry.
+        let gone = Record {
+            op: Did::Delete,
+            kind: Kind::Node,
+            parent: None,
+            name: None,
+            files: std::collections::BTreeMap::new(),
+            tree: None,
+        };
+        recorded(&root, "top", uid, &gone);
+        o.refresh(&[written]);
+        assert_eq!(o.project.held_extensions(), Vec::<HostPath>::new());
+        assert!(!o.index.entries.contains_key(&tree("tools/my.tool.node")));
+        drop(o);
+        crate::local::remove_all(&root);
     }
 
     #[test]

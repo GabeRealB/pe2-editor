@@ -404,6 +404,21 @@ impl Store {
         sharded(&self.dir.join(&OBJECTS), &sha1.to_string())
     }
 
+    /// Where a whole object is kept: in this store, else - for a while - in the other.
+    ///
+    /// # Errors
+    /// Neither keeps it.
+    pub fn held_object(&self, sha1: &Sha1) -> io::Result<HostPath> {
+        let own = self.object_path(sha1)?;
+        if self.fs().is_file(&own) {
+            return Ok(own);
+        }
+        match self.other().map(|other| other.object_path(sha1)).transpose()? {
+            Some(other) if self.fs().is_file(&other) => Ok(other),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: no such object", own.display()))),
+        }
+    }
+
     fn tree_path(&self, sha1: &Sha1) -> io::Result<HostPath> {
         sharded(&self.dir.join(&TREES), &sha1.to_string())
     }
@@ -437,7 +452,11 @@ impl Store {
     /// # Errors
     /// It is not kept.
     pub fn get_object(&self, sha1: &Sha1) -> io::Result<Vec<u8>> {
-        self.fs().read(&self.object_path(sha1)?)
+        // Kept here, or - for a while - in the other store.
+        self.fs().read(&self.object_path(sha1)?).or_else(|e| match self.other() {
+            Some(other) => other.fs().read(&other.object_path(sha1)?).map_err(|_| e),
+            None => Err(e),
+        })
     }
 
     /// Keep a tree (its objects kept already), by the SHA-1 of its text (given).
@@ -703,8 +722,11 @@ struct Refs {
 }
 
 impl Named {
-    /// What a record names: its files' contents, as `refs`'; their bases, this machine's.
+    /// What a record names: its files' contents and its tree, as `local` says whose; their bases, this machine's.
     fn record(&mut self, local: bool, record: &crate::records::Record) {
+        if let Some(tree) = record.tree {
+            if local { &mut self.local } else { &mut self.shipped }.trees.insert(tree);
+        }
         for file in record.files.values() {
             if let Some(crate::records::Content::Stored { sha1, .. }) = &file.content {
                 if local { &mut self.local } else { &mut self.shipped }.files.insert(*sha1);
@@ -713,14 +735,12 @@ impl Named {
         }
     }
 
-    /// What a text the history or the conflicts keep names, where it is a record or an extension's: this machine's.
-    /// Any other text, or bytes, names nothing.
+    /// What a text the history or the conflicts keep names, where it is a record: this machine's. Any other text, or
+    /// bytes, names nothing.
     fn kept(&mut self, bytes: &[u8]) {
         let Ok(text) = std::str::from_utf8(bytes) else { return };
         if let Ok(record) = crate::records::Record::parse(text) {
             self.record(true, &record);
-        } else if let Ok(Some(tree)) = crate::records::extension_tree(text) {
-            self.local.trees.insert(tree);
         }
     }
 }
@@ -739,8 +759,6 @@ fn named(project: &crate::Project) -> anyhow::Result<Named> {
         for held in crate::records::read_records(fs, &layer.records, None)?.values() {
             named.record(local, &held.record);
         }
-        let trees = crate::records::extensions_of(fs, &layer.records)?.into_values().flatten();
-        if local { &mut named.local } else { &mut named.shipped }.trees.extend(trees);
         if layer.kind == crate::LayerKind::Generated {
             named.local.files.extend(crate::plan::made(fs, layer)?);
         }
@@ -939,10 +957,19 @@ mod tests {
         assert_eq!(store.get_object(&tree.files["docs/a b.md"].sha1).unwrap(), b"# A\n");
         // Kept again: the same hash, nothing new.
         assert_eq!(store.put_folder(&folder).unwrap().0, sha1);
-        // Named by a layer's record of an extension, the tree and its objects stay; named by nothing, they go.
-        let named = crate::records::extension_path(&root.join(&crate::LAYERS).at("project"), "x").unwrap();
+        // Named by a layer's sealed node, the tree and its objects stay; named by nothing, they go.
+        let record = crate::records::Record {
+            op: crate::records::Op::Create,
+            kind: crate::records::Kind::Node,
+            parent: None,
+            name: Some(pe2_path::Name::constant("x").to_owned()),
+            files: std::collections::BTreeMap::new(),
+            tree: Some(sha1),
+        };
+        let layer = root.join(&crate::LAYERS).at("project");
+        let named = crate::records::path_of(&layer, crate::testing::uid("uid://e1")).unwrap();
         std::fs::create_dir_all(named.parent().unwrap()).unwrap();
-        std::fs::write(&named, crate::records::extension_record(Some(&sha1))).unwrap();
+        std::fs::write(&named, record.render()).unwrap();
         assert_eq!(super::sweep(&project).unwrap().0, 0);
         std::fs::remove_file(&named).unwrap();
         assert_eq!(super::sweep(&project).unwrap().0, 3);
@@ -966,7 +993,7 @@ mod tests {
         let file = File { content: Some(Content::Stored { sha1, size: 1 }), base };
         let op = if base.is_some() { Op::Override } else { Op::Create };
         let name = base.is_none().then(|| pe2_path::Name::new(uid.trim_start_matches("uid://")).unwrap().to_owned());
-        let record = Record { op, kind: Kind::File, parent: None, name, files: [(root_file, file)].into() };
+        let record = Record { op, kind: Kind::File, parent: None, name, files: [(root_file, file)].into(), tree: None };
         let layer = root.join(&crate::LAYERS).at("project");
         let path = crate::records::path_of(&layer, crate::testing::uid(uid)).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

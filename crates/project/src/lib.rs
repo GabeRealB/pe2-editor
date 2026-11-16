@@ -770,42 +770,23 @@ impl Project {
             .collect()
     }
 
-    /// The extensions it holds: those its layers' records name (`records::EXTENSIONS`), each id's from the highest
-    /// layer holding it or leaving it off, as the folders their files are read at (`records::held_folder`: on no disk,
-    /// read through `content`), in name order. One whose tree is not in the store is said, and left out.
+    /// The extensions it holds: the sealed nodes its stack places (`records::Set::sealed`) whose trees hold an
+    /// extension's manifest - wherever they are, however named - as the folders their files are read at (on no disk,
+    /// read through `content`), in path order. A record set already open is read as it is.
     #[must_use]
     pub fn held_extensions(&self) -> Vec<HostPath> {
-        let mut held: std::collections::BTreeMap<String, Option<HostPath>> = std::collections::BTreeMap::new();
-        for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            let records = match records::extensions_of(self.io.filesystem(), &layer.records) {
-                Ok(records) => records,
-                Err(e) => {
-                    eprintln!("the extensions {} holds: {e:#}", layer.name);
-                    continue;
-                }
-            };
-            for (id, tree) in records {
-                if held.contains_key(&id) {
-                    continue;
-                }
-                let folder = tree.and_then(|tree| {
-                    let folder = match records::held_folder(&layer.path, &id) {
-                        Ok(folder) => folder,
-                        Err(why) => {
-                            eprintln!("{}: {id}: {why}", layer.name);
-                            return None;
-                        }
-                    };
-                    if records::held(&self.io, &folder).is_none() {
-                        eprintln!("{}: {id}: its tree {tree} is not in the store", layer.name);
-                        return None;
-                    }
-                    Some(folder)
-                });
-                held.insert(id, folder);
+        let set = match records::Set::current(&self.root).map_or_else(|| records::Set::open(self), Ok) {
+            Ok(set) => set,
+            Err(e) => {
+                eprintln!("the extensions the project holds: {e:#}");
+                return Vec::new();
             }
-        }
-        held.into_values().flatten().collect()
+        };
+        let manifest = crate::ext::folder::MANIFEST.as_str();
+        let mut held: Vec<HostPath> =
+            set.sealed().into_iter().filter(|(_, tree)| tree.files.contains_key(manifest)).map(|(at, _)| at).collect();
+        held.sort();
+        held
     }
 
     /// The layer an extension added to it goes in: its highest that is written.

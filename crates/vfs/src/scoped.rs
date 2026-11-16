@@ -433,7 +433,7 @@ mod tests {
         let name = pe2_path::Name::new("a").expect("a name").to_owned();
         let files =
             std::collections::BTreeMap::from([(pe2_path::RelPath::new("movie.str").expect("a name").to_owned(), held)]);
-        let record = Record { op: Op::Create, kind: Kind::Node, parent: None, name: Some(name), files };
+        let record = Record { op: Op::Create, kind: Kind::Node, parent: None, name: Some(name), files, tree: None };
         let layer = p.layer(pe2_path::Name::constant("project")).expect("its own layer");
         let uid = pe2_path::Uid::new("uid://1a2b3c4d5e6f7").expect("a uid");
         let records = std::collections::BTreeMap::from([(uid, record)]);

@@ -23,8 +23,9 @@ freely.
 
 ## Finding and loading
 
-Extensions are found in three places: held by the project (sealed in a layer), the user's extensions folder, and
-beside the editor. Only the project's run; the others are offered to add, and adding copies them into the project.
+Extensions are found in three places: held by the project (a sealed node of a layer's, anywhere in its tree, found by
+its manifest), the user's extensions folder, and beside the editor (folders named `<id>.extension`, or their
+archives). Only the project's run; the others are offered to add, and adding copies them into the project.
 The built-ins are embedded in the programs.
 
 Loading resolves what is found into the registry, `Extensions`:

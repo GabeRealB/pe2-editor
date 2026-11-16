@@ -74,10 +74,14 @@ When the version below changes, the index merges three ways, by what the file is
 bytes not at all. A conflict leaves the layer's side shown and the override stale until the user keeps or drops it.
 Merges are cached by what they were made from; diffs are never stored.
 
-## Sealed extensions
+## Sealed nodes and extensions
 
-A layer can hold an extension. It is sealed: kept whole as one tree of objects in the store, named by its hash,
-never merged, read-only. A higher layer's copy replaces a lower one's. See [The extension
+A node's record may hold a tree in place of files (`tree = "<sha1>"`, `Record::tree`): a sealed node, kept whole as
+one tree of objects in the store, its files the tree's (`Content::Object`), never merged and never written into - an
+edit writing one is refused. It is an entry like any other: placed anywhere, moved, renamed, deleted; a higher layer
+replaces it whole by overriding it with another tree, removing what the one below had and its tree has not. A sealed
+node whose tree holds an extension's manifest is an extension the project holds (`Project::held_extensions`), by what
+it holds, wherever it is and however it is named; one is added in `extensions/`, named by its id. See [The extension
 runtime](../extensions/runtime.md).
 
 ## Edits by path

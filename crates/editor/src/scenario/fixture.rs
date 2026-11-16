@@ -87,12 +87,12 @@ impl Fixture {
         Fixture::new().node("notes", stack).stored("notes", "notes.txt")
     }
 
-    /// An extension to be held by a layer: its component, with the manifest it carries, in a folder of its own in the
-    /// layer's (`extensions/<id>.extension`, as layers held them before records), which `settle` makes the layer hold.
+    /// An extension to be held by a layer: its component, with the manifest it carries, in a node of its own in the
+    /// layer's tree (`extensions/<id>.node`), which `settle` makes the layer's records: a sealed node, by its manifest.
     /// Its folder, for what else it is to have.
     fn hold(&self, layer: &str, component: &[u8]) -> HostPath {
         let about = project::ext::component::about(component).expect("who it is");
-        let at = self.root.at(&format!("layers/{layer}/extensions/{}.extension", about.id));
+        let at = self.root.at(&format!("layers/{layer}/extensions/{}.node", about.id));
         std::fs::create_dir_all(&at).expect("its folder");
         std::fs::write(at.at("extension.wasm"), component).expect("a component");
         let manifest = project::ext::component::manifest_text(component).expect("its manifest");
@@ -116,22 +116,15 @@ impl Fixture {
         }
         fixture.write("project.toml", &file);
         fixture.hold("mods", &bytes);
-        fixture.settle("mods");
+        fixture.settle();
         fixture
     }
 
-    /// Make a layer hold the extensions `hold` put in it, as a project holds them: each named by a record of the layer's,
+    /// Make a layer hold the extensions `hold` put in it, as a project holds them: each a sealed node of the layer's,
     /// its tree in the store.
-    fn settle(&self, layer: &str) {
-        let at = self.root.at("layers").at(layer);
-        // A layer of records, holding nothing else but them.
-        if !project::records::is_records(&pe2_io::SystemFilesystem, &at) {
-            project::records::mark(&pe2_io::SystemFilesystem, &at, &project::records::Settings::default())
-                .expect("a records layer");
-        }
+    fn settle(&self) {
+        // Its tree imported, as every layer of the fixture's not records yet.
         project::records::import_trees(&self.root, &pe2_io::system()).expect("the fixture's layers made records");
-        let project = project::Project::load(&self.root).expect("the project");
-        project::records::hold_extensions(&project, &at).expect("its extensions held");
     }
 
     /// A project of what a suite declares, holding its tests.
@@ -165,7 +158,7 @@ impl Fixture {
         for entry in std::fs::read_dir(suite.folder.at("data")).into_iter().flatten().flatten() {
             std::fs::copy(entry.path(), at.at("data").entry(&entry.file_name())).expect("its data");
         }
-        fixture.settle(layers[0]);
+        fixture.settle();
         if declared.trust {
             extensions::trust::trust(&fixture.root, std::slice::from_ref(&fixture.root)).expect("what is trusted");
         }
@@ -186,7 +179,7 @@ impl Fixture {
         std::fs::create_dir_all(at.at("tests/data")).expect("its tests' folder");
         std::fs::write(at.at("tests/tests.wasm"), tests).expect("its tests");
         std::fs::copy(suite.at("data/doll.usda"), at.at("tests/data/doll.usda")).expect("its data");
-        fixture.settle(LAYER);
+        fixture.settle();
         fixture
     }
 

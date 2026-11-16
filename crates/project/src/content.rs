@@ -34,8 +34,7 @@ enum Form {
         store: Store,
         modified: std::time::SystemTime,
     },
-    /// A file of an extension a layer holds, a whole object of its tree (`records::held_at`): read where it is, never
-    /// written.
+    /// A file of a sealed node, a whole object of its tree (`records::Record::tree`): read where it is, never written.
     Object {
         path: HostPath,
         sha1: pe2_ext::Sha1,
@@ -76,18 +75,6 @@ fn stored_manifest(store: &Store, sha1: &pe2_ext::Sha1) -> io::Result<(Arc<Manif
             Some(other) => held(&other).map(|manifest| (manifest, other)),
             None => Err(e),
         }
-    })
-}
-
-/// A held extension's file at a path: its object.
-fn held(io: &Io, path: &HostPath) -> Option<Form> {
-    let (held, within) = crate::records::held_at(io, path)?;
-    let file = held.file(&within)?;
-    Some(Form::Object {
-        path: held.store.object_path(&file.sha1).ok()?,
-        sha1: file.sha1,
-        size: file.size,
-        modified: held.modified,
     })
 }
 
@@ -199,16 +186,17 @@ fn listed(io: &Io, path: &HostPath) -> Option<io::Result<Form>> {
             let store = Store { dir: store, io: io.clone() };
             Some(stored_manifest(&store, &sha1).map(|(manifest, store)| Form::Stored { manifest, store, modified }))
         }
+        Source::Object { sha1, size, store } => {
+            let store = Store { dir: store, io: io.clone() };
+            Some(store.held_object(&sha1).map(|path| Form::Object { path, sha1, size, modified }))
+        }
     }
 }
 
-/// Where a path's content is: what is known without the disk first - a held extension's tree, what is served, a records
-/// layer's records, by the path's prefix - then the file.
+/// Where a path's content is: what is known without the disk first - what is served, a records layer's records, by the
+/// path's prefix - then the file.
 fn form(io: &Io, path: &HostPath) -> io::Result<Form> {
     let fs = io.filesystem();
-    if let Some(form) = held(io, path) {
-        return Ok(form);
-    }
     if let Some(form) = listed(io, path) {
         return form;
     }
@@ -218,6 +206,9 @@ fn form(io: &Io, path: &HostPath) -> io::Result<Form> {
             crate::records::Content::Stored { sha1, .. } => {
                 let (manifest, store) = stored_manifest(&store, &sha1)?;
                 Form::Stored { manifest, store, modified }
+            }
+            crate::records::Content::Object { sha1, size } => {
+                Form::Object { path: store.held_object(&sha1)?, sha1, size, modified }
             }
         });
     }
@@ -703,11 +694,9 @@ pub fn read_dir(io: &Arc<dyn pe2_io::Io>, dir: &HostPath) -> Vec<(Listed, HostPa
             out.push((name, dir.entry(&raw), folder));
         }
     }
-    // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
-    let held = crate::records::held_at(io, dir).map(|(held, within)| held.list(&within));
-    let held = held.into_iter().flatten().map(|(name, folder)| (Name::new(&name).map(ToOwned::to_owned), folder));
+    // A records layer's, as its records make it.
     let recorded = crate::records::Set::list(dir).into_iter().flatten().map(|(name, folder)| (Ok(name), folder));
-    for (name, folder) in held.chain(recorded) {
+    for (name, folder) in recorded {
         let text = shown(&name).to_owned();
         if seen.insert(text.clone()) {
             out.push((name, dir.entry(std::ffi::OsStr::new(&text)), folder));
@@ -716,20 +705,16 @@ pub fn read_dir(io: &Arc<dyn pe2_io::Io>, dir: &HostPath) -> Vec<(Listed, HostPa
     out
 }
 
-/// Whether a path is a folder: on disk, in a held extension's tree, or in a records layer's.
+/// Whether a path is a folder: on disk, or in a records layer's.
 #[must_use]
 pub fn is_dir(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
-    crate::records::held_at(io, path).is_some_and(|(held, within)| held.is_folder(&within))
-        || crate::records::Set::is_folder(path) == Some(true)
-        || io.filesystem().is_folder(path)
+    crate::records::Set::is_folder(path) == Some(true) || io.filesystem().is_folder(path)
 }
 
-/// Whether a path is a file: on disk, in a held extension's tree, or in a records layer's.
+/// Whether a path is a file: on disk, or in a records layer's.
 #[must_use]
 pub fn is_file(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
-    crate::records::held_at(io, path).is_some_and(|(held, within)| held.file(&within).is_some())
-        || crate::records::Set::is_file(path) == Some(true)
-        || io.filesystem().is_file(path)
+    crate::records::Set::is_file(path) == Some(true) || io.filesystem().is_file(path)
 }
 
 #[cfg(test)]

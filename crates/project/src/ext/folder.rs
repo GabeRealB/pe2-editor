@@ -1,4 +1,5 @@
-//! An extension as it is kept, shipped and held by a project: a folder named by its id, `<id>.extension/`.
+//! An extension as it is kept, shipped and held by a project: a folder holding its manifest - kept and shipped named by
+//! its id, `<id>.extension/`, and held by a project under whatever name and wherever it is placed.
 //!
 //! - `extension.toml`, its manifest: who it is, how it depends on others, whether it runs unsandboxed, and what is said
 //!   of it (`pe2_ext::extension!`). Its component carries the same, and the two have to agree: what reads the folder
@@ -9,11 +10,12 @@
 //!   `CHANGELOG.md`, its icon, and `tests/`. None of it counts toward trusting it, so a fixed typo is not another
 //!   extension.
 //!
-//! A project holds extensions in its layers, sealed: each one object, a tree in the project's store, named by a record
-//! of the layer's (`records::EXTENSIONS`), a higher layer's in place of a lower one's. What is in one is named by its
-//! path within it, read where its folder was (`records::held_folder`), through `content`: nothing is laid out, and a
-//! program is handed a path through the filesystem the project is served as (`content::for_program`). It loads those
-//! and the built-ins, nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them from,
+//! A project holds extensions as sealed nodes of its layers, placed anywhere in its tree like any entry: each one
+//! object, a tree in the project's store (`records::Record::tree`), a higher layer's in place of a lower one's, and an
+//! extension by what it holds - its manifest - not by where it is or how it is named (`Project::held_extensions`). What
+//! is in one is read through `content`, where the layer's tree shows it: nothing is laid out, and a program is handed a
+//! path through the filesystem the project is served as (`content::for_program`). It loads those and the built-ins,
+//! nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them from,
 //! kept as a tree when added - or from an archive of a folder (`<id>-<version>.extension.zip`), unpacked.
 
 use pe2_path::Name;
@@ -30,10 +32,6 @@ pub const SUFFIX: &str = ".extension";
 
 /// What an archive of an extension's folder is named with: `<id>-<version>.extension.zip`, its folder whole inside.
 pub const ARCHIVE_SUFFIX: &str = ".extension.zip";
-
-/// The folder of a project's layer its extensions' files are read at (`records::held_folder`): where they were folders
-/// before they were records (`records::hold_extensions`).
-pub const HELD: &Name = Name::constant("extensions");
 
 /// An extension's manifest, in its folder.
 pub const MANIFEST: &Name = Name::constant(MANIFEST_NAME);
@@ -73,22 +71,21 @@ pub fn manifest(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     toml::from_str(&text).with_context(|| file.display().to_string())
 }
 
-/// What a folder holds, checked: its manifest, which is its component's (`bytes`), in a folder named for its id.
+/// What a folder holds, checked: its manifest, which is its component's (`bytes`). Its folder may be named anything:
+/// an extension is what it holds.
 ///
 /// # Errors
-/// It has no manifest, its component carries another or none, or its folder is named for another id.
+/// It has no manifest, or its component carries another or none.
 pub fn checked(folder: &HostPath, bytes: &[u8], io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     let text =
         crate::content::read_to_string(io, &folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
-    let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
-    checked_text(&text, &name, bytes)
+    checked_text(&text, bytes)
 }
 
-/// The manifest of an extension that has no component, checked: its keys and what it names in its folder (`check`), in
-/// a folder named for its id.
+/// The manifest of an extension that has no component, checked: its keys and what it names in its folder (`check`).
 ///
 /// # Errors
-/// It has no manifest, or what it says is wrong (`pe2_manifest::check`), or its folder is named for another id.
+/// It has no manifest, or what it says is wrong (`pe2_manifest::check`).
 pub fn checked_alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<About> {
     let text =
         crate::content::read_to_string(io, &folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
@@ -98,12 +95,7 @@ pub fn checked_alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<Abou
         crate::content::read(io, &folder.join(&within)).map_err(|e| e.to_string())
     };
     pe2_manifest::check(&table, &read).map_err(|why| anyhow::anyhow!("{MANIFEST}: {why}"))?;
-    let about: About = toml::from_str(&text).context(MANIFEST)?;
-    let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
-    if id_named(&name) != Some(about.id.as_str()) {
-        bail!("it is {}, in {name}: its folder is {}{SUFFIX}", about.id, about.id);
-    }
-    Ok(about)
+    toml::from_str(&text).context(MANIFEST)
 }
 
 /// Whether an extension's folder is only its manifest: no component beside it.
@@ -113,12 +105,11 @@ pub fn alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> bool {
         && crate::content::is_file(io, &folder.join(&MANIFEST))
 }
 
-/// An extension's manifest (`text`) checked: its component's (`bytes`), in a folder named (`name`) for its id - in its
-/// folder, or in an archive of it.
+/// An extension's manifest (`text`) checked: its component's (`bytes`) - in its folder, or in an archive of it.
 ///
 /// # Errors
-/// Its component carries another manifest or none, or its folder is named for another id.
-pub fn checked_text(text: &str, name: &str, bytes: &[u8]) -> Result<About> {
+/// Its component carries another manifest or none.
+pub fn checked_text(text: &str, bytes: &[u8]) -> Result<About> {
     let about: About = toml::from_str(text).context(MANIFEST)?;
     component::sandboxed_fetches_nothing(&about)?;
     let held: toml::Table = text.parse().with_context(|| MANIFEST.to_string())?;
@@ -129,9 +120,6 @@ pub fn checked_text(text: &str, name: &str, bytes: &[u8]) -> Result<About> {
         let keys = held.keys().chain(carried.keys());
         let differs = keys.into_iter().find(|key| held.get(*key) != carried.get(*key)).cloned().unwrap_or_default();
         bail!("its {MANIFEST} is not its component's: {differs} differs");
-    }
-    if id_named(name) != Some(about.id.as_str()) {
-        bail!("it is {}, in {name}: its folder is {}{SUFFIX}", about.id, about.id);
     }
     Ok(about)
 }
@@ -160,11 +148,11 @@ mod tests {
     fn only_what_runs_unsandboxed_fetches() {
         let setup = "\n[[setup]]\nname = \"a tool\"\nurl = \"https://example.com/t\"\nsha256 = \"00\"\ntake = { file = \"tool\", sha256 = \"00\" }\n";
         let sandboxed = format!("id = \"a\"\nversion = \"0.1.0\"\n{setup}");
-        let why = checked_text(&sandboxed, "a.extension", b"").unwrap_err();
+        let why = checked_text(&sandboxed, b"").unwrap_err();
         assert!(format!("{why:#}").contains("only an unsandboxed extension fetches"), "{why:#}");
         // Unsandboxed, it gets as far as its component.
         let unsandboxed = format!("id = \"a\"\nversion = \"0.1.0\"\nunsandboxed = true\n{setup}");
-        let why = checked_text(&unsandboxed, "a.extension", b"").unwrap_err();
+        let why = checked_text(&unsandboxed, b"").unwrap_err();
         assert!(format!("{why:#}").contains("carries no manifest"), "{why:#}");
     }
 

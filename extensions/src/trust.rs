@@ -243,7 +243,7 @@ impl Allowed {
 }
 
 /// Which of these places holds a file, where it really is now: its links resolved again as far as it is on disk (what
-/// is not - an extension's files a project holds, read from its tree: `records::held_folder` - as it is below that),
+/// is not - an extension's files a project holds, read from its tree in a records layer's - as it is below that),
 /// so that a link out of a place is not in it.
 fn holding<'a>(file: &HostPath, mut places: impl Iterator<Item = &'a HostPath>) -> Option<HostPath> {
     let real = HostPath::new(file).ok()?;

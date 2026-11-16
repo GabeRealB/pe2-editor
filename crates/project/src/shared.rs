@@ -268,6 +268,13 @@ fn place(disk: &HostPath, source: &Source) -> Vec<u8> {
             text(&mut out, &sha1.to_string());
             text(&mut out, &store.to_string_lossy());
         }
+        Source::Object { sha1, size, store } => {
+            out.push(3);
+            text(&mut out, &disk.to_string_lossy());
+            text(&mut out, &sha1.to_string());
+            text(&mut out, &size.to_string());
+            text(&mut out, &store.to_string_lossy());
+        }
     }
     out
 }
@@ -289,6 +296,11 @@ pub fn placed(said: &[u8]) -> Option<(HostPath, Source)> {
         0 => Source::Disk,
         1 => Source::RecordText { record: place(text()?)?, name: text()? },
         2 => Source::Stored { sha1: pe2_ext::Sha1::from_hex(&text()?).ok()?, store: place(text()?)? },
+        3 => Source::Object {
+            sha1: pe2_ext::Sha1::from_hex(&text()?).ok()?,
+            size: text()?.parse().ok()?,
+            store: place(text()?)?,
+        },
         _ => return None,
     };
     Some((disk, source))

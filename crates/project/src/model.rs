@@ -424,11 +424,20 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
                 out.0.extend_from_slice(sha1.bytes());
                 out.u64(*size);
             }
+            Some(Content::Object { sha1, size }) => {
+                out.u8(3);
+                out.0.extend_from_slice(sha1.bytes());
+                out.u64(*size);
+            }
         }
         out.u8(u8::from(held.base.is_some()));
         if let Some(base) = &held.base {
             out.0.extend_from_slice(base.bytes());
         }
+    }
+    out.u8(u8::from(record.tree.is_some()));
+    if let Some(tree) = &record.tree {
+        out.0.extend_from_slice(tree.bytes());
     }
     if long {
         out.text(name);
@@ -464,6 +473,7 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
             0 => None,
             1 => Some(Content::Text(read.text()?)),
             2 => Some(Content::Stored { sha1: sha1_in(&mut read)?, size: read.u64()? }),
+            3 => Some(Content::Object { sha1: sha1_in(&mut read)?, size: read.u64()? }),
             _ => return None,
         };
         let base = match read.u8()? {
@@ -472,8 +482,12 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
         };
         files.insert(file, File { content, base });
     }
+    let tree = match read.u8()? {
+        0 => None,
+        _ => Some(sha1_in(&mut read)?),
+    };
     let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
-    let record = Record { op, kind, parent, name, files };
+    let record = Record { op, kind, parent, name, files, tree };
     read.0.is_empty().then_some(((Arc::new(record), modified, len), long))
 }
 
@@ -1130,6 +1144,7 @@ mod tests {
                 parent: (placed && n % 2 == 0).then(|| uid(&format!("uid://parent{n}"))),
                 name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap().to_owned()),
                 files,
+                tree: None,
             };
             (uid(&format!("uid://{n:012}")), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
         };

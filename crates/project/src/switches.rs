@@ -3,9 +3,9 @@
 //! kept) as a step of the project's history, so it can be undone. The editor opens the project again when
 //! `project.toml` changes, loading its extensions as it now says.
 //!
-//! The extensions it holds are sealed, kept whole as trees in its store and named by its layers' records
-//! (`records::EXTENSIONS`): one is added from wherever it is kept - and updated the same way - and removed, each as one
-//! step with what the project requires of it (`[[extension]]`).
+//! The extensions it holds are sealed nodes, kept whole as trees in its store (`records::Record::tree`) and found by
+//! their manifests wherever they are: one is added from wherever it is kept - and updated the same way - and removed,
+//! each as one step with what the project requires of it (`[[extension]]`).
 
 use pe2_path::Name;
 use sfs::HostPath;
@@ -44,31 +44,44 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
     write(&project.root, &document, history, label)
 }
 
-/// What a layer's records say of an extension.
-#[derive(PartialEq, Eq)]
-enum Says {
-    /// It holds it, as this tree.
-    Holds(pe2_ext::Sha1),
-    /// It leaves the one below off.
-    LeavesOff,
+/// The id an extension's tree says it is, by its manifest; none where it holds none, or one not read.
+fn id_in(project: &Project, tree: &crate::chunks::Tree) -> Option<String> {
+    let manifest = tree.files.get(folder::MANIFEST.as_str())?;
+    let bytes = crate::chunks::Store::at(&project.root, project.io.clone()).get_object(&manifest.sha1).ok()?;
+    let about: About = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some(about.id)
 }
 
-/// The folder of a layer's records, where the extensions it holds are said.
-fn records_of(layer: &crate::Layer) -> Result<&HostPath> {
-    anyhow::ensure!(!layer.mounted, "{} is a mount: its records list its tree, and hold no extensions", layer.name);
-    Ok(&layer.records)
+/// What the layers record of the extension of an id, bottom to top: each record of a sealed node whose tree is that
+/// extension, and each deleting one of those.
+fn records_of(project: &Project, set: &crate::records::Set, id: &str) -> Vec<crate::records::SealedRecord> {
+    let all = set.sealed_records();
+    let uids: std::collections::HashSet<pe2_path::Uid> = all
+        .iter()
+        .filter(|held| held.tree.as_ref().is_some_and(|tree| id_in(project, tree).as_deref() == Some(id)))
+        .map(|held| held.uid)
+        .collect();
+    all.into_iter().filter(|held| uids.contains(&held.uid)).collect()
 }
 
-/// What a layer's records say of an extension; nothing where they say nothing of it.
-fn held_in(layer: &crate::Layer, id: &str, fs: &dyn pe2_io::Filesystem) -> Option<Says> {
-    let said = crate::records::extensions_of(fs, &layer.records).ok()?.remove(id)?;
-    Some(said.map_or(Says::LeavesOff, Says::Holds))
+/// The layer whose records' folder it is.
+fn layer_of<'a>(project: &'a Project, folder: &HostPath) -> Option<&'a crate::Layer> {
+    project.layers.iter().find(|layer| layer.records == *folder)
 }
+
+/// The project's record set, as it is open, or read now.
+fn set_of(project: &Project) -> Result<std::sync::Arc<crate::records::Set>> {
+    crate::records::Set::current(&project.root).map_or_else(|| crate::records::Set::open(project), Ok)
+}
+
+/// Where an extension is placed when the project holds it nowhere yet: in the folder `extensions`, by its id.
+const PLACED_IN: &Name = Name::constant("extensions");
 
 /// Add an extension to the project, or update the one it holds of its id: its folder kept whole as a tree in the
-/// store, named by a layer's record in place of what was there, and required at the versions of its line (`^0.1`). The
-/// layer is the one named (`into`), else the one holding it already, else the project's highest that is written. What
-/// it is is checked first, as loading checks it.
+/// store - a sealed node, found by its manifest wherever it is - and required at the versions of its line (`^0.1`). The
+/// layer is the one named (`into`), else the one holding it already, else the project's highest that is written: where
+/// that layer records it, its record holds the new tree; where one below does, it overrides it; else it is placed in
+/// `extensions/`, named by its id. What it is is checked first, as loading checks it.
 ///
 /// # Errors
 /// It is no extension's folder, the project has no such layer or none to hold it, or it cannot be kept or
@@ -80,6 +93,7 @@ pub fn add_extension(
     history: &mut History,
     label: String,
 ) -> Result<About> {
+    use crate::records::{Kind, Op, Record};
     let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
     // One that is only its manifest - programs and what they are fetched from - is checked as loading checks it.
     let about = if folder::alone(from, &project.io) {
@@ -89,12 +103,14 @@ pub fn add_extension(
         let bytes = project.io.filesystem().read(&component).with_context(|| component.display().to_string())?;
         folder::checked(from, &bytes, &project.io).with_context(|| from.display().to_string())?
     };
+    let set = set_of(project)?;
+    let held = records_of(project, &set, &about.id);
+    let writable = |layer: &crate::Layer| !layer.mounted && !layer.read_only && layer.kind == crate::LayerKind::Assets;
     let holding = || {
-        project
-            .layers
-            .iter()
+        held.iter()
             .rev()
-            .find(|l| !l.mounted && matches!(held_in(l, &about.id, project.io.filesystem()), Some(Says::Holds(_))))
+            .filter(|h| h.tree.is_some())
+            .find_map(|h| layer_of(project, &h.folder).filter(|l| writable(l)))
     };
     let layer = match into {
         Some(into) => project.layer(into)?,
@@ -102,65 +118,158 @@ pub fn add_extension(
             holding().or_else(|| project.extensions_layer()).context("the project has no layer it writes to hold it")?
         }
     };
-    anyhow::ensure!(
-        !layer.mounted && !layer.read_only && layer.kind == crate::LayerKind::Assets,
-        "{} cannot hold extensions: the project does not write it",
-        layer.name
-    );
+    anyhow::ensure!(writable(layer), "{} cannot hold extensions: the project does not write it", layer.name);
     let (tree, _) = crate::chunks::Store::at(&project.root, project.io.clone()).put_folder(from)?;
-    let held_already = held_in(layer, &about.id, project.io.filesystem()) == Some(Says::Holds(tree));
+    let at = |uid| crate::records::path_of(&layer.records, uid).map_err(anyhow::Error::from);
+    let below: Vec<&crate::records::SealedRecord> = held.iter().filter(|h| h.folder != layer.records).collect();
+    let own = held.iter().find(|h| h.folder == layer.records);
+    let mut writes: Vec<(HostPath, String)> = Vec::new();
+    match own {
+        // Its record here holds the new tree, where and as what it is.
+        Some(own) if own.record.tree == Some(tree) => {}
+        Some(own) => {
+            // An override's removals are of the version below, by the new tree.
+            let below = below.iter().rev().find_map(|h| h.tree.as_deref().filter(|_| h.uid == own.uid));
+            let files = if own.record.op == Op::Override {
+                removed(below, &project.io, &tree, &project.root)
+            } else {
+                own.record.files.clone()
+            };
+            writes.push((at(own.uid)?, Record { tree: Some(tree), files, ..(*own.record).clone() }.render()));
+        }
+        // Held below: overridden here, whole.
+        None if let Some(below) = below.iter().rev().find(|h| h.tree.is_some()) => {
+            let record = Record {
+                op: Op::Override,
+                kind: Kind::Node,
+                parent: None,
+                name: None,
+                files: removed(below.tree.as_deref(), &project.io, &tree, &project.root),
+                tree: Some(tree),
+            };
+            writes.push((at(below.uid)?, record.render()));
+        }
+        // Held nowhere: placed in `extensions/`, which is made where the stack has no such folder.
+        None => writes.extend(placed(project, &set, layer, &about.id, tree)?),
+    }
     let mut document = read(project.io.filesystem(), &project.root)?;
     let before = document.to_string();
     let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
     require(&mut document, &Requirement { id: about.id.clone(), version: Some(format!("^{line}")) })?;
     // Held as it is, and required so: nothing to do.
-    if held_already && document.to_string() == before {
+    if writes.is_empty() && document.to_string() == before {
         return Ok(about);
     }
     let mut tx = history.begin(label);
-    if !held_already {
-        let record = crate::records::extension_path(records_of(layer)?, &about.id)?;
-        tx.write(&record, crate::records::extension_record(Some(&tree)).as_bytes())?;
+    for (path, text) in writes {
+        tx.write(&path, text.as_bytes())?;
     }
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit()?;
     Ok(about)
 }
 
+/// The records placing an extension the project holds nowhere yet in a layer: in the folder `extensions`, by its id - and
+/// that folder's, where the stack has none.
+fn placed(
+    project: &Project,
+    set: &crate::records::Set,
+    layer: &crate::Layer,
+    id: &str,
+    tree: pe2_ext::Sha1,
+) -> Result<Vec<(HostPath, String)>> {
+    use crate::records::{Kind, Op, Record};
+    let at = |uid| crate::records::path_of(&layer.records, uid).map_err(anyhow::Error::from);
+    let mut writes = Vec::new();
+    let mut taken = set.uids();
+    let mut uid = || {
+        let uid = crate::uid::new(project.io.random(), |uid| taken.contains(&uid));
+        taken.insert(uid);
+        uid
+    };
+    let placed_in = crate::TreePath::root().join(PLACED_IN);
+    let parent = if let Some(parent) = set.placed_at(&placed_in) {
+        parent
+    } else {
+        let folder = uid();
+        let record = Record {
+            op: Op::Create,
+            kind: Kind::Folder,
+            parent: None,
+            name: Some(PLACED_IN.to_owned()),
+            files: std::collections::BTreeMap::new(),
+            tree: None,
+        };
+        writes.push((at(folder)?, record.render()));
+        folder
+    };
+    let name = Name::new(id).with_context(|| format!("{id}: no name an entry takes"))?;
+    let record = Record {
+        op: Op::Create,
+        kind: Kind::Node,
+        parent: Some(parent),
+        name: Some(name.to_owned()),
+        files: std::collections::BTreeMap::new(),
+        tree: Some(tree),
+    };
+    writes.push((at(uid())?, record.render()));
+    Ok(writes)
+}
+
+/// What an override of a sealed node whole removes of the version below (`below`): each of its files the new tree
+/// (`tree`, kept in the store) has not.
+fn removed(
+    below: Option<&crate::chunks::Tree>,
+    io: &std::sync::Arc<dyn pe2_io::Io>,
+    tree: &pe2_ext::Sha1,
+    root: &HostPath,
+) -> std::collections::BTreeMap<std::sync::Arc<pe2_path::RelPath>, crate::records::File> {
+    let now = crate::chunks::Store::at(root, io.clone()).get_tree(tree).unwrap_or_default();
+    let names = below.into_iter().flat_map(|below| below.files.keys()).filter(|name| !now.files.contains_key(*name));
+    names
+        .filter_map(|name| pe2_path::RelPath::new(name).ok().map(ToOwned::to_owned))
+        .map(|name| (name, crate::records::File { content: None, base: None }))
+        .collect()
+}
+
 /// Remove an extension from the project: the records of the layers written that hold it, and what the project requires
-/// of it. Where a layer the project does not write holds it still, its highest written layer leaves that one off (a
-/// record deleting it).
+/// of it. Where a layer the project does not write holds it still, its highest written layer deletes it there.
 ///
 /// # Errors
-/// The project neither holds nor requires it, a layer the project does not write holds it and none written can leave it
-/// off, or what holds it cannot be removed or `project.toml` written.
+/// The project neither holds nor requires it, a layer the project does not write holds it and none written can delete
+/// it, or what holds it cannot be removed or `project.toml` written.
 pub fn remove_extension(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
-    let saying: Vec<&crate::Layer> = project
-        .layers
-        .iter()
-        .filter(|layer| !layer.mounted && held_in(layer, id, project.io.filesystem()).is_some())
-        .collect();
-    let holding = |layer: &crate::Layer| matches!(held_in(layer, id, project.io.filesystem()), Some(Says::Holds(_)));
-    let fixed = saying.iter().find(|layer| holding(layer) && layer.read_only);
+    let set = set_of(project)?;
+    let held = records_of(project, &set, id);
+    let written = |folder: &HostPath| layer_of(project, folder).is_some_and(|layer| !layer.read_only);
+    let fixed = held.iter().find(|h| h.tree.is_some() && !written(&h.folder));
     let off_in = match fixed {
         Some(fixed) => {
             let layer = project.extensions_layer().filter(|l| l.kind == crate::LayerKind::Assets);
-            Some(layer.with_context(|| format!("{id} is in {}, and no layer written can leave it off", fixed.name))?)
+            let name = layer_of(project, &fixed.folder).map_or_default(|l| l.name.to_string());
+            Some((layer.with_context(|| format!("{id} is in {name}, and no layer written can delete it"))?, fixed.uid))
         }
         None => None,
     };
     let mut document = read(project.io.filesystem(), &project.root)?;
     let required = unrequire(&mut document, id);
-    if !saying.iter().any(|layer| holding(layer)) && !required {
+    if !held.iter().any(|h| h.tree.is_some()) && !required {
         bail!("the project neither holds nor requires {id}");
     }
     let mut tx = history.begin(label);
-    for layer in saying.iter().filter(|layer| !layer.read_only) {
-        tx.remove(&crate::records::extension_path(records_of(layer)?, id)?)?;
+    for h in held.iter().filter(|h| written(&h.folder)) {
+        tx.remove(&crate::records::path_of(&h.folder, h.uid)?)?;
     }
-    if let Some(layer) = off_in {
-        let record = crate::records::extension_path(records_of(layer)?, id)?;
-        tx.write(&record, crate::records::extension_record(None).as_bytes())?;
+    if let Some((layer, uid)) = off_in {
+        let record = crate::records::Record {
+            op: crate::records::Op::Delete,
+            kind: crate::records::Kind::Node,
+            parent: None,
+            name: None,
+            files: std::collections::BTreeMap::new(),
+            tree: None,
+        };
+        tx.write(&crate::records::path_of(&layer.records, uid)?, record.render().as_bytes())?;
     }
     if required {
         tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;

@@ -30,6 +30,10 @@ and installation notes, and the licenses of what it ships and downloads.
 
 Adding, updating and removing an extension are changes to the project, and can be undone.
 
+An extension the project holds is also in the project's tree, in the **Assets** pane: a read-only node, in the
+`extensions` folder when it is added. You can move or rename it like any node, and it stays the extension it is; its
+files cannot be edited. A layer above can update or remove it, leaving the layer that holds it as it is.
+
 From a terminal: `pe2-cli project extension add <id, folder or archive>`, `update`, `remove`, `list`.
 
 ## Settings

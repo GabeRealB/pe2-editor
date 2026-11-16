@@ -60,6 +60,8 @@ pub enum Source {
     RecordText { record: HostPath, name: String },
     /// Kept in a store for a record, by its SHA-1.
     Stored { sha1: pe2_ext::Sha1, store: HostPath },
+    /// A whole object of a sealed node's tree, in a store, by its SHA-1.
+    Object { sha1: pe2_ext::Sha1, size: u64, store: HostPath },
 }
 
 /// What changed of a listing: the paths shown anew or otherwise - written otherwise among them - and the paths gone.

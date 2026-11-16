@@ -70,7 +70,15 @@ pub fn read(fs: &dyn pe2_io::Filesystem, file: &HostPath) -> Result<(About, Vec<
     };
     let component = entry(EXTENSION_COMPONENT.as_str())?;
     let manifest = String::from_utf8(entry(folder::MANIFEST.as_str())?).context(folder::MANIFEST.to_string())?;
-    let about = folder::checked_text(&manifest, &top, &component)?;
+    let about = folder::checked_text(&manifest, &component)?;
+    // An archive is found by its folder's name: the id its manifest says.
+    ensure!(
+        folder::id_named(&top) == Some(about.id.as_str()),
+        "it is {}, in {top}: its folder is {}{}",
+        about.id,
+        about.id,
+        folder::SUFFIX
+    );
     Ok((about, component))
 }
 

@@ -68,11 +68,13 @@ pub enum Kind {
     File,
 }
 
-/// A file's content in a record: inline text, or a file kept whole in the store.
+/// A file's content in a record: inline text, or a file kept whole in the store - or, a sealed node's, a whole object
+/// of its tree (`Record::tree`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
     Text(String),
     Stored { sha1: pe2_ext::Sha1, size: u64 },
+    Object { sha1: pe2_ext::Sha1, size: u64 },
 }
 
 /// A file of an entry, as a record holds it: its content, none where the layer removes it; and, for an override's,
@@ -91,235 +93,12 @@ pub struct Record {
     /// Where it is: its parent's uid (none at the top) and its name - for what the layer creates or moves.
     pub parent: Option<Uid>,
     pub name: Option<Arc<Name>>,
-    /// Its files by name; a plain file's own by the root.
+    /// Its files by name; a plain file's own by the root. A sealed node's are its tree's: these are only those it
+    /// removes of the version below.
     pub files: BTreeMap<Arc<RelPath>, File>,
-}
-
-/// Where a layer keeps the extensions it holds, in its folder: a record an id, `extensions/<id>.toml`. They are no
-/// entries - an extension is not in the tree of what the project holds - and are sealed: kept whole, as one tree of
-/// whole objects in the store (`chunks::Store::put_folder`), never merged, a higher layer's in place of a lower one's,
-/// and deleted to leave a lower one's off:
-///
-/// ```toml
-/// format = 1
-/// op = "create"
-/// kind = "extension"
-/// tree = "<the SHA-1 of its tree>"
-/// ```
-pub const EXTENSIONS: &Name = Name::constant("extensions");
-
-/// An extension's id with what follows it in a file's name.
-fn id_name(id: &str, suffix: &str) -> Result<Arc<Name>, pe2_path::PathError> {
-    (Name::new(&format!("{id}{suffix}"))).map(ToOwned::to_owned)
-}
-
-/// Where a layer's record of the extension of an id is.
-///
-/// # Errors
-/// The id makes no file's name on every system: no layer holds it.
-pub fn extension_path(layer: &HostPath, id: &str) -> Result<HostPath, pe2_path::PathError> {
-    Ok(layer.join(&EXTENSIONS).join(&id_name(id, ".toml")?))
-}
-
-/// The text of a layer's record of an extension: holding the tree named, or (none) leaving below's off.
-#[must_use]
-pub fn extension_record(tree: Option<&pe2_ext::Sha1>) -> String {
-    let mut doc = toml_edit::DocumentMut::new();
-    doc["format"] = toml_edit::value(FORMAT);
-    doc["op"] = toml_edit::value(if tree.is_some() { "create" } else { "delete" });
-    doc["kind"] = toml_edit::value("extension");
-    if let Some(tree) = tree {
-        doc["tree"] = toml_edit::value(tree.to_string());
-    }
-    doc.to_string()
-}
-
-/// The extensions a layer holds, by id: each its tree, none where the layer leaves below's off.
-///
-/// # Errors
-/// A record cannot be read, or is of a format this program does not know.
-pub fn extensions_of(fs: &dyn pe2_io::Filesystem, layer: &HostPath) -> Result<BTreeMap<String, Option<pe2_ext::Sha1>>> {
-    let mut out = BTreeMap::new();
-    let folder = layer.join(&EXTENSIONS);
-    for file in fs.read_directory(&folder).unwrap_or_default() {
-        let path = folder.entry(&file.name);
-        let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".toml")) else {
-            continue;
-        };
-        let text = fs.read_to_string(&path)?;
-        out.insert(id.to_string(), extension_tree(&text).with_context(|| path.display().to_string())?);
-    }
-    Ok(out)
-}
-
-/// What a record of an extension says: the tree it holds, or (none) that it leaves below's off.
-///
-/// # Errors
-/// It is no extension's record of a format this program knows.
-pub fn extension_tree(text: &str) -> Result<Option<pe2_ext::Sha1>> {
-    let table: toml::Table = toml::from_str(text)?;
-    match table.get("format").and_then(toml::Value::as_integer) {
-        Some(FORMAT) => {}
-        Some(other) if other > FORMAT => bail!("of format {other}, written by a newer pe2"),
-        other => bail!("not a record of format {FORMAT} ({other:?})"),
-    }
-    let word = |key: &str| table.get(key).and_then(toml::Value::as_str);
-    if word("kind") != Some("extension") {
-        bail!("not an extension's record");
-    }
-    match word("op") {
-        Some("create") => Ok(Some(pe2_ext::Sha1::from_hex(word("tree").context("no tree")?).context("its tree")?)),
-        Some("delete") => Ok(None),
-        other => bail!("an extension is created or deleted, not {other:?}"),
-    }
-}
-
-/// An extension a layer holds, as what reads its files sees it: they are at `<layer>/extensions/<id>.extension/<path>`
-/// (`held_folder`), where it was a folder before it was a record, read from its tree in the store - a path that is on
-/// no disk, read through `content` as a records layer's files are. The tree is the object: what is in it is named by
-/// its path within it, never by its own hash.
-#[derive(Clone, Debug)]
-pub struct HeldExtension {
-    pub layer: HostPath,
-    pub id: String,
-    /// Its tree's hash.
-    pub tree: pe2_ext::Sha1,
-    pub files: std::sync::Arc<crate::chunks::Tree>,
-    pub store: crate::chunks::Store,
-    /// When its record was written.
-    pub modified: std::time::SystemTime,
-}
-
-/// Where the files of the extension of an id a layer holds are read: its folder, as a path on no disk.
-///
-/// # Errors
-/// The id makes no file's name on every system: no layer holds it.
-pub fn held_folder(layer: &HostPath, id: &str) -> Result<HostPath, pe2_path::PathError> {
-    Ok(layer.join(&crate::ext::folder::HELD).join(&id_name(id, crate::ext::folder::SUFFIX)?))
-}
-
-/// The trees of the extensions read, by their records' files and their stamps: a tree is read once.
-type HeldRead =
-    std::collections::HashMap<HostPath, (std::time::SystemTime, u64, Option<std::sync::Arc<HeldExtension>>)>;
-static HELD_TREES: std::sync::RwLock<Option<HeldRead>> = std::sync::RwLock::new(None);
-
-/// The extension a layer holds at a folder (`held_folder`): none where the folder is no held extension's, or the layer
-/// leaves it off.
-#[must_use]
-pub fn held(io: &Arc<dyn pe2_io::Io>, folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
-    let id = crate::ext::folder::id_of(folder)?;
-    let parent = folder.parent()?;
-    if parent.file_name()? != crate::ext::folder::HELD {
-        return None;
-    }
-    let layer = parent.parent()?;
-    let folder = shipped_of(&layer)?;
-    // Its id is a folder's name: the name of its record too.
-    let record = extension_path(&folder, id).ok()?;
-    let stat = io.filesystem().stat(&record).ok()?;
-    let stamp = (stat.modified?, stat.size);
-    if let Some(found) =
-        HELD_TREES.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|h| h.get(&record))
-        && (found.0, found.1) == stamp
-    {
-        return found.2.clone();
-    }
-    let read = || -> Option<std::sync::Arc<HeldExtension>> {
-        let tree = extensions_of(io.filesystem(), &folder).ok()?.remove(id)??;
-        // Its tree is the layer's store's, or - until a sweep shares it again - this machine's.
-        let (store, files) = crate::chunks::Store::of(&layer, io)?.holding_tree(&tree)?;
-        let files = std::sync::Arc::new(files);
-        Some(std::sync::Arc::new(HeldExtension {
-            layer: layer.clone(),
-            id: id.to_string(),
-            tree,
-            files,
-            store,
-            modified: stamp.0,
-        }))
-    };
-    let held = read();
-    let mut cache = HELD_TREES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.get_or_insert_default().insert(record, (stamp.0, stamp.1, held.clone()));
-    held
-}
-
-/// The held extension a path is in (`held`), and the path within its folder ("" for the folder).
-#[must_use]
-pub fn held_at(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> Option<(std::sync::Arc<HeldExtension>, String)> {
-    // Its folder is the nearest ancestor named `<id>.extension` in a layer's `extensions/`.
-    let folder = path.ancestors().find(|a| {
-        crate::ext::folder::id_of(a).is_some()
-            && a.parent().is_some_and(|layer| layer.file_name().is_some_and(|name| name == crate::ext::folder::HELD))
-    })?;
-    let held = held(io, &folder)?;
-    // Its files are its tree's, held by names: a place within by one no path takes is none of them.
-    let within = path.within(&folder).ok()?.as_str().to_owned();
-    Some((held, within))
-}
-
-impl HeldExtension {
-    /// A file of it by its path within it.
-    #[must_use]
-    pub fn file(&self, name: &str) -> Option<&crate::chunks::TreeFile> {
-        self.files.files.get(name)
-    }
-
-    /// Whether a path within it is a folder of it ("" its own).
-    #[must_use]
-    pub fn is_folder(&self, within: &str) -> bool {
-        within.is_empty() || {
-            let prefix = format!("{within}/");
-            self.files.files.range(prefix.clone()..).next().is_some_and(|(name, _)| name.starts_with(&prefix))
-        }
-    }
-
-    /// What a folder of it holds: each name, and whether it is a folder.
-    #[must_use]
-    pub fn list(&self, within: &str) -> Vec<(String, bool)> {
-        let prefix = if within.is_empty() { String::new() } else { format!("{within}/") };
-        let mut out: Vec<(String, bool)> = Vec::new();
-        for name in self.files.files.keys().filter(|n| n.starts_with(&prefix)) {
-            let rest = &name[prefix.len()..];
-            let (first, folder) = match rest.split_once('/') {
-                Some((first, _)) => (first, true),
-                None => (rest, false),
-            };
-            if out.last().is_none_or(|(last, _)| last != first) {
-                out.push((first.to_string(), folder));
-            }
-        }
-        out
-    }
-}
-
-/// Hold the extensions a layer has as folders (`extensions/<id>.extension`, as it held them before records) as
-/// records: each folder kept as a tree in the store, its record written, the folder removed. How many there were.
-///
-/// # Errors
-/// A folder cannot be read or kept, or its record written.
-pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usize> {
-    let fs = project.io.filesystem();
-    let held = layer.join(&crate::ext::folder::HELD);
-    let store = crate::chunks::Store::at(&project.root, project.io.clone());
-    let mut count = 0;
-    for entry in fs.read_directory(&held).unwrap_or_default() {
-        let folder = held.entry(&entry.name);
-        let Some(id) = crate::ext::folder::id_of(&folder).map(str::to_string) else { continue };
-        if entry.kind != pe2_io::Kind::Folder {
-            continue;
-        }
-        let (tree, _) = store.put_folder(&folder)?;
-        let at = extension_path(layer, &id)?;
-        fs.create_folder_all(&layer.join(&EXTENSIONS))?;
-        crate::local::write_atomic(fs, &at, extension_record(Some(&tree)).as_bytes())?;
-        project.io.filesystem().remove_all(&folder)?;
-        count += 1;
-    }
-    if pe2_io::is_empty_folder(fs, &held) {
-        project.io.filesystem().remove_folder(&held)?;
-    }
-    Ok(count)
+    /// A sealed node's content: a tree of whole objects in the store (`chunks::Tree`), kept and replaced whole, never
+    /// merged or edited - an extension, where it holds a manifest (`ext::folder::MANIFEST`), wherever it is.
+    pub tree: Option<pe2_ext::Sha1>,
 }
 
 /// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
@@ -455,6 +234,7 @@ impl Content {
         match self {
             Content::Text(text) => Ok(text.clone().into_bytes()),
             Content::Stored { sha1, .. } => store.get_file(sha1),
+            Content::Object { sha1, .. } => store.get_object(sha1),
         }
     }
 
@@ -463,7 +243,7 @@ impl Content {
     pub fn size(&self) -> u64 {
         match self {
             Content::Text(text) => text.len() as u64,
-            Content::Stored { size, .. } => *size,
+            Content::Stored { size, .. } | Content::Object { size, .. } => *size,
         }
     }
 
@@ -472,7 +252,7 @@ impl Content {
     pub fn sha1(&self) -> pe2_ext::Sha1 {
         match self {
             Content::Text(text) => crate::extract::sha1_of(text.as_bytes()),
-            Content::Stored { sha1, .. } => *sha1,
+            Content::Stored { sha1, .. } | Content::Object { sha1, .. } => *sha1,
         }
     }
 }
@@ -530,7 +310,11 @@ impl Record {
             let base = field("base").map(|base| pe2_ext::Sha1::from_hex(&base)).transpose();
             files.insert(at, File { content, base: base.with_context(|| format!("{name}: its base"))? });
         }
-        Ok(Record { op, kind, parent, name, files })
+        let tree = string("tree").map(|text| pe2_ext::Sha1::from_hex(&text)).transpose().context("its tree")?;
+        if tree.is_some() && kind != Kind::Node {
+            bail!("a tree is a node's, not a {}'s", kind.name());
+        }
+        Ok(Record { op, kind, parent, name, files, tree })
     }
 
     /// Its text: its format first, what it does and where, then its files by name.
@@ -546,6 +330,9 @@ impl Record {
         if let Some(name) = &self.name {
             doc["name"] = toml_edit::value(name.as_str());
         }
+        if let Some(tree) = &self.tree {
+            doc["tree"] = toml_edit::value(tree.to_string());
+        }
         if !self.files.is_empty() {
             let mut files = toml_edit::Table::new();
             files.set_implicit(true);
@@ -556,7 +343,7 @@ impl Record {
                 }
                 match &file.content {
                     Some(Content::Text(text)) => table["text"] = toml_edit::value(text.as_str()),
-                    Some(Content::Stored { sha1, size }) => {
+                    Some(Content::Stored { sha1, size } | Content::Object { sha1, size }) => {
                         table["sha1"] = toml_edit::value(sha1.to_string());
                         table["size"] = toml_edit::value(i64::try_from(*size).unwrap_or(i64::MAX));
                     }
@@ -568,6 +355,17 @@ impl Record {
         }
         doc.to_string()
     }
+}
+
+/// What a layer records of a sealed node (`Set::sealed_records`).
+#[derive(Clone, Debug)]
+pub struct SealedRecord {
+    /// The layer's records' folder.
+    pub folder: HostPath,
+    pub uid: Uid,
+    pub record: std::sync::Arc<Record>,
+    /// Its tree, where the record has one and a store keeps it.
+    pub tree: Option<std::sync::Arc<crate::chunks::Tree>>,
 }
 
 /// A records layer as what reads it sees it: its records by uid, each with its file's time, and the tree of files they
@@ -598,6 +396,8 @@ struct View {
     children: std::collections::HashMap<Arc<TreePath>, Vec<(Arc<Name>, bool)>>,
     /// What is wrong with its records: those with no place.
     problems: Vec<String>,
+    /// The trees of its sealed nodes (`Record::tree`), by hash, read once.
+    trees: std::collections::HashMap<pe2_ext::Sha1, Arc<crate::chunks::Tree>>,
 }
 
 impl View {
@@ -620,18 +420,51 @@ impl View {
             Kind::Node => {
                 self.folders.insert(at.clone());
                 self.nodes.insert(at.clone());
-                for (name, file) in &record.files {
-                    if file.content.is_some() {
-                        self.files.insert(at.join_path(name), (uid, name.clone()));
-                        let mut folder = name.parent();
-                        while let Some(f) = folder.filter(|f| !f.is_root()) {
-                            self.folders.insert(at.join_path(f));
-                            folder = f.parent();
-                        }
+                let mut names: Vec<Arc<RelPath>> =
+                    record.files.iter().filter(|(_, file)| file.content.is_some()).map(|(n, _)| n.clone()).collect();
+                if let Some(tree) = &record.tree {
+                    names.extend(self.tree_names(at, tree));
+                }
+                for name in names {
+                    let mut folder = name.parent();
+                    while let Some(f) = folder.filter(|f| !f.is_root()) {
+                        self.folders.insert(at.join_path(f));
+                        folder = f.parent();
                     }
+                    self.files.insert(at.join_path(&name), (uid, name));
                 }
             }
         }
+    }
+
+    /// The names of a sealed node's files, its tree read where it is not yet: none, and a problem, where neither of the
+    /// project's stores keeps it or a name in it is none a path takes.
+    fn tree_names(&mut self, at: &TreePath, sha1: &pe2_ext::Sha1) -> Vec<Arc<RelPath>> {
+        if !self.trees.contains_key(sha1) {
+            let Some((_, tree)) = self.store.holding_tree(sha1) else {
+                self.problems.push(format!("{at}: its tree {sha1} is in neither of the project's stores"));
+                return Vec::new();
+            };
+            self.trees.insert(*sha1, Arc::new(tree));
+        }
+        let mut names = Vec::new();
+        for name in self.trees[sha1].files.keys() {
+            match RelPath::new(name) {
+                Ok(name) => names.push(name.to_owned()),
+                Err(e) => self.problems.push(format!("{at}: its tree holds {name}, which no path takes: {e}")),
+            }
+        }
+        names
+    }
+
+    /// A file's content in an entry: its record's - none where it removes it - or, a sealed node's, its tree's.
+    fn content(&self, uid: Uid, name: &RelPath) -> Option<Content> {
+        let held = self.records.get(&uid)?;
+        if let Some(file) = held.record.files.get(name) {
+            return file.content.clone();
+        }
+        let file = self.trees.get(held.record.tree.as_ref()?)?.files.get(name.as_str())?;
+        Some(Content::Object { sha1: file.sha1, size: file.size })
     }
 
     /// What a records layer whose tree is at `dir` and records in `folder` is seen as before its records are read.
@@ -650,6 +483,7 @@ impl View {
             named: std::sync::Arc::default(),
             children: std::collections::HashMap::new(),
             problems: Vec::new(),
+            trees: std::collections::HashMap::new(),
         }
     }
 }
@@ -1062,6 +896,76 @@ impl Set {
         Ok(set)
     }
 
+    /// What each layer records of the sealed nodes (`Record::tree`), bottom to top: each record of one, the records
+    /// deleting one among them, with the layer's records' folder and the node's tree where the record has one.
+    #[must_use]
+    pub fn sealed_records(&self) -> Vec<SealedRecord> {
+        let sealed: std::collections::HashSet<Uid> = self
+            .views
+            .iter()
+            .flat_map(|view| view.records.iter())
+            .filter(|(_, held)| held.record.tree.is_some())
+            .map(|(uid, _)| *uid)
+            .collect();
+        let mut out = Vec::new();
+        for view in self.views.iter().filter(|view| !view.external) {
+            for (uid, held) in view.records.iter().filter(|(uid, _)| sealed.contains(*uid)) {
+                let tree = held.record.tree.as_ref().and_then(|tree| view.trees.get(tree)).cloned();
+                out.push(SealedRecord { folder: view.folder.clone(), uid: *uid, record: held.record.clone(), tree });
+            }
+        }
+        out
+    }
+
+    /// The entry the stack places at a path, as the highest layer placing one there has it.
+    #[must_use]
+    pub fn placed_at(&self, path: &TreePath) -> Option<Uid> {
+        let mut found = None;
+        for view in self.views.iter().filter(|view| !view.external) {
+            for (uid, held) in &view.records {
+                if held.record.op == Op::Delete && found == Some(*uid) {
+                    found = None;
+                } else if view.placed.get(uid).is_some_and(|at| **at == *path) {
+                    found = Some(*uid);
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether an entry is a sealed node (`Record::tree`): kept whole, replaced or deleted, never written into.
+    #[must_use]
+    pub fn is_sealed(&self, uid: Uid) -> bool {
+        self.views.iter().any(|view| view.records.get(&uid).is_some_and(|held| held.record.tree.is_some()))
+    }
+
+    /// Every uid a layer's records name.
+    #[must_use]
+    pub fn uids(&self) -> std::collections::HashSet<Uid> {
+        self.views.iter().flat_map(|view| view.records.keys().copied()).collect()
+    }
+
+    /// The sealed nodes the stack places (`Record::tree`), each as the highest layer recording it has it - none where
+    /// it deletes it - by where its files are read (its view's tree, on no disk), with its tree.
+    #[must_use]
+    pub fn sealed(&self) -> Vec<(HostPath, std::sync::Arc<crate::chunks::Tree>)> {
+        let mut found: BTreeMap<Uid, Option<(HostPath, std::sync::Arc<crate::chunks::Tree>)>> = BTreeMap::new();
+        for view in self.views.iter().filter(|view| !view.external) {
+            for (uid, held) in &view.records {
+                match (held.record.op, &held.record.tree) {
+                    (Op::Delete, _) => drop(found.insert(*uid, None)),
+                    (Op::Create | Op::Override, Some(tree)) => {
+                        let at = view.placed.get(uid).zip(view.trees.get(tree));
+                        let sealed = at.map(|(at, tree)| (view.dir.join(&at.rel()), tree.clone()));
+                        found.insert(*uid, sealed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found.into_values().flatten().collect()
+    }
+
     /// What is read of a project's records layers now, where anything is.
     #[must_use]
     pub fn current(root: &HostPath) -> Option<std::sync::Arc<Set>> {
@@ -1229,7 +1133,7 @@ impl Set {
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
         let held = view.records.get(uid)?;
-        Some((held.record.files.get(name)?.content.clone()?, held.modified, view.store.clone()))
+        Some((view.content(*uid, name)?, held.modified, view.store.clone()))
     }
 
     /// Where the content of a file of a records layer lives, for what serves it to read it without the records: the
@@ -1240,13 +1144,23 @@ impl Set {
         let (set, i, rel) = Set::view_of(path)?;
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
-        let held = view.records.get(uid)?;
-        Some(match held.record.files.get(name)?.content.as_ref()? {
+        Some(match view.content(*uid, name)? {
             Content::Text(_) => {
                 Source::RecordText { record: path_of(&view.folder, *uid).ok()?, name: name.to_string() }
             }
-            Content::Stored { sha1, .. } => Source::Stored { sha1: *sha1, store: view.store.dir.clone() },
+            Content::Stored { sha1, .. } => Source::Stored { sha1, store: view.store.dir.clone() },
+            Content::Object { sha1, size } => Source::Object { sha1, size, store: view.store.dir.clone() },
         })
+    }
+
+    /// The sealed node a records layer shows at a path (`Record::tree`): the layer's records' folder and its tree. None
+    /// where the path is no sealed node's.
+    #[must_use]
+    pub fn sealed_at(path: &HostPath) -> Option<(HostPath, pe2_ext::Sha1)> {
+        let (set, i, rel) = Set::view_of(path)?;
+        let view = &set.views[i];
+        let (uid, _) = view.placed.iter().find(|(_, at)| ***at == *rel)?;
+        Some((view.folder.clone(), view.records.get(uid)?.record.tree?))
     }
 
     /// A file of a records layer's length and when its record was written, without its content.
@@ -1256,7 +1170,7 @@ impl Set {
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
         let held = view.records.get(uid)?;
-        Some((held.record.files.get(name)?.content.as_ref()?.size(), held.modified))
+        Some((view.content(*uid, name)?.size(), held.modified))
     }
 
     /// What a folder of a records layer holds: each name, and whether it is a folder. None for a path in no records layer.
@@ -1310,7 +1224,7 @@ impl Set {
                     continue;
                 }
                 Op::Override => {
-                    let files = record
+                    let mut files: BTreeMap<_, _> = record
                         .files
                         .iter()
                         .map(|(name, f)| {
@@ -1318,6 +1232,15 @@ impl Set {
                             (name.clone(), base)
                         })
                         .collect();
+                    // A sealed node's tree replaces the version below's files whole: each of its own is the layer's.
+                    let tree = record.tree.as_ref().and_then(|tree| view.trees.get(tree));
+                    for name in tree.into_iter().flat_map(|tree| tree.files.keys()) {
+                        if let Ok(name) = RelPath::new(name) {
+                            files
+                                .entry(name.to_owned())
+                                .or_insert(crate::changeset::Base { was: None, removed: false });
+                        }
+                    }
                     let to = if record.name.is_some() { path_of(uid) } else { None };
                     crate::changeset::Op::Override { files, to }
                 }
@@ -1362,12 +1285,60 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     let mut tree =
         Staging { fs, store: &store, listing: &listing, random: project.io.random(), taken, records: BTreeMap::new() };
     tree.folder(from, TreePath::root(), None)?;
-    let records = tree.records;
+    // The extensions added to the layer are no part of the tree a tool hands over: kept, as the layer holds them.
+    let records = with_sealed(&read_records(fs, &layer.records, None)?, tree.records);
     let said = Settings { read_only: listing.read_only, ignore: listing.ignore.clone() };
     // What changes, and only that: each record that differs from what the layer has, those it no longer has gone, its
     // settings where they differ.
     replace(project, &layer.records, &said, &records, &format!("Import the layer {name}"))?;
     Ok(records.len())
+}
+
+/// What an import makes (`records`), with the sealed nodes the layer holds (`old`) that it does not make - an extension
+/// added to the layer - and the folders each is placed in: one the import has at the same place is the import's.
+fn with_sealed(old: &Read, mut records: BTreeMap<Uid, Record>) -> BTreeMap<Uid, Record> {
+    let mut made: std::collections::HashMap<(Option<Uid>, Arc<Name>), Uid> =
+        records.iter().filter_map(|(uid, r)| Some(((r.parent, r.name.clone()?), *uid))).collect();
+    // What each folder kept above a sealed node is now: the import's at its place, else itself.
+    let mut now: std::collections::HashMap<Uid, Option<Uid>> = std::collections::HashMap::new();
+    let sealed: Vec<Uid> = old
+        .iter()
+        .filter(|(uid, held)| held.record.tree.is_some() && !records.contains_key(*uid))
+        .map(|(uid, _)| *uid)
+        .collect();
+    for uid in sealed {
+        // Its folders, from the top down.
+        let mut chain = Vec::new();
+        let mut at = old[&uid].record.parent;
+        while let Some(parent) = at.filter(|parent| !chain.contains(parent)) {
+            chain.push(parent);
+            at = old.get(&parent).and_then(|held| held.record.parent);
+        }
+        let mut parent = None;
+        for folder in chain.into_iter().rev() {
+            if let Some(known) = now.get(&folder) {
+                parent = *known;
+                continue;
+            }
+            let Some(held) = old.get(&folder) else { break };
+            let placed = held.record.name.clone().map(|name| (parent, name));
+            let is = if let Some(theirs) = placed.as_ref().and_then(|place| made.get(place)) {
+                *theirs
+            } else {
+                records.insert(folder, Record { parent, ..(*held.record).clone() });
+                if let Some(place) = placed {
+                    made.insert(place, folder);
+                }
+                folder
+            };
+            now.insert(folder, Some(is));
+            parent = Some(is);
+        }
+        let record = &old[&uid].record;
+        let parent = if record.parent.is_some() { parent } else { None };
+        records.insert(uid, Record { parent, ..(**record).clone() });
+    }
+    records
 }
 
 /// A mount's records, as its listing makes them: each entry it lists by its uid, where it is - its parent's uid, its
@@ -1384,7 +1355,7 @@ pub fn listed(
         let (Some(kind), Some(name)) = (kind_of(path), path.last()) else { continue };
         let parent = path.parent().filter(|parent| !parent.is_root()).and_then(|parent| uid_at.get(parent).copied());
         let name = Some(name.to_owned());
-        records.insert(*uid, Record { op: Op::Create, kind, parent, name, files: BTreeMap::new() });
+        records.insert(*uid, Record { op: Op::Create, kind, parent, name, files: BTreeMap::new(), tree: None });
     }
     records
 }
@@ -1556,13 +1527,25 @@ impl Staging<'_> {
             let (disk, at) = (dir.join(name), path.join(name));
             let node = entry.kind == pe2_io::Kind::Folder && at.as_str().ends_with(crate::index::BUNDLE_SUFFIX);
             let uid = self.uid(&at, node.then(|| disk.join(crate::index::NODE_FILE)).as_ref());
+            // A folder holding an extension's manifest is a sealed node, kept whole as its tree: an extension, by what
+            // it holds, wherever it is.
+            let sealed =
+                entry.kind == pe2_io::Kind::Folder && self.fs.is_file(&disk.join(&crate::ext::folder::MANIFEST));
             let record = match entry.kind {
+                pe2_io::Kind::Folder if sealed => {
+                    let (tree, _) = self.store.put_folder(&disk).with_context(|| disk.display().to_string())?;
+                    // Named as a node's folder is, without `.node`; any other folder by its name.
+                    let named = if node { crate::index::asset_named(&at)? } else { at.clone() };
+                    let name = named.last().with_context(|| format!("{at}: no name"))?.to_owned();
+                    let files = BTreeMap::new();
+                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files, tree: Some(tree) }
+                }
                 pe2_io::Kind::Folder if at.as_str().ends_with(crate::index::BUNDLE_SUFFIX) => {
                     let mut files = BTreeMap::new();
                     self.files(&disk, RelPath::root(), &mut files)?;
                     let named = crate::index::asset_named(&at)?;
                     let name = named.last().with_context(|| format!("{at}: no name"))?.to_owned();
-                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files }
+                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files, tree: None }
                 }
                 pe2_io::Kind::Folder => {
                     self.folder(&disk, &at, Some(uid))?;
@@ -1572,6 +1555,7 @@ impl Staging<'_> {
                         parent,
                         name: Some(name.to_owned()),
                         files: BTreeMap::new(),
+                        tree: None,
                     }
                 }
                 _ => {
@@ -1579,7 +1563,7 @@ impl Staging<'_> {
                         Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
                     let files =
                         BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content), base: None })]);
-                    Record { op: Op::Create, kind: Kind::File, parent, name: Some(name.to_owned()), files }
+                    Record { op: Op::Create, kind: Kind::File, parent, name: Some(name.to_owned()), files, tree: None }
                 }
             };
             self.records.insert(uid, record);
@@ -1618,6 +1602,22 @@ pub fn export(project: &crate::Project, name: &Name, to: &std::path::Path) -> Re
     Set::open(project)?;
     let mut changeset = Set::changeset(&layer.path).with_context(|| format!("{name} is no records layer"))?;
     changeset.ops.clear();
+    // The extensions added to the layer are no part of the tree it hands over, as an import keeps them: its sealed
+    // nodes, and the folders that hold nothing else, are left out.
+    let records = Set::records_of(&layer.path).unwrap_or_default();
+    let sealed: Vec<Arc<TreePath>> = records
+        .iter()
+        .filter(|(_, record)| record.tree.is_some())
+        .filter_map(|(uid, _)| changeset.entries.get(uid).cloned())
+        .collect();
+    let paths: Vec<Arc<TreePath>> = changeset.entries.values().cloned().collect();
+    changeset.entries.retain(|_, path| {
+        let within = |p: &Arc<TreePath>| p.starts_with(path) && **p != **path;
+        let below: Vec<&Arc<TreePath>> = paths.iter().filter(|p| within(p)).collect();
+        let left = sealed.iter().any(|s| path.starts_with(s))
+            || (!below.is_empty() && below.iter().all(|p| sealed.iter().any(|s| p.starts_with(s))));
+        !left
+    });
     for path in changeset.entries.values() {
         let (from, out) = (layer.path.join(path), to.join(path));
         if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
@@ -1728,36 +1728,30 @@ pub fn records_for(
     let mut new = BTreeMap::new();
     for (uid, path) in &changeset.entries {
         let before = old.get(uid).filter(|r| r.op == Op::Create);
-        let kind = before.map_or_else(
-            || {
-                if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
-                    Kind::Node
-                } else if written.get(path).is_some_and(Option::is_some) {
-                    Kind::File
-                } else {
-                    Kind::Folder
-                }
-            },
-            |r| r.kind,
-        );
+        let kind = before.map_or_else(|| new_kind(path, written), |r| r.kind);
         let mut files = before.map_or_else(BTreeMap::new, |r| r.files.clone());
+        let tree = before.and_then(|r| r.tree);
         for (name, bytes) in written_at(path, kind) {
+            // A sealed node is replaced whole, never written into.
+            anyhow::ensure!(tree.is_none(), "{path} is sealed - kept whole, as an extension is - and only read");
             match bytes {
                 Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), base: None }),
                 None => files.remove(&name),
             };
         }
         let (parent, name) = place(path)?;
-        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files });
+        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files, tree });
     }
     for (uid, op) in &changeset.ops {
         let from = below.of(*uid);
         let kind = old.get(uid).map(|r| r.kind).or_else(|| from.map(|(_, k)| of_kind(k))).unwrap_or(Kind::File);
         let record = match op {
-            Did::Delete => Record { op: Op::Delete, kind, parent: None, name: None, files: BTreeMap::new() },
+            Did::Delete => {
+                Record { op: Op::Delete, kind, parent: None, name: None, files: BTreeMap::new(), tree: None }
+            }
             Did::Move { to } => {
                 let (parent, name) = place(to)?;
-                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new() }
+                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new(), tree: None }
             }
             Did::Override { files: bases, to } => {
                 let at = to.as_deref().or(from.map(|(p, _)| p)).context("an override of nothing")?.to_owned();
@@ -1766,8 +1760,15 @@ pub fn records_for(
                     None => (None, None),
                 };
                 let now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
-                let held = old.get(uid).filter(|r| r.op == Op::Override).map(|r| &r.files);
-                Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, &store)? }
+                let held = old.get(uid).filter(|r| r.op == Op::Override);
+                // A sealed node's override keeps its tree, and what it removes of below's, as they were.
+                let tree = held.and_then(|r| r.tree);
+                anyhow::ensure!(tree.is_none() || now.is_empty(), "{at} is sealed - kept whole - and only read");
+                let files = match held.filter(|_| tree.is_some()) {
+                    Some(sealed) => sealed.files.clone(),
+                    None => override_files(bases, now, held.map(|r| &r.files), &store)?,
+                };
+                Record { op: Op::Override, kind, parent, name, files, tree }
             }
         };
         new.insert(*uid, record);
@@ -1778,6 +1779,18 @@ pub fn records_for(
     let gone = old.keys().filter(|uid| !new.contains_key(*uid)).copied().collect();
     new.retain(|uid, record| old.get(uid) != Some(record));
     Ok((new, gone))
+}
+
+/// What an entry the layer makes anew is: a node by its folder's name, a file where one was written at its path, else
+/// a folder.
+fn new_kind(path: &TreePath, written: &BTreeMap<Arc<TreePath>, Option<Vec<u8>>>) -> Kind {
+    if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
+        Kind::Node
+    } else if written.get(path).is_some_and(Option::is_some) {
+        Kind::File
+    } else {
+        Kind::Folder
+    }
 }
 
 /// An override's files in its record: each it holds as written now, else as it held it; each it removes, removed;
@@ -1823,6 +1836,7 @@ mod tests {
             parent: Some(uid("uid://1izcb2mud6bit")),
             name: Some(name("box")),
             files: BTreeMap::default(),
+            tree: None,
         };
         for (name, content) in [
             ("node.toml", text("type = \"data\"\n[settings]\nsize = 3\n")),
@@ -1932,6 +1946,49 @@ mod tests {
         super::import(&project, &layer, tree.as_path()).unwrap();
         assert_eq!(files(root.at("layers/project").as_path()), before);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_import_keeps_the_extensions_added_to_its_layer_and_an_export_leaves_them_out() {
+        let (root, tree) = staged("import-sealed");
+        let layer = crate::testing::name("project");
+        let project = crate::Project::load(&root).unwrap();
+        super::import(&project, &layer, tree.as_path()).unwrap();
+        // An extension added to the layer, in a folder of its own and in one the tree has.
+        let folder = root.at("kept/my.tool");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.at("extension.toml"), "id = \"my.tool\"\nversion = \"0.1.0\"\n").unwrap();
+        let store = crate::chunks::Store::at(&root, crate::testing::io());
+        let (sealed, _) = store.put_folder(&sfs::HostPath::new(folder.as_path()).unwrap()).unwrap();
+        let mine = |name: &str, parent: Option<pe2_path::Uid>| super::Record {
+            op: super::Op::Create,
+            kind: if parent.is_some() { super::Kind::Node } else { super::Kind::Folder },
+            parent,
+            name: Some(pe2_path::Name::new(name).unwrap().to_owned()),
+            files: std::collections::BTreeMap::new(),
+            tree: parent.map(|_| sealed),
+        };
+        let records = root.at("layers/project");
+        let write = |uid: &str, record: &super::Record| {
+            let at = super::path_of(&records, crate::testing::uid(uid)).unwrap();
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, record.render()).unwrap();
+        };
+        write("uid://e1", &mine("extensions", None));
+        write("uid://e2", &mine("my.tool", Some(crate::testing::uid("uid://e1"))));
+        write("uid://e3", &mine("tool", Some(crate::testing::uid("uid://3g"))));
+        // Imported again: what the tree has is the layer's, its extensions kept where they were.
+        super::import(&project, &layer, tree.as_path()).unwrap();
+        let project = crate::Project::load(&root).unwrap();
+        super::Set::open(&project).unwrap();
+        let held = project.held_extensions();
+        let at = |path: &str| root.at("layers/project/tree").at(path);
+        assert_eq!(held, [at("extensions/my.tool.node"), at("g/tool.node")]);
+        // Exported: the tree as it was handed over, with no extension in it, nor the folder holding nothing else.
+        let out = root.at("staging/out");
+        super::export(&project, &layer, out.as_path()).unwrap();
+        assert_eq!(files(out.as_path()), files(tree.as_path()));
+        crate::local::remove_all(&root);
     }
 
     #[test]

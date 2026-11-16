@@ -904,6 +904,11 @@ fn asked(text: &str) -> Result<Arc<pe2_path::Asked>, pe2_path::PathError> {
     pe2_path::Asked::new(text).map(Arc::from)
 }
 
+/// The id an extension the project holds says it is, by its manifest: where it is placed and named tells nothing.
+fn held_id(p: &project::Project, folder: &sfs::HostPath) -> Option<String> {
+    project::ext::folder::manifest(folder, &p.io).ok().map(|about| about.id)
+}
+
 /// A file the user names, read whole.
 fn read_named(io: &dyn pe2_io::Io, path: &Path) -> Result<Vec<u8>> {
     let place = sfs::HostPath::new(path).with_context(|| path.display().to_string())?;
@@ -1283,7 +1288,7 @@ fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
             "{what} is no folder or archive, and no extension of that id is kept to be added (in {}); {} holds {}",
             places.join(" or "),
             p.root.display(),
-            p.held_extensions().iter().filter_map(|f| project::ext::folder::id_of(f)).collect::<Vec<_>>().join(", ")
+            p.held_extensions().iter().filter_map(|f| held_id(p, f)).collect::<Vec<_>>().join(", ")
         )
     })
 }
@@ -1376,7 +1381,7 @@ fn set_up(p: &project::Project, only: Option<&str>, enable: &[String], disable: 
 /// What to know of an extension just added: whether it has to be trusted, and what to set up first.
 fn added(p: &project::Project, about: &project::ext::component::About) {
     println!("{} {}", about.id, about.version);
-    let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(about.id.as_str()));
+    let held = p.held_extensions().into_iter().find(|f| held_id(p, f).as_deref() == Some(about.id.as_str()));
     // Its page read from what the project holds: a held extension's files are on no disk to point at.
     let install = about.described.install.as_ref().zip(held.as_ref());
     if let Some((page, text)) = install.and_then(|(page, held)| {
@@ -1451,10 +1456,13 @@ fn extension(command: ExtensionCommand) -> Result<()> {
         ExtensionCommand::Add { what, layer, .. } => {
             let from = kept_folder(&p, &what)?;
             let about = add_from(&p, &from, layer.as_deref(), &mut history, format!("Add {what}"))?;
-            added(&project::Project::load(&project)?, &about);
+            // Its records read again, as an index taking the change in would: what is held is read through them.
+            let p = project::Project::load(&project)?;
+            project::records::Set::open(&p)?;
+            added(&p, &about);
         }
         ExtensionCommand::Update { id, from, .. } => {
-            let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(id.as_str()));
+            let held = p.held_extensions().into_iter().find(|f| held_id(&p, f).as_deref() == Some(id.as_str()));
             let held =
                 held.with_context(|| format!("the project holds no {id}: `pe2-cli project extension add {id}`"))?;
             let was = project::ext::folder::manifest(&held, &p.io).map_or_default(|about| about.version);

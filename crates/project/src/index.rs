@@ -42,17 +42,9 @@ pub const SETTINGS_FILE: &Name = Name::constant("settings.toml");
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
 
-/// Whether a path is in a records layer's folder: one of its records, its marker, or the record of an extension it
-/// holds.
+/// Whether a path is in a records layer's folder: one of its records, or its marker.
 fn in_records(layers: &[LayerState], path: &HostPath) -> bool {
     layers.iter().any(|layer| path.starts_with(&layer.records))
-}
-
-/// Whether a path is a layer's record of an extension it holds: no entry, nothing of the index's.
-fn of_extensions(layers: &[LayerState], path: &HostPath) -> bool {
-    let Some(folder) = path.parent() else { return false };
-    folder.file_name().is_some_and(|n| n == crate::records::EXTENSIONS)
-        && folder.parent().is_some_and(|records| layers.iter().any(|layer| layer.records == records))
 }
 
 /// A file an override merged over the one below, in the outputs (`.local/outputs/merged/<sha1>/<name>`), written where it is not
@@ -852,13 +844,7 @@ impl Place {
     /// Whether a resolved path is left out: by its names within the layer.
     fn ignores(&self, path: &TreePath) -> bool {
         let within = path.strip_prefix(&self.at).unwrap_or(path.rel());
-        changeset::ignored(&self.ignore, within.as_str()) || self.holds_extension(path)
-    }
-
-    /// Whether a path is in the folder of a layer holding its extensions (`extensions/`, `ext::folder`): code, which no
-    /// asset is.
-    fn holds_extension(&self, path: &TreePath) -> bool {
-        self.at.is_root() && path.parts().next() == Some(crate::ext::folder::HELD)
+        changeset::ignored(&self.ignore, within.as_str())
     }
 }
 
@@ -2654,7 +2640,7 @@ impl Index {
         let mut wanted: Vec<(usize, Arc<TreePath>)> = Vec::new();
         // The records layers whose changesets changed, with what each said before.
         let mut were: Vec<(usize, Changeset)> = Vec::new();
-        if changed.iter().any(|p| in_records(&self.layers, p) && !of_extensions(&self.layers, p)) {
+        if changed.iter().any(|p| in_records(&self.layers, p)) {
             changesets |= self.take_in_records(project, changed, &mut wanted, &mut were, &mut refreshed.model)?;
         }
         for path in changed {
@@ -4479,17 +4465,6 @@ mod tests {
         root
     }
 
-    #[test]
-    fn what_a_layer_holds_of_extensions_is_no_asset() {
-        let root = project("extensions");
-        write(&root, "layers/top/extensions/my.tool.extension/extension.wasm", "code");
-        write(&root, "layers/top/extensions/old.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
-        let (_, index) = open(&root);
-        assert!(index.assets.keys().all(|path| !path.starts_with(&tree("extensions"))), "{:?}", index.assets.keys());
-        assert!(index.base_hash(&tree("extensions")).is_none(), "not even a folder");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     fn write(root: &HostPath, path: &str, text: &str) -> HostPath {
         let path = root.at(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -4742,7 +4717,7 @@ mod tests {
             let sha1 = crate::chunks::Store::local(root, crate::testing::io()).put_file(texels.as_bytes()).unwrap();
             let held = File { content: Some(Content::Stored { sha1, size: texels.len() as u64 }), base: None };
             let files = std::collections::BTreeMap::from([(rel("native.texels"), held)]);
-            let record = Record { op: Op::Override, kind: Kind::Node, parent: None, name: None, files };
+            let record = Record { op: Op::Override, kind: Kind::Node, parent: None, name: None, files, tree: None };
             let folder = &layer.records;
             let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
             let records = std::collections::BTreeMap::from([(uid("uid://a"), record)]);

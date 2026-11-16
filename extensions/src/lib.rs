@@ -712,8 +712,8 @@ fn file_stamp(file: &HostPath, io: &Arc<dyn pe2_io::Io>) -> String {
 /// The stamps of what an extension's folder holds: its tests are not it. One a project holds is its tree, whose hash
 /// tells its versions apart.
 fn own_stamp(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> String {
-    if let Some(held) = project::records::held(io, folder) {
-        return held.tree.to_string();
+    if let Some((_, tree)) = project::records::Set::sealed_at(folder) {
+        return tree.to_string();
     }
     let mut entries: Vec<HostPath> = folder.entries().collect();
     entries.retain(|entry| entry.file_name().is_none_or(|name| name != TESTS));
@@ -752,9 +752,10 @@ fn components_in(folder: &Path, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2
         .collect()
 }
 
-/// The extension in a folder of its own (`<id>.extension`), holding its component and what it ships.
+/// The extension in a folder of its own, holding its manifest - whatever the folder is named - its component and what
+/// it ships.
 fn component_at(entry: HostPath, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2_io::Io>) -> Option<Found> {
-    if !project::content::is_dir(io, &entry) || folder::id_of(&entry).is_none() {
+    if !project::content::is_file(io, &entry.join(&folder::MANIFEST)) {
         return None;
     }
     // Its component; or, where it is only its manifest (programs and what they are fetched from), that.
@@ -938,7 +939,8 @@ mod tests {
         let Some(Status::Refused(why)) = status(&extensions, held) else { panic!("{:?}", extensions.present) };
         assert!(why.contains("is not its component's"), "{why}");
         assert!(extensions.problems.iter().any(|p| p.contains("is not its component's")), "{:?}", extensions.problems);
-        let renamed = dir.at("other.extension");
+        // A folder named anything: an extension by what it holds.
+        let renamed = dir.at("anything");
         std::fs::rename(&folder, &renamed).unwrap();
         let folder = kept_as(&dir, "pe2-events");
         std::fs::remove_dir_all(&renamed).unwrap();
@@ -950,12 +952,13 @@ mod tests {
             Some(&[]),
             &pe2_io::system(),
         );
-        let Some(Status::Refused(why)) = status(&extensions, held) else { panic!("{:?}", extensions.present) };
-        assert!(why.contains("its folder is pe2.events.extension"), "{why}");
+        let status = status(&extensions, held);
+        assert!(status.is_some() && !matches!(status, Some(Status::Refused(_))), "{:?}", extensions.present);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one extension's life in a project, a step after another")]
     fn an_extension_is_added_whole_updated_and_removed_as_steps() {
         use project::history::History;
         use project::local::Local;
@@ -978,15 +981,27 @@ mod tests {
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
         let index = project::index::Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
+        // What a step wrote read again, as the index taking it in would.
+        let read = |root: &HostPath| {
+            let project = project::Project::load(root).unwrap();
+            project::records::Set::open(&project).unwrap();
+            project
+        };
         let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
         assert_eq!(about.id, "pe2.events");
-        let project = project::Project::load(&root).unwrap();
-        // Held by a record of the layer's: its files read where its folder was, from its tree, on no disk.
-        let record = root.at("layers/mine/extensions/pe2.events.toml");
+        let project = read(&root);
+        // A sealed node of the layer's, placed in `extensions/`: its files read from its tree, on no disk.
         let [held] = project.held_extensions().try_into().unwrap();
-        assert_eq!(held, root.at("layers/mine/tree/extensions/pe2.events.extension"));
-        assert!(record.is_file() && !held.exists() && !root.at(".local/outputs/extensions").exists());
-        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at("layers/mine/tree"));
+        assert_eq!(held, root.at("layers/mine/tree/extensions/pe2.events.node"));
+        assert!(!held.exists() && !root.at(".local/outputs/extensions").exists());
+        let (layer, _) = project::records::Set::sealed_at(&held).unwrap();
+        assert_eq!(layer, root.at("layers/mine"));
+        // Its records: the folder it is placed in, and it.
+        let records = |layer: &str| {
+            read(&root);
+            project::records::Set::records_of(&root.at("layers").at(layer).at("tree"))
+        };
+        assert_eq!(records("mine").unwrap().len(), 2);
         assert_eq!(project.requires, [project::Requirement { id: "pe2.events".into(), version: Some("^0.1".into()) }]);
         // Trusted as the folder it came from was: the hash read from its tree is the folder's.
         let trust = |folder: &HostPath| {
@@ -1018,7 +1033,8 @@ mod tests {
         let loaded = extensions.loaded.iter().find(|l| l.id == "pe2.events").unwrap();
         assert_eq!(loaded.origin, project::ext::Origin::Project(held.clone()));
         // Updated: added again, in place of what was there; undone, what was there is back. As it is, it is no step.
-        let tool = |project: &project::Project| {
+        let tool = |root: &HostPath| {
+            let project = read(root);
             project::content::read_to_string(&project.io, &project.held_extensions()[0].at(&shipped_tool())).unwrap()
         };
         let steps = history.done().len();
@@ -1026,25 +1042,27 @@ mod tests {
         assert_eq!(history.done().len(), steps, "added as it is, nothing was done");
         std::fs::write(source.at(&shipped_tool()), "#!/bin/sh\necho new\n").unwrap();
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
-        assert_eq!(tool(&project), "#!/bin/sh\necho new\n");
+        assert_eq!(tool(&root), "#!/bin/sh\necho new\n");
+        assert_eq!(records("mine").unwrap().len(), 2, "updated in its record");
         history.undo(&index, None, false).unwrap();
-        assert_eq!(tool(&project), "#!/bin/sh\n");
+        assert_eq!(tool(&root), "#!/bin/sh\n");
         // Removed: its record and what was required of it.
+        let project = read(&root);
         remove_extension(&project, "pe2.events", &mut history, "remove".into()).unwrap();
-        let project = project::Project::load(&root).unwrap();
+        let project = read(&root);
         assert!(project.held_extensions().is_empty() && project.requires.is_empty());
         history.undo(&index, None, false).unwrap();
         history.undo(&index, None, false).unwrap();
-        assert!(!record.exists(), "undone, it was never added");
+        assert!(records("mine").unwrap_or_default().is_empty(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
+        let project = read(&root);
         add_extension(&project, &source, Some(pe2_path::Name::constant("game")), &mut history, "add".into()).unwrap();
-        let in_game = root.at("layers/game/extensions/pe2.events.toml");
-        assert!(in_game.is_file());
-        let project = project::Project::load(&root).unwrap();
+        assert_eq!(records("game").unwrap().len(), 2);
+        let project = read(&root);
         std::fs::write(source.at(&shipped_tool()), "#!/bin/sh\necho newer\n").unwrap();
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
-        assert!(!record.exists());
-        assert_eq!(tool(&project), "#!/bin/sh\necho newer\n");
+        assert!(records("mine").unwrap_or_default().is_empty());
+        assert_eq!(tool(&root), "#!/bin/sh\necho newer\n");
         assert!(
             add_extension(&project, &source, Some(pe2_path::Name::constant("nowhere")), &mut history, "add".into())
                 .is_err()
@@ -1056,9 +1074,13 @@ mod tests {
             text.replacen("name = \"game\"", "name = \"game\"\nread_only = true", 1),
         )
         .unwrap();
-        let project = project::Project::load(&root).unwrap();
+        let project = read(&root);
         remove_extension(&project, "pe2.events", &mut history, "remove".into()).unwrap();
-        assert!(in_game.is_file() && record.is_file() && project.held_extensions().is_empty());
+        let project = read(&root);
+        assert_eq!(records("game").unwrap().len(), 2, "what it does not write is as it was");
+        let deleted = records("mine").unwrap();
+        assert!(deleted.values().all(|record| record.op == project::records::Op::Delete), "{deleted:?}");
+        assert_eq!(project.held_extensions(), Vec::<HostPath>::new());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }
