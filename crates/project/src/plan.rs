@@ -501,39 +501,63 @@ struct Record {
     releases: Option<std::collections::BTreeSet<String>>,
 }
 
+/// A plan's record of its last run, as it is written; none where it cannot be read - what it said is then made again.
 fn read_record(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Record {
-    let Ok(text) = fs.read_to_string(path) else { return Record::default() };
+    fs.read_to_string(path).ok().and_then(|text| parse_record(&text).ok()).unwrap_or_default()
+}
+
+/// What a generated layer's plan made in its last run, by SHA-1: none where it has not run.
+///
+/// # Errors
+/// Its record is there and cannot be read.
+pub(crate) fn made(fs: &dyn pe2_io::Filesystem, layer: &crate::Layer) -> Result<Vec<pe2_ext::Sha1>> {
+    let path = record_of(layer)?;
+    let text = match fs.read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    let record = parse_record(&text).with_context(|| path.display().to_string())?;
+    Ok(record.files.into_values().filter_map(|written| written.sha1).collect())
+}
+
+/// A record of a run, from its text.
+///
+/// # Errors
+/// A line of it is no record's.
+fn parse_record(text: &str) -> Result<Record> {
     let mut record = Record::default();
-    let head = text.lines().next().and_then(|line| serde_json::from_str::<Value>(line).ok());
+    let mut lines = text.lines().enumerate();
+    let head = match lines.next() {
+        Some((_, line)) => serde_json::from_str::<Value>(line).context("its first line")?,
+        None => return Ok(record),
+    };
     record.releases = head
-        .as_ref()
-        .and_then(|h| h.get("releases"))
+        .get("releases")
         .and_then(Value::as_array)
         .map(|r| r.iter().filter_map(Value::as_str).map(str::to_string).collect());
-    for line in text.lines().skip(1) {
-        let Ok(line) = serde_json::from_str::<Value>(line) else { continue };
+    for (at, line) in lines.filter(|(_, line)| !line.trim().is_empty()) {
+        let line = serde_json::from_str::<Value>(line).with_context(|| format!("line {}", at + 1))?;
         let field = |name: &str| line.get(name).and_then(Value::as_str).map(str::to_string);
         if let (Some(check), Some(key)) = (field("check"), field("key")) {
             record.checks.insert(check, key);
             continue;
         }
-        if let (Some(node), Some(file), Some(key), Some(sha1)) =
+        let (Some(node), Some(file), Some(key), Some(sha1)) =
             (field("node"), field("file"), field("key"), field("sha1"))
-        {
-            let size = line.get("size").and_then(Value::as_u64).unwrap_or(0);
-            let shared = line.get("shared").and_then(Value::as_bool) == Some(true);
-            // An optional file not made is recorded with no hash; one recorded by what is no hash is not recorded.
-            let sha1 = match sha1.as_str() {
-                "" => None,
-                written => match pe2_ext::Sha1::from_hex(written) {
-                    Ok(sha1) => Some(sha1),
-                    Err(_) => continue,
-                },
-            };
-            record.files.insert((node, file), Written { key, sha1, size, shared });
-        }
+        else {
+            bail!("line {}: neither a check's nor a file's", at + 1);
+        };
+        let size = line.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let shared = line.get("shared").and_then(Value::as_bool) == Some(true);
+        // An optional file not made is recorded with no hash.
+        let sha1 = match sha1.as_str() {
+            "" => None,
+            written => Some(pe2_ext::Sha1::from_hex(written).with_context(|| format!("line {}", at + 1))?),
+        };
+        record.files.insert((node, file), Written { key, sha1, size, shared });
     }
-    record
+    Ok(record)
 }
 
 fn write_record(fs: &dyn pe2_io::Filesystem, path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
@@ -1644,6 +1668,24 @@ mod tests {
         )
         .unwrap();
         crate::Project::load(&root).unwrap()
+    }
+
+    #[test]
+    fn a_run_record_holds_files_made_and_not_and_refuses_what_is_none_of_its() {
+        let made = "1111111111111111111111111111111111111111";
+        let text = format!(
+            "{{\"record\":1,\"plan\":\"{made}\",\"releases\":[\"USA\"]}}\n\
+             {{\"node\":\"a\",\"file\":\"x.png\",\"key\":\"k\",\"sha1\":\"{made}\",\"size\":3}}\n\
+             {{\"node\":\"a\",\"file\":\"under.png\",\"key\":\"k\",\"sha1\":\"\",\"size\":0}}\n\
+             {{\"check\":\"c\",\"key\":\"k\"}}\n"
+        );
+        let record = super::parse_record(&text).unwrap();
+        // An optional file not made is recorded, by no hash.
+        let hashes: Vec<_> = record.files.values().map(|written| written.sha1.map(|sha1| sha1.to_string())).collect();
+        assert_eq!(hashes, [None, Some(made.to_string())]);
+        assert_eq!(record.checks.len(), 1);
+        assert!(super::parse_record(&format!("{text}{{\"sha1\":\"{made}\"}}\n")).is_err());
+        assert!(super::parse_record(&text.replace(made, "nothing")).is_err());
     }
 
     #[test]

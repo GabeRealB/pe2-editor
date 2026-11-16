@@ -17,6 +17,7 @@ While the editor has the project open, changes made with `pe2-cli` go through th
 | `pe2-cli project problems` | Lists the project's problems. |
 | `pe2-cli project dump` | Writes, as JSON, every entry of the project as it resolves - its path, uid, layers and files by hash - and its problems; two compare. |
 | `pe2-cli project paths` | Writes, as JSON, where the project keeps what other programs reach of it: its lock, where its host listens, each layer and its plan. |
+| `pe2-cli project store gc` | Removes what the project's stores keep that nothing in the project names any more: content of entries deleted, files a plan no longer makes. What only this computer needs is kept in `.local/store`, never shipped. The editor does this once a day. |
 | `pe2-cli project trust` | Shows and changes which places of the project you trust. |
 | `pe2-cli project mount locate <name> <folder>` | Says where your discs are on this computer. |
 

@@ -887,11 +887,11 @@ impl Worker {
         let project = self.core.project.clone();
         let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
             let _ = project::imports::sweep_store(&store, &nodes);
-            // The layers' chunks too, where it is due: those nothing names, and long enough ago to be no write's.
-            if let Some(Ok((chunks, bytes))) = project::chunks::sweep_if_due(&project)
-                && chunks > 0
+            // The project's stores too, where it is due: what nothing names, and long enough ago to be no write's.
+            if let Some(Ok((gone, bytes))) = project::chunks::sweep_if_due(&project)
+                && gone > 0
             {
-                tracing::info!(chunks, bytes, "swept the chunk store");
+                tracing::info!(gone, bytes, "swept the project's stores");
             }
         });
     }

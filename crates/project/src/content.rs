@@ -67,9 +67,16 @@ fn manifest(key: String, read: impl FnOnce() -> io::Result<Manifest>) -> io::Res
     Ok(manifest)
 }
 
-/// A file kept in the store, by its SHA-1: its manifest.
-fn stored_manifest(store: &Store, sha1: &pe2_ext::Sha1) -> io::Result<Arc<Manifest>> {
-    manifest(format!("{}:{sha1}", store.dir.display()), || store.file_manifest(sha1))
+/// A file kept in the store, by its SHA-1: its manifest, with the store its chunks are read from - this one, or, where
+/// only the project's other store keeps it, that one.
+fn stored_manifest(store: &Store, sha1: &pe2_ext::Sha1) -> io::Result<(Arc<Manifest>, Store)> {
+    let held = |store: &Store| manifest(format!("{}:{sha1}", store.dir.display()), || store.file_manifest(sha1));
+    held(store).map(|manifest| (manifest, store.clone())).or_else(|e| {
+        match store.other().filter(|o| o.has_file(sha1)) {
+            Some(other) => held(&other).map(|manifest| (manifest, other)),
+            None => Err(e),
+        }
+    })
 }
 
 /// A held extension's file at a path: its object.
@@ -190,7 +197,7 @@ fn listed(io: &Io, path: &HostPath) -> Option<io::Result<Form>> {
         }
         Source::Stored { sha1, store } => {
             let store = Store { dir: store, io: io.clone() };
-            Some(stored_manifest(&store, &sha1).map(|manifest| Form::Stored { manifest, store, modified }))
+            Some(stored_manifest(&store, &sha1).map(|(manifest, store)| Form::Stored { manifest, store, modified }))
         }
     }
 }
@@ -209,7 +216,8 @@ fn form(io: &Io, path: &HostPath) -> io::Result<Form> {
         return Ok(match content {
             crate::records::Content::Text(text) => Form::Inline { bytes: text.into_bytes(), modified },
             crate::records::Content::Stored { sha1, .. } => {
-                Form::Stored { manifest: stored_manifest(&store, &sha1)?, store, modified }
+                let (manifest, store) = stored_manifest(&store, &sha1)?;
+                Form::Stored { manifest, store, modified }
             }
         });
     }

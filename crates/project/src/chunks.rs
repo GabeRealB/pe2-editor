@@ -313,6 +313,28 @@ impl Store {
         self.io.filesystem()
     }
 
+    /// The project's other store: of its shipped one, this machine's (`.local/store`); of that, the shipped one. What
+    /// one store's records name may be kept in the other a while - what an undo names again, until a sweep shares it -
+    /// and is read there. None of a store that is neither.
+    #[must_use]
+    pub fn other(&self) -> Option<Store> {
+        let parent = self.dir.parent()?;
+        if self.dir.file_name().is_none_or(|name| name != crate::STORE.as_str()) {
+            return None;
+        }
+        if parent.file_name().is_some_and(|name| name == crate::local::DIR.as_str()) {
+            Some(Store::at(&parent.parent()?, self.io.clone()))
+        } else {
+            Some(Store::local(&parent, self.io.clone()))
+        }
+    }
+
+    /// Of this store and the other, the first that keeps a file whole by its SHA-1.
+    #[must_use]
+    pub fn holding_file(&self, sha1: &Sha1) -> Option<Store> {
+        std::iter::once(self.clone()).chain(self.other()).find(|store| store.has_file(sha1))
+    }
+
     /// Have the folder a file of the store goes in.
     fn folder_for(&self, path: &HostPath) -> io::Result<()> {
         self.fs().create_folder_all(&path.parent().unwrap_or_else(|| self.dir.clone()))
@@ -354,9 +376,16 @@ impl Store {
     /// # Errors
     /// It is not kept, or its chunks are not all there.
     pub fn get_file(&self, sha1: &Sha1) -> io::Result<Vec<u8>> {
-        let manifest = Manifest::parse(&self.fs().read_to_string(&self.file_path(sha1)?)?)?;
-        let len = usize::try_from(manifest.size).map_err(io::Error::other)?;
-        manifest.read_range(self, 0, len)
+        // Kept here, or - for a while, or a base - in the other store.
+        let held = |store: &Store| -> io::Result<Vec<u8>> {
+            let manifest = store.file_manifest(sha1)?;
+            let len = usize::try_from(manifest.size).map_err(io::Error::other)?;
+            manifest.read_range(store, 0, len)
+        };
+        held(self).or_else(|e| match self.other().filter(|other| other.has_file(sha1)) {
+            Some(other) => held(&other),
+            None => Err(e),
+        })
     }
 
     /// The manifest of a file kept whole, by its SHA-1: for reading it by range.
@@ -428,6 +457,41 @@ impl Store {
     /// It is not kept, or is no tree.
     pub fn get_tree(&self, sha1: &Sha1) -> io::Result<Tree> {
         Tree::parse(&self.fs().read_to_string(&self.tree_path(sha1)?)?)
+    }
+
+    /// Of this store and the other, the first that keeps a tree, with it.
+    #[must_use]
+    pub fn holding_tree(&self, sha1: &Sha1) -> Option<(Store, Tree)> {
+        let found = std::iter::once(self.clone()).chain(self.other());
+        found.map(|store| store.get_tree(sha1).map(|tree| (store, tree))).find_map(Result::ok)
+    }
+
+    /// Have a file kept whole in another store as well: its chunks, then its manifest naming them.
+    fn copy_file(&self, sha1: &Sha1, to: &Store) -> io::Result<()> {
+        let text = self.fs().read(&self.file_path(sha1)?)?;
+        let manifest = Manifest::parse(std::str::from_utf8(&text).map_err(io::Error::other)?)?;
+        for (hash, _) in &manifest.chunks {
+            to.write_once(&to.path(hash)?, &self.get(hash)?)?;
+        }
+        to.write_once(&to.file_path(sha1)?, &text)
+    }
+
+    /// Have a tree in another store as well: its objects, then the tree naming them.
+    fn copy_tree(&self, sha1: &Sha1, to: &Store) -> io::Result<()> {
+        let text = self.fs().read(&self.tree_path(sha1)?)?;
+        let tree = Tree::parse(std::str::from_utf8(&text).map_err(io::Error::other)?)?;
+        for file in tree.files.values() {
+            let copied = to.put_object(&self.get_object(&file.sha1)?)?;
+            if file.executable {
+                to.fs().set_executable(&to.object_path(&copied)?, true)?;
+            }
+        }
+        to.write_once(&to.tree_path(sha1)?, &text)
+    }
+
+    /// Whether a tree is kept, by its SHA-1.
+    fn has_tree(&self, sha1: &Sha1) -> bool {
+        self.tree_path(sha1).is_ok_and(|path| self.fs().is_file(&path))
     }
 
     /// Keep a folder's files as a tree of whole objects, by the tree's SHA-1 (given), with the tree.
@@ -621,78 +685,157 @@ pub fn sweep_if_due(project: &crate::Project) -> Option<io::Result<(usize, u64)>
     Some(sweep_settled(project, SETTLED))
 }
 
-/// Remove the chunks nothing names, as `sweep` does, of those stored longer ago than `settled`: what a write stores just
-/// before its manifest names it is left to it.
-///
-/// # Errors
-/// The store cannot be read.
-pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<(usize, u64)> {
-    let fs = project.io.filesystem();
-    let mut named = BTreeSet::new();
-    let mut found = Vec::new();
-    for layer in project.layers.iter().filter(|l| !l.mounted) {
-        files_under(fs, layer.folder(), &mut found);
-    }
-    for part in [crate::local::HISTORY, crate::local::CONFLICTS] {
-        files_under(fs, &crate::local::part(&project.root, part), &mut found);
-    }
-    let mut kept = BTreeSet::new();
-    for path in found {
-        // A record, a changeset, a step's content: what names a file kept whole, by its hash - none of them large.
-        let small = fs.stat(&path).is_ok_and(|m| m.size < (THRESHOLD as u64));
-        if small && let Ok(text) = fs.read(&path) {
-            named.extend(named_by(&text));
-            kept.extend(sha1s_in(&text));
+/// What names the content the stores keep, by whose it is: the shipped store's, what the shipped records name; this
+/// machine's, what only it has. Read from what names it, parsed - never guessed at from text.
+#[derive(Default)]
+struct Named {
+    shipped: Refs,
+    /// This machine's records (a generated layer's), every record's bases - the versions below overrides were made
+    /// from - what a plan's last run made, and what the history and the conflicts kept aside could put back.
+    local: Refs,
+}
+
+/// Files kept whole and trees, by SHA-1.
+#[derive(Default)]
+struct Refs {
+    files: BTreeSet<Sha1>,
+    trees: BTreeSet<Sha1>,
+}
+
+impl Named {
+    /// What a record names: its files' contents, as `refs`'; their bases, this machine's.
+    fn record(&mut self, local: bool, record: &crate::records::Record) {
+        for file in record.files.values() {
+            if let Some(crate::records::Content::Stored { sha1, .. }) = &file.content {
+                if local { &mut self.local } else { &mut self.shipped }.files.insert(*sha1);
+            }
+            self.local.files.extend(file.base);
         }
     }
-    let store = Store::at(&project.root, project.io.clone());
+
+    /// What a text the history or the conflicts keep names, where it is a record or an extension's: this machine's.
+    /// Any other text, or bytes, names nothing.
+    fn kept(&mut self, bytes: &[u8]) {
+        let Ok(text) = std::str::from_utf8(bytes) else { return };
+        if let Ok(record) = crate::records::Record::parse(text) {
+            self.record(true, &record);
+        } else if let Ok(Some(tree)) = crate::records::extension_tree(text) {
+            self.local.trees.insert(tree);
+        }
+    }
+}
+
+/// What names the content of a project's stores (`Named`).
+///
+/// # Errors
+/// A layer's records, or a plan's record, cannot be read: what they name is not known, and nothing may go.
+fn named(project: &crate::Project) -> anyhow::Result<Named> {
+    let fs = project.io.filesystem();
+    let local_layers = crate::local::part(&project.root, crate::local::LAYERS);
+    let mut named = Named::default();
+    // A mount's records name no content: its files are its tree.
+    for layer in project.layers.iter().filter(|layer| !layer.mounted) {
+        let local = layer.records.starts_with(&local_layers);
+        for held in crate::records::read_records(fs, &layer.records, None)?.values() {
+            named.record(local, &held.record);
+        }
+        let trees = crate::records::extensions_of(fs, &layer.records)?.into_values().flatten();
+        if local { &mut named.local } else { &mut named.shipped }.trees.extend(trees);
+        if layer.kind == crate::LayerKind::Generated {
+            named.local.files.extend(crate::plan::made(fs, layer)?);
+        }
+    }
+    let mut kept = Vec::new();
+    for part in [crate::local::HISTORY, crate::local::CONFLICTS] {
+        files_under(fs, &crate::local::part(&project.root, part), &mut kept);
+    }
+    for path in kept {
+        // A record is small; what is larger is a file's content, which names nothing.
+        if fs.stat(&path).is_ok_and(|m| m.size < (THRESHOLD as u64))
+            && let Ok(bytes) = fs.read(&path)
+        {
+            named.kept(&bytes);
+        }
+    }
+    Ok(named)
+}
+
+/// Remove what nothing names, as `sweep` does, of what was stored longer ago than `settled`: what a write stores just
+/// before what names it is written is left to it. What each store holds is the one's whose records name it - what a
+/// shipped record names that only this machine's store holds is shared again; what the shipped store holds that only
+/// this machine names moves to its store - each copied whole before anything of it is removed, so that a sweep cut
+/// short loses nothing still named.
+///
+/// # Errors
+/// What names the stores' content cannot be read (nothing is removed then), or something cannot be copied.
+pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<(usize, u64)> {
+    let named = named(project).map_err(|e| io::Error::other(format!("{e:#}")))?;
+    let fs = project.io.filesystem();
+    let shipped = Store::at(&project.root, project.io.clone());
+    let local = Store::local(&project.root, project.io.clone());
     let now = project.io.clock().wall();
     let old = |path: &HostPath| {
         let modified = fs.stat(path).ok().and_then(|m| m.modified);
         settled.is_zero() || modified.and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age >= settled)
     };
-    // A tree named keeps its objects; one nothing names goes, and so does an object neither a tree nor a text names.
-    let (mut gone_files, mut freed) = (0, 0);
-    for (sha1, path) in store.kept_in(TREES) {
-        if kept.contains(&sha1) || !old(&path) {
-            let tree = fs.read_to_string(&path).ok().and_then(|t| Tree::parse(&t).ok()).unwrap_or_default();
-            kept.extend(tree.files.into_values().map(|file| file.sha1));
-        } else {
-            freed += fs.stat(&path).map_or(0, |m| m.size);
-            gone_files += 1;
-            let _ = fs.remove_file(&path);
+    // What the shipped records name is shipped: shared again where only this machine's store has it.
+    for sha1 in &named.shipped.files {
+        if !shipped.has_file(sha1) && local.has_file(sha1) {
+            local.copy_file(sha1, &shipped)?;
         }
     }
-    for (sha1, path) in store.kept_in(OBJECTS) {
-        if !kept.contains(&sha1) && old(&path) {
-            freed += fs.stat(&path).map_or(0, |m| m.size);
-            gone_files += 1;
-            // Read-only as it is: Windows refuses to remove a read-only file.
-            let _ = fs.set_readonly(&path, false);
-            let _ = fs.remove_file(&path);
+    for sha1 in &named.shipped.trees {
+        if !shipped.has_tree(sha1) && local.has_tree(sha1) {
+            local.copy_tree(sha1, &shipped)?;
         }
     }
-    // A file kept whole that nothing names goes; one named keeps its chunks.
-    for (sha1, path) in store.files() {
-        let text = fs.read(&path).unwrap_or_default();
-        if kept.contains(&sha1) || !old(&path) {
-            named.extend(named_by(&text));
-        } else {
-            freed += text.len() as u64;
-            gone_files += 1;
-            let _ = fs.remove_file(&path);
+    // Removed, read-only as an object is (Windows refuses to remove a read-only file): the bytes it held.
+    let remove = |path: &HostPath| {
+        let size = fs.stat(path).map_or(0, |m| m.size);
+        let _ = fs.set_readonly(path, false);
+        fs.remove_file(path).map_or(0, |()| size)
+    };
+    let (mut gone, mut freed) = (0, 0);
+    // The shipped store's first: what only this machine names moves to its store, which then keeps what it names.
+    for (store, own, moved_to) in [(&shipped, &named.shipped, Some(&local)), (&local, &named.local, None)] {
+        for (sha1, path) in store.files() {
+            if own.files.contains(&sha1) || !old(&path) {
+                continue;
+            }
+            if let Some(to) = moved_to.filter(|_| named.local.files.contains(&sha1)) {
+                store.copy_file(&sha1, to)?;
+            }
+            (gone, freed) = (gone + 1, freed + remove(&path));
         }
+        for (sha1, path) in store.kept_in(TREES) {
+            if own.trees.contains(&sha1) || !old(&path) {
+                continue;
+            }
+            if let Some(to) = moved_to.filter(|_| named.local.trees.contains(&sha1)) {
+                store.copy_tree(&sha1, to)?;
+            }
+            (gone, freed) = (gone + 1, freed + remove(&path));
+        }
+        // An object is kept by a tree the store keeps; a chunk, by a file it keeps.
+        let mut objects = BTreeSet::new();
+        for (_, path) in store.kept_in(TREES) {
+            objects.extend(Tree::parse(&fs.read_to_string(&path)?)?.files.into_values().map(|file| file.sha1));
+        }
+        for (sha1, path) in store.kept_in(OBJECTS) {
+            if !objects.contains(&sha1) && old(&path) {
+                (gone, freed) = (gone + 1, freed + remove(&path));
+            }
+        }
+        let mut chunks = BTreeSet::new();
+        for (_, path) in store.files() {
+            chunks.extend(named_by(&fs.read(&path)?));
+        }
+        let mut unnamed = unreferenced(store, &chunks);
+        unnamed.retain(|hash| store.path(hash).is_ok_and(|path| old(&path)));
+        gone += unnamed.len();
+        freed += store.remove(&unnamed);
     }
-    let mut gone = unreferenced(&store, &named);
-    gone.retain(|hash| store.path(hash).is_ok_and(|path| old(&path)));
-    freed += store.remove(&gone);
-    Ok((gone.len() + gone_files, freed))
-}
-
-/// What may be a file's SHA-1 in a text: every run of forty hexadecimal digits.
-fn sha1s_in(text: &[u8]) -> Vec<Sha1> {
-    let runs = text.split(|b| !b.is_ascii_hexdigit()).filter(|run| run.len() == 40);
-    runs.filter_map(|run| Sha1::from_hex(std::str::from_utf8(run).ok()?).ok()).collect()
+    Ok((gone, freed))
 }
 
 #[cfg(test)]
@@ -796,14 +939,145 @@ mod tests {
         assert_eq!(store.get_object(&tree.files["docs/a b.md"].sha1).unwrap(), b"# A\n");
         // Kept again: the same hash, nothing new.
         assert_eq!(store.put_folder(&folder).unwrap().0, sha1);
-        // Named in a layer's text, the tree and its objects stay; named by nothing, they go.
-        let named = root.join(&crate::LAYERS).at("project").at("named.toml");
-        std::fs::write(&named, format!("tree = \"{sha1}\"\n")).unwrap();
+        // Named by a layer's record of an extension, the tree and its objects stay; named by nothing, they go.
+        let named = crate::records::extension_path(&root.join(&crate::LAYERS).at("project"), "x").unwrap();
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::fs::write(&named, crate::records::extension_record(Some(&sha1))).unwrap();
         assert_eq!(super::sweep(&project).unwrap().0, 0);
         std::fs::remove_file(&named).unwrap();
         assert_eq!(super::sweep(&project).unwrap().0, 3);
         assert!(store.get_tree(&sha1).is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A project of one layer of its own (`project`), with its stores: the shipped one and this machine's.
+    fn stored(name: &str) -> (sfs::HostPath, Store, Store) {
+        let root = crate::testing::scratch(name);
+        let _ = std::fs::remove_dir_all(&root);
+        crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
+        (root.clone(), Store::at(&root, crate::testing::io()), Store::local(&root, crate::testing::io()))
+    }
+
+    /// Have the layer `project` hold a record: a file of its own, its content kept by hash, made from `base`. Where
+    /// its record is.
+    fn held(root: &sfs::HostPath, uid: &str, sha1: pe2_ext::Sha1, base: Option<pe2_ext::Sha1>) -> sfs::HostPath {
+        use crate::records::{Content, File, Kind, Op, Record};
+        let root_file: std::sync::Arc<pe2_path::RelPath> = pe2_path::RelPath::root().to_owned();
+        let file = File { content: Some(Content::Stored { sha1, size: 1 }), base };
+        let op = if base.is_some() { Op::Override } else { Op::Create };
+        let name = base.is_none().then(|| pe2_path::Name::new(uid.trim_start_matches("uid://")).unwrap().to_owned());
+        let record = Record { op, kind: Kind::File, parent: None, name, files: [(root_file, file)].into() };
+        let layer = root.join(&crate::LAYERS).at("project");
+        let path = crate::records::path_of(&layer, crate::testing::uid(uid)).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, record.render()).unwrap();
+        path
+    }
+
+    /// Have the history keep a text, as it keeps what a step overwrote.
+    fn kept_by_history(root: &sfs::HostPath, text: &str) {
+        let blobs = crate::local::part(root, crate::local::HISTORY).at("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.at(&crate::extract::sha1_of(text.as_bytes()).to_string()), text).unwrap();
+    }
+
+    #[test]
+    fn what_only_this_machine_names_moves_to_its_store_and_is_shared_again_once_a_record_names_it() {
+        let (root, shipped, local) = stored("chunks-moved");
+        let project = crate::Project::load(&root).unwrap();
+        let bytes = content(5000, 7);
+        let sha1 = shipped.put_file(&bytes).unwrap();
+        let record = held(&root, "uid://a1", sha1, None);
+        assert_eq!(super::sweep(&project).unwrap().0, 0, "a record names it");
+        // Its record removed by a step, which the history can put back: named by this machine alone.
+        kept_by_history(&root, &std::fs::read_to_string(&record).unwrap());
+        let text = std::fs::read_to_string(&record).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        super::sweep(&project).unwrap();
+        assert!(!shipped.has_file(&sha1) && local.has_file(&sha1), "moved to this machine's store");
+        // Put back - an undo: read where it is, and shared again by the next sweep.
+        std::fs::write(&record, text).unwrap();
+        assert_eq!(shipped.get_file(&sha1).unwrap(), bytes);
+        super::sweep(&project).unwrap();
+        assert!(shipped.has_file(&sha1), "shared again");
+        assert_eq!(shipped.get_file(&sha1).unwrap(), bytes);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn a_base_only_a_shipped_record_names_is_kept_in_this_machines_store() {
+        let (root, shipped, local) = stored("chunks-base");
+        let project = crate::Project::load(&root).unwrap();
+        let (mine, base) = (content(3000, 8), content(3000, 9));
+        let (mine, base) = (shipped.put_file(&mine).unwrap(), shipped.put_file(&base).unwrap());
+        held(&root, "uid://b2", mine, Some(base));
+        super::sweep(&project).unwrap();
+        assert!(shipped.has_file(&mine) && !shipped.has_file(&base) && local.has_file(&base));
+        assert_eq!(shipped.get_file(&base).unwrap(), content(3000, 9), "read where it is");
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn a_record_not_read_leaves_everything() {
+        let (root, shipped, local) = stored("chunks-unread");
+        let project = crate::Project::load(&root).unwrap();
+        let (one, two) = (shipped.put_file(&content(100, 1)).unwrap(), local.put_file(&content(100, 2)).unwrap());
+        let record = held(&root, "uid://c3", one, None);
+        std::fs::write(&record, "format = 1\nop = \"overturn\"\n").unwrap();
+        assert!(super::sweep(&project).is_err());
+        assert!(shipped.has_file(&one) && local.has_file(&two), "nothing went");
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn a_sweep_cut_short_at_any_change_loses_nothing_still_named() {
+        // A shipped record's content only this machine's store has; one only the history names, in the shipped store;
+        // a base; and what nothing names, in both.
+        let make = |name: &str| {
+            let (root, shipped, local) = stored(name);
+            let shared = local.put_file(&content(4000, 1)).unwrap();
+            held(&root, "uid://d1", shared, None);
+            let moved = shipped.put_file(&content(4000, 2)).unwrap();
+            let gone = held(&root, "uid://d2", moved, None);
+            kept_by_history(&root, &std::fs::read_to_string(&gone).unwrap());
+            std::fs::remove_file(&gone).unwrap();
+            let (mine, base) =
+                (shipped.put_file(&content(4000, 3)).unwrap(), shipped.put_file(&content(4000, 4)).unwrap());
+            held(&root, "uid://d3", mine, Some(base));
+            shipped.put_file(&content(4000, 5)).unwrap();
+            local.put_file(&content(4000, 6)).unwrap();
+            (root, [(shared, 1), (moved, 2), (mine, 3), (base, 4)])
+        };
+        let faulty = |root: &sfs::HostPath| {
+            let fs = pe2_io::Faulty::new(std::sync::Arc::new(pe2_io::SystemFilesystem));
+            let io = pe2_io::Composed { filesystem: std::sync::Arc::new(fs.clone()), ..pe2_io::Composed::system() };
+            (crate::Project::load_with(root.as_path(), std::sync::Arc::new(io)).unwrap(), fs)
+        };
+        let readable = |root: &sfs::HostPath, named: &[(pe2_ext::Sha1, u32)]| {
+            let store = Store::at(root, crate::testing::io());
+            named.iter().all(|(sha1, seed)| store.get_file(sha1).is_ok_and(|bytes| bytes == content(4000, *seed)))
+        };
+        let (root, named) = make("chunks-cut-counted");
+        let (project, fs) = faulty(&root);
+        let counted = fs.changes();
+        super::sweep(&project).unwrap();
+        let changes = fs.changes() - counted;
+        assert!(changes > 8 && readable(&root, &named), "{changes} changes");
+        crate::local::remove_all(&root);
+        for how in [pe2_io::Fault::Once, pe2_io::Fault::From] {
+            for nth in 1..=changes + 1 {
+                let (root, named) = make(&format!("chunks-cut-{how:?}-{nth}"));
+                let (project, fs) = faulty(&root);
+                fs.fail(nth, how);
+                let swept = super::sweep(&project);
+                fs.heal();
+                assert!(readable(&root, &named), "{how:?} at change {nth} ({swept:?}): something named is lost");
+                // Swept again, whole: as one not cut short leaves it.
+                super::sweep(&crate::Project::load(&root).unwrap()).unwrap();
+                assert!(readable(&root, &named), "{how:?} at change {nth}, swept again");
+                crate::local::remove_all(&root);
+            }
+        }
     }
 
     #[test]

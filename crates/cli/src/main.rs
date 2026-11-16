@@ -377,7 +377,8 @@ struct EditAt {
 
 #[derive(Subcommand)]
 enum StoreCommand {
-    /// Remove what the project's store keeps that nothing names any more: no layer's record, nor the history
+    /// Remove what the project's stores keep that nothing names any more - no record, plan, history step or conflict
+    /// - and have each content in the store of what names it: the shipped one, or this machine's (`.local/store`)
     Gc {
         /// The project's directory
         #[arg(long, default_value = ".")]
@@ -1957,7 +1958,7 @@ fn store(command: &StoreCommand) -> Result<()> {
     match command {
         StoreCommand::Gc { .. } => {
             let (gone, freed) = project::chunks::sweep(&p)?;
-            println!("{gone} chunks no longer named removed: {} MiB freed", mib(freed));
+            println!("{gone} kept by hash and no longer named removed: {} MiB freed", mib(freed));
         }
     }
     Ok(())

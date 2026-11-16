@@ -147,27 +147,31 @@ pub fn extensions_of(fs: &dyn pe2_io::Filesystem, layer: &HostPath) -> Result<BT
             continue;
         };
         let text = fs.read_to_string(&path)?;
-        let table: toml::Table = toml::from_str(&text).with_context(|| path.display().to_string())?;
-        match table.get("format").and_then(toml::Value::as_integer) {
-            Some(FORMAT) => {}
-            Some(other) if other > FORMAT => bail!("{}: of format {other}, written by a newer pe2", path.display()),
-            other => bail!("{}: not a record of format {FORMAT} ({other:?})", path.display()),
-        }
-        let word = |key: &str| table.get(key).and_then(toml::Value::as_str);
-        if word("kind") != Some("extension") {
-            bail!("{}: not an extension's record", path.display());
-        }
-        let tree = match word("op") {
-            Some("create") => {
-                let tree = word("tree").with_context(|| format!("{}: no tree", path.display()))?;
-                Some(pe2_ext::Sha1::from_hex(tree).with_context(|| format!("{}: its tree", path.display()))?)
-            }
-            Some("delete") => None,
-            other => bail!("{}: an extension is created or deleted, not {other:?}", path.display()),
-        };
-        out.insert(id.to_string(), tree);
+        out.insert(id.to_string(), extension_tree(&text).with_context(|| path.display().to_string())?);
     }
     Ok(out)
+}
+
+/// What a record of an extension says: the tree it holds, or (none) that it leaves below's off.
+///
+/// # Errors
+/// It is no extension's record of a format this program knows.
+pub fn extension_tree(text: &str) -> Result<Option<pe2_ext::Sha1>> {
+    let table: toml::Table = toml::from_str(text)?;
+    match table.get("format").and_then(toml::Value::as_integer) {
+        Some(FORMAT) => {}
+        Some(other) if other > FORMAT => bail!("of format {other}, written by a newer pe2"),
+        other => bail!("not a record of format {FORMAT} ({other:?})"),
+    }
+    let word = |key: &str| table.get(key).and_then(toml::Value::as_str);
+    if word("kind") != Some("extension") {
+        bail!("not an extension's record");
+    }
+    match word("op") {
+        Some("create") => Ok(Some(pe2_ext::Sha1::from_hex(word("tree").context("no tree")?).context("its tree")?)),
+        Some("delete") => Ok(None),
+        other => bail!("an extension is created or deleted, not {other:?}"),
+    }
 }
 
 /// An extension a layer holds, as what reads its files sees it: they are at `<layer>/extensions/<id>.extension/<path>`
@@ -222,8 +226,9 @@ pub fn held(io: &Arc<dyn pe2_io::Io>, folder: &HostPath) -> Option<std::sync::Ar
     }
     let read = || -> Option<std::sync::Arc<HeldExtension>> {
         let tree = extensions_of(io.filesystem(), &folder).ok()?.remove(id)??;
-        let store = crate::chunks::Store::of(&layer, io)?;
-        let files = std::sync::Arc::new(store.get_tree(&tree).ok()?);
+        // Its tree is the layer's store's, or - until a sweep shares it again - this machine's.
+        let (store, files) = crate::chunks::Store::of(&layer, io)?.holding_tree(&tree)?;
+        let files = std::sync::Arc::new(files);
         Some(std::sync::Arc::new(HeldExtension {
             layer: layer.clone(),
             id: id.to_string(),
@@ -697,14 +702,14 @@ pub struct Differences {
 
 /// A record read, with the stamp of its file: what a reading again finds unchanged it takes as it was.
 #[derive(Clone)]
-struct Held {
-    record: std::sync::Arc<Record>,
+pub(crate) struct Held {
+    pub(crate) record: std::sync::Arc<Record>,
     modified: std::time::SystemTime,
     len: u64,
 }
 
 /// A layer's records read, by uid.
-type Read = BTreeMap<Uid, Held>;
+pub(crate) type Read = BTreeMap<Uid, Held>;
 
 /// A project's records layers, as seen through its stack: what `content` and a scan read them by. One a project, made
 /// again as its records or its changesets change (`Set::open`).
@@ -875,7 +880,7 @@ fn no_time(path: &HostPath) -> std::io::Error {
     std::io::Error::other(format!("{}: the system gives no time of it", path.display()))
 }
 
-fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>) -> Result<Read> {
+pub(crate) fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>) -> Result<Read> {
     // What waits is asked first: a record not waiting by now is in its file already, as it was last said - where
     // one read from its file first, and found waiting no more after, would be missed in both.
     let waiting = crate::storage::waiting_under(dir);

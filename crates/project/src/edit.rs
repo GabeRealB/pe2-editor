@@ -269,7 +269,8 @@ fn own_copy(
     // A plain file is its content: its override holds a copy of it at once - code, edited where it is served, with its
     // own tools. A node's holds what it changes, as it changes it.
     if below.kind == Kind::File {
-        let store = crate::chunks::Store::at(&out.project.root, index.io().clone());
+        // The version it was made from: this machine's to merge with, never shipped.
+        let store = crate::chunks::Store::local(&out.project.root, index.io().clone());
         for (file, source) in &below.files {
             let bytes = crate::content::read(index.io(), source).with_context(|| source.display().to_string())?;
             let disk = if file.is_root() { layer.disk(&at) } else { layer.disk(&at).join(file) };
@@ -359,7 +360,8 @@ fn put_files(
     };
     let below =
         at.index.below(at.layer_name, at.uid).with_context(|| format!("{} is gone below {}", at.uid, at.layer_name))?;
-    let store = crate::chunks::Store::at(&at.project.root, at.project.io.clone());
+    // The versions below an override is made from: this machine's to merge with, never shipped.
+    let store = crate::chunks::Store::local(&at.project.root, at.project.io.clone());
     for (file, bytes) in files {
         let disk = at.disk(file);
         let now = below.files.iter().find(|(name, _)| name == *file).map(|(_, path)| path);
@@ -866,7 +868,8 @@ pub fn resolve(
         (Resolution::KeepMine, Op::Override { files, to }) => {
             let below = below.with_context(|| format!("{uid} is gone below {layer_name}"))?;
             let at = at.unwrap_or_else(|| below.path.clone());
-            let store = crate::chunks::Store::at(&project.root, project.io.clone());
+            // The version below kept as the new base: this machine's, as every base.
+            let store = crate::chunks::Store::local(&project.root, project.io.clone());
             let mut tx = history.begin(format!("Keep my version of {shown}"));
             let mut out = Out::new(&mut tx, project, index, layer);
             let place = Place { project, index, layer, layer_name, uid, path: &at };

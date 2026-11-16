@@ -31,10 +31,19 @@ care how it is stored.
 
 ## The store
 
-Large files (1 MiB and over) are split into content-defined chunks, kept once by hash in the project's store
-(`store/`, at its root), so an edit stores only what changed and identical data is kept once across layers and
-releases. Whole objects and trees of objects (an extension) are kept by hash too. Garbage collection removes what no
-record, listing, history step or conflict kept aside names.
+Large files (1 MiB and over) are split into content-defined chunks, kept once by hash, so an edit stores only what
+changed and identical data is kept once across layers and releases. Whole objects and trees of objects (an extension)
+are kept by hash too. A project has two stores: the shipped one (`store/`, at its root) holds what the shipped records
+name; this machine's (`.local/store/`) holds what only it names - a generated layer's files, the version below each
+override that it was made from (its base, to merge with), what the history or a conflict kept aside could put back. A
+content is read from whichever holds it (`chunks::Store::other`).
+
+The sweep (`chunks::sweep_settled`, daily while the editor holds a project, and `pe2-cli project store gc`) reads what
+names each content - records, a plan's last run, the history's and the conflicts' records - parsed, never guessed at
+from text; one it cannot read stops it, removing nothing. What a shipped record names that only this machine's store
+has (an undo put the record back) is shared again; what the shipped store holds that only this machine names moves to
+its store; then each removes what nothing names, stored longer ago than a write takes to name it. What moves is copied
+whole before anything of it is removed, so a sweep cut short loses nothing still named.
 
 ## Where a project keeps itself
 
