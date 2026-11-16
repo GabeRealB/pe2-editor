@@ -217,15 +217,12 @@ enum LayerCommand {
     Add {
         #[arg(value_parser = name)]
         name: Arc<pe2_path::Name>,
-        /// A layer of plain files only (code), not assets
-        #[arg(long)]
-        files: bool,
         /// Below every other layer, as one the rest build on (the game's)
         #[arg(long)]
         bottom: bool,
         /// A generated layer, filled by its plan (`layers/<name>.plan.jsonl`, written beside it by whoever makes it)
         /// with the files of the nodes of the layer it fills
-        #[arg(long, requires = "fills", conflicts_with_all = ["files", "bottom"])]
+        #[arg(long, requires = "fills", conflicts_with = "bottom")]
         generated: bool,
         /// The layer a generated layer fills
         #[arg(long, requires = "generated", value_parser = name)]
@@ -405,16 +402,6 @@ enum StoreCommand {
     },
     /// Unpack a packed layer: its files written back as files
     Unpack {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The layer
-        #[arg(long, value_parser = name)]
-        layer: Arc<pe2_path::Name>,
-    },
-    /// Store a layer stored as a tree of files as records (one a entry, by uid): kept only where the project shows the
-    /// same after, else the tree is put back
-    Convert {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -1545,12 +1532,11 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
             project::create(&directory, io.filesystem())?;
             println!("an empty project in {}", directory.display());
         }
-        ProjectCommand::Layer { command: LayerCommand::Add { name, files, bottom, generated: _, fills, project } } => {
+        ProjectCommand::Layer { command: LayerCommand::Add { name, bottom, generated: _, fills, project } } => {
             if let Some(fills) = fills {
                 edit_project(&project, |p, history| project::setup::add_generated(p, &name, &fills, history))?;
             } else {
-                let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
-                edit_project(&project, |p, history| project::stack::add_at(p, &name, kind, bottom, history))?;
+                edit_project(&project, |p, history| project::stack::add_at(p, &name, bottom, history))?;
             }
         }
         ProjectCommand::Layer { command: LayerCommand::Import { name, from, project } } => {
@@ -1558,8 +1544,8 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", &*p.io, |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
             })?;
-            let local = project::local::Local::open(&p, &lock)?;
-            let count = project::records::import(&p, &local, &name, &from)?;
+            let _lock = lock;
+            let count = project::records::import(&p, &name, &from)?;
             println!("{name}: {count} records");
         }
         ProjectCommand::Layer { command: LayerCommand::Export { name, to, project } } => {
@@ -1877,8 +1863,7 @@ fn store(command: &StoreCommand) -> Result<()> {
     let (StoreCommand::Migrate { project }
     | StoreCommand::Gc { project }
     | StoreCommand::Pack { project, .. }
-    | StoreCommand::Unpack { project, .. }
-    | StoreCommand::Convert { project, .. }) = command;
+    | StoreCommand::Unpack { project, .. }) = command;
     let p = project::Project::load(project)?;
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
@@ -1904,18 +1889,6 @@ fn store(command: &StoreCommand) -> Result<()> {
         StoreCommand::Unpack { layer, .. } => {
             let count = project::pack::unpack_layer(&p, layer)?;
             println!("{layer}: {count} files unpacked");
-        }
-        StoreCommand::Convert { layer, .. } => {
-            let local = project::local::Local::open(&p, &lock)?;
-            let started = std::time::Instant::now();
-            let converted = project::records::convert(&p, &local, layer)?;
-            let took = started.elapsed().as_secs_f64();
-            if converted.records > 0 {
-                println!("{layer}: {} records, the project showing the same ({took:.1}s)", converted.records);
-            }
-            if converted.extensions > 0 {
-                println!("{layer}: {} extensions held as records", converted.extensions);
-            }
         }
         StoreCommand::Gc { .. } => {
             let (gone, freed) = project::chunks::sweep(&p)?;

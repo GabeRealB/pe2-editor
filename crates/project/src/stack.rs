@@ -12,7 +12,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
 use crate::index::LayerInfo;
-use crate::{FILE, LAYERS, LayerKind, Project};
+use crate::{FILE, LAYERS, Project};
 use pe2_path::Name;
 
 pub(crate) fn read(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<DocumentMut> {
@@ -104,12 +104,12 @@ pub fn check_name(project: &Project, name: &Name) -> Result<()> {
     Ok(())
 }
 
-/// Add a new, empty layer of a kind at the top of the stack: `layers/<name>/` and its entry in `project.toml`.
+/// Add a new, empty layer at the top of the stack: `layers/<name>/`, its records, and its entry in `project.toml`.
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
-pub fn add(project: &Project, name: &Name, kind: LayerKind, history: &mut History) -> Result<()> {
-    add_at(project, name, kind, false, history)
+pub fn add(project: &Project, name: &Name, history: &mut History) -> Result<()> {
+    add_at(project, name, false, history)
 }
 
 /// Add a new, empty layer at the top of the stack, or at its bottom (`bottom`): below every other, as a layer the rest
@@ -117,15 +117,12 @@ pub fn add(project: &Project, name: &Name, kind: LayerKind, history: &mut Histor
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
-pub fn add_at(project: &Project, name: &Name, kind: LayerKind, bottom: bool, history: &mut History) -> Result<()> {
+pub fn add_at(project: &Project, name: &Name, bottom: bool, history: &mut History) -> Result<()> {
     check_name(project, name)?;
     let mut document = read(project.io.filesystem(), &project.root)?;
     let mut table = Table::new();
     table.insert("name", value(name.as_str()));
     table.insert("path", value(format!("{LAYERS}/{name}")));
-    if kind == LayerKind::Files {
-        table.insert("kind", value("files"));
-    }
     let tables = layer_tables(&mut document)?;
     if bottom && !tables.is_empty() {
         // An array of tables takes no insert: rebuilt with it first, holding what was written over the first (the
@@ -147,11 +144,9 @@ pub fn add_at(project: &Project, name: &Name, kind: LayerKind, bottom: bool, his
     let mut tx = history.begin(format!("Add the layer {name}"));
     let folder = project.root.join(&LAYERS).join(name);
     tx.make_dir(&folder)?;
-    // An assets layer is records (`records`); code is a tree, worked on with its own tools.
-    if kind == LayerKind::Assets {
-        let marker = folder.join(&crate::records::DIR).join(&crate::records::MARKER);
-        tx.write(&marker, format!("format = {}\n", crate::records::FORMAT).as_bytes())?;
-    }
+    // A layer is its records (`records`).
+    let marker = folder.join(&crate::records::DIR).join(&crate::records::MARKER);
+    tx.write(&marker, format!("format = {}\n", crate::records::FORMAT).as_bytes())?;
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)
 }
@@ -225,6 +220,7 @@ mod tests {
         let text = "# the stack\n[[layer]]\nname = \"game\"\n\
                     \n# mine\n[[layer]]\nname = \"mod\"\n";
         std::fs::write(root.at("project.toml"), text).unwrap();
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
@@ -235,12 +231,12 @@ mod tests {
         let why = stack::order_breaks(&layers, &order).unwrap();
         assert_eq!(why, "mod acts on 2 entries of game, so it stays above it");
         assert!(stack::reorder(&project, &layers, &order, history).is_err());
-        stack::add(&project, pe2_path::Name::constant("fixes"), LayerKind::Assets, history).unwrap();
+        stack::add(&project, pe2_path::Name::constant("fixes"), history).unwrap();
         let project = Project::load(&root).unwrap();
-        assert!(stack::add(&project, pe2_path::Name::constant("fixes"), LayerKind::Assets, history).is_err());
-        stack::add(&project, pe2_path::Name::constant("patch"), LayerKind::Files, history).unwrap();
+        assert!(stack::add(&project, pe2_path::Name::constant("fixes"), history).is_err());
+        stack::add(&project, pe2_path::Name::constant("patch"), history).unwrap();
         let read = Project::load(&root).unwrap();
-        assert_eq!(read.layer(pe2_path::Name::constant("patch")).unwrap().kind, LayerKind::Files);
+        assert_eq!(read.layer(pe2_path::Name::constant("patch")).unwrap().kind, LayerKind::Assets);
         history.undo(&index, None, false).unwrap();
         let project = Project::load(&root).unwrap();
         let layers = [info("game", &[]), info("mod", &["game"]), info("fixes", &[])];

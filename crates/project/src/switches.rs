@@ -257,6 +257,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let text = "# the project\n[[layer]]\nname = \"game\"\n";
         std::fs::write(root.at("project.toml"), text).unwrap();
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
@@ -299,6 +300,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"base\"\n").unwrap();
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();

@@ -44,9 +44,8 @@ fn an_edit_is_unsaved_until_it_is_saved() {
 fn a_change_on_disk_under_unsaved_work_is_asked_about() {
     let mut editor = Scenario::open(Fixture::rig());
     move_pelvis(&mut editor, "-900");
-    let file = editor.node_folder("rig/skeleton").at("node.toml");
-    let text = std::fs::read_to_string(&file).expect("its declaration");
-    std::fs::write(&file, text.replace("-927", "-800")).expect("written");
+    let text = toml::to_string(&editor.declaration("rig/skeleton")).expect("its declaration");
+    editor.write_on_disk("rig/skeleton", &text.replace("-927", "-800"));
     editor.take_in_outside_changes();
     editor.expect("Changed on disk while you edited it");
     assert_eq!(pelvis(&editor.working("rig/skeleton")), [0, -900, 0], "the working copy stays the user's");

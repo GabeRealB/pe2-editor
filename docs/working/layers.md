@@ -14,7 +14,7 @@ Each layer is a card, top to bottom. Hover a card to see what the layer changes 
 | Keep edits out of a layer | Its **lock** |
 | Work on one layer alone | Right-click it, **Solo**: the layers above it are hidden, the others locked, and it becomes active. **End the solo** puts everything back. |
 | Reorder layers | Drag a card, or right-click it and choose **Move up** or **Move down** |
-| Add a layer | **New layer**, then name it and choose **Assets** (assets and plain files) or **Files** (plain files only, such as code) |
+| Add a layer | **New layer**, then name it |
 | Remove a layer from the project | Right-click it, **Take out of the stack**. Its files stay on disk. |
 
 The eye, the lock and solo are your view of the project: they are kept for you, and change nothing for anyone else.
@@ -27,7 +27,8 @@ depends on.
 
 When you edit an asset from a layer below, the editor copies it into the active layer first: an **override**. You
 can also do this yourself: right-click the asset in the Assets pane and choose **Override in** *layer*. The override
-holds only the files you change; everything else still comes from below.
+holds only the files you change; everything else still comes from below. A plain file - code, for instance - is
+copied whole when you override it, so that you can edit it in the `assets` folder with your own tools.
 
 To give up your version, right-click the asset and choose **Take the version below**.
 

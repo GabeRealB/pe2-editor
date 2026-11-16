@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use super::suite::Suite;
 
 /// The layer fixtures write to.
-const LAYER: &str = "base";
+pub const LAYER: &str = "base";
 
 /// A project in a folder of its own, gone with it.
 pub struct Fixture {
@@ -124,6 +124,12 @@ impl Fixture {
     /// its tree in the store.
     fn settle(&self, layer: &str) {
         let at = self.root.at("layers").at(layer);
+        // A layer of records, holding nothing else but them.
+        if !project::records::is_records(&pe2_io::SystemFilesystem, &at) {
+            project::records::mark(&pe2_io::SystemFilesystem, &at, &project::records::Settings::default())
+                .expect("a records layer");
+        }
+        project::records::import_trees(&self.root, &pe2_io::system()).expect("the fixture's layers made records");
         let project = project::Project::load(&self.root).expect("the project");
         project::records::hold_extensions(&project, &at).expect("its extensions held");
     }
@@ -198,10 +204,9 @@ impl Fixture {
         let fixture = Fixture::new();
         fixture.write(
             "project.toml",
-            &format!("[[layer]]\nname = \"code\"\nkind = \"files\"\n\n[[layer]]\nname = \"{LAYER}\"\n"),
+            &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[mount]]\nat = \"code\"\npath = \"code\"\n"),
         );
-        fixture.write(&format!("layers/{LAYER}/.keep"), "");
-        fixture.write("layers/code/src/thing.c", "int thing;\n");
+        fixture.write("code/src/thing.c", "int thing;\n");
         fixture
     }
 
@@ -286,6 +291,11 @@ name = "played"
     #[must_use]
     pub fn root(&self) -> &HostPath {
         &self.root
+    }
+
+    /// Its layers written as trees made records layers, as a project made by hand is (`records::import_trees`).
+    pub fn as_records(&self) {
+        project::records::import_trees(&self.root, &pe2_io::system()).expect("the fixture's layers made records");
     }
 
     /// Where a node's declaration is.

@@ -1026,6 +1026,7 @@ mod attaching {
     }
 
     fn open(root: &HostPath, extensions: &Extensions) -> (Index, super::Attached) {
+        crate::testing::as_records(root);
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let local = Local::open(&project, &lock).unwrap();
@@ -1160,6 +1161,7 @@ mod attaching {
         };
         let extensions = Extensions::load(vec![Loadable::from(extension)], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let (mut index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.failed.len()), (2, 0), "{:?}", attached.failed);
@@ -1168,16 +1170,16 @@ mod attaching {
         drop(lock);
         // Its first attach is what it learns what each read from.
         imports.attach(&mut index, &extensions);
-        write(&root, "layers/base/s.node/source.txt", "a b c");
-        let refreshed = index.refresh(&project, &[root.at("layers/base/s.node/source.txt")]).unwrap();
+        let changed = crate::testing::write_in(&root, "base", "s.node/source.txt", Some("a b c"));
+        let refreshed = index.refresh(&project, &changed).unwrap();
         assert!(!refreshed.assets.contains(&tree("c")), "c's own files did not change");
         imports.attach_changed(&mut index, &extensions, &refreshed.assets);
         let (fresh, _) = open(&root, &extensions);
         assert_eq!(shown(&index), shown(&fresh));
         // What it reads emptied, it fails; filled again, it is made again, though its failure read nothing.
         for (text, fails) in [("", true), ("a", false)] {
-            write(&root, "layers/base/s.node/source.txt", text);
-            let refreshed = index.refresh(&project, &[root.at("layers/base/s.node/source.txt")]).unwrap();
+            let changed = crate::testing::write_in(&root, "base", "s.node/source.txt", Some(text));
+            let refreshed = index.refresh(&project, &changed).unwrap();
             imports.attach_changed(&mut index, &extensions, &refreshed.assets);
             let failed = index.problems.iter().any(|p| matches!(p, Problem::Import { asset, .. } if asset == "c"));
             assert_eq!(failed, fails, "{text:?}: {:?}", index.problems);
@@ -1408,6 +1410,7 @@ mod attaching {
     }
 
     fn opened(root: &HostPath) -> (Lock, Local, Index) {
+        crate::testing::as_records(root);
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         let local = Local::open(&project, &lock).unwrap();
@@ -1487,10 +1490,11 @@ mod attaching {
         drop(make("chain").unwrap());
         assert_eq!(runs_of("doubled "), 3, "each item kept, by what it was given");
         // A loop, a step a turn: one, then two, which names three, which names none.
-        write(
+        crate::testing::write_in(
             &root,
-            "layers/base/two.node/node.toml",
-            &staged_node("counted", "arrived = \"yes\"\nnext = \"three\"", "transient"),
+            "base",
+            "two.node/node.toml",
+            Some(&staged_node("counted", "arrived = \"yes\"\nnext = \"three\"", "transient")),
         );
         let index = Index::open(&Project::load(&root).unwrap(), &local).unwrap();
         let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
@@ -1551,7 +1555,12 @@ mod attaching {
         drop(make(&index));
         assert_eq!(runs_of("piece s"), 3, "kept");
         // One more piece: only it is made.
-        write(&root, "layers/base/whole.node/node.toml", &settings("\"s1\", \"s2\", \"s3\", \"s4\""));
+        crate::testing::write_in(
+            &root,
+            "base",
+            "whole.node/node.toml",
+            Some(&settings("\"s1\", \"s2\", \"s3\", \"s4\"")),
+        );
         let project = Project::load(&root).unwrap();
         let again = Index::open(&project, &local).unwrap();
         assert!(make(&again).contains("s1s2s3s4"));
@@ -1587,6 +1596,7 @@ mod attaching {
             })],
             true,
         );
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let local = Local::open(&project, &lock).unwrap();
@@ -1653,7 +1663,7 @@ mod attaching {
         // Opened again: found made. The source changed: made again, its old import swept.
         let (_, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (0, 1));
-        write(&root, "layers/base/s.node/source.txt", "a b z");
+        crate::testing::write_in(&root, "base", "s.node/source.txt", Some("a b z"));
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (1, 0));
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingOutput { .. })));
@@ -1747,6 +1757,7 @@ mod attaching {
             })],
             true,
         );
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let (mut index, _) = open(&root, &extensions);
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();

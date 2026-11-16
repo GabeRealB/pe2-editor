@@ -306,6 +306,7 @@ mod tests {
             "layers/base/n.node/node.toml",
             "[[stack]]\nop = \"test.requested@slow\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"transient\"\n",
         );
+        crate::testing::as_records(&root);
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let local = Local::open(&project, &lock).unwrap();

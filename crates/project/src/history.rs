@@ -1563,7 +1563,7 @@ fn current_hash(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Option<pe2_ext:
     reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
 )]
 mod tests {
-    use super::{History, Kind, StepError};
+    use super::{History, StepError};
     use crate::Project;
     use crate::index::Index;
     use crate::local::Local;
@@ -1582,6 +1582,7 @@ mod tests {
     }
 
     fn history(root: &HostPath) -> (History, Option<String>) {
+        crate::testing::as_records(root);
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         History::open(&Local::open(&project, &lock).unwrap()).unwrap()
@@ -1589,6 +1590,7 @@ mod tests {
 
     /// The index of a project, for what undo reads of documents.
     fn index(root: &HostPath) -> Index {
+        crate::testing::as_records(root);
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
         Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap()
@@ -2009,10 +2011,7 @@ mod tests {
         assert!(edit(&mut history, "uid://b", "uid = \"uid://b\"\ny = 2\n"));
         assert!(edit(&mut history, "uid://a", "uid = \"uid://a\"\nx = 3\n"));
         // Nothing is written: the working copies hold the edits, and the index shows them.
-        assert_eq!(
-            std::fs::read_to_string(root.at("layers/top/a.node/node.toml")).unwrap(),
-            "uid = \"uid://a\"\nx = 1\n"
-        );
+        assert_eq!(self::index(&root).assets[&tree("a")].text(), "uid = \"uid://a\"\nx = 1\n");
         let mut shown = index.clone();
         shown.set_working(history.working());
         assert!(
@@ -2041,7 +2040,6 @@ mod tests {
         let root = documents_project("save");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let a = root.at("layers/top/a.node/node.toml");
         history
             .edit(
                 &index,
@@ -2055,19 +2053,19 @@ mod tests {
             .unwrap();
         let files = history.to_save(uid("uid://a")).unwrap();
         assert_eq!(files.len(), 1);
-        let mut tx = history.begin("Save a").kind(Kind::Save);
-        tx.write(&a, files[0].1.as_deref().unwrap()).unwrap();
-        tx.commit().unwrap();
+        let project = Project::load(&root).unwrap();
+        let top = pe2_path::Name::constant("top");
+        crate::edit::save(&project, &index, top, uid("uid://a"), &files, "Save a".into(), &mut history).unwrap();
         history.saved(uid("uid://a"));
         let index = self::index(&root);
         assert!(history.document(uid("uid://a")).is_none());
         // Undone after the save: the edit is taken back from the working copy, which is unsaved again; the save stays.
         history.undo(&index, None, false).unwrap();
         assert!(working_text(&history, "uid://a").unwrap().contains("x = 1"));
-        assert!(std::fs::read_to_string(&a).unwrap().contains("x = 2"));
+        assert!(self::index(&root).assets[&tree("a")].text().contains("x = 2"));
         assert!(history.to_undo(None).is_none());
         // Changed on disk meanwhile: stale, and kept or taken.
-        std::fs::write(&a, "uid = \"uid://a\"\nx = 9\n").unwrap();
+        crate::testing::write_in(&root, "top", "a.node/node.toml", Some("uid = \"uid://a\"\nx = 9\n"));
         let index = self::index(&root);
         assert!(history.reconcile(&index));
         assert!(history.document(uid("uid://a")).unwrap().stale.is_some());

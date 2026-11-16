@@ -717,13 +717,14 @@ impl Project {
             }
             let kind = match l.kind.as_deref() {
                 None | Some("assets") => LayerKind::Assets,
-                Some("files") => LayerKind::Files,
                 Some("generated") => LayerKind::Generated,
-                Some(other) => {
-                    bail!("{}: the layer {}: no kind {other} (assets, files, generated)", root.join(&FILE), l.name)
-                }
+                Some(other) => bail!("{}: the layer {}: no kind {other} (assets, generated)", root.join(&FILE), l.name),
             };
             let generated = kind == LayerKind::Generated;
+            // A layer is its records; only what a plan fills is a tree of files, until plans write records too.
+            if !generated && !records::is_records(io.filesystem(), &path) {
+                bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, path.display());
+            }
             if generated != l.fills.is_some() {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
@@ -893,6 +894,82 @@ pub(crate) mod testing {
         crate::create(&root, &pe2_io::SystemFilesystem).expect("a test's project made");
         crate::Project::load(&root).expect("a test's project opened");
         root
+    }
+
+    /// Make the layers a test wrote as trees of files records layers (`records::import_trees`).
+    pub fn as_records(root: &HostPath) {
+        crate::records::import_trees(root, &io()).expect("a test's layers made records");
+    }
+
+    /// Write a file of a records layer as a tool would: the layer exported as a tree, the file written there (or, none,
+    /// removed), and the tree imported back - every entry keeping its uid. The records' files written, which is what
+    /// changed on disk.
+    pub fn write_in(root: &HostPath, layer: &str, path: &str, text: Option<&str>) -> Vec<HostPath> {
+        let project = crate::Project::load(root).expect("a test's project");
+        let staging = root.join(&pe2_path::Name::constant("staging"));
+        let tree = staging.join(&name(layer));
+        let _ = std::fs::remove_dir_all(&staging);
+        crate::records::export(&project, &name(layer), tree.as_path()).expect("the layer exported");
+        let file = tree.at(path);
+        match text {
+            Some(text) => {
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, text).unwrap();
+            }
+            None if file.is_dir() => std::fs::remove_dir_all(&file).unwrap(),
+            None => std::fs::remove_file(&file).unwrap(),
+        }
+        crate::records::import(&project, &name(layer), tree.as_path()).expect("the layer imported");
+        std::fs::remove_dir_all(&staging).unwrap();
+        records_in(root, layer)
+    }
+
+    /// The files of a records layer's records, listed from its folder, not read: what is read of the records is the
+    /// index's to read again.
+    pub fn records_in(root: &HostPath, layer: &str) -> Vec<HostPath> {
+        let records = root.join(&crate::LAYERS).join(&name(layer)).join(&crate::records::DIR);
+        let mut written = Vec::new();
+        for shard in std::fs::read_dir(&records).unwrap().flatten().filter(|e| e.path().is_dir()) {
+            for file in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                written.push(HostPath::new(&file.path()).unwrap());
+            }
+        }
+        written
+    }
+
+    /// Make a records layer's records what a changeset and the files written with it say, as an edit makes them
+    /// (`records::records_for`): what a test writes of a layer's operations on what is below it.
+    pub fn apply(root: &HostPath, layer: &str, changeset: &crate::changeset::Changeset, files: &[(&str, &str)]) {
+        let project = crate::Project::load(root).expect("a test's project");
+        let lock = crate::lock::Lock::try_acquire(root, "a test", &pe2_io::System).expect("the project's lock");
+        let index = crate::index::Index::open(&project, &crate::local::Local::open(&project, &lock).unwrap()).unwrap();
+        let layer = project.layer(&name(layer)).expect("the layer");
+        let old = crate::records::Set::records_of(&layer.path).expect("a records layer");
+        let written = files.iter().map(|(path, text)| (tree(path), Some(text.as_bytes().to_vec()))).collect();
+        let (new, gone) =
+            crate::records::records_for(&project, &index, layer, changeset, &old, &written).expect("records made");
+        for (uid, record) in new {
+            let at = crate::records::path_of(&layer.path, uid).unwrap();
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, record.render()).unwrap();
+        }
+        for uid in gone {
+            std::fs::remove_file(crate::records::path_of(&layer.path, uid).unwrap()).unwrap();
+        }
+    }
+
+    /// What a layer says it does, as a changeset: a records layer's records (`records::Set::changeset`), read afresh,
+    /// or a mount's changeset.
+    pub fn changeset(root: &HostPath, layer: &str) -> crate::changeset::Changeset {
+        let project = crate::Project::load(root).expect("a test's project");
+        let layer = project.layer(&name(layer)).expect("the layer");
+        if layer.mounted {
+            return crate::changeset::Changeset::load(&pe2_io::SystemFilesystem, &layer.changeset).unwrap();
+        }
+        let set = crate::records::Set::open(&project).expect("its records read");
+        let found = crate::records::Set::changeset(&layer.path).expect("a records layer");
+        drop(set);
+        found
     }
 
     /// A uid a test writes, checked.

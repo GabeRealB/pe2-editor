@@ -262,14 +262,7 @@ mod tests {
         let project = || Project::load(&dir).unwrap();
         let lock = crate::lock::Lock::try_acquire(&dir, "a test", &pe2_io::System).unwrap();
         let (mut history, _) = History::open(&Local::open(&project(), &lock).unwrap()).unwrap();
-        crate::stack::add_at(
-            &project(),
-            pe2_path::Name::constant("game"),
-            crate::LayerKind::Assets,
-            true,
-            &mut history,
-        )
-        .unwrap();
+        crate::stack::add_at(&project(), pe2_path::Name::constant("game"), true, &mut history).unwrap();
         let (files, game) = (pe2_path::Name::constant("game-files"), pe2_path::Name::constant("game"));
         super::add_generated(&project(), files, game, &mut history).unwrap();
         super::add_mount(&project(), pe2_path::Name::constant("roms"), None, false, true, &mut history).unwrap();

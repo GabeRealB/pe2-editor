@@ -3420,6 +3420,7 @@ mod calling {
             true,
         );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        crate::testing::as_records(&root);
         let project = Opened::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
         let index = Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();

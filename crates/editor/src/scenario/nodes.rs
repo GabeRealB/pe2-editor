@@ -60,15 +60,3 @@ fn a_second_preview_has_a_tab_of_its_own() {
     editor.show("rig/skeleton");
     editor.expect(icons::EYE);
 }
-
-#[test]
-fn an_entry_gone_from_the_disk_can_be_forgotten() {
-    let mut editor = Scenario::open(Fixture::rig());
-    let folder = editor.node_folder("rig/skeleton");
-    std::fs::remove_dir_all(folder).expect("a folder");
-    editor.take_in_outside_changes();
-    assert!(editor.problems().iter().any(|problem| problem.contains("does not hold it")), "{:?}", editor.problems());
-    editor.click("Problems");
-    editor.click("Forget it");
-    assert_eq!(editor.problems(), [""; 0]);
-}

@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use crate::TreePath;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 
 /// The folder of a layer's records, in its folder: a name a scan of the layer leaves out.
 pub const DIR: &Name = Name::constant(".records");
@@ -309,6 +308,12 @@ pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usi
     Ok(count)
 }
 
+/// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
+/// of them where there are fewer.
+pub(crate) fn is_shard(name: &std::ffi::OsStr) -> bool {
+    (1..=2).contains(&name.len())
+}
+
 /// Where a layer's record of an entry is, in its folder.
 ///
 /// # Errors
@@ -350,6 +355,13 @@ pub struct Settings {
 /// # Errors
 /// The marker cannot be written.
 pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) -> Result<()> {
+    fs.create_folder_all(&layer.join(&DIR))?;
+    let at = layer.join(&DIR).join(&MARKER);
+    crate::local::write_atomic(fs, &at, marker(settings).as_bytes())
+}
+
+/// The text of a layer's marker: the format of its records, and its settings.
+fn marker(settings: &Settings) -> String {
     let mut doc = toml_edit::DocumentMut::new();
     doc["format"] = toml_edit::value(FORMAT);
     if settings.read_only {
@@ -358,9 +370,7 @@ pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) 
     if !settings.ignore.is_empty() {
         doc["ignore"] = toml_edit::value(settings.ignore.iter().map(String::as_str).collect::<toml_edit::Array>());
     }
-    fs.create_folder_all(&layer.join(&DIR))?;
-    let at = layer.join(&DIR).join(&MARKER);
-    crate::local::write_atomic(fs, &at, doc.to_string().as_bytes())
+    doc.to_string()
 }
 
 /// A records layer's settings, its format checked: one this program knows.
@@ -798,7 +808,7 @@ fn read_changed(
         .map(|path| {
             // A record is `<shard>/<uid>.toml`, its shard a folder of the records' own named by two letters -
             // what is beside the shards (the extensions the layer holds, its settings) is no record of an entry.
-            let shard = path.parent().filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2));
+            let shard = path.parent().filter(|shard| shard.file_name().is_some_and(is_shard));
             let in_shard = shard.and_then(|shard| shard.parent()).is_some_and(|records| records == within);
             Some((uid_of(path).filter(|_| in_shard)?, *path))
         })
@@ -872,7 +882,7 @@ fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Rea
         .read_directory(&records_dir)
         .unwrap_or_default()
         .iter()
-        .filter(|shard| shard.kind == pe2_io::Kind::Folder && shard.name.len() == 2)
+        .filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name))
         .map(|shard| records_dir.entry(&shard.name))
         .collect();
     let read_shard = |shard: &HostPath| -> Result<Vec<(Uid, Held)>> {
@@ -1074,9 +1084,11 @@ impl Set {
                 if let (Some(was), Some(is)) = (was, is)
                     && std::sync::Arc::ptr_eq(&was.record, &is.record)
                 {
-                    // The same record, in a file of another time or length: told to the model, and nothing else.
+                    // The same record, in a file of another time or length: told to the model, and its entry's files -
+                    // whose times are its file's - scanned again; placed as it was.
                     if was.modified != is.modified || was.len != is.len {
                         records.push((view.dir.clone(), *uid));
+                        paths.extend(view.placed.get(uid).cloned());
                     }
                     continue;
                 }
@@ -1137,7 +1149,7 @@ impl Set {
             let records_dir = view.dir.join(&DIR);
             let fs = self.store.io.filesystem();
             let shards = fs.read_directory(&records_dir).unwrap_or_default();
-            for shard in shards.iter().filter(|shard| shard.kind == pe2_io::Kind::Folder && shard.name.len() == 2) {
+            for shard in shards.iter().filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name)) {
                 let shard = records_dir.entry(&shard.name);
                 for file in fs.read_directory(&shard).unwrap_or_default() {
                     let path = shard.entry(&file.name);
@@ -1286,187 +1298,238 @@ impl Set {
     }
 }
 
-/// What a layer stored as a tree holds, as records: one per entry it creates or acts on, read from its changeset and its
-/// files (by the index, which places them), each file's content as a record keeps it.
+/// Make a layer's records those of a tree of files and its listing (`<folder>.toml` beside it, a changeset of
+/// `[entries]` alone) - what a tool writes as a tree - in place of all it had but the extensions it holds. How many
+/// records it holds. What the tree holds is read as it is, by no index: a `<name>.node` folder a node of every file in
+/// it, another folder a folder, another file a plain file; each by the uid its listing gives its path, else one drawn
+/// anew; each placed in the folder above it.
 ///
 /// # Errors
-/// A file cannot be read or kept, or an entry's place has no uid to name it by.
-pub fn of_tree(
-    project: &crate::Project,
-    index: &crate::index::Index,
-    layer: &crate::Layer,
-) -> Result<(Settings, BTreeMap<Uid, Record>)> {
-    let changeset = index.changeset(&layer.name).with_context(|| format!("the index has no layer {}", layer.name))?;
-    let records = records_of_tree(project, index, &layer.name, &|path| layer.disk(path), changeset)?;
-    Ok((Settings { read_only: changeset.read_only, ignore: changeset.ignore.clone() }, records))
-}
-
-/// The records a tree of files and its changeset make, as a layer's (`layer`, which places what it names below it):
-/// `disk` says where a path of the tree is.
-fn records_of_tree(
-    project: &crate::Project,
-    index: &crate::index::Index,
-    layer: &Name,
-    disk: &dyn Fn(&TreePath) -> HostPath,
-    changeset: &crate::changeset::Changeset,
-) -> Result<BTreeMap<Uid, Record>> {
-    use crate::changeset::Op as Did;
-    let store = crate::chunks::Store::at(&project.root, project.io.clone());
-    let below = index.entries_below(layer);
-    // Who is where: what the layer places, then what is below it.
-    let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> =
-        below.iter().map(|(path, (uid, _))| (path.clone(), *uid)).collect();
-    for (uid, path) in &changeset.entries {
-        uid_at.insert(path.clone(), *uid);
-    }
-    for (uid, op) in &changeset.ops {
-        if let Did::Move { to } | Did::Override { to: Some(to), .. } = op {
-            uid_at.insert(to.clone(), *uid);
-        }
-    }
-    // Where a path is, as a record says it: its parent's uid (none at the top), and its name - a node's its asset's.
-    let place = |path: &TreePath| -> Result<(Option<Uid>, Arc<Name>)> {
-        let parent = match path.parent().filter(|parent| !parent.is_root()) {
-            Some(parent) => Some(*uid_at.get(parent).with_context(|| format!("{path}: nothing names {parent}"))?),
-            None => None,
-        };
-        let asset = crate::index::asset_named(path)?;
-        let name = asset.last().with_context(|| format!("{path}: no name"))?;
-        Ok((parent, name.to_owned()))
-    };
-    let kind_at = |path: &TreePath| -> Kind {
-        if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
-            Kind::Node
-        } else if crate::pack::is_dir(&project.io, &disk(path)) {
-            Kind::Folder
-        } else {
-            Kind::File
-        }
-    };
-    let content = |disk: &HostPath| -> Result<Content> {
-        let bytes = crate::content::read(&project.io, disk).with_context(|| disk.display().to_string())?;
-        Content::of(&bytes, &store)
-    };
-    // A bundle's files, by name, as its folder holds them.
-    let bundle = |path: &TreePath| -> Result<BTreeMap<Arc<RelPath>, File>> {
-        let mut files = BTreeMap::new();
-        let (held, refused) = crate::index::bundle_files(&project.io, &disk(path));
-        // Every file of it is the record's, or none is: one named so no path takes it is renamed first.
-        if let Some(why) = refused.first() {
-            bail!("{path}: {why}");
-        }
-        for (name, file) in held {
-            files.insert(name, File { content: Some(content(&file)?), was: None });
-        }
-        Ok(files)
-    };
-    let mut records = BTreeMap::new();
-    for (uid, path) in &changeset.entries {
-        let kind = kind_at(path);
-        let files = match kind {
-            Kind::Node => bundle(path)?,
-            Kind::File => {
-                BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content(&disk(path))?), was: None })])
-            }
-            Kind::Folder => BTreeMap::new(),
-        };
-        let (parent, name) = place(path)?;
-        records.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files });
-    }
-    for (uid, op) in &changeset.ops {
-        let from = below.iter().find(|(_, (u, _))| u == uid);
-        let kind = from.map_or(Kind::File, |(_, (_, kind))| match kind {
-            crate::index::Kind::Asset => Kind::Node,
-            crate::index::Kind::Folder => Kind::Folder,
-            crate::index::Kind::File => Kind::File,
-        });
-        let record = match op {
-            Did::Delete => Record { op: Op::Delete, kind, parent: None, name: None, files: BTreeMap::new() },
-            Did::Move { to } => {
-                let (parent, name) = place(to)?;
-                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new() }
-            }
-            Did::Override { files: bases, to } => {
-                let at = to.clone().or_else(|| from.map(|(path, _)| path.clone())).context("an override of nothing")?;
-                let (parent, name) = match to {
-                    Some(to) => {
-                        let (parent, name) = place(to)?;
-                        (parent, Some(name))
-                    }
-                    None => (None, None),
-                };
-                let mut files = BTreeMap::new();
-                for (file, base) in bases {
-                    let held_at = if file.is_root() { disk(&at) } else { disk(&at).join(file) };
-                    let held = if base.removed { None } else { Some(content(&held_at)?) };
-                    files.insert(file.clone(), File { content: held, was: base.was });
-                }
-                Record { op: Op::Override, kind, parent, name, files }
-            }
-        };
-        records.insert(*uid, record);
-    }
-    Ok(records)
-}
-
-/// Make a layer's records those of a tree of files and its changeset (`<folder>.toml`, beside it) - what a tool writes
-/// as a tree - in place of all it had but the extensions it holds: a records layer from
-/// now on, its tree, where it was one, gone. How many records it holds.
-///
-/// # Errors
-/// The tree or its changeset cannot be read, or the records cannot be written.
-pub fn import(
-    project: &crate::Project,
-    local: &crate::local::Local,
-    name: &Name,
-    from: &std::path::Path,
-) -> Result<usize> {
+/// The layer is no records layer; the listing does something else than create (an import makes, and only that); the
+/// tree or its listing cannot be read; or the records cannot be written.
+pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> Result<usize> {
     let from = &HostPath::new(from).with_context(|| from.display().to_string())?;
     let layer = project.layer(name)?;
     if layer.mounted || layer.kind == crate::LayerKind::Generated {
         bail!("{name}: a mounted or generated layer is no records layer");
     }
-    let changeset =
-        crate::changeset::Changeset::load(project.io.filesystem(), &from.with_suffix(crate::CHANGESET_SUFFIX))?;
-    let records = {
-        let index = crate::index::Index::open(project, local)?;
-        let disk = |path: &TreePath| from.join(path);
-        records_of_tree(project, &index, name, &disk, &changeset)?
-    };
-    let settings = Settings { read_only: changeset.read_only, ignore: changeset.ignore.clone() };
-    // Written beside, as a layer of its own, then in the place of what was there.
-    let fresh = layer.path.join(&Name::constant(".import"));
-    let _ = project.io.filesystem().remove_all(&fresh);
-    write_all(project.io.filesystem(), &fresh, &settings, &records)?;
-    // The extensions it holds are no entries of the tree: kept as they are.
-    let held = layer.path.join(&DIR).join(&EXTENSIONS);
-    if project.io.filesystem().is_folder(&held) {
-        project.io.filesystem().rename(&held, &fresh.join(&DIR).join(&EXTENSIONS))?;
+    let fs = project.io.filesystem();
+    let listing = crate::changeset::Changeset::load(fs, &from.with_suffix(crate::CHANGESET_SUFFIX))?;
+    if let Some(uid) = listing.ops.keys().next() {
+        bail!("{name}: the listing does something to {uid} from below: an import only makes what it lists");
     }
-    let old = layer.path.join(&Name::constant(".records.old"));
-    let _ = project.io.filesystem().remove_all(&old);
-    if project.io.filesystem().exists(&layer.path.join(&DIR)) {
-        project.io.filesystem().rename(&layer.path.join(&DIR), &old)?;
+    // The uids taken: by every layer's records, and by the listing.
+    let mut taken: std::collections::HashSet<Uid> = listing.entries.keys().copied().collect();
+    for view in &Set::open(project)?.views {
+        taken.extend(view.records.keys().copied());
     }
-    project.io.filesystem().rename(&fresh.join(&DIR), &layer.path.join(&DIR))?;
-    let _ = project.io.filesystem().remove_all(&old);
-    project.io.filesystem().remove_all(&fresh)?;
-    // A tree it was: its files and changeset go.
-    for entry in project.io.filesystem().read_directory(&layer.path)? {
-        if of_the_tree(&entry.name) {
-            let path = layer.path.entry(&entry.name);
-            if project.io.filesystem().is_folder(&path) {
-                project.io.filesystem().remove_all(&path)?;
-            } else {
-                project.io.filesystem().remove_file(&path)?;
-            }
+    let store = crate::chunks::Store::at(&project.root, project.io.clone());
+    let mut tree =
+        Staging { fs, store: &store, listing: &listing, random: project.io.random(), taken, records: BTreeMap::new() };
+    tree.folder(from, TreePath::root(), None)?;
+    let records = tree.records;
+    let said = Settings { read_only: listing.read_only, ignore: listing.ignore.clone() };
+    // What changes, and only that: each record that differs from what the layer has, those it no longer has gone, its
+    // settings where they differ.
+    let old = read_records(fs, &layer.path, None)?;
+    let mut writes: Vec<(HostPath, Option<String>)> = Vec::new();
+    for (uid, record) in &records {
+        if old.get(uid).is_none_or(|held| *held.record != *record) {
+            writes.push((path_of(&layer.path, *uid)?, Some(record.render())));
         }
     }
-    if project.io.filesystem().is_file(&layer.changeset) {
-        project.io.filesystem().remove_file(&layer.changeset)?;
+    for uid in old.keys().filter(|uid| !records.contains_key(*uid)) {
+        writes.push((path_of(&layer.path, *uid)?, None));
     }
-    // What it held as folders of extensions, held as records.
-    Ok(records.len() + hold_extensions(project, &layer.path)?)
+    if settings(fs, &layer.path).ok().as_ref() != Some(&said) {
+        writes.push((layer.path.join(&DIR).join(&MARKER), Some(marker(&said))));
+    }
+    write_set(project, &format!("Import the layer {name}"), &writes)?;
+    Ok(records.len())
+}
+
+/// Write a set of files of a project whole: said in its log before any is touched (`storage::Storage::say`), so that
+/// one cut short is made whole as the project is next opened; each written whole, or (none) removed; the folders they
+/// are in made.
+fn write_set(project: &crate::Project, label: &str, writes: &[(HostPath, Option<String>)]) -> Result<()> {
+    use crate::storage::Stored;
+    let fs = project.io.filesystem();
+    let mut storage = crate::storage::Storage::open(&project.root, project.io.clone());
+    if let Some(storage) = &mut storage {
+        let mut folders = BTreeSet::new();
+        let mut said = Vec::new();
+        for (path, text) in writes {
+            match text {
+                Some(text) => {
+                    for folder in path.ancestors().skip(1).take_while(|f| *f != project.root && !fs.exists(f)) {
+                        folders.insert(folder);
+                    }
+                    said.push(Stored::Put { path: storage.name(path), bytes: text.as_bytes().to_vec() });
+                }
+                None => said.push(Stored::Delete { path: storage.name(path) }),
+            }
+        }
+        // The folders first, outermost first.
+        let made = folders.iter().map(|folder| Stored::MakeDir { path: storage.name(folder) });
+        let said: Vec<Stored> = made.chain(said).collect();
+        storage.say(label, &said)?;
+    }
+    for (path, text) in writes {
+        match text {
+            Some(text) => {
+                if let Some(folder) = path.parent() {
+                    fs.create_folder_all(&folder)?;
+                }
+                crate::local::write_atomic(fs, path, text.as_bytes())?;
+            }
+            None => fs.remove_file(path)?,
+        }
+    }
+    if let Some(mut storage) = storage {
+        storage.wrote(writes.iter().map(|(path, _)| path.clone()));
+        storage.checkpoint();
+    }
+    Ok(())
+}
+
+/// Make the layers of the project in `root` written as trees of files - `layers/<name>/`, with a listing beside where
+/// one was written (`layers/<name>.toml`) - records layers, each imported as a tool's tree is (`import`): every layer
+/// but a generated one, not records yet. What makes a project of trees written by hand, as a test or a scenario writes
+/// one.
+///
+/// # Errors
+/// `project.toml` cannot be read, a tree cannot be moved aside, or one cannot be imported.
+pub fn import_trees(root: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<()> {
+    let fs = io.filesystem();
+    let file = root.join(&crate::FILE);
+    let said: toml::Table = fs.read_to_string(&file)?.parse().with_context(|| file.display().to_string())?;
+    let layers = said.get("layer").and_then(toml::Value::as_array).cloned().unwrap_or_default();
+    let staging = root.join(&Name::constant("staging"));
+    let mut staged = Vec::new();
+    for layer in layers.iter().filter(|l| l.get("kind").and_then(toml::Value::as_str) != Some("generated")) {
+        let name = layer.get("name").and_then(toml::Value::as_str).context("a layer with no name")?;
+        let name = Name::new(name)?.to_owned();
+        let folder = root.join(&crate::LAYERS).join(&name);
+        if is_records(fs, &folder) {
+            continue;
+        }
+        let (tree, listing) = (staging.join(&name), folder.with_suffix(crate::CHANGESET_SUFFIX));
+        fs.create_folder_all(&staging)?;
+        if fs.exists(&folder) {
+            fs.rename(&folder, &tree)?;
+        } else {
+            fs.create_folder_all(&tree)?;
+        }
+        if fs.exists(&listing) {
+            fs.rename(&listing, &tree.with_suffix(crate::CHANGESET_SUFFIX))?;
+        }
+        fs.create_folder_all(&folder)?;
+        mark(fs, &folder, &Settings::default())?;
+        staged.push((name, tree));
+    }
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let project = crate::Project::load_with(root.as_path(), io.clone())?;
+    for (name, tree) in staged {
+        import(&project, &name, tree.as_path())?;
+    }
+    fs.remove_all(&staging)?;
+    Ok(())
+}
+
+/// A tree of files read as a layer's records (`import`).
+struct Staging<'a> {
+    fs: &'a dyn pe2_io::Filesystem,
+    store: &'a crate::chunks::Store,
+    listing: &'a crate::changeset::Changeset,
+    random: &'a dyn pe2_io::Random,
+    /// The uids given, or listed: a uid drawn anew is none of them.
+    taken: std::collections::HashSet<Uid>,
+    records: BTreeMap<Uid, Record>,
+}
+
+impl Staging<'_> {
+    /// The uid of what is at a path: the listing's; else, for a node, the one its `node.toml` names where none has it,
+    /// as the index lists what a layer holds unlisted; else one drawn anew.
+    fn uid(&mut self, path: &TreePath, node_toml: Option<&HostPath>) -> Uid {
+        if let Some((uid, _)) = self.listing.entries.iter().find(|(_, at)| ***at == *path) {
+            return *uid;
+        }
+        let declared = node_toml
+            .and_then(|file| self.fs.read_to_string(file).ok())
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|table| Uid::new(table.get("uid")?.as_str()?).ok())
+            .filter(|uid| !self.taken.contains(uid));
+        if let Some(uid) = declared {
+            self.taken.insert(uid);
+            return uid;
+        }
+        let taken = &self.taken;
+        let uid = crate::uid::new(self.random, |uid| taken.contains(&uid));
+        self.taken.insert(uid);
+        uid
+    }
+
+    /// What a folder of the tree holds, at `path`, in the entry `parent`.
+    fn folder(&mut self, dir: &HostPath, path: &TreePath, parent: Option<Uid>) -> Result<()> {
+        let mut entries = self.fs.read_directory(dir).with_context(|| dir.display().to_string())?;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let name =
+                Name::new(entry.name.to_str().with_context(|| format!("{}: a name that is no text", dir.display()))?)
+                    .with_context(|| format!("{}: {}", dir.display(), entry.name.to_string_lossy()))?;
+            let (disk, at) = (dir.join(name), path.join(name));
+            let node = entry.kind == pe2_io::Kind::Folder && at.as_str().ends_with(crate::index::BUNDLE_SUFFIX);
+            let uid = self.uid(&at, node.then(|| disk.join(crate::index::NODE_FILE)).as_ref());
+            let record = match entry.kind {
+                pe2_io::Kind::Folder if at.as_str().ends_with(crate::index::BUNDLE_SUFFIX) => {
+                    let mut files = BTreeMap::new();
+                    self.files(&disk, RelPath::root(), &mut files)?;
+                    let named = crate::index::asset_named(&at)?;
+                    let name = named.last().with_context(|| format!("{at}: no name"))?.to_owned();
+                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files }
+                }
+                pe2_io::Kind::Folder => {
+                    self.folder(&disk, &at, Some(uid))?;
+                    Record {
+                        op: Op::Create,
+                        kind: Kind::Folder,
+                        parent,
+                        name: Some(name.to_owned()),
+                        files: BTreeMap::new(),
+                    }
+                }
+                _ => {
+                    let content =
+                        Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
+                    let files =
+                        BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content), was: None })]);
+                    Record { op: Op::Create, kind: Kind::File, parent, name: Some(name.to_owned()), files }
+                }
+            };
+            self.records.insert(uid, record);
+        }
+        Ok(())
+    }
+
+    /// A node's files, by their names in it.
+    fn files(&self, dir: &HostPath, within: &RelPath, out: &mut BTreeMap<Arc<RelPath>, File>) -> Result<()> {
+        for entry in self.fs.read_directory(dir).with_context(|| dir.display().to_string())? {
+            let name =
+                Name::new(entry.name.to_str().with_context(|| format!("{}: a name that is no text", dir.display()))?)
+                    .with_context(|| format!("{}: {}", dir.display(), entry.name.to_string_lossy()))?;
+            let (disk, at) = (dir.join(name), within.join(name));
+            if entry.kind == pe2_io::Kind::Folder {
+                self.files(&disk, &at, out)?;
+            } else {
+                let content =
+                    Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
+                out.insert(at, File { content: Some(content), was: None });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Write a records layer's entries out as a tree of files, with its changeset beside it (`<folder>.toml`): what it
@@ -1664,123 +1727,6 @@ fn override_files(
         files.insert(file.clone(), File { content, was: base.was });
     }
     Ok(files)
-}
-
-/// Whether what a layer's folder holds by this name is of its tree of entries: not its records, nor anything hidden,
-/// nor the extensions it holds (`ext::folder::HELD`), which are no entries: held as records of their own
-/// (`hold_extensions`).
-fn of_the_tree(name: &std::ffi::OsStr) -> bool {
-    !name.to_string_lossy().starts_with('.') && *name != *crate::ext::folder::HELD
-}
-
-/// What a project's index shows, for comparing: each entry by path - its kind, uid, and files by name and SHA-1.
-fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
-    let mut out = BTreeMap::new();
-    for (path, entry) in index.entries.iter() {
-        let mut said = format!("{:?} {}", entry.kind, entry.uid);
-        match entry.kind {
-            crate::index::Kind::Asset => {
-                let asset = crate::index::asset_of(path);
-                for file in index.assets.get(&asset).map_or_else(Vec::new, |a| a.files.clone()) {
-                    let _ = write!(said, " {}={}", file.name, file.sha1);
-                }
-            }
-            crate::index::Kind::File => {
-                let sha1 = crate::content::sha1(index.io(), &entry.disk).map_or_default(|sha1| sha1.to_string());
-                let _ = write!(said, " ={sha1}");
-            }
-            crate::index::Kind::Folder => {}
-        }
-        out.insert(path.clone(), said);
-    }
-    out
-}
-
-/// Store a layer stored as a tree as records: its records written, its tree and changeset set aside while the project
-/// is read again and shows the same - each entry, its uid, its files and their hashes - then removed; where it shows
-/// otherwise, the tree is put back and what differs is said. The extensions it holds as folders are held as records
-/// (`hold_extensions`) - of a records layer, those alone. What was made.
-///
-/// # Errors
-/// The layer is a records layer holding no extensions as folders, mounted or generated; what it holds cannot be read;
-/// or the project shows otherwise once converted.
-pub fn convert(project: &crate::Project, local: &crate::local::Local, name: &Name) -> Result<Converted> {
-    let layer = project.layer(name)?;
-    if is_records(project.io.filesystem(), &layer.path) {
-        // What it still holds as folders, of what it held before records: its extensions.
-        let extensions = hold_extensions(project, &layer.path)?;
-        if extensions == 0 {
-            bail!("{name} is stored as records already");
-        }
-        return Ok(Converted { records: 0, extensions });
-    }
-    if layer.mounted || layer.kind == crate::LayerKind::Generated {
-        bail!("{name}: a mounted or generated layer stays a tree");
-    }
-    let (before, settings, records) = {
-        let index = crate::index::Index::open(project, local)?;
-        let (settings, records) = of_tree(project, &index, layer)?;
-        (shown(&index), settings, records)
-    };
-    // The tree aside, where nothing reads it: a dot-folder of the layer's.
-    let aside = layer.path.join(&Name::constant(".tree"));
-    project.io.filesystem().create_folder_all(&aside)?;
-    let mut moved = Vec::new();
-    for entry in project.io.filesystem().read_directory(&layer.path)? {
-        let file_name = entry.name;
-        if !of_the_tree(&file_name) {
-            continue;
-        }
-        project.io.filesystem().rename(&layer.path.entry(&file_name), &aside.entry(&file_name))?;
-        moved.push(file_name);
-    }
-    let changeset_aside = aside.join(&Name::constant(".changeset.toml"));
-    let had_changeset = project.io.filesystem().is_file(&layer.changeset);
-    if had_changeset {
-        project.io.filesystem().rename(&layer.changeset, &changeset_aside)?;
-    }
-    let put_back = || -> Result<()> {
-        let _ = project.io.filesystem().remove_all(&layer.path.join(&DIR));
-        for file_name in &moved {
-            project.io.filesystem().rename(&aside.entry(file_name), &layer.path.entry(file_name))?;
-        }
-        if had_changeset {
-            project.io.filesystem().rename(&changeset_aside, &layer.changeset)?;
-        }
-        project.io.filesystem().remove_all(&aside)?;
-        Ok(())
-    };
-    let written = write_all(project.io.filesystem(), &layer.path, &settings, &records)
-        .and_then(|()| Ok(shown(&crate::index::Index::open(project, local)?)));
-    let after = match written {
-        Ok(after) => after,
-        Err(e) => {
-            put_back()?;
-            Set::open(project)?;
-            return Err(e.context(format!("{name} is left as it was")));
-        }
-    };
-    if after != before {
-        put_back()?;
-        Set::open(project)?;
-        let differ: Vec<String> = before
-            .iter()
-            .filter(|(path, said)| after.get(*path) != Some(*said))
-            .map(|(path, said)| format!("{path}: {said} / {}", after.get(path).map_or("gone", String::as_str)))
-            .chain(after.keys().filter(|p| !before.contains_key(*p)).map(|p| format!("{p}: new")))
-            .take(10)
-            .collect();
-        bail!("{name} would show otherwise as records, and is left as it was:\n{}", differ.join("\n"));
-    }
-    project.io.filesystem().remove_all(&aside)?;
-    Ok(Converted { records: records.len(), extensions: hold_extensions(project, &layer.path)? })
-}
-
-/// What a conversion made: the layer's records, and the extensions it held as folders, held as records now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Converted {
-    pub records: usize,
-    pub extensions: usize,
 }
 
 #[cfg(test)]

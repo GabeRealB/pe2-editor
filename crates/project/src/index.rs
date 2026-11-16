@@ -4447,6 +4447,7 @@ mod tests {
     }
 
     fn open(root: &HostPath) -> (Project, Index) {
+        crate::testing::as_records(root);
         let project = Project::load(root).unwrap();
         // Held while opening; released for the test's next opening.
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
@@ -4459,7 +4460,7 @@ mod tests {
     }
 
     fn changeset(root: &HostPath, layer: &str) -> Changeset {
-        Changeset::load(&pe2_io::SystemFilesystem, &root.at(&format!("layers/{layer}.toml"))).unwrap()
+        crate::testing::changeset(root, layer)
     }
 
     #[test]
@@ -4505,9 +4506,12 @@ mod tests {
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml", "native.texels"]));
         top.ops.insert(uid_of("b.node"), Op::Move { to: tree("c.node") });
         top.ops.insert(uid_of("f.node"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        write(&root, "layers/top/g/a.node/native.texels", "repainted");
+        crate::testing::apply(
+            &root,
+            "top",
+            &top,
+            &[("g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n"), ("g/a.node/native.texels", "repainted")],
+        );
         let (_, index) = open(&root);
         assert_eq!(index.assets.keys().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["c", "g/a"]);
         assert_eq!(
@@ -4526,7 +4530,7 @@ mod tests {
         assert!(below.files.iter().all(|f| *f.layer == "base"));
         assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
-        write(&root, "layers/base/g/a.node/native.texels", "retouched");
+        crate::testing::write_in(&root, "base", "g/a.node/native.texels", Some("retouched"));
         let (_, index) = open(&root);
         assert_eq!(index.problems, [Problem::Stale { layer: crate::testing::name("top"), path: "g/a.node".into() }]);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4539,8 +4543,7 @@ mod tests {
         let mut top = Changeset::default();
         top.entries.insert(uid("uid://again"), tree("g"));
         top.entries.insert(uid("uid://beside"), tree("g/beside.node"));
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
+        crate::testing::apply(&root, "top", &top, &[("g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n")]);
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
         assert!(index.assets.contains_key(&tree("g/a")) && index.assets.contains_key(&tree("g/beside")));
@@ -4554,30 +4557,44 @@ mod tests {
     #[test]
     fn a_name_no_path_takes_is_a_problem_and_nothing_of_the_projects() {
         let root = project("refused");
+        let outside = mounted(&root);
         let refused = |path: &str| Problem::Refused {
-            layer: crate::testing::name("base"),
+            layer: crate::testing::name("code"),
             path: path.into(),
             why: index_why(path),
         };
         // `:` is a name Windows takes for something else: made here, where the system lets it be.
-        std::fs::write(root.at("layers/base/g").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
+        std::fs::write(outside.at("g").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
         let (project, index) = open(&root);
-        assert!(index.problems.contains(&refused("g/a:b.txt")), "{:?}", index.problems);
-        assert!(index.assets.contains_key(&tree("g/a")), "what is beside it is as it was");
+        assert!(index.problems.contains(&refused("code/g/a:b.txt")), "{:?}", index.problems);
+        assert!(index.entries.contains_key(&tree("code/g/notes")), "what is beside it is as it was");
         drop(index);
         // Opened again from what the model keeps: still said.
         let (_, index) = open(&root);
-        assert!(index.problems.contains(&refused("g/a:b.txt")), "{:?}", index.problems);
+        assert!(index.problems.contains(&refused("code/g/a:b.txt")), "{:?}", index.problems);
         drop(index);
-        // Come since, in a bundle: its bundle is the project's as it was, the file none of it.
+        // Come since: none of the project's.
         let (_, mut index) = open(&root);
-        let file = root.at("layers/base/g/a.node").entry(std::ffi::OsStr::new("x:y.bin"));
+        let file = outside.at("g").entry(std::ffi::OsStr::new("x:y.bin"));
         std::fs::write(&file, "y").unwrap();
         index.refresh(&project, &[file]).unwrap();
-        assert!(index.problems.contains(&refused("g/a.node/x:y.bin")), "{:?}", index.problems);
-        assert!(!index.assets[&tree("g/a")].files.iter().any(|file| file.name.as_str().contains(':')));
+        assert!(index.problems.contains(&refused("code/g/x:y.bin")), "{:?}", index.problems);
+        assert!(!index.entries.keys().any(|path| path.as_str().contains(':')));
         drop(index);
         crate::local::remove_all(&root);
+        crate::local::remove_all(&outside);
+    }
+
+    /// A tree outside the project, mounted at `code`, holding the folder `g` and in it the file `notes`: what a walk
+    /// finds there is read as it is.
+    fn mounted(root: &HostPath) -> HostPath {
+        let tree = root.with_suffix(pe2_path::Name::constant(".tree"));
+        let _ = std::fs::remove_dir_all(&tree);
+        write(&tree, "g/notes", "notes");
+        let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
+        let mount = format!("[[mount]]\nat = \"code\"\npath = '{}'\n", tree.display());
+        std::fs::write(root.at("project.toml"), format!("{text}\n{mount}")).unwrap();
+        tree
     }
 
     /// Two of a folder named alike - one name in both its normal forms, as a system keeping either writes them - are
@@ -4587,13 +4604,12 @@ mod tests {
     #[test]
     fn names_alike_beside_each_other_are_each_a_problem() {
         let root = project("alike");
+        let outside = mounted(&root);
         let (composed, decomposed) = ("caf\u{e9}.txt", "cafe\u{301}.txt");
-        for folder in ["layers/base/g", "layers/base/g/a.node"] {
-            for (name, text) in [(composed, "a"), (decomposed, "b")] {
-                std::fs::write(root.at(folder).entry(std::ffi::OsStr::new(name)), text).unwrap();
-            }
+        for (name, text) in [(composed, "a"), (decomposed, "b")] {
+            std::fs::write(outside.at("g").entry(std::ffi::OsStr::new(name)), text).unwrap();
         }
-        let paths = [composed, decomposed].map(|name| [format!("g/{name}"), format!("g/a.node/{name}")]);
+        let paths = [composed, decomposed].map(|name| format!("code/g/{name}"));
         for _ in 0..2 {
             let (_, index) = open(&root);
             let said = |path: &str| {
@@ -4601,13 +4617,13 @@ mod tests {
                     matches!(p, Problem::Refused { path: at, why, .. } if at == path && why.contains("one name with"))
                 })
             };
-            for path in paths.iter().flatten() {
+            for path in &paths {
                 assert!(said(path), "{path}: {:?}", index.problems);
             }
-            assert!(!index.entries.contains_key(&*tree(&format!("g/{composed}"))), "neither is taken");
-            assert!(!index.assets[&tree("g/a")].files.iter().any(|file| file.name.as_str().starts_with("caf")));
+            assert!(!index.entries.contains_key(&*tree(&format!("code/g/{composed}"))), "neither is taken");
         }
         crate::local::remove_all(&root);
+        crate::local::remove_all(&outside);
     }
 
     /// Why a path the tests make is refused, as the index says it.
@@ -4621,20 +4637,21 @@ mod tests {
     fn reports_what_does_not_add_up() {
         let root = project("problems");
         open(&root);
-        let mut top = Changeset { read_only: true, ..Changeset::default() };
-        top.entries.insert(uid("uid://gone"), tree("nowhere"));
+        // Top makes another `b` where base has one, a node it cannot read, and deletes what nothing has made.
+        let mut top = Changeset::default();
+        top.entries.insert(uid("uid://another"), tree("b.node"));
+        top.entries.insert(uid("uid://new"), tree("new.node"));
         top.ops.insert(uid("uid://unknown"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/b.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
-        write(&root, "layers/top/new.node/node.toml", "kind = [unclosed\n");
+        let files =
+            [("b.node/node.toml", "stack = [{ op = \"t.file\" }]\n"), ("new.node/node.toml", "kind = [unclosed\n")];
+        crate::testing::apply(&root, "top", &top, &files);
         let (_, index) = open(&root);
         let has = |p: &Problem| index.problems.contains(p);
         assert!(has(&Problem::Conflict {
             path: "b.node".into(),
             layers: vec![crate::testing::name("base"), crate::testing::name("top")]
         }));
-        assert!(has(&Problem::Unlisted { layer: crate::testing::name("top"), path: "new.node".into() }));
-        assert!(has(&Problem::Missing { layer: crate::testing::name("top"), path: "nowhere".into(), left_out: false }));
+        assert!(index.problems.iter().any(|p| matches!(p, Problem::Unreadable { asset, .. } if asset == "new")));
         assert!(has(&Problem::Unbound { layer: crate::testing::name("top"), uid: "uid://unknown".into() }));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -4643,36 +4660,11 @@ mod tests {
     fn follows_the_watcher() {
         let root = project("refresh");
         let (project, mut index) = open(&root);
-        let folder = *changeset(&root, "base").entries.iter().find(|(_, p)| ***p == *"g").unwrap().0;
-        // A file of a bundle changed: that bundle, its file read again.
-        let texels = write(&root, "layers/base/g/a.node/native.texels", "repainted");
-        let refreshed = index.refresh(&project, &[texels]).unwrap();
+        // A file of a bundle changed: that bundle - one record, holding both its files - read again.
+        let changed = crate::testing::write_in(&root, "base", "g/a.node/native.texels", Some("repainted"));
+        let refreshed = index.refresh(&project, &changed).unwrap();
         assert_eq!(refreshed.assets.iter().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["g/a"]);
-        assert_eq!(index.read, 1);
-        // A folder renamed in the layer's folder, by other means than the editor: no edit, a problem - what it holds now
-        // is unlisted, what it listed missing - until it is adopted, which follows the move: the uids are kept.
-        std::fs::rename(root.at("layers/base/g"), root.at("layers/base/h")).unwrap();
-        index.refresh(&project, &[root.at("layers/base/g"), root.at("layers/base/h")]).unwrap();
-        assert!(!index.assets.contains_key(&tree("h/a")));
-        assert!(index.problems.contains(&Problem::Unlisted { layer: crate::testing::name("base"), path: "h".into() }));
-        let adopted = index.adoption(pe2_path::Name::constant("base"), &tree("h")).unwrap();
-        assert!(adopted.contains(&(uid("uid://a"), tree("h/a.node"))), "{adopted:?}");
-        assert!(adopted.contains(&(folder, tree("h"))), "{adopted:?}");
-        let mut base = changeset(&root, "base");
-        base.entries.extend(adopted);
-        base.save(&pe2_io::SystemFilesystem, &root.at("layers/base.toml")).unwrap();
-        index.refresh(&project, &[root.at("layers/base.toml")]).unwrap();
-        assert_eq!(index.assets[&tree("h/a")].uid, Some(uid("uid://a")));
-        assert!(index.problems.is_empty(), "{:?}", index.problems);
-        // A bundle removed: its entry is missing until it is dropped from the changeset.
-        std::fs::remove_dir_all(root.at("layers/base/f.node")).unwrap();
-        index.refresh(&project, &[root.at("layers/base/f.node")]).unwrap();
-        assert!(!index.assets.contains_key(&tree("f")));
-        assert!(index.problems.contains(&Problem::Missing {
-            layer: crate::testing::name("base"),
-            path: "f.node".into(),
-            left_out: false
-        }));
+        assert_eq!(index.read, 2);
         assert!(index.refresh(&project, &[root.at("project.toml")]).unwrap().project_file);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -4713,8 +4705,7 @@ mod tests {
         // An override of the node's declaration sees the files the plan makes, and what it makes otherwise reaches it.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        crate::testing::apply(&root, "top", &top, &[("g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n")]);
         let below = index.below(pe2_path::Name::constant("top"), uid("uid://a")).unwrap();
         assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
         write(&root, "layers/base-files/g/a.node/native.texels", "extracted otherwise");
@@ -4735,50 +4726,34 @@ mod tests {
             let (_, fresh) = open(&root);
             assert_eq!(shown(index), shown(&fresh), "after {what}");
         };
-        let base = |p: &str| root.at("layers/base").at(p);
+        let base = |path: &str, text: Option<&str>| crate::testing::write_in(&root, "base", path, text);
         // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
-        write(&root, "layers/base/g/a.node/native.texels", "repainted");
-        check(&mut index, &project, &[base("g/a.node/native.texels")], "a file of a bundle", false);
-        write(
-            &root,
-            "layers/base/b.node/node.toml",
-            "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n",
-        );
-        check(&mut index, &project, &[base("b.node/node.toml")], "references changed", false);
-        write(&root, "layers/base/f.node/node.toml", "kind = [unclosed\n");
-        check(&mut index, &project, &[base("f.node/node.toml")], "an unreadable declaration", false);
-        write(&root, "layers/base/f.node/node.toml", "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\" }\n");
-        check(&mut index, &project, &[base("f.node/node.toml")], "readable again", false);
+        check(&mut index, &project, &base("g/a.node/native.texels", Some("repainted")), "a file of a bundle", false);
+        let declared = "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n";
+        check(&mut index, &project, &base("b.node/node.toml", Some(declared)), "references changed", false);
+        let unclosed = base("f.node/node.toml", Some("kind = [unclosed\n"));
+        check(&mut index, &project, &unclosed, "an unreadable declaration", false);
+        let readable = "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\" }\n";
+        check(&mut index, &project, &base("f.node/node.toml", Some(readable)), "readable again", false);
         // A file added to a bundle: its content changes, its paths stay.
-        write(&root, "layers/base/g/a.node/extra.bin", "more");
-        check(&mut index, &project, &[base("g/a.node/extra.bin")], "a file added to a bundle", false);
-        // Structure: a new bundle, listed in its changeset; one removed.
-        write(&root, "layers/base/n.node/node.toml", "stack = [{ op = \"t.file\" }]\nto = \"uid://a\"\n");
-        check(&mut index, &project, &[base("n.node/node.toml")], "a new bundle", true);
-        std::fs::remove_dir_all(base("n.node")).unwrap();
-        check(&mut index, &project, &[base("n.node")], "a bundle removed", true);
+        check(&mut index, &project, &base("g/a.node/extra.bin", Some("more")), "a file added to a bundle", false);
+        // Structure: a new bundle; one removed.
+        let new = base("n.node/node.toml", Some("stack = [{ op = \"t.file\" }]\nto = \"uid://a\"\n"));
+        check(&mut index, &project, &new, "a new bundle", true);
+        let mut gone = crate::testing::records_in(&root, "base");
+        gone.extend(base("n.node", None));
+        check(&mut index, &project, &gone, "a bundle removed", true);
         // An override in top, then what is below it changed: merged again, though only contents changed.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        check(
-            &mut index,
-            &project,
-            &[root.at("layers/top.toml"), root.at("layers/top/g/a.node/node.toml")],
-            "an override",
-            true,
-        );
-        write(&root, "layers/base/g/a.node/native.texels", "retouched");
-        check(&mut index, &project, &[base("g/a.node/native.texels")], "an override's base changed", true);
-        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n");
-        check(
-            &mut index,
-            &project,
-            &[root.at("layers/top/g/a.node/node.toml")],
-            "the override's own content, merged again",
-            true,
-        );
+        crate::testing::apply(&root, "top", &top, &[("g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n")]);
+        check(&mut index, &project, &crate::testing::records_in(&root, "top"), "an override", true);
+        let retouched = base("g/a.node/native.texels", Some("retouched"));
+        check(&mut index, &project, &retouched, "an override's base changed", true);
+        let noted = "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n";
+        crate::testing::apply(&root, "top", &top, &[("g/a.node/node.toml", noted)]);
+        let own = crate::testing::records_in(&root, "top");
+        check(&mut index, &project, &own, "the override's own content, merged again", true);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4816,8 +4791,7 @@ mod tests {
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
         top.ops.insert(uid("uid://nothing"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
-        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        crate::testing::apply(&root, "top", &top, &[("g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n")]);
         let (_, mut index) = open(&root);
         let info = index.layers();
         assert_eq!((info[1].overrides, info[1].deletes, info[1].problems), (1, 1, 1));

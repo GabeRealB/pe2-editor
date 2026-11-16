@@ -612,7 +612,7 @@ impl Storage {
         let record = |file: &Behind| {
             let shard = if file.folder { Some(file.path.clone()) } else { file.path.parent() };
             let records = shard
-                .filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2))
+                .filter(|shard| shard.file_name().is_some_and(crate::records::is_shard))
                 .and_then(|shard| shard.parent());
             let named = name_in(&self.root, &file.path).is_ok_and(|name| name.len() <= WAITING_PATH);
             named && records.is_some_and(|records| records.file_name().is_some_and(|name| name == crate::records::DIR))

@@ -1,5 +1,4 @@
 //! What a project is made of changing: it is read again with what it was still showing.
-use sfs::testing::At as _;
 
 use project::ext::Status;
 
@@ -92,6 +91,7 @@ fn what_is_asked_while_it_is_being_read_waits_without_stopping_the_window() {
 fn another_project_opens_without_waiting_for_the_one_left() {
     let mut editor = Scenario::open(Fixture::rig());
     let other = Fixture::notes();
+    other.as_records();
     editor.hold_reading().expect("held");
     // A window that waited for the worker would wait here for good: it is let go below.
     editor.editor().open_project(other.root());
@@ -102,33 +102,24 @@ fn another_project_opens_without_waiting_for_the_one_left() {
 }
 
 #[test]
-fn code_is_overridden_in_a_layer_made_for_it() {
+fn code_is_overridden_in_the_active_layer() {
     let mut editor = Scenario::open(Fixture::code());
-    let root = editor.fixture.root().clone();
-    editor.override_entry("src/thing.c").expect("an entry");
-    editor.expect("is code, from code");
-    editor.type_into("new files layer", "mine");
-    editor.click("Create and override");
-    assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    let copy = root.at("layers/mine/src/thing.c");
-    assert_eq!(std::fs::read_to_string(&copy).expect("the copy"), "int thing;\n");
-    assert!(editor.workspace().layers.iter().any(|layer| *layer.name == "mine"), "the project has it");
+    editor.override_entry("code/src/thing.c").expect("an entry");
+    let entry = &editor.workspace().index.entries[&super::path("code/src/thing.c")];
+    assert_eq!(entry.overrides.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(), ["base"]);
 }
 
 #[test]
-fn code_overridden_while_the_project_is_read_waits_its_turn() {
+fn an_override_asked_while_the_project_is_read_waits_its_turn() {
     let mut editor = Scenario::open(Fixture::code());
-    let root = editor.fixture.root().clone();
-    editor.override_entry("src/thing.c").expect("an entry");
-    editor.type_into("new files layer", "mine");
     editor.hold_reading().expect("held");
-    editor.click("Create and override");
+    editor.ask_override("code/src/thing.c").expect("an entry");
+    editor.frame();
     // The thread holding the project is reading it: what was asked is done after, the window going on.
     assert!(editor.editor().is_deferring(), "it waits its turn");
-    assert!(!editor.project_file().contains("name = \"mine\""), "nothing is written while the project is read");
     editor.release_reading().expect("let go");
-    assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    assert!(root.at("layers/mine/src/thing.c").is_file());
+    let entry = &editor.workspace().index.entries[&super::path("code/src/thing.c")];
+    assert_eq!(entry.overrides.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(), ["base"]);
 }
 
 #[test]

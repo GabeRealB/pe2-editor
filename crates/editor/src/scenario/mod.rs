@@ -296,6 +296,8 @@ impl Scenario {
         // A scenario that failed says so itself: the next has nothing to do with it.
         let alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture.root().clone();
+        // What the fixture wrote as trees, its layers' records, as a project made by hand is.
+        fixture.as_records();
         let show = show.map(str::to_string);
         // kittest's setup - a software rasterizer where there is one - with the editor's shader compiler.
         let mut setup = egui_kittest::wgpu::default_wgpu_setup();
@@ -372,11 +374,20 @@ impl Scenario {
     /// # Errors
     /// There is no such entry.
     pub fn override_entry(&mut self, path: &str) -> Result<(), String> {
+        self.ask_override(path)?;
+        self.settle();
+        Ok(())
+    }
+
+    /// Ask for an entry to be overridden in the active layer, as its context menu does, and go on.
+    ///
+    /// # Errors
+    /// There is no such entry.
+    pub fn ask_override(&mut self, path: &str) -> Result<(), String> {
         let at = tree(path)?;
         let uid =
             self.workspace().index.entries.get(&at).map(|entry| entry.uid).ok_or_else(|| format!("no entry {path}"))?;
         self.harness.state_mut().ask(&crate::workspace::EditRequest::Override(uid));
-        self.settle();
         Ok(())
     }
 
@@ -909,8 +920,22 @@ impl Scenario {
     /// A node's declaration, as written in the top layer that has it.
     #[track_caller]
     pub fn declaration(&self, path: &str) -> toml::Table {
-        let text = std::fs::read_to_string(self.written(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
-        text.parse().unwrap_or_else(|e| panic!("{path}: {e}"))
+        let bytes =
+            project::content::read(&pe2_io::system(), &self.written(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+        String::from_utf8(bytes).expect("text").parse().unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Write a node's declaration on disk as another program would: the layer exported as a tree, the file written
+    /// there, and the tree imported back, every entry keeping its uid.
+    pub fn write_on_disk(&self, path: &str, text: &str) {
+        let root = self.fixture.root();
+        let project = project::Project::load(root).expect("the project");
+        let layer = pe2_path::Name::new(fixture::LAYER).expect("a layer's name");
+        let staging = root.at("staging").at(fixture::LAYER);
+        project::records::export(&project, layer, staging.as_path()).expect("the layer exported");
+        std::fs::write(staging.at(&format!("{path}.node/node.toml")), text).expect("written");
+        project::records::import(&project, layer, staging.as_path()).expect("the layer imported");
+        std::fs::remove_dir_all(root.at("staging")).expect("the tree gone");
     }
 
     fn written(&self, path: &str) -> HostPath {

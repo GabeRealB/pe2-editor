@@ -17,8 +17,6 @@ use crate::workspace::{EditRequest, Workspace};
 #[derive(Default)]
 pub struct LayersState {
     pub new_layer: Option<String>,
-    /// The kind of the layer being added: plain files (true) or assets.
-    pub files: bool,
 }
 
 /// A layer's row being dragged: its name.
@@ -67,7 +65,7 @@ enum Action {
         above: bool,
     },
     /// A new layer, of plain files (true) or of assets.
-    Add(Arc<Name>, bool),
+    Add(Arc<Name>),
     Remove(Arc<Name>),
 }
 
@@ -105,9 +103,8 @@ impl Action {
                 ws.reorder(&order, said(format!("{layer} moved")));
                 None
             }
-            Action::Add(name, files) => {
-                let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
-                ws.add_layer(&name, kind, said(format!("{name} added at the top of the stack")));
+            Action::Add(name) => {
+                ws.add_layer(&name, said(format!("{name} added at the top of the stack")));
                 state.new_layer = None;
                 None
             }
@@ -356,13 +353,11 @@ fn footer_ui(ui: &mut egui::Ui, ws: &Workspace, state: &mut LayersState, action:
             ui.horizontal(|ui| {
                 let edit = ui.add(egui::TextEdit::singleline(name).hint_text("name").desired_width(140.0));
                 edit.request_focus();
-                ui.selectable_value(&mut state.files, false, "Assets").on_hover_text("Assets and plain files");
-                ui.selectable_value(&mut state.files, true, "Files").on_hover_text("Plain files only: code, a patch");
                 let valid = new_name(&ws.project, name);
                 let add = ui.add_enabled(valid.is_ok(), egui::Button::new("Add"));
                 let confirmed = add.clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if confirmed && let Ok(name) = &valid {
-                    *action = Some(Action::Add(name.clone(), state.files));
+                    *action = Some(Action::Add(name.clone()));
                 }
                 cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
                 if let Err(e) = valid

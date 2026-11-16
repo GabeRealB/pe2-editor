@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 use egui_tiles::{Behavior as _, TileId};
-use pe2_path::{Name, Uid};
+use pe2_path::Uid;
 use project::TreePath;
 use serde::Deserialize;
 use sfs::HostPath;
@@ -66,16 +66,7 @@ struct Capture {
 /// What was asked while the project was being read, done once it has been.
 enum Deferred {
     Edit(EditRequest),
-    Step {
-        redo: bool,
-        force: bool,
-        scope: Option<Uid>,
-    },
-    /// A files layer made of this name, and the entry of this uid overridden in it.
-    OverrideInNew {
-        uid: Uid,
-        name: Arc<Name>,
-    },
+    Step { redo: bool, force: bool, scope: Option<Uid> },
 }
 
 /// What waits on the documents with unsaved changes being saved or let go.
@@ -148,8 +139,6 @@ pub struct Editor {
     exports: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// An entry being renamed: its uid, its real path, the new name being typed.
     renaming: Option<(Uid, Arc<TreePath>, String)>,
-    /// Code being overridden while an asset layer is active: which files layer takes it.
-    choosing: Option<Choosing>,
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(HostPath, String)>,
@@ -322,7 +311,6 @@ impl Editor {
             exports: Vec::new(),
             agent_running: false,
             renaming: None,
-            choosing: None,
             layers_state: crate::layers::LayersState::default(),
             in_use: None,
             opened: None,
@@ -514,7 +502,6 @@ impl Editor {
             match deferred {
                 Deferred::Edit(request) => self.edit(&request),
                 Deferred::Step { redo, force, scope } => drop(self.step(redo, force, scope)),
-                Deferred::OverrideInNew { uid, name } => self.override_in_new(uid, name),
             }
         }
     }
@@ -633,24 +620,6 @@ impl Editor {
             return;
         }
         ws.author = author;
-        if let EditRequest::Override(uid) = request {
-            match ws.override_choice(*uid) {
-                Err(why) => {
-                    self.message = Some(why);
-                    return;
-                }
-                Ok(Some(layers)) => {
-                    let Some((path, entry)) = ws.index.entries.iter().find(|(_, e)| e.uid == *uid) else {
-                        self.message = Some(format!("{uid}: no entry has it"));
-                        return;
-                    };
-                    let (path, home) = (path.clone(), entry.home.clone());
-                    self.choosing = Some(Choosing { uid: *uid, path, home, layers, name: String::new() });
-                    return;
-                }
-                Ok(None) => {}
-            }
-        }
         // Asked of the worker, the window going on: what came of it is said once it is handed over.
         let said = |editor: &mut Editor, made: anyhow::Result<String>| {
             editor.message = Some(made.unwrap_or_else(|e| format!("{e:#}")));
@@ -676,78 +645,6 @@ impl Editor {
         for then in done {
             then(self);
         }
-    }
-
-    /// Which files layer takes code being overridden: one of those above its own, or a new one (added, the project
-    /// read again, then the override made in it).
-    fn choose_dialog(&mut self, ctx: &egui::Context) {
-        let Some(choosing) = &mut self.choosing else { return };
-        let (mut chosen, mut create, mut cancel) = (None, false, false);
-        let valid = self.workspace.as_ref().map(|ws| crate::layers::new_name(&ws.project, &choosing.name));
-        egui::Window::new("Override in a files layer")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_max_width(460.0);
-                ui.label(format!(
-                    "{} is code, from {}: it is overridden in a files layer above it, not in an asset layer.",
-                    choosing.path, choosing.home
-                ));
-                ui.add_space(6.0);
-                for layer in &choosing.layers {
-                    if ui.button(format!("Override in {layer}")).clicked() {
-                        chosen = Some(layer.clone());
-                    }
-                }
-                if choosing.layers.is_empty() {
-                    ui.label(RichText::new("No files layer can take it yet.").color(theme::weak()));
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut choosing.name)
-                            .hint_text("new files layer")
-                            .desired_width(160.0),
-                    );
-                    let ok = valid.as_ref().is_some_and(Result::is_ok);
-                    create = ui.add_enabled(ok, egui::Button::new("Create and override")).clicked();
-                });
-                if let Some(Err(e)) = &valid
-                    && !choosing.name.trim().is_empty()
-                {
-                    ui.label(RichText::new(e.to_string()).small().color(ui.visuals().warn_fg_color));
-                }
-                ui.add_space(6.0);
-                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
-            });
-        if cancel {
-            self.choosing = None;
-        } else if let Some(layer) = chosen {
-            let uid = choosing.uid;
-            self.choosing = None;
-            self.edit(&EditRequest::OverrideIn(uid, layer));
-        } else if create && let Some(Ok(name)) = valid {
-            let uid = choosing.uid;
-            self.choosing = None;
-            self.override_in_new(uid, name);
-        }
-    }
-
-    /// Make a files layer of this name and override the entry of this uid in it: once the project has been read,
-    /// where it is being read - the window goes on meanwhile.
-    fn override_in_new(&mut self, uid: Uid, name: Arc<Name>) {
-        let Some(ws) = &mut self.workspace else { return };
-        if let Some(ticket) = ws.reading_until() {
-            self.deferred.push((ticket, Deferred::OverrideInNew { uid, name }));
-            return;
-        }
-        let layer = name.clone();
-        ws.add_layer(&name, project::LayerKind::Files, move |editor, added| match added {
-            // The layer is there by now: the project was read again with it.
-            Ok(()) => editor.edit(&EditRequest::OverrideIn(uid, layer)),
-            Err(e) => editor.message = Some(format!("{e:#}")),
-        });
     }
 
     /// The new name of an entry being renamed: in its folder, a bundle keeping its `.node`.
@@ -1422,7 +1319,6 @@ impl Editor {
         self.exports_done();
         self.left_dialog(ctx);
         self.rename_dialog(ctx);
-        self.choose_dialog(ctx);
     }
 
     /// The window closing with unsaved documents: they are asked about first.
@@ -2149,7 +2045,7 @@ impl Editor {
         let view_edit = self.workspace.as_mut().and_then(|ws| ws.view_edit.take());
         if let Some(request) = outcome.edit.or(view_edit) {
             // An edit keeps what it edited open.
-            if matches!(request, EditRequest::Override(_) | EditRequest::OverrideIn(..) | EditRequest::Write { .. })
+            if matches!(request, EditRequest::Override(_) | EditRequest::Write { .. })
                 && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
             {
                 self.layouts.keep(&path);
@@ -3274,15 +3170,6 @@ fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(Uid, Arc<TreePa
     .response
     .on_hover_text("Documents with changes not saved: what is shown and made follows them; saving writes them");
     asked
-}
-
-/// Code being overridden: its uid, path and own layer, the files layers that can take it, a new one's name.
-struct Choosing {
-    uid: Uid,
-    path: Arc<TreePath>,
-    home: Arc<Name>,
-    layers: Vec<Arc<Name>>,
-    name: String,
 }
 
 /// What the layouts asked for in a frame: where to go, a message, windows to dock back, tab actions by window.

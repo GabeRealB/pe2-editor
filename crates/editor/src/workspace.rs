@@ -241,11 +241,6 @@ impl LayerView {
     }
 }
 
-/// Layers' names as a list says them.
-fn names(layers: &[Arc<Name>]) -> String {
-    layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>().join(", ")
-}
-
 /// Where this machine's settings of the project keep the view of the layers.
 const LAYER_VIEW: &[&str] = &["editor", "layers"];
 
@@ -448,8 +443,6 @@ type Steps = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(String, Optio
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditRequest {
     Override(Uid),
-    /// Override in this layer, not the active one: code, overridden in a files layer chosen for it.
-    OverrideIn(Uid, Arc<Name>),
     /// Ask for a new name, then rename: the uid and the entry's real path.
     Rename(Uid, Arc<TreePath>),
     /// Rename to this real path.
@@ -2201,12 +2194,6 @@ impl Workspace {
             let Some(document) = self.history.document(uid) else { continue };
             let path = document.path.clone();
             let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
-            if let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)? {
-                anyhow::bail!(
-                    "code is overridden in a files layer ({})",
-                    if choices.is_empty() { "none yet".into() } else { names(&choices) }
-                );
-            }
             saving.push((uid, layer, format!("Save {}", path.name().unwrap_or_default())));
         }
         let work = move |w: &mut crate::takein::Worker| {
@@ -2309,15 +2296,6 @@ impl Workspace {
             anyhow::bail!("{why}");
         }
         let name = match request {
-            // A files layer chosen for code: it is to be writable, as the active one is.
-            EditRequest::OverrideIn(_, layer) => {
-                let chosen = self.layers.iter().find(|l| l.name == *layer);
-                let chosen = chosen.with_context(|| format!("the project has no layer {layer}"))?;
-                if self.is_locked(chosen) {
-                    anyhow::bail!("{layer} is locked");
-                }
-                layer.clone()
-            }
             // Only the list is written: its own, whether it is the active layer or not.
             EditRequest::Forget(layer, _) => {
                 let chosen = self.layers.iter().find(|l| l.name == *layer);
@@ -2347,40 +2325,19 @@ impl Workspace {
             }
             _ => self.editable_layer().map_err(anyhow::Error::msg)?.name.clone(),
         };
-        let uid = match request {
-            EditRequest::Override(uid)
-            | EditRequest::OverrideIn(uid, _)
-            | EditRequest::Rename(uid, _)
-            | EditRequest::RenameTo(uid, _)
-            | EditRequest::Delete(uid)
-            | EditRequest::Forget(_, uid)
-            | EditRequest::Resolve(uid, _)
-            | EditRequest::Write { uid, .. } => *uid,
-            EditRequest::ShowGraph
-            | EditRequest::Refused(_)
-            | EditRequest::Adopt(..)
-            | EditRequest::RemoveUnlisted(..) => {
-                return Ok(Box::new(|_| Ok(String::new())));
-            }
-        };
-        // Code goes to a files layer: an override of it in an asset layer is asked of the user first
-        // (`override_choice`), and a write into it is made there.
-        if matches!(request, EditRequest::Override(_) | EditRequest::Write { .. })
-            && let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)?
-        {
-            anyhow::bail!(
-                "code is overridden in a files layer ({})",
-                if choices.is_empty() { "none yet".into() } else { names(&choices) }
-            );
+        // What edits no entry is done here: nothing is asked of the worker.
+        if matches!(
+            request,
+            EditRequest::ShowGraph | EditRequest::Refused(_) | EditRequest::Adopt(..) | EditRequest::RemoveUnlisted(..)
+        ) {
+            return Ok(Box::new(|_| Ok(String::new())));
         }
         let (request, selected) = (request.clone(), self.selected.clone());
         // An edit reads the index (a layer's changeset): made by the worker, once what was asked before is taken in.
         Ok(Box::new(move |w| {
             let (project, index, history) = (&w.core.project, &w.core.index, &mut w.history);
             match &request {
-                EditRequest::Override(uid) | EditRequest::OverrideIn(uid, _) => {
-                    edit::override_entry(project, index, &name, *uid, history)?
-                }
+                EditRequest::Override(uid) => edit::override_entry(project, index, &name, *uid, history)?,
                 EditRequest::Delete(uid) => edit::delete(project, index, &name, *uid, history)?,
                 EditRequest::Forget(_, uid) => edit::forget(project, index, &name, *uid, history)?,
                 EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, *uid, to, history)?,
@@ -2420,43 +2377,11 @@ impl Workspace {
         self.ask(move |w| project::stack::reorder(&w.core.project, &layers, &order, &mut w.history), then);
     }
 
-    /// Add a new, empty layer of a type at the top of the stack: `then` is done once the project was read again
-    /// with it - or given why it could not be: the name is not one a layer may take, or it cannot be written.
-    pub fn add_layer(
-        &mut self,
-        name: &Name,
-        kind: project::LayerKind,
-        then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static,
-    ) {
+    /// Add a new, empty layer at the top of the stack: `then` is done once the project was read again with it - or
+    /// given why it could not be: the name is not one a layer may take, or it cannot be written.
+    pub fn add_layer(&mut self, name: &Name, then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
         let name = name.to_owned();
-        self.ask(move |w| project::stack::add(&w.core.project, &name, kind, &mut w.history), then);
-    }
-
-    /// Where an override of an entry (by uid) goes: the active layer (none), or - code (an entry of a files layer)
-    /// while an asset layer is active - one of the files layers above its own, which can be written: the user's
-    /// choice, these the candidates (perhaps none: a files layer is to be made).
-    ///
-    /// # Errors
-    /// The active layer cannot be written, or holds plain files only and the entry is an asset.
-    pub fn override_choice(&self, uid: Uid) -> Result<Option<Vec<Arc<Name>>>, String> {
-        use project::LayerKind;
-        let active = self.editable_layer()?;
-        let Some(entry) = self.index.entries.values().find(|e| e.uid == uid) else { return Ok(None) };
-        if active.kind == LayerKind::Files && entry.kind == project::index::Kind::Asset {
-            return Err(format!("{} is a files layer: it holds plain files, not assets", active.name));
-        }
-        let home = self.layers.iter().position(|l| l.name == entry.home);
-        let code = home.is_some_and(|h| self.layers[h].kind == LayerKind::Files);
-        if !code || active.kind == LayerKind::Files {
-            return Ok(None);
-        }
-        let above = home.map_or(0, |h| h + 1);
-        let candidates = self.layers[above..]
-            .iter()
-            .filter(|l| l.kind == LayerKind::Files && !l.mounted && !self.is_locked(l))
-            .map(|l| l.name.clone())
-            .collect();
-        Ok(Some(candidates))
+        self.ask(move |w| project::stack::add(&w.core.project, &name, &mut w.history), then);
     }
 
     /// Take a layer out of the stack; its files stay on disk. `then` is given why it could not be, where it could

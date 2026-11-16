@@ -50,7 +50,7 @@ with no console at all makes Windows open a terminal for every console program i
 ## Watching the layers
 
 One watch (`holder::watch`) follows what changes under a project's layers by other means than the holder: git, an
-editor in a code layer, a script. Changes are batched until the layers are quiet for a moment, and taken in like any
+editor in a mounted tree, a script. Changes are batched until the layers are quiet for a moment, and taken in like any
 change. What the holder wrote itself it recognizes by the stamp the file will have, so it never takes in its own
 writes.
 
