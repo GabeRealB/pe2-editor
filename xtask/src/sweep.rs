@@ -2,7 +2,13 @@
 //! crate built with other features, for another profile, or before what it depends on changed - each in a folder of
 //! its own (`target/debug/build/<package>/<hash>`), and the workspace's crates pile up dozens of them. What the
 //! checks build now is asked of cargo itself: it says each unit it made or found fresh. Every other unit's folder
-//! goes, and so do incremental caches rustc has not touched in a week, which no unit names.
+//! goes.
+//!
+//! Incremental caches (`target/debug/incremental/<crate>-<hash>`) are rustc's, one a unit, and no unit names its own:
+//! a crate's are made anew whenever what its units are built with changes - a dependency added anywhere below it - and
+//! the old ones stay. So a crate the checks build keeps its newest caches, as many as it has units now; the rest are
+//! of units no longer built. A crate they do not build keeps those touched in the last week. A cache taken that was
+//! still live costs a slower build, never a wrong one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -17,6 +23,9 @@ const BUILDS: [&[&str]; 2] = [&["clippy", "--workspace", "--all-targets"], &["te
 /// How long an incremental cache rustc has not touched is kept.
 const INCREMENTAL_KEPT: Duration = Duration::from_hours(7 * 24);
 
+/// By crate, as rustc names it (`pe2_cli`), each of its units by the files it made.
+type Units = BTreeMap<String, BTreeSet<Vec<PathBuf>>>;
+
 /// Sweep the build folder of the workspace's debug builds; say what was removed.
 ///
 /// # Errors
@@ -25,8 +34,13 @@ pub fn run(workspace: &Path, target: &Path) -> Result<()> {
     let debug = target.join("debug");
     let units = debug.join("build");
     let mut kept = BTreeSet::new();
+    let mut crates = Units::new();
     for args in BUILDS {
-        kept.extend(named(workspace, &units, args)?);
+        let (named, built) = named(workspace, &units, args)?;
+        kept.extend(named);
+        for (name, built) in built {
+            crates.entry(name).or_default().extend(built);
+        }
     }
     let mut freed = 0;
     let mut removed = 0;
@@ -45,20 +59,34 @@ pub fn run(workspace: &Path, target: &Path) -> Result<()> {
     let mut caches = 0;
     let incremental = debug.join("incremental");
     let now = SystemTime::now();
+    // Each crate's caches, newest first.
+    let mut by_crate: BTreeMap<String, Vec<(Option<SystemTime>, PathBuf)>> = BTreeMap::new();
     for cache in std::fs::read_dir(&incremental).into_iter().flatten().flatten() {
-        let touched = last_touched(&cache.path());
-        if touched.is_some_and(|touched| now.duration_since(touched).unwrap_or_default() > INCREMENTAL_KEPT) {
-            freed += size_of(&cache.path());
+        let name = cache.file_name().to_string_lossy().into_owned();
+        let Some((name, _)) = name.rsplit_once('-') else { continue };
+        by_crate.entry(name.to_string()).or_default().push((last_touched(&cache.path()), cache.path()));
+    }
+    for (name, mut held) in by_crate {
+        held.sort_by_key(|(touched, _)| std::cmp::Reverse(*touched));
+        let old = |touched: Option<SystemTime>| {
+            touched.is_some_and(|touched| now.duration_since(touched).unwrap_or_default() > INCREMENTAL_KEPT)
+        };
+        let gone: Vec<PathBuf> = match crates.get(&name) {
+            Some(units) => held.into_iter().skip(units.len()).map(|(_, cache)| cache).collect(),
+            None => held.into_iter().filter(|(touched, _)| old(*touched)).map(|(_, cache)| cache).collect(),
+        };
+        for cache in gone {
+            freed += size_of(&cache);
             caches += 1;
-            std::fs::remove_dir_all(cache.path()).with_context(|| cache.path().display().to_string())?;
+            std::fs::remove_dir_all(&cache).with_context(|| cache.display().to_string())?;
         }
     }
     println!("{removed} old units and {caches} incremental caches removed: {} MiB", freed >> 20);
     Ok(())
 }
 
-/// The units' folders a build makes or finds fresh, as cargo says them.
-fn named(workspace: &Path, units: &Path, args: &[&str]) -> Result<BTreeSet<PathBuf>> {
+/// The units' folders a build makes or finds fresh, as cargo says them; and the units of each crate.
+fn named(workspace: &Path, units: &Path, args: &[&str]) -> Result<(BTreeSet<PathBuf>, Units)> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .args(args)
@@ -69,6 +97,7 @@ fn named(workspace: &Path, units: &Path, args: &[&str]) -> Result<BTreeSet<PathB
         .with_context(|| format!("cargo {}", args.join(" ")))?;
     ensure!(output.status.success(), "cargo {} failed: nothing is removed", args.join(" "));
     let mut kept = BTreeSet::new();
+    let mut crates = Units::new();
     // A program is said by its copy beside the units (`target/debug/pe2-cli`): its unit is found by that copy.
     let mut programs: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -83,6 +112,11 @@ fn named(workspace: &Path, units: &Path, args: &[&str]) -> Result<BTreeSet<PathB
             Some("build-script-executed") => message["out_dir"].as_str().map(PathBuf::from).into_iter().collect(),
             _ => continue,
         };
+        if message["reason"] == "compiler-artifact"
+            && let Some(name) = message["target"]["name"].as_str()
+        {
+            crates.entry(name.replace('-', "_")).or_default().insert(said.clone());
+        }
         for file in said {
             if let Some(unit) = unit_of(units, &file) {
                 kept.insert(unit);
@@ -97,7 +131,7 @@ fn named(workspace: &Path, units: &Path, args: &[&str]) -> Result<BTreeSet<PathB
             kept.extend(program_units(&units.join(&package), &copy));
         }
     }
-    Ok(kept)
+    Ok((kept, crates))
 }
 
 /// The unit's folder a file is in: `<units>/<package>/<hash>`.
