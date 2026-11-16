@@ -50,10 +50,9 @@ pub fn add_generated(project: &Project, name: &Name, fills: &Name, history: &mut
     for table in all {
         layers.push(table);
     }
+    // What it holds is this machine's alone, in the local folder, made as its plan first runs: nothing of it ships.
     let mut tx = history.begin(format!("Add the layer {name}, filling {fills}"));
-    tx.make_dir(&project.root.join(&crate::LAYERS).join(name))?;
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
-    ignored(&mut tx, &project.root, &format!("/{path}/"))?;
     tx.commit().map(drop)
 }
 
@@ -307,7 +306,7 @@ mod tests {
         assert!(at("game") < at("project"), "the game's layer is below the project's own");
         assert_eq!(at("game-files"), at("game") + 1, "a generated layer is right above the layer it fills");
         let ignored = std::fs::read_to_string(dir.at(".gitignore")).unwrap();
-        assert!(ignored.contains("/layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
+        assert!(!ignored.contains("game-files") && ignored.contains("/roms/"), "{ignored}");
         assert!(ignored.contains("/.local/"), "{ignored}");
         // Where the discs are is this machine's.
         let elsewhere = dir.with_suffix(pe2_path::Name::constant(".elsewhere"));

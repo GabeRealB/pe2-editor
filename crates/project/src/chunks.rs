@@ -302,6 +302,13 @@ impl Store {
         Store { dir: root.join(&crate::STORE), io }
     }
 
+    /// The store of what only this machine's records name, of the project in `root` (`.local/store`): what a plan
+    /// makes of the discs, which is never shipped.
+    #[must_use]
+    pub fn local(root: &HostPath, io: Arc<dyn pe2_io::Io>) -> Store {
+        Store { dir: crate::local::part(root, crate::local::STORE), io }
+    }
+
     fn fs(&self) -> &dyn Filesystem {
         self.io.filesystem()
     }

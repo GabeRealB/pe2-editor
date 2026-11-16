@@ -17,7 +17,7 @@ below is copied or changed.
 |---|---|---|
 | A project's layers | **Records**: one file per entry it touches, by uid, in the layer's folder (`layers/<layer>/<aa>/<uid>.toml`, beside its `layer.toml`), its tree addressed under `layers/<layer>/tree` on no disk | Nobody edits them by hand: what they hold - assets, and plain files such as code - is edited through the served folder with any tool; renaming a folder of thousands of entries is one record; text stays text in version control. |
 | Mounts | Plain trees of files, outside the project | Worked on with their own tools, where they are. |
-| Generated layers | A tree of files, or **packed**: one journaled listing, contents in the store | Written only by their plan; nothing to scan. |
+| Generated layers | **Records** too - an override of each node a plan gives files - this machine's alone: in `.local/layers/<layer>/`, what they hold in `.local/store/` | Made of the user's own discs by their plan, which alone writes them: never shipped. |
 
 A tool hands a layer over as a tree of files and its listing (`pe2-cli project layer import`): read as it is, by
 no index - a `<name>.node` folder a node, another folder a folder, another file a plain file, each by the uid its
@@ -48,6 +48,8 @@ project is made with leaves out (`project::local`):
 | `filesystem/` | the shared filesystem's log and the space its processes share | until applied, and as long as it says its own format |
 | `history/` | the session's history: steps, blobs, journal, trash | until the session closes cleanly |
 | `conflicts/` | what writes that met a change made meanwhile left aside | until the user settles it |
+| `layers/` | the records of the layers that are this machine's alone: a generated layer's | as long as the layer |
+| `store/` | what those records hold, by hash: what a plan made of the discs | as long as something names it |
 | `outputs/` | what is derived from the layers: the work graph's store, imports, merges, materialized files | until another schema or version opens it: the only part wiped |
 | `set-aside/` | what the served folder held that was not the project's | until the user removes it |
 | `settings.toml` | this machine's settings of the project (where its unmanaged mounts are, links to what builds deploy, how it is served) and the editor's view of it (`[editor.layers]`, `[editor.fill]`) | always |

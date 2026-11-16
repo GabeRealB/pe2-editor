@@ -4735,12 +4735,27 @@ mod tests {
     #[test]
     fn a_generated_layer_gives_the_nodes_it_fills_their_files() {
         let root = project("generated");
-        // The nodes are base's; what their plan made, base-files' - without a node of its own, and its record beside.
+        // The nodes are base's; what their plan made, base-files' - an override of each node it gives files, in the
+        // local folder, what it holds in the local store - as a plan's run writes them.
         let text = "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"base-files\"\nkind = \"generated\"\nfills = \"base\"\n\n[[layer]]\nname = \"top\"\n";
         write(&root, "project.toml", text);
         std::fs::remove_file(root.at("layers/base/g/a.node/native.texels")).unwrap();
-        write(&root, "layers/base-files/g/a.node/native.texels", "texels");
-        write(&root, "layers/base-files/extraction.record.jsonl", "{}");
+        let fill = |root: &HostPath, texels: &str| -> Vec<HostPath> {
+            use crate::records::{Content, File, Kind, Op, Record};
+            let project = Project::load(root).unwrap();
+            let layer = project.layer(pe2_path::Name::constant("base-files")).unwrap();
+            let sha1 = crate::chunks::Store::local(root, crate::testing::io()).put_file(texels.as_bytes()).unwrap();
+            let held = File { content: Some(Content::Stored { sha1, size: texels.len() as u64 }), base: None };
+            let files = std::collections::BTreeMap::from([(rel("native.texels"), held)]);
+            let record = Record { op: Op::Override, kind: Kind::Node, parent: None, name: None, files };
+            let folder = layer.records.as_ref().unwrap();
+            let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
+            let records = std::collections::BTreeMap::from([(uid("uid://a"), record)]);
+            crate::records::replace(&project, folder, &settings, &records, "fill").unwrap();
+            vec![crate::records::path_of(folder, uid("uid://a")).unwrap()]
+        };
+        crate::testing::as_records(&root);
+        fill(&root, "texels");
         let (project, mut index) = open(&root);
         let a = &index.assets[&tree("g/a")];
         let held: Vec<(&str, &str)> = a.files.iter().map(|f| (f.name.as_str(), f.layer.as_str())).collect();
@@ -4754,8 +4769,8 @@ mod tests {
         );
         // What the plan writes again is taken in as the node's.
         let (_, fresh) = open(&root);
-        let texels = write(&root, "layers/base-files/g/a.node/native.texels", "repainted");
-        index.refresh(&project, std::slice::from_ref(&texels)).unwrap();
+        let changed = fill(&root, "repainted");
+        index.refresh(&project, &changed).unwrap();
         assert_ne!(shown(&index), shown(&fresh));
         let (_, again) = open(&root);
         assert_eq!(shown(&index), shown(&again));
@@ -4765,11 +4780,11 @@ mod tests {
         crate::testing::apply(&root, "top", &top, &[("g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n")]);
         let below = index.below(pe2_path::Name::constant("top"), uid("uid://a")).unwrap();
         assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
-        write(&root, "layers/base-files/g/a.node/native.texels", "extracted otherwise");
+        fill(&root, "extracted otherwise");
         let (_, after) = open(&root);
         assert!(!after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
         let texels = after.assets[&tree("g/a")].files.iter().find(|f| *f.name == *"native.texels").unwrap();
-        assert_eq!(std::fs::read_to_string(&texels.path).unwrap(), "extracted otherwise");
+        assert_eq!(crate::content::read(&crate::testing::io(), &texels.path).unwrap(), b"extracted otherwise");
         let _ = std::fs::remove_dir_all(&root);
     }
 

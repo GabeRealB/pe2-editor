@@ -319,7 +319,8 @@ pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usi
 
 /// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
 /// of them where there are fewer.
-pub(crate) fn is_shard(name: &std::ffi::OsStr) -> bool {
+#[must_use]
+pub fn is_shard(name: &std::ffi::OsStr) -> bool {
     (1..=2).contains(&name.len())
 }
 
@@ -571,6 +572,8 @@ struct View {
     dir: HostPath,
     /// Where its records are.
     folder: HostPath,
+    /// Where what they keep by hash is: the project's store, or - for records this machine's alone - its local one.
+    store: crate::chunks::Store,
     settings: Settings,
     records: Read,
     /// Each file by its path in the layer: its entry's uid and its name in the entry (the root for a plain file).
@@ -624,10 +627,11 @@ impl View {
     }
 
     /// What a records layer whose tree is at `dir` and records in `folder` is seen as before its records are read.
-    fn new(dir: HostPath, folder: HostPath) -> View {
+    fn new(dir: HostPath, folder: HostPath, store: crate::chunks::Store) -> View {
         View {
             dir,
             folder,
+            store,
             settings: Settings::default(),
             records: Read::default(),
             files: BTreeMap::new(),
@@ -1015,7 +1019,8 @@ impl Set {
                 continue;
             }
             below_changed = true;
-            let settings = settings(fs, folder)?;
+            // A layer whose records are none yet - a generated one before its plan first ran - holds nothing.
+            let settings = if fs.exists(folder) { settings(fs, folder)? } else { Settings::default() };
             // The records that changed read again, where the paths say which; else all of them looked at.
             let after = before.zip(changed).and_then(|(view, paths)| read_changed(fs, folder, &view.records, paths));
             // What is known of the layer, as records read: what was read here before, where nothing else is.
@@ -1031,7 +1036,13 @@ impl Set {
                 (None, Some(known)) => read_records(fs, folder, Some(&known))?,
                 (None, None) => read_records(fs, folder, before.map(|v| &v.records))?,
             };
-            let mut view = View { settings, ..View::new(layer.path.clone(), folder.clone()) };
+            // This machine's alone, where its records are in the local folder: what they keep is in the local store.
+            let store = if folder.starts_with(&crate::local::part(&project.root, crate::local::LAYERS)) {
+                crate::chunks::Store::local(&project.root, project.io.clone())
+            } else {
+                crate::chunks::Store::at(&project.root, project.io.clone())
+            };
+            let mut view = View { settings, ..View::new(layer.path.clone(), folder.clone(), store) };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<Uid, Arc<TreePath>> = std::collections::HashMap::new();
@@ -1238,7 +1249,7 @@ impl Set {
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
         let held = view.records.get(uid)?;
-        Some((held.record.files.get(name)?.content.clone()?, held.modified, set.store.clone()))
+        Some((held.record.files.get(name)?.content.clone()?, held.modified, view.store.clone()))
     }
 
     /// Where the content of a file of a records layer lives, for what serves it to read it without the records: the
@@ -1254,7 +1265,7 @@ impl Set {
             Content::Text(_) => {
                 Source::RecordText { record: path_of(&view.folder, *uid).ok()?, name: name.to_string() }
             }
-            Content::Stored { sha1, .. } => Source::Stored { sha1: *sha1, store: set.store.dir.clone() },
+            Content::Stored { sha1, .. } => Source::Stored { sha1: *sha1, store: view.store.dir.clone() },
         })
     }
 
@@ -1376,9 +1387,27 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     // What changes, and only that: each record that differs from what the layer has, those it no longer has gone, its
     // settings where they differ.
     let folder = layer.records.as_ref().with_context(|| format!("{name} is no records layer"))?;
+    replace(project, folder, &said, &records, &format!("Import the layer {name}"))?;
+    Ok(records.len())
+}
+
+/// Make the records in `folder` these, with these settings: each record that differs from what the folder has
+/// written, those it no longer has removed, its marker where its settings differ - as one set said in the log
+/// (`write_set`), only what differs.
+///
+/// # Errors
+/// The folder's records cannot be read, or the set cannot be written.
+pub fn replace(
+    project: &crate::Project,
+    folder: &HostPath,
+    settings_now: &Settings,
+    records: &BTreeMap<Uid, Record>,
+    label: &str,
+) -> Result<()> {
+    let fs = project.io.filesystem();
     let old = read_records(fs, folder, None)?;
     let mut writes: Vec<(HostPath, Option<String>)> = Vec::new();
-    for (uid, record) in &records {
+    for (uid, record) in records {
         if old.get(uid).is_none_or(|held| *held.record != *record) {
             writes.push((path_of(folder, *uid)?, Some(record.render())));
         }
@@ -1386,11 +1415,10 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     for uid in old.keys().filter(|uid| !records.contains_key(*uid)) {
         writes.push((path_of(folder, *uid)?, None));
     }
-    if settings(fs, folder).ok().as_ref() != Some(&said) {
-        writes.push((folder.join(&MARKER), Some(marker(&said))));
+    if settings(fs, folder).ok().as_ref() != Some(settings_now) {
+        writes.push((folder.join(&MARKER), Some(marker(settings_now))));
     }
-    write_set(project, &format!("Import the layer {name}"), &writes)?;
-    Ok(records.len())
+    write_set(project, label, &writes)
 }
 
 /// Write a set of files of a project whole: said in its log before any is touched (`storage::Storage::say`), so that

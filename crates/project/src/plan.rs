@@ -36,7 +36,16 @@ use std::sync::{Arc, Mutex};
 use crate::discs::{self, Container, OpenDisc};
 use crate::extract::sha1_hex;
 
-pub const RECORD: &Name = Name::constant("extraction.record.jsonl");
+pub const RECORD: &Name = Name::constant("plan.record.jsonl");
+
+/// Where a generated layer's plan keeps the record of its last run: beside the layer's records, in the local folder.
+///
+/// # Errors
+/// The layer is no generated one: it has no records' folder.
+pub fn record_of(layer: &crate::Layer) -> Result<HostPath> {
+    let folder = layer.records.as_ref().with_context(|| format!("{} has no records", layer.name))?;
+    Ok(folder.join(RECORD))
+}
 
 /// A release a plan reads: where its discs are looked for (`res://`), and each disc's image, by name, size and sha1 -
 /// the sha1 deciding, the name where it is looked for first.
@@ -542,6 +551,9 @@ fn write_record(fs: &dyn pe2_io::Filesystem, path: &HostPath, plan: &Plan, recor
         text.push_str(&json!({"check": check, "key": key}).to_string());
         text.push('\n');
     }
+    if let Some(folder) = path.parent() {
+        fs.create_folder_all(&folder)?;
+    }
     crate::local::write_atomic(fs, path, text.as_bytes())
 }
 
@@ -801,7 +813,7 @@ pub fn observe(
         plan: &plan,
         keys: &keys,
         inputs: plan.inputs.iter().map(|(r, i)| Ok((r.clone(), look_in(&i.look_in)?))).collect::<Result<_>>()?,
-        layer: None,
+        store: None,
         found: HashMap::new(),
         engine,
         extensions,
@@ -834,18 +846,9 @@ impl Plan {
     }
 }
 
-/// Where a recorded file's bytes are in the layer: its own place, or, one the same as what the releases share, the
-/// shared file's.
-fn on_disk(plan: &Plan, layer: &HostPath, node: &str, file: &str, written: &Written) -> HostPath {
-    match plan.plain_of(file).filter(|_| written.shared) {
-        Some(shared) => file_path(layer, node, shared),
-        None => file_path(layer, node, file),
-    }
-}
-
-/// Keep no release's own file that is the same as what the releases share: each removed, recorded as the shared one.
-/// How many.
-fn share_alike(io: &std::sync::Arc<dyn pe2_io::Io>, plan: &Plan, layer: &HostPath, record: &mut Record) -> usize {
+/// Keep no release's own file that is the same as what the releases share: each recorded as the shared one, and given
+/// to no node, which reads the shared one in its place. How many.
+fn share_alike(plan: &Plan, record: &mut Record) -> usize {
     let alike: Vec<(String, String)> = record
         .files
         .iter()
@@ -859,36 +862,61 @@ fn share_alike(io: &std::sync::Arc<dyn pe2_io::Io>, plan: &Plan, layer: &HostPat
         })
         .map(|(entry, _)| entry.clone())
         .collect();
-    for (node, file) in &alike {
-        let path = file_path(layer, node, file);
-        let _ = crate::content::remove(io, &path);
-        if let Some(folder) = path.parent() {
-            let _ = io.filesystem().remove_folder(&folder);
-        }
-        if let Some(written) = record.files.get_mut(&(node.clone(), file.clone())) {
+    for entry in &alike {
+        if let Some(written) = record.files.get_mut(entry) {
             written.shared = true;
         }
     }
     alike.len()
 }
 
-/// The path of a bundle's file in the layer.
-fn file_path(layer: &HostPath, node: &str, file: &str) -> HostPath {
-    // Its names are the plan's, checked as it is read (`Plan::read`): one that is no path is the layer's folder,
-    // which no file can be written as.
-    match RelPath::new(&format!("{node}{}/{file}", crate::index::BUNDLE_SUFFIX)) {
-        Ok(within) => layer.join(&within),
-        Err(_) => layer.clone(),
+/// Whether what a run recorded is there: what it made of a file, in the store - or, none made, nothing.
+fn there(store: &crate::chunks::Store, written: &Written) -> bool {
+    written.sha1.is_none_or(|sha1| store.has_file(&sha1))
+}
+
+/// Make the generated layer's records what a run recorded: an override of each node it gives files, holding them by
+/// their hashes in the local store - but a release's own file that is what the releases share, which the node reads
+/// in its place - written as one set, only what differs.
+///
+/// # Errors
+/// The layer it fills is no records layer, a node is none of its, or the records cannot be written.
+fn write_records(project: &crate::Project, generated: &crate::Layer, record: &Record) -> Result<()> {
+    use crate::records::{Content, File, Kind, Op};
+    let fills = generated.fills.as_deref().with_context(|| format!("{} is no generated layer", generated.name))?;
+    let nodes = project.layer(fills)?;
+    crate::records::Set::open(project)?;
+    let listed = crate::records::Set::changeset(&nodes.path).with_context(|| format!("{fills} is no records layer"))?;
+    let uid_at: HashMap<&str, pe2_path::Uid> = listed.entries.iter().map(|(uid, at)| (at.as_str(), *uid)).collect();
+    let mut records: BTreeMap<pe2_path::Uid, crate::records::Record> = BTreeMap::new();
+    for ((node, file), written) in &record.files {
+        let Some(sha1) = written.sha1.filter(|_| !written.shared) else { continue };
+        let at = format!("{node}{}", crate::index::BUNDLE_SUFFIX);
+        let uid = *uid_at.get(at.as_str()).with_context(|| format!("{at}: no node of {fills}"))?;
+        let name = RelPath::new(file).with_context(|| format!("{at}: {file}"))?.to_owned();
+        let held = File { content: Some(Content::Stored { sha1, size: written.size }), base: None };
+        let override_ = || crate::records::Record {
+            op: Op::Override,
+            kind: Kind::Node,
+            parent: None,
+            name: None,
+            files: BTreeMap::new(),
+        };
+        records.entry(uid).or_insert_with(override_).files.insert(name, held);
     }
+    let folder = generated.records.as_ref().with_context(|| format!("{} has no records", generated.name))?;
+    let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
+    crate::records::replace(project, folder, &settings, &records, &format!("Fill {}", generated.name))?;
+    crate::records::Set::open(project)?;
+    Ok(())
 }
 
 /// What a run is to make: each file whose key changed, or which is not there as written - a folder's, any of its
 /// files; what is as written goes into the new record as it was.
 fn wanted(
-    io: &std::sync::Arc<dyn pe2_io::Io>,
+    store: &crate::chunks::Store,
     plan: &Plan,
     keys: &[String],
-    layer: &HostPath,
     old: &Record,
     record: &mut Record,
     ran: &mut Ran,
@@ -908,13 +936,12 @@ fn wanted(
                 })
                 .collect();
             let as_written = |((node, file), written): &(&(String, String), &Written)| {
-                let there = crate::content::len(io, &on_disk(plan, layer, node, file, written)).ok();
                 // What a release's own file was the same as is so still.
                 let alike = !written.shared
                     || plan.plain_of(file).is_some_and(|plain| {
                         old.files.get(&(node.clone(), plain.to_string())).is_some_and(|s| s.sha1 == written.sha1)
                     });
-                written.key == key && alike && there == written.present().then_some(written.size)
+                written.key == key && alike && there(store, written)
             };
             if !given.possible {
                 // Left as it is: what the last run made of it, if anything.
@@ -985,17 +1012,21 @@ pub fn run(
     // What the nodes are, read as any layer's: a records layer's through its records.
     crate::records::Set::open(project)?;
     let layer = &generated.path;
+    // What it makes is kept by hash in the local store - made of the discs, never shipped - and its record beside the
+    // layer's records.
+    let store = crate::chunks::Store::local(&project.root, project.io.clone());
+    let record_file = record_of(generated)?;
     let mut plan = Plan::read(project.io.filesystem(), &generated.plan())?;
     let unmet = plan.unmet(extensions);
     anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
     let (available, found) = found_releases(project, &plan, releases)?;
     let possible = plan.resolve(&available);
-    let old = read_record(project.io.filesystem(), &layer.join(&RECORD));
+    let old = read_record(project.io.filesystem(), &record_file);
     let mut record = Record::default();
     let in_order = plan.releases().into_iter().filter(|r| available.contains(r)).collect();
     let mut ran = Ran { releases: in_order, ..Ran::default() };
-    let wanted = wanted(&project.io, &plan, &keys, layer, &old, &mut record, &mut ran);
+    let wanted = wanted(&store, &plan, &keys, &old, &mut record, &mut ran);
     // Each check whose key changed; a check of what was written, after everything is.
     let mut checked = vec![false; plan.ops.len()];
     let mut last = Vec::new();
@@ -1049,7 +1080,7 @@ pub fn run(
             .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
             .collect::<Result<_>>()?,
         found,
-        layer: Some((layer, &project.io)),
+        store: Some(&store),
         engine,
         extensions,
         checked,
@@ -1079,12 +1110,16 @@ pub fn run(
     if let Some(why) = failed {
         record.releases = Some(available.iter().cloned().chain(old.releases.clone().unwrap_or_default()).collect());
         // What was written is kept as made: a run stopped or failed goes on from there next time.
-        write_record(project.io.filesystem(), &layer.join(&RECORD), &plan, &record)?;
+        write_records(project, generated, &record)?;
+        write_record(project.io.filesystem(), &record_file, &plan, &record)?;
         return Err(why);
     }
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
         record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
     }
+    // What was made is the layer's before what joins it is checked: read as the project reads it.
+    ran.shared = share_alike(&plan, &mut record);
+    write_records(project, generated, &record)?;
     joined(&plan, &keys, &last, [nodes, layer], engine, extensions, &mut record, &mut ran)?;
     // The releases the files are of: those read, and those of what was left as it was.
     record.releases = Some(if ran.skipped > 0 {
@@ -1093,20 +1128,9 @@ pub fn run(
     } else {
         available.clone()
     });
-    ran.shared = share_alike(&project.io, &plan, layer, &mut record);
-    ran.removed = remove_left(&project.io, layer, &old, &record);
-    write_record(project.io.filesystem(), &layer.join(&RECORD), &plan, &record)?;
+    ran.removed = old.files.keys().filter(|entry| !record.files.contains_key(*entry)).count();
+    write_record(project.io.filesystem(), &record_file, &plan, &record)?;
     Ok(ran)
-}
-
-/// Remove what no bundle is given any more: what the last run recorded and this one did not. How many went.
-fn remove_left(io: &std::sync::Arc<dyn pe2_io::Io>, layer: &HostPath, old: &Record, record: &Record) -> usize {
-    let left = old.files.keys().filter(|entry| !record.files.contains_key(*entry));
-    left.filter(|(node, file)| {
-        let path = file_path(layer, node, file);
-        crate::content::exists(io, &path) && crate::content::remove(io, &path).is_ok()
-    })
-    .count()
 }
 
 const ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::AcqRel;
@@ -1128,8 +1152,8 @@ struct RunState<'a> {
     /// Where each release's discs are looked for, and where those found are, by sha1.
     inputs: HashMap<String, HostPath>,
     found: HashMap<pe2_ext::Sha1, HostPath>,
-    /// The layer it writes, and the clock its files are written by; none where it only observes.
-    layer: Option<(&'a HostPath, &'a std::sync::Arc<dyn pe2_io::Io>)>,
+    /// The store what it makes is kept in; none where it only observes.
+    store: Option<&'a crate::chunks::Store>,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
     /// The checks to run.
@@ -1149,14 +1173,9 @@ struct RunState<'a> {
 }
 
 impl RunState<'_> {
-    /// The layer it writes.
-    fn layer(&self) -> Result<&HostPath> {
-        self.layer.map(|(layer, _)| layer).context("observing what a plan reads writes nothing")
-    }
-
-    /// The I/O it writes through.
-    fn io(&self) -> Result<&std::sync::Arc<dyn pe2_io::Io>> {
-        self.layer.map(|(_, io)| io).context("observing what a plan reads writes nothing")
+    /// The store it keeps what it makes in.
+    fn store(&self) -> Result<&crate::chunks::Store> {
+        self.store.context("observing what a plan reads writes nothing")
     }
 
     fn run(&self, at: usize, add: &dyn Fn(usize)) {
@@ -1186,20 +1205,12 @@ impl RunState<'_> {
                     let key = Plan::file_key(self.keys, given);
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
-                        let _ = crate::content::remove(self.io()?, &file_path(self.layer()?, node, &file));
                         self.lock_written()
                             .push(((node.clone(), file), Written { key, sha1: None, size: 0, shared: false }));
                         continue;
                     };
-                    let path = file_path(self.layer()?, node, &file);
-                    crate::content::write(self.io()?, &path, bytes.as_slice())
-                        .with_context(|| path.display().to_string())?;
-                    let written = Written {
-                        key,
-                        sha1: Some(crate::extract::sha1_of(&bytes)),
-                        size: bytes.len() as u64,
-                        shared: false,
-                    };
+                    let sha1 = self.store()?.put_file(bytes.as_slice()).with_context(|| format!("{node}: {file}"))?;
+                    let written = Written { key, sha1: Some(sha1), size: bytes.len() as u64, shared: false };
                     self.lock_written().push(((node.clone(), file), written));
                     self.progress.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1463,13 +1474,15 @@ impl Plan {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn state(plan_file: &HostPath, layer: &HostPath, extensions: &crate::ext::Extensions) -> Result<State> {
+pub fn state(project: &crate::Project, layer: &crate::Layer, extensions: &crate::ext::Extensions) -> Result<State> {
+    let plan_file = &layer.plan();
     if !extensions.io().filesystem().is_file(plan_file) {
         return Ok(State::NoPlan);
     }
     let fs = extensions.io().filesystem();
     let mut plan = Plan::read(fs, plan_file)?;
-    let record = read_record(fs, &layer.join(&RECORD));
+    let record = read_record(fs, &record_of(layer)?);
+    let store = crate::chunks::Store::local(&project.root, extensions.io().clone());
     if record.files.is_empty() && record.checks.is_empty() {
         return Ok(State::Empty);
     }
@@ -1492,12 +1505,10 @@ pub fn state(plan_file: &HostPath, layer: &HostPath, extensions: &crate::ext::Ex
             if held.is_empty() {
                 gone += 1;
             }
-            for ((node, file), written) in held {
+            for (_, written) in held {
                 if written.key != key {
                     other += 1;
-                } else if written.present()
-                    && !crate::content::exists(extensions.io(), &on_disk(&plan, layer, node, file, written))
-                {
+                } else if !there(&store, written) {
                     gone += 1;
                 }
             }
@@ -1550,16 +1561,12 @@ impl Checked {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn verify(
-    plan_file: &HostPath,
-    layer: &HostPath,
-    versions: &dyn Fn(&str) -> String,
-    io: &std::sync::Arc<dyn pe2_io::Io>,
-) -> Result<Checked> {
-    let fs = io.filesystem();
-    let mut plan = Plan::read(fs, plan_file)?;
+pub fn verify(project: &crate::Project, layer: &crate::Layer, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
+    let fs = project.io.filesystem();
+    let mut plan = Plan::read(fs, &layer.plan())?;
     let keys = plan.keys(versions);
-    let record = read_record(fs, &layer.join(&RECORD));
+    let record = read_record(fs, &record_of(layer)?);
+    let store = crate::chunks::Store::local(&project.root, project.io.clone());
     let releases = plan.as_recorded(&record);
     let possible = plan.resolve(&releases);
     // Each file given, as recorded: a folder's, every file recorded in it - none being one missing.
@@ -1582,19 +1589,17 @@ pub fn verify(
             entries.extend(held);
         }
     }
+    // Each made held to what it was made as: in the store, its bytes still of its hash.
     let found = crate::parallel(&entries, |(node, file, key, written)| {
         let name = format!("{node}: {file}");
         let Some(written) = written else { return Some((0, name)) };
         if written.key != *key {
             return Some((1, name));
         }
-        let path = on_disk(&plan, layer, node, file, written);
-        if !written.present() {
-            return crate::content::exists(io, &path).then_some((2, name));
-        }
-        match crate::content::sha1(io, &path) {
+        let sha1 = written.sha1?;
+        match store.get_file(&sha1) {
             Err(_) => Some((0, name)),
-            Ok(sha1) if Some(sha1) != written.sha1 => Some((2, name)),
+            Ok(bytes) if crate::extract::sha1_of(&bytes) != sha1 => Some((2, name)),
             Ok(_) => None,
         }
     });
@@ -1624,26 +1629,39 @@ pub fn verify(
 mod tests {
     use super::Plan;
     use crate::extract::sha1_of;
-    use crate::testing::At as _;
+
+    /// A project of a records layer `base`, filled by the generated layer `gen`: with no plan, nothing made yet.
+    fn generated(name: &str) -> crate::Project {
+        let root = crate::testing::scratch(name);
+        let _ = std::fs::remove_dir_all(&root);
+        crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
+        let said = "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"gen\"\nkind = \"generated\"\nfills = \"base\"\n";
+        std::fs::write(root.join(&crate::FILE), said).unwrap();
+        crate::records::mark(
+            &pe2_io::SystemFilesystem,
+            &root.join(&crate::LAYERS).join(&crate::testing::name("base")),
+            &crate::records::Settings::default(),
+        )
+        .unwrap();
+        crate::Project::load(&root).unwrap()
+    }
 
     #[test]
     fn a_layer_says_whether_its_plan_ran_and_what_it_needs() {
-        let layer = crate::testing::scratch("plan-state");
-        let _ = std::fs::remove_dir_all(&layer);
-        std::fs::create_dir_all(&layer).unwrap();
+        let project = generated("plan-state");
+        let layer = project.layer(pe2_path::Name::constant("gen")).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
-        let plan_file = layer.with_suffix(crate::PLAN_SUFFIX);
-        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::NoPlan);
+        let plan_file = layer.plan();
+        assert_eq!(super::state(&project, layer, &extensions).unwrap(), super::State::NoPlan);
         let plan = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[]}},"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
 {"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"0000000000000000000000000000000000000000"},"slots":[]}}
 {"emit":"n/m","files":{"native.bin":"a"}}
 "#;
         std::fs::write(&plan_file, plan).unwrap();
-        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Empty);
+        assert_eq!(super::state(&project, layer, &extensions).unwrap(), super::State::Empty);
         let unmet = Plan::parse(plan).unwrap().unmet(&extensions);
         assert!(unmet.len() == 1 && unmet[0].contains("pe2.nothing"), "{unmet:?}");
-        let _ = std::fs::remove_dir_all(&layer);
-        let _ = std::fs::remove_file(&plan_file);
+        let _ = std::fs::remove_dir_all(&project.root);
     }
 
     #[test]
@@ -1691,38 +1709,33 @@ mod tests {
         plan.resolve(&only(&["USA"]));
         assert!(!plan.emits[0].files.iter().find(|g| g.name == "EUR/own.bin").unwrap().possible);
         assert_eq!(plan.ops[plan.by_id["made"]].takes["bytes"], ["a:USA"]);
-        // What is recorded of USA alone, every file of it there: filled but for Europe.
-        let layer = crate::testing::scratch("plan-partial");
-        let _ = std::fs::remove_dir_all(&layer);
-        std::fs::create_dir_all(layer.at("n.node")).unwrap();
-        let plan_file = layer.with_suffix(crate::PLAN_SUFFIX);
-        std::fs::write(&plan_file, &text).unwrap();
+        // What is recorded of USA alone, every file of it in the local store: filled but for Europe.
+        let project = generated("plan-partial");
+        let layer = project.layer(pe2_path::Name::constant("gen")).unwrap();
+        std::fs::write(layer.plan(), &text).unwrap();
+        let store = crate::chunks::Store::local(&project.root, crate::testing::io());
         let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
         for name in ["native.bin", "inflated"] {
-            std::fs::write(layer.at("n.node").at(name), "x").unwrap();
-            let written = super::Written { key: key(&plan, name), sha1: Some(sha1_of(b"x")), size: 1, shared: false };
+            let sha1 = store.put_file(b"x").unwrap();
+            let written = super::Written { key: key(&plan, name), sha1: Some(sha1), size: 1, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         let parsed = Plan::parse(&text).unwrap();
-        super::write_record(&pe2_io::SystemFilesystem, &layer.join(&super::RECORD), &parsed, &record).unwrap();
+        let record_file = super::record_of(layer).unwrap();
+        super::write_record(&pe2_io::SystemFilesystem, &record_file, &parsed, &record).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
-        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
+        assert_eq!(super::state(&project, layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
         // A release's own file the same as what the releases share is not kept: the shared one is it.
         let mut record = super::Record::default();
-        std::fs::create_dir_all(layer.at("n.node/EUR")).unwrap();
         for (name, bytes) in [("own.bin", "same"), ("EUR/own.bin", "same"), ("inflated", "x"), ("EUR/inflated", "y")] {
-            std::fs::write(layer.at("n.node").at(name), bytes).unwrap();
             let written =
                 super::Written { key: "k".into(), sha1: Some(sha1_of(bytes.as_bytes())), size: 4, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
-        assert_eq!(super::share_alike(&pe2_io::system(), &parsed, &layer, &mut record), 1);
-        assert!(!layer.at("n.node/EUR/own.bin").exists() && layer.at("n.node/EUR/inflated").exists());
-        let own = &record.files[&("n".to_string(), "EUR/own.bin".to_string())];
-        assert!(own.shared);
-        assert_eq!(super::on_disk(&parsed, &layer, "n", "EUR/own.bin", own), layer.at("n.node/own.bin"));
-        let _ = std::fs::remove_dir_all(&layer);
-        let _ = std::fs::remove_file(&plan_file);
+        assert_eq!(super::share_alike(&parsed, &mut record), 1);
+        assert!(record.files[&("n".to_string(), "EUR/own.bin".to_string())].shared);
+        assert!(!record.files[&("n".to_string(), "EUR/inflated".to_string())].shared);
+        let _ = std::fs::remove_dir_all(&project.root);
     }
 
     #[test]

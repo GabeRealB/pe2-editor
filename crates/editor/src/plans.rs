@@ -44,7 +44,7 @@ pub struct Plans {
 
 /// The files a project's plans are worked out from: each generated layer's plan and its record.
 pub fn watched(project: &Project) -> Vec<HostPath> {
-    project.generated().flat_map(|l| [l.plan(), l.path.join(&project::plan::RECORD)]).collect()
+    project.generated().flat_map(|l| [Some(l.plan()), project::plan::record_of(l).ok()]).flatten().collect()
 }
 
 impl Plans {
@@ -93,7 +93,7 @@ impl Plans {
             for layer in project.generated() {
                 let plan = layer.plan();
                 let header = project::plan::header(extensions.io().filesystem(), &plan).map_err(|e| format!("{e:#}"));
-                let state = project::plan::state(&plan, &layer.path, &extensions).map_err(|e| format!("{e:#}"));
+                let state = project::plan::state(&project, layer, &extensions).map_err(|e| format!("{e:#}"));
                 // A generated layer fills one: the project refuses it otherwise.
                 let Some(fills) = layer.fills.clone() else { continue };
                 let filled = matches!(state, Ok(State::Filled | State::Partial(_) | State::NoPlan));

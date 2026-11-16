@@ -1570,7 +1570,7 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
             let extensions = project_extensions(&p);
             for l in generated_layers(&p, layer.as_deref())? {
                 let name = &l.name;
-                match project::plan::state(&l.plan(), &l.path, &extensions)? {
+                match project::plan::state(&p, l, &extensions)? {
                     project::plan::State::NoPlan => println!("{name} has no plan ({})", l.plan().display()),
                     project::plan::State::Empty => println!("{name} is empty: its plan has not run"),
                     project::plan::State::Filled => println!("{name} is filled, as its plan says"),
@@ -2061,7 +2061,7 @@ fn verify_layer(project: &Path, only: Option<&pe2_path::Name>) -> Result<()> {
     let extensions = project_extensions(&p);
     let mut whole = true;
     for layer in generated_layers(&p, only)? {
-        let checked = project::plan::verify(&layer.plan(), &layer.path, &|id| extensions.version_of(id), &p.io)?;
+        let checked = project::plan::verify(&p, layer, &|id| extensions.version_of(id))?;
         for (what, files) in [("missing", &checked.missing), ("stale", &checked.stale), ("changed", &checked.changed)] {
             for file in files.iter().take(20) {
                 println!("{}: {what}: {file}", layer.name);

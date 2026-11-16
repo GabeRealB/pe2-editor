@@ -414,10 +414,10 @@ pub struct Layer {
     /// Its name, which names its folder in `layers/` and its changeset.
     pub name: Arc<Name>,
     pub kind: LayerKind,
-    /// Where its content is addressed: a records layer's tree, on no disk (`records::TREE`); a generated layer's
-    /// folder in `layers/`; a mounted tree.
+    /// Where its content is addressed: a records layer's tree, on no disk (`records::TREE`); a mounted tree.
     pub path: HostPath,
-    /// The folder of its records (`layers/<name>/`), where it is a records layer.
+    /// The folder of its records, where it is a records layer: `layers/<name>/`, or - a generated layer's, this
+    /// machine's alone - `.local/layers/<name>/`.
     pub records: Option<HostPath>,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
     pub at: Arc<TreePath>,
@@ -443,11 +443,11 @@ pub struct Mount {
 }
 
 impl Layer {
-    /// A generated layer's plan: `<path>.plan.jsonl`, beside its folder as its changeset would be, so that what fills
-    /// the layer travels with the project while what it made does not.
+    /// A generated layer's plan: `layers/<name>.plan.jsonl`, shipped, so that what fills the layer travels with the
+    /// project while what it made - its records, in the local folder - does not.
     #[must_use]
     pub fn plan(&self) -> HostPath {
-        self.path.with_suffix(PLAN_SUFFIX)
+        records::shipped_of(&self.path).unwrap_or_else(|| self.path.clone()).with_suffix(PLAN_SUFFIX)
     }
 
     /// Where it is on disk: a records layer's folder of records, another's tree.
@@ -735,7 +735,9 @@ impl Project {
             if !generated && !records::is_records(io.filesystem(), &folder) {
                 bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, folder.display());
             }
-            let (path, records) = if generated { (folder, None) } else { (folder.join(records::TREE), Some(folder)) };
+            // What a plan fills is this machine's alone: its records are in the local folder.
+            let records = if generated { local::part(&root, local::LAYERS).join(&name) } else { folder.clone() };
+            let (path, records) = (folder.join(records::TREE), Some(records));
             if generated != l.fills.is_some() {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }

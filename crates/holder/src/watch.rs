@@ -55,7 +55,16 @@ pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> a
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
         at_root || *path == settings || layers.iter().any(|layer| path.starts_with(layer)) || changesets.contains(path)
     };
-    let wanted = move |path: &HostPath| !ignore.iter().any(|i| path.starts_with(i)) && concerns(path);
+    // A records layer's shard - the folder of the records whose uids begin alike - is no change by itself: the records
+    // in it are told of each, and it is made or removed as they are, after what said them.
+    let records: Vec<HostPath> = p.layers.iter().filter_map(|l| l.records.clone()).collect();
+    let io = p.io.clone();
+    let shard = move |path: &HostPath| {
+        path.parent().is_some_and(|folder| records.contains(&folder))
+            && path.file_name().is_some_and(project::records::is_shard)
+            && !io.filesystem().is_file(path)
+    };
+    let wanted = move |path: &HostPath| !ignore.iter().any(|i| path.starts_with(i)) && concerns(path) && !shard(path);
     watch(&p.io, &roots, &shallow, wanted, taken)
 }
 
