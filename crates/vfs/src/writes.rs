@@ -2530,7 +2530,7 @@ mod tests {
         let dir = sfs::testing::scratch("writes-late");
         let owner = Holder::new(&dir, &[], Takes::Never);
         let served = owner.served.clone();
-        let writes = Writes::new(&served, owner, &dir).unwrap();
+        let writes = standing(&served, owner, &dir, super::Pace::default());
         // Written and closed: answered at once, before the project is asked.
         let handle = writes.create(p("a.txt")).unwrap();
         writes.write(handle, 0, b"one").unwrap();
@@ -2546,7 +2546,7 @@ mod tests {
                     break (handle, told);
                 }
                 writes.close(handle, true).unwrap();
-                std::thread::sleep(Duration::from_millis(10));
+                passes(&writes, Duration::from_millis(10));
             }
         };
         let (again, told) = told_at(false);

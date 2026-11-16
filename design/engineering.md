@@ -122,7 +122,10 @@ The concurrency-heavy parts have harnesses of their own: the shared filesystem's
 every step of a transaction, and run a second process against the same space.
 
 A test decides correctness, never time. What waits, waits on its `Io`'s clock, which a test moves
-(`pe2_io::Standing`): the writes' settling and what an edit joins in a history are tested so, without sleeping. A test reaches no network - the scenarios' `Io` serves nothing, setup's tests serve what they give - and a
+(`pe2_io::Standing`), and `Standing::settle` waits until what waits by it has taken in all it was told: the writes'
+settling, the watcher's batches and what an edit joins in a history are tested so, without sleeping. A scenario runs
+the whole editor, many threads that wait by its clock, on one that runs as the system's and that the scenario skips
+ahead (`pe2_io::Skipping`, `Scenario::passes`). A test reaches no network - the scenarios' `Io` serves nothing, setup's tests serve what they give - and a
 program it would start, a file change it would hear of and a channel it would open can be another's
 (`pe2_io::Scripted`, `Telling`, `InMemory`). How long something takes is a benchmark's to say.
 

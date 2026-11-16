@@ -125,11 +125,13 @@ fn isolate() {
     });
 }
 
-/// The system's I/O but its network: a test reaches none - what an extension would fetch, it is told is not there.
-pub(crate) fn offline() -> Arc<dyn pe2_io::Io> {
+/// The system's I/O but its network and its clock: a test reaches no network - what an extension would fetch, it is
+/// told is not there - and says when a while has passed rather than waiting for it (`Scenario::passes`).
+pub(crate) fn offline(clock: &pe2_io::Skipping) -> Arc<dyn pe2_io::Io> {
     Arc::new(pe2_io::Composed {
         http: Arc::new(pe2_io::Served::default()),
         sockets: Arc::new(pe2_io::Closed),
+        clock: Arc::new(clock.clone()),
         ..pe2_io::Composed::system()
     })
 }
@@ -252,6 +254,8 @@ pub struct Scenario {
     fixture: Fixture,
     /// What lets the worker go, where it is held (`hold_reading`).
     held: Option<std::sync::mpsc::Sender<()>>,
+    /// The editor's clock, which a scenario moves on (`passes`).
+    clock: pe2_io::Skipping,
     /// One at a time: a process has one set of extensions, keeping what they make in the project open.
     _alone: std::sync::MutexGuard<'static, ()>,
 }
@@ -298,6 +302,8 @@ impl Scenario {
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut setup {
             crate::shader_compiler(new);
         }
+        let clock = pe2_io::Skipping::default();
+        let io = offline(&clock);
         let harness = Harness::builder().with_size(size).wgpu_setup(setup).build_eframe(move |cc| {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
@@ -311,11 +317,11 @@ impl Scenario {
                 agents_drive: false,
                 unattended,
                 monitors: Vec::new(),
-                io: offline(),
+                io: io.clone(),
             };
             Editor::new(cc, start)
         });
-        let mut scenario = Scenario { harness, fixture, held: None, _alone: alone };
+        let mut scenario = Scenario { harness, fixture, held: None, clock, _alone: alone };
         scenario.settle();
         assert!(
             scenario.harness.state_mut().workspace().is_some(),
@@ -382,6 +388,14 @@ impl Scenario {
         field.unwrap_or_else(|| panic!("no field hinting {hint:?}")).click();
         self.settle();
         self.typing(text);
+    }
+
+    /// A while passes, at once - by the editor's clock - and the editor settles after it: what is timed by it (an
+    /// edit no longer continued, a batch of changes gone) is as it would be that much later.
+    #[track_caller]
+    pub fn passes(&mut self, by: Duration) {
+        self.clock.skip(by);
+        self.settle();
     }
 
     /// Frames until the editor has nothing going on: a few, while the worker is held, as it would never be.

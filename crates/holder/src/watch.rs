@@ -232,4 +232,124 @@ mod tests {
         assert!(!seen.contains(&root.at("b.node")), "the folder they were made in: {seen:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    /// Watching driven by a test: what it tells, by a clock it moves - on no system's watcher, at no system's pace.
+    struct Driven {
+        telling: pe2_io::Telling,
+        clock: pe2_io::Standing,
+        batches: mpsc::Receiver<Change>,
+        _watching: Box<dyn pe2_io::Watching>,
+    }
+
+    impl Driven {
+        fn new(root: &HostPath, wanted: impl Fn(&HostPath) -> bool + Send + 'static, goes_on: usize) -> Driven {
+            let (telling, clock) = (pe2_io::Telling::default(), pe2_io::Standing::monotonic());
+            let io: std::sync::Arc<dyn pe2_io::Io> = std::sync::Arc::new(pe2_io::Composed {
+                watch: std::sync::Arc::new(telling.clone()),
+                clock: std::sync::Arc::new(clock.clone()),
+                ..pe2_io::Composed::system()
+            });
+            let (seen, batches) = mpsc::channel();
+            // What takes the batches goes on for as many as it is told to, then says to stop.
+            let taken = std::sync::atomic::AtomicUsize::new(0);
+            let taken = move |change| {
+                let _ = seen.send(change);
+                taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 < goes_on
+            };
+            let watching = watch(&io, std::slice::from_ref(root), &[], wanted, taken).unwrap();
+            let driven = Driven { telling, clock, batches, _watching: watching };
+            driven.clock.settle(1);
+            driven
+        }
+
+        /// A change told, and taken in.
+        fn tell(&self, kind: pe2_io::ChangeKind, paths: &[&HostPath]) {
+            let paths = paths.iter().map(|path| (*path).clone().into_path_buf()).collect();
+            self.telling.tell(&pe2_io::Change { kind, paths });
+            self.clock.settle(1);
+        }
+
+        /// Time passes, and what it brings due goes.
+        fn passes(&self, millis: u64) {
+            self.clock.advance(std::time::Duration::from_millis(millis));
+            self.clock.settle(1);
+        }
+
+        /// The batches gone since it was last asked, each by its paths.
+        fn gone(&self) -> Vec<Vec<HostPath>> {
+            self.batches
+                .try_iter()
+                .map(|change| match change {
+                    Change::Paths(paths) => paths,
+                    Change::Error(why) => panic!("an error: {why}"),
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_batch_goes_once_the_layers_are_quiet_or_a_second_after_it_began() {
+        let root = sfs::testing::scratch("watch-driven");
+        let driven = Driven::new(&root, |_| true, usize::MAX);
+        let (a, b) = (root.at("a.node/node.toml"), root.at("b.node/node.toml"));
+        // Changed, then quiet: it goes once the layers have been quiet for 150 ms, and not before.
+        driven.tell(pe2_io::ChangeKind::Changed, &[&a]);
+        driven.passes(149);
+        assert_eq!(driven.gone(), [] as [Vec<HostPath>; 0], "not quiet long enough");
+        driven.passes(1);
+        assert_eq!(driven.gone(), [vec![a.clone()]]);
+        // Changes that keep coming go a second after the first of them, in one batch, however close they are.
+        for at in 0..10 {
+            driven.tell(pe2_io::ChangeKind::Changed, &[if at == 5 { &b } else { &a }]);
+            driven.passes(100);
+        }
+        assert_eq!(driven.gone(), [vec![a.clone(), b.clone()]], "a second after the first");
+        // What comes after begins a batch of its own.
+        driven.tell(pe2_io::ChangeKind::Made, &[&b]);
+        driven.passes(150);
+        assert_eq!(driven.gone(), [vec![b.clone()]]);
+        // Nothing comes of time alone.
+        driven.passes(5_000);
+        assert_eq!(driven.gone(), [] as [Vec<HostPath>; 0]);
+    }
+
+    #[test]
+    fn what_is_read_written_aside_or_not_wanted_and_what_came_or_went_in_a_folder_is_no_change() {
+        let root = sfs::testing::scratch("watch-left-out");
+        std::fs::create_dir_all(root.at("folder.node")).unwrap();
+        let cache = root.at(".cache");
+        let driven = Driven::new(&root, move |path| !path.starts_with(&cache), usize::MAX);
+        let file = root.at("folder.node/node.toml");
+        driven.tell(pe2_io::ChangeKind::Read, &[&file]);
+        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node/.node.toml.1.tmp")]);
+        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at(".cache/index.json")]);
+        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node")]);
+        driven.passes(1_000);
+        assert_eq!(driven.gone(), [] as [Vec<HostPath>; 0], "none of them changes the project");
+        // A folder renamed is a change of its own, both its names.
+        let moved = root.at("moved.node");
+        driven.tell(pe2_io::ChangeKind::Renamed, &[&root.at("folder.node"), &moved]);
+        driven.passes(150);
+        assert_eq!(driven.gone(), [vec![root.at("folder.node"), moved]]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failing_watcher_says_so_and_what_takes_the_batches_ends_the_watching() {
+        let root = sfs::testing::scratch("watch-ends");
+        // What takes them takes two: the error, and one batch.
+        let driven = Driven::new(&root, |_| true, 2);
+        driven.telling.fail("the system's limit of watches");
+        driven.clock.settle(1);
+        assert!(matches!(driven.batches.try_recv(), Ok(Change::Error(why)) if why.contains("limit of watches")));
+        let a = root.at("a.node");
+        driven.tell(pe2_io::ChangeKind::Made, &[&a]);
+        driven.clock.advance(std::time::Duration::from_millis(150));
+        // Told to stop, it waits by the clock no more: it ended.
+        driven.clock.settle(0);
+        assert!(matches!(driven.batches.recv(), Ok(Change::Paths(paths)) if paths == [a.clone()]));
+        driven.telling.tell(&pe2_io::Change { kind: pe2_io::ChangeKind::Made, paths: vec![a.into_path_buf()] });
+        driven.clock.advance(std::time::Duration::from_millis(150));
+        assert!(driven.batches.recv().is_err(), "nothing more is taken");
+    }
 }

@@ -104,10 +104,33 @@ pub struct Standing(Arc<Stands>);
 
 /// Where a standing clock is, and what tells its waits it moved.
 struct Stands {
-    at: Mutex<(Instant, SystemTime)>,
+    at: Mutex<At>,
     moved: Condvar,
+    /// What tells a test waiting for its waits (`Standing::settle`) that one began to wait.
+    parked: Condvar,
     /// Whether the time of day stands too, or is the system's.
     standing_wall: bool,
+}
+
+/// A standing clock's time, and its waits.
+struct At {
+    now: Instant,
+    wall: SystemTime,
+    /// How many wait now, told nothing since they began.
+    waiting: usize,
+    /// How many were told - moved past, or woken - and have not yet looked.
+    told: usize,
+}
+
+impl At {
+    fn new(now: Instant, wall: SystemTime) -> At {
+        At { now, wall, waiting: 0, told: 0 }
+    }
+
+    /// Every wait is told to look again.
+    fn tell_all(&mut self) {
+        self.told += std::mem::take(&mut self.waiting);
+    }
 }
 
 impl Standing {
@@ -121,8 +144,9 @@ impl Standing {
     #[must_use]
     pub fn at(wall: SystemTime) -> Standing {
         Standing(Arc::new(Stands {
-            at: Mutex::new((Instant::now(), wall)),
+            at: Mutex::new(At::new(Instant::now(), wall)),
             moved: Condvar::new(),
+            parked: Condvar::new(),
             standing_wall: true,
         }))
     }
@@ -132,17 +156,28 @@ impl Standing {
     /// them as they are written (a time that stood would give two writes one time).
     #[must_use]
     pub fn monotonic() -> Standing {
-        let at = Mutex::new((Instant::now(), SystemTime::now()));
-        Standing(Arc::new(Stands { at, moved: Condvar::new(), standing_wall: false }))
+        let at = Mutex::new(At::new(Instant::now(), SystemTime::now()));
+        Standing(Arc::new(Stands { at, moved: Condvar::new(), parked: Condvar::new(), standing_wall: false }))
     }
 
     /// Moved on by this much: what waits for a moment it reaches returns.
     pub fn advance(&self, by: Duration) {
         let mut at = lock(&self.0.at);
-        at.0 += by;
-        at.1 += by;
+        at.now += by;
+        at.wall += by;
+        at.tell_all();
         drop(at);
         self.0.moved.notify_all();
+    }
+
+    /// Wait until `waits` threads wait by this clock and each has looked at all it was told - what it was woken by, or
+    /// the clock moved - and waits again: what a test does between moving the clock and asking what came of it, so
+    /// that it asks once the threads that wait by it have done all they could.
+    pub fn settle(&self, waits: usize) {
+        let mut at = lock(&self.0.at);
+        while at.waiting < waits || at.told > 0 {
+            at = self.0.parked.wait(at).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -154,11 +189,11 @@ impl Default for Standing {
 
 impl Clock for Standing {
     fn now(&self) -> Instant {
-        lock(&self.0.at).0
+        lock(&self.0.at).now
     }
 
     fn wall(&self) -> SystemTime {
-        if self.0.standing_wall { lock(&self.0.at).1 } else { SystemTime::now() }
+        if self.0.standing_wall { lock(&self.0.at).wall } else { SystemTime::now() }
     }
 
     fn waiter(&self) -> Arc<dyn Waiter> {
@@ -183,17 +218,99 @@ impl Waiter for StandingWaiter {
                 return true;
             }
             drop(woken);
-            if until.is_some_and(|until| at.0 >= until) {
+            if until.is_some_and(|until| at.now >= until) {
                 return false;
             }
+            at.waiting += 1;
+            self.clock.parked.notify_all();
             at = self.clock.moved.wait(at).unwrap_or_else(PoisonError::into_inner);
+            // Told to look, or woken by the system for nothing: either way it looks now.
+            if at.told > 0 {
+                at.told -= 1;
+            } else {
+                at.waiting = at.waiting.saturating_sub(1);
+            }
+            self.clock.parked.notify_all();
         }
     }
 
     fn wake(&self) {
-        let at = lock(&self.clock.at);
+        let mut at = lock(&self.clock.at);
         *lock(&self.woken) = true;
+        at.tell_all();
         drop(at);
+        self.clock.moved.notify_all();
+    }
+}
+
+/// A clock that runs as the system's, and that a test moves on ([`Skipping::skip`]): for what runs many threads
+/// that wait by it - an editor whole - which a clock that stood would keep waiting, where a test still has to say that
+/// a while has passed without waiting for it. What waits by it waits until the system's time, moved on as far as it
+/// was skipped, reaches the moment, or it is woken.
+#[derive(Clone, Default)]
+pub struct Skipping(Arc<Skips>);
+
+/// How far a skipping clock is ahead of the system's, and what tells its waits it moved.
+#[derive(Default)]
+struct Skips {
+    ahead: Mutex<Duration>,
+    moved: Condvar,
+}
+
+impl Skipping {
+    /// Moved on by this much, at once: what waits for a moment it reaches returns.
+    pub fn skip(&self, by: Duration) {
+        *lock(&self.0.ahead) += by;
+        self.0.moved.notify_all();
+    }
+}
+
+impl Clock for Skipping {
+    fn now(&self) -> Instant {
+        Instant::now() + *lock(&self.0.ahead)
+    }
+
+    fn wall(&self) -> SystemTime {
+        SystemTime::now() + *lock(&self.0.ahead)
+    }
+
+    fn waiter(&self) -> Arc<dyn Waiter> {
+        Arc::new(SkippingWaiter { clock: self.0.clone(), woken: Mutex::new(false) })
+    }
+}
+
+/// A wait by a skipping clock: woken, or the time it is ahead to reached.
+struct SkippingWaiter {
+    clock: Arc<Skips>,
+    woken: Mutex<bool>,
+}
+
+impl Waiter for SkippingWaiter {
+    fn wait_until(&self, until: Option<Instant>) -> bool {
+        let mut ahead = lock(&self.clock.ahead);
+        loop {
+            // Under the clock's lock, which a wake takes before it tells: none is lost between looking and waiting.
+            let mut woken = lock(&self.woken);
+            if *woken {
+                *woken = false;
+                return true;
+            }
+            drop(woken);
+            let now = Instant::now() + *ahead;
+            ahead = match until {
+                Some(until) if now >= until => return false,
+                Some(until) => {
+                    self.clock.moved.wait_timeout(ahead, until - now).map_or_else(|e| e.into_inner().0, |(a, _)| a)
+                }
+                None => self.clock.moved.wait(ahead).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+    }
+
+    fn wake(&self) {
+        let ahead = lock(&self.clock.ahead);
+        *lock(&self.woken) = true;
+        drop(ahead);
         self.clock.moved.notify_all();
     }
 }
@@ -348,9 +465,55 @@ impl<T> Receiver<T> {
     reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
 )]
 mod tests {
-    use super::{Clock, Signal, Standing, SystemClock};
+    use super::{Clock, Signal, Skipping, Standing, SystemClock};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn a_skipping_clock_runs_and_is_moved_on_with_its_waits() {
+        let clock = Skipping::default();
+        let (then, wall) = (clock.now(), clock.wall());
+        let waiter = clock.waiter();
+        let until = then + Duration::from_secs(3600);
+        let waiting = {
+            let waiter = waiter.clone();
+            std::thread::spawn(move || waiter.wait_until(Some(until)))
+        };
+        // An hour's wait over at once: the clock skipped it.
+        clock.skip(Duration::from_secs(3600));
+        assert!(!waiting.join().unwrap(), "the moment came, by the clock");
+        assert!(clock.now() - then >= Duration::from_secs(3600));
+        assert!(clock.wall().duration_since(wall).unwrap() >= Duration::from_secs(3600));
+        // It runs: a moment just ahead comes by itself.
+        assert!(!clock.waiter().wait_until(Some(clock.now() + Duration::from_millis(1))));
+        waiter.wake();
+        assert!(waiter.wait_until(None), "a wake given before is kept for the wait");
+    }
+
+    #[test]
+    fn a_test_waits_until_what_waits_by_a_standing_clock_has_taken_in_all_it_was_told() {
+        let clock = Standing::new();
+        let (waiter, rounds) = (clock.waiter(), Arc::new(Mutex::new(0)));
+        let waiting = {
+            let (waiter, rounds, clock) = (waiter.clone(), rounds.clone(), clock.clone());
+            std::thread::spawn(move || {
+                // Woken, it counts; the clock moved an hour, it ends.
+                let end = clock.now() + Duration::from_secs(3600);
+                while waiter.wait_until(Some(end)) {
+                    *rounds.lock().unwrap() += 1;
+                }
+            })
+        };
+        clock.settle(1);
+        for told in 1..=3 {
+            waiter.wake();
+            clock.settle(1);
+            assert_eq!(*rounds.lock().unwrap(), told, "taken in, and waiting again");
+        }
+        clock.advance(Duration::from_secs(3600));
+        clock.settle(0);
+        waiting.join().unwrap();
+    }
 
     #[test]
     fn a_standing_clock_moves_only_when_moved_and_its_waits_with_it() {

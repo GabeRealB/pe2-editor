@@ -452,7 +452,6 @@ impl Ring {
 mod tests {
     use super::*;
     use crate::HostPath;
-    use std::sync::atomic::AtomicBool;
 
     /// A page's bytes, as its key alone says them: what is read back is held to it.
     fn page_of(key: &Key, len: usize) -> Vec<u8> {
@@ -511,17 +510,18 @@ mod tests {
 
     #[test]
     fn threads_that_put_and_read_at_once_read_whole_pages_or_none() {
+        const ASKED: usize = 20_000;
         // Few slots, many keys: every slot is taken again and again under the readers.
         let ring = Ring::private(32 * (PAGE + SAID) as u64).unwrap();
-        let stop = AtomicBool::new(false);
         let (hits, misses) = (AtomicU64::new(0), AtomicU64::new(0));
+        // Each thread asks as many times: what is tested is what they meet, not how long they run.
         std::thread::scope(|scope| {
             for thread in 0..4u64 {
-                let (ring, stop, hits, misses) = (&ring, &stop, &hits, &misses);
+                let (ring, hits, misses) = (&ring, &hits, &misses);
                 scope.spawn(move || {
                     let mut out = [0u8; PAGE];
                     let mut n = thread;
-                    while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..ASKED {
                         n = n.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
                         let key = Key { number: (n >> 33) % 200, version: 1, page: (n >> 20) % 3 };
                         let len = 1 + usize::try_from(key.hash() % PAGE as u64).unwrap();
@@ -536,8 +536,6 @@ mod tests {
                     }
                 });
             }
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            stop.store(true, Ordering::Relaxed);
         });
         assert!(hits.load(Ordering::Relaxed) > 0 && misses.load(Ordering::Relaxed) > 0);
     }

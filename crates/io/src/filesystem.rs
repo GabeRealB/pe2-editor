@@ -839,13 +839,16 @@ impl Descriptor for SystemDescriptor {
         match self {
             SystemDescriptor::File(_, file) => file.set_times(times),
             // A folder's times are set through a handle to it, opened to write its times alone (Windows refuses them
-            // through one opened only to read).
+            // through one opened only to read), and as one opens a folder there (backup semantics) - a file alike.
             SystemDescriptor::Folder(at) => {
                 #[cfg(windows)]
                 let handle = {
                     use std::os::windows::fs::OpenOptionsExt as _;
                     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
-                    std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(at)?
+                    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                    let mut options = std::fs::OpenOptions::new();
+                    options.access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+                    options.open(at)?
                 };
                 #[cfg(not(windows))]
                 let handle = std::fs::File::open(at)?;
@@ -1111,5 +1114,83 @@ pub fn sync_file(fs: &dyn Filesystem, at: &HostPath) {
     let how = if cfg!(unix) { Open::READ } else { Open { write: true, ..Open::default() } };
     if let Ok(file) = fs.open(at, how) {
         let _ = file.sync();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
+)]
+mod tests {
+    use super::{Filesystem as _, Kind, Open, SystemFilesystem};
+    use crate::HostPath;
+    use std::time::{Duration, SystemTime};
+
+    fn scratch(name: &str) -> HostPath {
+        let dir = std::env::temp_dir().join(format!("pe2-io-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        HostPath::new(&dir).unwrap()
+    }
+
+    fn at(dir: &HostPath, name: &str) -> HostPath {
+        dir.entry(std::ffi::OsStr::new(name))
+    }
+
+    #[test]
+    fn a_link_leads_to_a_file_or_a_folder_as_written_where_the_system_lets_this_user_make_one() {
+        let (fs, dir) = (SystemFilesystem, scratch("links"));
+        fs.write(&at(&dir, "target.txt"), b"held").unwrap();
+        fs.create_folder(&at(&dir, "folder")).unwrap();
+        fs.write(&at(&at(&dir, "folder"), "inner.txt"), b"in").unwrap();
+        let made = fs.symlink(std::path::Path::new("target.txt"), &at(&dir, "to-file"));
+        // Windows makes links only for a user it lets: an administrator, or with developer mode on.
+        if cfg!(windows) && made.as_ref().is_err_and(|e| e.raw_os_error() == Some(1314)) {
+            eprintln!("this user may not make links here: what makes them is not tested");
+            return;
+        }
+        made.unwrap();
+        // As written - relative to where the link is - and followed to what it names.
+        assert_eq!(fs.read_link(&at(&dir, "to-file")).unwrap(), std::path::Path::new("target.txt"));
+        assert_eq!(fs.stat_link(&at(&dir, "to-file")).unwrap().kind, Kind::Link);
+        let followed = fs.stat(&at(&dir, "to-file")).unwrap();
+        assert_eq!((followed.kind, followed.size), (Kind::File, 4));
+        assert_eq!(fs.read(&at(&dir, "to-file")).unwrap(), b"held");
+        // To a folder: what is in it is reached through it (on Windows, a link to a folder is one of its own kind).
+        fs.symlink(std::path::Path::new("folder"), &at(&dir, "to-folder")).unwrap();
+        assert_eq!(fs.stat(&at(&dir, "to-folder")).unwrap().kind, Kind::Folder);
+        let listed = fs.read_directory(&at(&dir, "to-folder")).unwrap();
+        assert_eq!(listed.iter().map(|entry| entry.name.clone()).collect::<Vec<_>>(), ["inner.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_and_a_folder_are_said_to_be_read_and_changed_when_they_are_told() {
+        let (fs, dir) = (SystemFilesystem, scratch("times"));
+        let file = at(&dir, "a.txt");
+        fs.write(&file, b"a").unwrap();
+        let folder = at(&dir, "folder");
+        fs.create_folder(&folder).unwrap();
+        let (read, changed) = (
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        for place in [&file, &folder] {
+            fs.set_times(place, Some(read), Some(changed)).unwrap();
+            let stat = fs.stat(place).unwrap();
+            assert_eq!((stat.accessed, stat.modified), (Some(read), Some(changed)), "{place}");
+            // One of them alone leaves the other as it was.
+            let later = changed + Duration::from_secs(60);
+            fs.set_times(place, None, Some(later)).unwrap();
+            let stat = fs.stat(place).unwrap();
+            assert_eq!((stat.accessed, stat.modified), (Some(read), Some(later)), "{place}");
+        }
+        // Through a file held open, as a component's descriptor does.
+        let held = fs.open(&file, Open::CHANGE).unwrap();
+        held.set_times(None, Some(changed)).unwrap();
+        assert_eq!(held.stat().unwrap().modified, Some(changed));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

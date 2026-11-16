@@ -112,7 +112,7 @@ fn a_point_of_the_history_is_shown_read_only_and_restored() {
     let mut editor = Scenario::open(Fixture::rig());
     move_pelvis(&mut editor, "-900");
     // Typed again, the pelvis still selected: a second step, once the first is no longer continued.
-    std::thread::sleep(std::time::Duration::from_millis(1600));
+    editor.passes(std::time::Duration::from_millis(1600));
     editor.number("Translation", 1);
     editor.typing("-800");
     editor.press(egui::Key::Enter);
