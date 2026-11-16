@@ -19,6 +19,7 @@
 use anyhow::{Context, Result};
 use pe2_path::Name;
 use sfs::HostPath;
+use std::io;
 
 use crate::Project;
 use crate::lock::Lock;
@@ -40,6 +41,10 @@ pub const STORE: &Name = Name::constant("store");
 pub const LAYERS: &Name = Name::constant("layers");
 /// What the served folder held that was not the project's.
 pub const SET_ASIDE: &Name = Name::constant("set-aside");
+/// Where a file written whole takes its temporary name (`write_atomic`), on the project's volume, in no tree.
+pub const TEMPORARY: &Name = Name::constant("temporary");
+/// How long a temporary file is left: longer than any write takes from making it to renaming it into place.
+const LEFT_FOR: std::time::Duration = std::time::Duration::from_hours(1);
 /// This machine's settings of the project.
 pub const SETTINGS: &Name = Name::constant("settings.toml");
 /// The socket agents reach the editor holding the project by (`mcp::link`): listening from the moment it holds the
@@ -97,6 +102,7 @@ impl Local {
         }
         // Before anything reads the project's files: they are as the log says they are to be.
         let recovered = crate::storage::redo(&project.root, fs)?;
+        sweep_temporary(fs, &project.root, project.io.clock().wall());
         Ok(Local { dir, io: project.io.clone(), recovered })
     }
 
@@ -180,25 +186,70 @@ pub fn processes(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<HostPat
     Ok(dir)
 }
 
-/// Write a file whole: to a temporary name beside it, then renamed over it, so no reader ever sees half a file. One
-/// that fails leaves nothing beside it: what it wrote under the temporary name is removed.
+/// Write a file whole: under a temporary name, then renamed over it, so no reader ever sees half a file. One that
+/// fails leaves nothing under the temporary name.
 ///
 /// # Errors
 /// The temporary file cannot be written or renamed.
 pub fn write_atomic(fs: &dyn pe2_io::Filesystem, path: &HostPath, bytes: &[u8]) -> Result<()> {
-    // Each writer's own: two threads may be writing the same file, as two nodes making one value do.
+    write_whole(fs, path, bytes, false).with_context(|| path.display().to_string())
+}
+
+/// Write `bytes` at `path` whole: under a temporary name - in its project's local folder (`temporary_for`), so that none
+/// is ever left in a tree; beside it for a file of no project, or one on another volume than its project's - then
+/// renamed over it. Each write has a temporary name of its own: two threads may be writing one file at once. Where
+/// the rename fails and the file is there all the same while `already` says that will do - what a store keeps by its
+/// hash, put there meanwhile by another - the write's own goes, and what is there stands.
+///
+/// # Errors
+/// The temporary file cannot be written or renamed.
+pub(crate) fn write_whole(fs: &dyn pe2_io::Filesystem, path: &HostPath, bytes: &[u8], already: bool) -> io::Result<()> {
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let aside = format!(".{name}.{}.{write}.tmp", std::process::id());
-    let aside = pe2_path::Name::new(&aside)?;
-    let temporary = path.parent().map(|folder| folder.join(aside)).with_context(|| path.display().to_string())?;
-    let written = fs.write(&temporary, bytes).with_context(|| format!("{}", temporary.display()));
-    let renamed = written.and_then(|()| fs.rename(&temporary, path).with_context(|| format!("{}", path.display())));
-    if renamed.is_err() {
-        let _ = fs.remove_file(&temporary);
+    let own = format!("{}.{write}.tmp", std::process::id());
+    let put = |temporary: &HostPath| -> io::Result<()> {
+        fs.write(temporary, bytes)?;
+        match fs.rename(temporary, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs.remove_file(temporary);
+                if already && fs.exists(path) { Ok(()) } else { Err(e) }
+            }
+        }
+    };
+    if let Some(folder) = crate::temporary_for(path) {
+        let temporary = folder.join(&Name::new(&own).map_err(io::Error::other)?);
+        let tried = put(&temporary).or_else(|e| {
+            // Its folder made where it is not yet, once.
+            if e.kind() == io::ErrorKind::NotFound && !fs.exists(&folder) {
+                fs.create_folder_all(&folder)?;
+                return put(&temporary);
+            }
+            Err(e)
+        });
+        match tried {
+            // On another volume: beside it.
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
+            done => return done,
+        }
     }
-    renamed
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let beside = format!(".{name}.{own}");
+    let beside = Name::new(&beside).map_err(io::Error::other)?;
+    put(&path.parent().map(|folder| folder.join(beside)).ok_or_else(|| io::Error::other("no folder"))?)
+}
+
+/// Remove what writes left in the project's folder of temporary names (`write_whole`) longer ago than any write takes:
+/// what a process dying mid-write left there.
+fn sweep_temporary(fs: &dyn pe2_io::Filesystem, root: &HostPath, now: std::time::SystemTime) {
+    let folder = part(root, TEMPORARY);
+    for entry in fs.read_directory(&folder).unwrap_or_default() {
+        let path = folder.entry(&entry.name);
+        let modified = fs.stat(&path).ok().and_then(|stat| stat.modified);
+        if modified.and_then(|at| now.duration_since(at).ok()).is_some_and(|age| age >= LEFT_FOR) {
+            let _ = fs.remove_file(&path);
+        }
+    }
 }
 
 /// Remove a test's project, whatever a history still alive in it is writing behind this moment: tried again

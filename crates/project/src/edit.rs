@@ -202,13 +202,18 @@ impl<'a, 'h> Out<'a, 'h> {
             .in_scope(|| crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written))?;
         // As it is, whatever its length: a record is read as a record, never kept as chunks as a layer's long
         // files are - which one holding a long text was, and was then not found again.
-        let folder = &self.layer.records;
+        // Each in its part (`records::Record::local`): one that changed part leaves the other.
         for (uid, record) in &new {
-            let at = crate::records::path_of(folder, *uid).with_context(|| format!("{uid}: its record"))?;
+            let at = self.layer.record_path(*uid, record.local).with_context(|| format!("{uid}: its record"))?;
             self.tx.write_stored(&at, record.render().as_bytes())?;
+            if let Some(was) = old.get(uid).filter(|was| was.local != record.local) {
+                self.tx
+                    .remove(&self.layer.record_path(*uid, was.local).with_context(|| format!("{uid}: its record"))?)?;
+            }
         }
         for uid in &gone {
-            self.tx.remove(&crate::records::path_of(folder, *uid).with_context(|| format!("{uid}: its record"))?)?;
+            let local = old.get(uid).is_some_and(|was| was.local);
+            self.tx.remove(&self.layer.record_path(*uid, local).with_context(|| format!("{uid}: its record"))?)?;
         }
         // What is written is in the records now.
         self.records = Some(BTreeMap::new());
@@ -1951,6 +1956,7 @@ mod tests {
             name: Some(pe2_path::Name::constant("plain").to_owned()),
             files: std::collections::BTreeMap::new(),
             tree: Some(sealed_tree(&root, &[("readme.txt", "just text")])),
+            local: false,
         };
         let written = recorded(&root, "base", crate::testing::uid("uid://p1a1n"), &plain);
         o.refresh(&[written]);
@@ -1993,8 +1999,15 @@ mod tests {
             pe2_path::RelPath::new("old.md").unwrap().to_owned(),
             File { content: None, base: None },
         )]);
-        let over =
-            Record { op: Did::Override, kind: Kind::Node, parent: None, name: None, files: removed, tree: Some(newer) };
+        let over = Record {
+            op: Did::Override,
+            kind: Kind::Node,
+            parent: None,
+            name: None,
+            files: removed,
+            tree: Some(newer),
+            local: false,
+        };
         let written = recorded(&root, "top", uid, &over);
         o.refresh(std::slice::from_ref(&written));
         let held = o.project.held_extensions();
@@ -2010,11 +2023,99 @@ mod tests {
             name: None,
             files: std::collections::BTreeMap::new(),
             tree: None,
+            local: false,
         };
         recorded(&root, "top", uid, &gone);
         o.refresh(&[written]);
         assert_eq!(o.project.held_extensions(), Vec::<HostPath>::new());
         assert!(!o.index.entries.contains_key(&tree("tools/my.tool.node")));
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    /// A layer's records, by uid, in its part: shipped (`layers/<layer>`) or this machine's (`.local/layers/<layer>`) -
+    /// as what waits to be written leaves them, as every reader of records reads them.
+    fn part(root: &HostPath, layer: &str, local: bool) -> Vec<String> {
+        let folder = if local { root.at(".local/layers").at(layer) } else { root.at("layers").at(layer) };
+        let read = crate::records::read_records(&pe2_io::SystemFilesystem, &folder, None).unwrap();
+        let mut uids: Vec<String> = read.keys().map(|uid| uid.digits()).collect();
+        uids.sort();
+        uids
+    }
+
+    #[test]
+    fn what_a_pattern_names_or_a_local_folder_holds_is_this_machines() {
+        let root = project("local-made");
+        let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
+        std::fs::write(root.at("project.toml"), format!("{text}\n[local]\npatterns = [\"*.swp\", \"scratch\"]\n"))
+            .unwrap();
+        let mut o = open(&root);
+        let top = pe2_path::Name::constant("top");
+        // A name a pattern says, and what is made in a folder it says: this machine's, and their content too.
+        let swap = b"\0swap";
+        let paths = super::create_file(&o.project, &o.index, top, &tree(".a.swp"), swap, &mut o.history).unwrap();
+        o.refresh(&paths);
+        let paths = super::create_folder(&o.project, &o.index, top, &tree("scratch"), &mut o.history).unwrap();
+        o.refresh(&paths);
+        let paths =
+            super::create_file(&o.project, &o.index, top, &tree("scratch/n.txt"), b"mine", &mut o.history).unwrap();
+        o.refresh(&paths);
+        // Shipped: nothing.
+        let paths = super::create_file(&o.project, &o.index, top, &tree("kept.txt"), b"ours", &mut o.history).unwrap();
+        o.refresh(&paths);
+        let uid = |path: &str| o.uid(path).digits();
+        let mine = [uid(".a.swp"), uid("scratch"), uid("scratch/n.txt")];
+        let mut mine: Vec<String> = mine.into_iter().collect();
+        mine.sort();
+        assert_eq!(part(&root, "top", true), mine);
+        assert_eq!(part(&root, "top", false), [uid("kept.txt")]);
+        let sha1 = crate::extract::sha1_of(swap);
+        assert!(
+            crate::chunks::Store::local(&root, crate::testing::io()).has_file(&sha1),
+            "kept in this machine's store"
+        );
+        assert!(!crate::chunks::Store::at(&root, crate::testing::io()).has_file(&sha1));
+        assert_eq!(crate::content::read(&o.project.io, &o.index.entries[&tree(".a.swp")].disk).unwrap(), swap);
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn an_entry_made_this_machines_takes_what_is_in_it_and_shared_takes_what_is_above_it() {
+        let root = project("local-moved");
+        let mut o = open(&root);
+        let top = pe2_path::Name::constant("top");
+        for (path, bytes) in [("d/e/f.bin", &b"\0f"[..]), ("d/g.txt", b"g")] {
+            let paths = super::create_file(&o.project, &o.index, top, &tree(path), bytes, &mut o.history).unwrap();
+            o.refresh(&paths);
+        }
+        let all = part(&root, "top", false);
+        assert_eq!(all.len(), 4);
+        let layer = o.project.layer(top).unwrap().clone();
+        // `d/e` this machine's: it and what is in it.
+        let paths = crate::records::set_local(&o.project, &layer, &tree("d/e"), true, &mut o.history).unwrap();
+        o.refresh(&paths);
+        let mut mine = vec![o.uid("d/e").digits(), o.uid("d/e/f.bin").digits()];
+        mine.sort();
+        assert_eq!(part(&root, "top", true), mine);
+        assert_eq!(o.index.entries[&tree("d/e/f.bin")].layer.as_str(), "top", "still the layer's");
+        let local = |path: &str| o.index.entries[&tree(path)].local;
+        assert!(local("d/e") && local("d/e/f.bin") && !local("d") && !local("d/g.txt"), "the index says which");
+        // What is made in it now is this machine's too; deleted, the deletion is.
+        let paths = super::create_file(&o.project, &o.index, top, &tree("d/e/h.txt"), b"h", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert_eq!(part(&root, "top", true).len(), 3);
+        // `d/e/f.bin` shared: it, and `d/e` above it; `h.txt` stays this machine's.
+        let paths = crate::records::set_local(&o.project, &layer, &tree("d/e/f.bin"), false, &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert_eq!(part(&root, "top", true), [o.uid("d/e/h.txt").digits()]);
+        assert!(!o.index.entries[&tree("d/e")].local && o.index.entries[&tree("d/e/h.txt")].local);
+        let sha1 = crate::extract::sha1_of(b"\0f");
+        assert!(crate::chunks::Store::at(&root, crate::testing::io()).has_file(&sha1), "shipped with its content");
+        // Undone: as it was.
+        let paths = o.history.undo(&o.index, None, false).unwrap().paths();
+        o.refresh(&paths);
+        assert_eq!(part(&root, "top", true).len(), 3);
         drop(o);
         crate::local::remove_all(&root);
     }

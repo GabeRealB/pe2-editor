@@ -32,6 +32,24 @@ copied whole when you override it, so that you can edit it in the `assets` folde
 
 To give up your version, right-click the asset and choose **Take the version below**.
 
+## Kept on this computer only
+
+Some of what you make is yours alone: scratch files, notes, test assets. An entry kept **on this computer only** is
+stored in the project's local folder, never shared through version control with the project. It is greyed in the
+Assets pane; the **eye** beside the filter hides what is yours alone, and shows it again.
+
+| To | Do |
+|---|---|
+| Keep an entry, and all in it, on this computer only | Right-click it, **Keep on this computer only** |
+| Share it with the project again, with the folders above it | Right-click it, **Share it** |
+| Keep what is made by some names on this computer, wherever it is made | List the names under `[local] patterns` in `project.toml`, as a `.gitignore` names them |
+
+What is made or moved into an entry kept on this computer is kept there too. A new project lists the names editors
+and systems leave beside files - swap and lock files, backups, folder settings - as yours alone; change the list as you
+need. Files your editors make for themselves while you edit in the `assets` folder never reach the project at all.
+
+From a terminal: `pe2-cli project local <path>` and `pe2-cli project share <path>`.
+
 ## When the layer below changes
 
 If the asset under your override changes later, the editor combines the two: your changes are kept, and the other

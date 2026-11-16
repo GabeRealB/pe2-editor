@@ -90,6 +90,30 @@ fn opened(root: &HostPath) {
     if !opened.contains(root) {
         opened.push(root.clone());
     }
+    placed(root, root);
+}
+
+/// The places of the projects this process opened - each root, each mount's tree - with the root of the project each
+/// is of: what tells where a file written in one takes its temporary name (`temporary_for`).
+static PLACES: std::sync::RwLock<Vec<(HostPath, HostPath)>> = std::sync::RwLock::new(Vec::new());
+
+/// Say a place is the project's in `root`.
+fn placed(place: &HostPath, root: &HostPath) {
+    let mut places = PLACES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !places.iter().any(|(known, _)| known == place) {
+        places.push((place.clone(), root.clone()));
+    }
+}
+
+/// The folder where a file written at `path` - in a project this process opened, or in one of its mounts' trees - takes
+/// its temporary name before it is renamed into place: its project's `.local/temporary`, so that none is left in a
+/// tree. None for a file of no project.
+#[must_use]
+pub fn temporary_for(path: &HostPath) -> Option<HostPath> {
+    let places = PLACES.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_, root) =
+        places.iter().filter(|(place, _)| path.starts_with(place)).max_by_key(|(place, _)| place.as_os_str().len())?;
+    Some(local::part(root, local::TEMPORARY))
 }
 /// What follows a layer's folder's name in its changeset's.
 pub const CHANGESET_SUFFIX: &Name = Name::constant(".toml");
@@ -113,7 +137,24 @@ struct ProjectFile {
     /// What its configs say beyond their release and target: `[property.<name>]`, in order.
     #[serde(default)]
     property: toml::Table,
+    /// What is this machine's alone wherever it is made: `[local]`.
+    #[serde(default)]
+    local: LocalPaths,
 }
+
+/// `[local]`: the names of what is this machine's alone, never shipped, wherever it is made or moved.
+#[derive(Default, Deserialize)]
+struct LocalPaths {
+    /// Name patterns, as a `.gitignore`'s (`*.swp`, `.DS_Store`): an entry whose name or any folder's above it
+    /// matches one.
+    #[serde(default)]
+    patterns: Vec<String>,
+}
+
+/// What `[local]` says of a new project: what editors and systems leave beside the files they work on - swap and lock
+/// files, backups, a folder's view settings - is this machine's. The project's to change.
+pub const LOCAL_PATTERNS: &[&str] =
+    &["*.swp", "*.swo", "*.swx", "*~", ".#*", "#*#", ".DS_Store", "._*", "Thumbs.db", "desktop.ini"];
 
 /// A build the project can be: `[config.<name>]`.
 #[derive(Clone, Debug, PartialEq)]
@@ -420,6 +461,10 @@ pub struct Layer {
     /// The folder of its records: `layers/<name>/`, or - a generated layer's, this machine's alone -
     /// `.local/layers/<name>/`.
     pub records: HostPath,
+    /// The folder of this machine's part of its records (`records::Record::local`), never shipped:
+    /// `.local/layers/<name>/`, over the shipped part. None for a layer whose records are all one part - a generated
+    /// layer's, all this machine's; a mount's, its listing.
+    pub local: Option<HostPath>,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
     pub at: Arc<TreePath>,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
@@ -443,6 +488,19 @@ impl Layer {
     #[must_use]
     pub fn plan(&self) -> HostPath {
         records::shipped_of(&self.path).unwrap_or_else(|| self.path.clone()).with_suffix(PLAN_SUFFIX)
+    }
+
+    /// Where a record of it is kept: in this machine's part (`local`) or the shipped one.
+    ///
+    /// # Errors
+    /// It has no part this machine's alone, or the uid makes no file's name.
+    pub fn record_path(&self, uid: pe2_path::Uid, local: bool) -> Result<HostPath> {
+        let folder = if local {
+            self.local.as_ref().with_context(|| format!("{} keeps nothing in this machine's part", self.name))?
+        } else {
+            &self.records
+        };
+        Ok(records::path_of(folder, uid)?)
     }
 
     /// Where it is on disk: a mount's tree, another's folder of records.
@@ -471,6 +529,8 @@ pub struct Project {
     pub disabled_extensions: Vec<String>,
     /// The extensions it requires (`[[extension]]`).
     pub requires: Vec<Requirement>,
+    /// The name patterns of what is this machine's alone wherever it is made or moved (`[local] patterns`).
+    pub local: Vec<String>,
     /// Its extensions' settings, by id (`[extensions."<id>"]`): the same for everyone on it.
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
     /// The builds it can be, by name, in order.
@@ -608,7 +668,13 @@ pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
     fs.create_folder_all(&own).with_context(|| directory.to_string())?;
     // Its own layer is records (`records`).
     records::mark(fs, &own, &records::Settings::default())?;
-    fs.write(&file, EMPTY.as_bytes()).with_context(|| file.to_string())?;
+    // What is this machine's alone wherever it is made, the project's own to change.
+    let patterns = LOCAL_PATTERNS.iter().map(|pattern| format!("{pattern:?}")).collect::<Vec<_>>().join(", ");
+    let text = format!(
+        "{EMPTY}\n# What is this machine's alone, never shipped, wherever it is made or moved: names, as a \
+         `.gitignore`'s.\n[local]\npatterns = [{patterns}]\n"
+    );
+    fs.write(&file, text.as_bytes()).with_context(|| file.to_string())?;
     // What is this machine's alone is no part of it, nor where it is served.
     let ignore = directory.join(&IGNORE);
     let mut text = fs.read_to_string(&ignore).unwrap_or_default();
@@ -655,6 +721,7 @@ impl Project {
     ///
     /// # Errors
     /// As `load`.
+    #[expect(clippy::too_many_lines, reason = "`project.toml` and this machine's settings read, a part after another")]
     pub fn load_with(directory: &Path, io: Arc<dyn pe2_io::Io>) -> Result<Project> {
         let root = HostPath::new(directory).with_context(|| format!("{}", directory.display()))?;
         let path = root.join(&FILE);
@@ -686,6 +753,7 @@ impl Project {
                     mounted: true,
                     fills: None,
                     records: folder,
+                    local: None,
                 });
                 continue;
             }
@@ -700,8 +768,10 @@ impl Project {
             if !generated && !records::is_records(io.filesystem(), &folder) {
                 bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, folder.display());
             }
-            // What a plan fills is this machine's alone: its records are in the local folder.
-            let records = if generated { local::part(&root, local::LAYERS).join(&name) } else { folder.clone() };
+            // What a plan fills is this machine's alone: its records are in the local folder. Another layer's part this
+            // machine's alone is there.
+            let mine = local::part(&root, local::LAYERS).join(&name);
+            let (records, local) = if generated { (mine, None) } else { (folder.clone(), Some(mine)) };
             let path = folder.join(records::TREE);
             if generated != l.fills.is_some() {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
@@ -717,9 +787,13 @@ impl Project {
                 mounted: false,
                 fills,
                 records,
+                local,
             });
         }
         check_fills(&root, &layers)?;
+        for layer in layers.iter().filter(|layer| layer.mounted) {
+            placed(&layer.path, &root);
+        }
         // The mounts, as what resolves a path through them reads them.
         let mounts = layers
             .iter()
@@ -728,6 +802,7 @@ impl Project {
             .collect();
         let disabled_extensions = file.extensions.disabled;
         let requires = file.extension;
+        let local_patterns = file.local.patterns;
         let extension_settings = file
             .extensions
             .settings
@@ -748,6 +823,7 @@ impl Project {
             unmanaged,
             disabled_extensions,
             requires,
+            local: local_patterns,
             extension_settings,
             configs,
             properties,

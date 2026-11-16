@@ -37,7 +37,7 @@ pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> a
     let roots: Vec<HostPath> = p
         .layers
         .iter()
-        .flat_map(|l| std::iter::once(&l.records).chain(l.mounted.then_some(&l.path)))
+        .flat_map(|l| std::iter::once(&l.records).chain(&l.local).chain(l.mounted.then_some(&l.path)))
         .cloned()
         .collect();
     // `project.toml`, in the project's own folder.
@@ -60,7 +60,8 @@ pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> a
     };
     // A records layer's shard - the folder of the records whose uids begin alike - is no change by itself: the records
     // in it are told of each, and it is made or removed as they are, after what said them.
-    let records: Vec<HostPath> = p.layers.iter().map(|l| l.records.clone()).collect();
+    let records: Vec<HostPath> =
+        p.layers.iter().flat_map(|l| std::iter::once(&l.records).chain(&l.local)).cloned().collect();
     let io = p.io.clone();
     let shard = move |path: &HostPath| {
         path.parent().is_some_and(|folder| records.contains(&folder))
@@ -132,10 +133,14 @@ fn debounce(
     wanted: &dyn Fn(&HostPath) -> bool,
     taken: &dyn Fn(Change) -> bool,
 ) {
-    // The temporary files of atomic writes (`.<name>.<pid>.tmp`, `project::local::write_atomic`) are nobody's.
+    // A write's temporary file is nobody's: in a project's local folder, which is not watched, but beside its file in
+    // a mount on another volume (`.<name>.<process>.<n>.tmp`, `project::local::write_whole`).
     let atomic = |path: &HostPath| {
-        path.extension().is_some_and(|e| e == "tmp")
-            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let parts: Vec<&str> = name.strip_suffix(".tmp").map_or_default(|rest| rest.rsplitn(3, '.').collect());
+        name.starts_with('.')
+            && parts.len() == 3
+            && parts[..2].iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
     };
     let clock = io.clock();
     let mut paths = BTreeSet::new();
@@ -223,7 +228,7 @@ mod tests {
             watch(&pe2_io::system(), std::slice::from_ref(&root), &[], move |path| !path.starts_with(&outputs), taken)
                 .unwrap();
         std::fs::write(root.at(".local/outputs/index.json"), "{}").unwrap();
-        std::fs::write(root.at("a.node/.node.toml.1.tmp"), "x").unwrap();
+        std::fs::write(root.at("a.node/.node.toml.1.2.tmp"), "x").unwrap();
         let declaration = root.at("a.node/node.toml");
         std::fs::write(&declaration, "uid = \"uid://a\"\n").unwrap();
         let seen = collect(&batches, |seen| seen.contains(&declaration));
@@ -340,7 +345,7 @@ mod tests {
         let driven = Driven::new(&root, move |path| !path.starts_with(&outputs), usize::MAX);
         let file = root.at("folder.node/node.toml");
         driven.tell(pe2_io::ChangeKind::Read, &[&file]);
-        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node/.node.toml.1.tmp")]);
+        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node/.node.toml.1.2.tmp")]);
         driven.tell(pe2_io::ChangeKind::Changed, &[&root.at(".local/outputs/index.json")]);
         driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node")]);
         driven.passes(1_000);

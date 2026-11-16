@@ -44,7 +44,9 @@ pub const BELOW: &str = "below:";
 
 /// Whether a path is in a records layer's folder: one of its records, or its marker.
 fn in_records(layers: &[LayerState], path: &HostPath) -> bool {
-    layers.iter().any(|layer| path.starts_with(&layer.records))
+    layers.iter().any(|layer| {
+        path.starts_with(&layer.records) || layer.local.as_ref().is_some_and(|local| path.starts_with(local))
+    })
 }
 
 /// A file an override merged over the one below, in the outputs (`.local/outputs/merged/<sha1>/<name>`), written where it is not
@@ -244,6 +246,8 @@ pub struct Entry {
     pub overrides: Vec<Arc<Name>>,
     /// The layer that moved it here, where one did.
     pub moved: Option<Arc<Name>>,
+    /// A layer keeps it, or what it does to it, in this machine's part (`records::Record::local`): never shipped.
+    pub local: bool,
 }
 
 /// How an operation of a layer applies to the layers below it.
@@ -871,7 +875,7 @@ impl Scan {
             }
         } else {
             let name = rel.name().unwrap_or_default();
-            if name.starts_with('.') || place.ignores(&rel) {
+            if place.ignores(&rel) {
                 return;
             }
             if crate::content::is_dir(&place.io, &start) {
@@ -936,7 +940,7 @@ impl Scan {
         let kept = |path: &TreePath| {
             let mut at = Some(path);
             while let Some(here) = at.filter(|here| !here.is_root()) {
-                if here.name().is_some_and(|name| name.starts_with('.')) || place.ignores(here) {
+                if place.ignores(here) {
                     return false;
                 }
                 at = here.parent();
@@ -978,9 +982,7 @@ impl Scan {
         let mut listing = Vec::new();
         for (name, path, is_dir) in crate::content::read_dir(&place.io, dir) {
             let name = match name {
-                Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
-                Err(why) if why.text.starts_with('.') => continue,
                 // What the folders above leave in, by its own name: refused, unless that is left out.
                 Err(why) => {
                     if !changeset::ignored(&place.ignore, &why.text) {
@@ -1106,10 +1108,7 @@ impl Scan {
         let mut changed = Vec::new();
         let mut above = rel.parent();
         while let Some(folder) = above.filter(|folder| !folder.is_root() && place.at != **folder) {
-            let name = folder.name().unwrap_or_default();
-            let there = !name.starts_with('.')
-                && !place.ignores(folder)
-                && crate::content::is_dir(&place.io, &place.disk(folder));
+            let there = !place.ignores(folder) && crate::content::is_dir(&place.io, &place.disk(folder));
             let was = self.folders.contains(folder);
             if there && !was {
                 self.folders.insert(folder.to_owned());
@@ -1215,9 +1214,7 @@ pub(crate) fn bundle_files(
         let mut listing = Vec::new();
         for (name, path, is_dir) in crate::content::read_dir(io, &folder) {
             let name = match name {
-                Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
-                Err(why) if why.text.starts_with('.') => continue,
                 Err(why) => {
                     refused.push(Refusal { text: within(&why.text), why: why.to_string().into() });
                     continue;
@@ -1380,6 +1377,8 @@ struct LayerState {
     place: Place,
     /// The folder of its records.
     records: HostPath,
+    /// The folder of this machine's part of its records, where it has one.
+    local: Option<HostPath>,
     changeset: Changeset,
     /// Names its tree's own rules leave out (a mount's `.gitignore`s), beside its changeset's.
     tree_ignore: Vec<String>,
@@ -1427,6 +1426,7 @@ impl LayerState {
             kind: layer.kind,
             place,
             records: layer.records.clone(),
+            local: layer.local.clone(),
             // A read-only mount's listing is still the project's to keep.
             writable: (layer.mounted || !layer.read_only) && !changeset.read_only,
             changeset,
@@ -1800,6 +1800,8 @@ pub struct Index {
     /// What applying the stack wrote of mounts' listings, as records, for the project's model to be told with what
     /// the opening or the refresh changed (`write_listing`).
     listed: crate::model::Delta,
+    /// The entries whose records a refresh read changed, whose `Entry::local` it tells again (`mark_local`).
+    records_changed: Vec<Uid>,
     resolved: Shared<Resolved>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
@@ -1889,6 +1891,7 @@ impl Index {
             stack_said: self.stack_said.clone(),
             stack_taken: self.stack_taken,
             listed: crate::model::Delta::default(),
+            records_changed: Vec::new(),
             hidden: self.hidden.clone(),
             ops: self.ops.clone(),
             dependencies: self.dependencies.clone(),
@@ -2184,6 +2187,7 @@ impl Index {
             stack_said: Arc::default(),
             stack_taken: false,
             listed: crate::model::Delta::default(),
+            records_changed: Vec::new(),
             resolved: Shared::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -2457,8 +2461,26 @@ impl Index {
     pub fn refresh(&mut self, project: &Project, changed: &[HostPath]) -> Result<Refreshed> {
         let _span = tracing::info_span!("index refresh").entered();
         let mut refreshed = self.refresh_files(project, changed)?;
+        self.mark_local();
         self.say_stack(&mut refreshed);
         Ok(refreshed)
+    }
+
+    /// The entries whose records changed told again whether they are this machine's alone (`Entry::local`): a record
+    /// moved between a layer's parts changes nothing else of its entry, which is then not made again.
+    fn mark_local(&mut self) {
+        let uids = std::mem::take(&mut self.records_changed);
+        let Some(set) = crate::records::Set::current(&self.root) else { return };
+        for uid in uids {
+            let Some(path) = self.placed.get(&uid).cloned() else { continue };
+            let local = set.is_local(uid);
+            if self.entries.get(&path).is_some_and(|entry| entry.local != local) {
+                let entries = Shared::make_mut(&mut self.entries);
+                if let Some(entry) = entries.get_mut(&path) {
+                    entry.local = local;
+                }
+            }
+        }
     }
 
     /// What a refresh changed of the stack, said of the project's model: the entries it touched, as they are now,
@@ -2597,6 +2619,7 @@ impl Index {
         let differences = tracing::info_span!("refresh: the records compared")
             .in_scope(|| crate::records::Set::differences(before.as_deref(), &now));
         // What that changed of the project's model: each record that came, went or changed, as it is now.
+        self.records_changed.extend(differences.records.iter().map(|(_, uid)| *uid));
         for (dir, uid) in &differences.records {
             if let Some(layer) = project.layers.iter().find(|layer| layer.path == *dir) {
                 let recorded = now
@@ -2845,6 +2868,7 @@ impl Index {
         let layer = &self.layers[at];
         let (name, writable) = (layer.name.clone(), layer.writable);
         let disk = |path: &TreePath| self.layers[at].place.disk(path);
+        let set = crate::records::Set::current(&self.root);
         let entries: Vec<Entry> = came
             .iter()
             .zip(kinds)
@@ -2856,6 +2880,7 @@ impl Index {
                 disk: disk(path),
                 overrides: vec![],
                 moved: None,
+                local: set.as_ref().is_some_and(|set| set.is_local(*uid)),
             })
             .collect();
         // What stood on the stack as it was, above this layer, stands on another now.
@@ -4097,6 +4122,7 @@ impl Index {
     /// The entries, from the resolved stack.
     fn assemble_entries(&mut self) {
         self.placed = Shared::new(self.resolved.iter().map(|(path, node)| (node.uid, path.clone())).collect());
+        let set = crate::records::Set::current(&self.root);
         self.entries = Shared::new(
             self.resolved
                 .iter()
@@ -4110,6 +4136,7 @@ impl Index {
                         disk: layer.place.disk(&node.content.1),
                         overrides: node.overrides.iter().map(|&i| self.layers[i].name.clone()).collect(),
                         moved: node.moved.map(|i| self.layers[i].name.clone()),
+                        local: set.as_ref().is_some_and(|set| set.is_local(node.uid)),
                     };
                     (path.clone(), entry)
                 })
@@ -4512,13 +4539,15 @@ mod tests {
         write(&root, "layers/base/f.node/node.toml", "stack = [{ op = \"file\", file = \"face.ufo\" }]\n");
         write(&root, "layers/base/f.node/face.ufo/metainfo.plist", "<plist/>");
         write(&root, "layers/base/f.node/face.ufo/glyphs/A_.glif", "<glyph/>");
-        write(&root, "layers/base/f.node/face.ufo/.hidden/x", "left out");
+        // A name starting with a dot is a name like any.
+        write(&root, "layers/base/f.node/face.ufo/.hidden/x", "kept");
         let (_, index) = open(&root);
         let names: Vec<&str> = index.assets[&tree("f")].files.iter().map(|file| file.name.as_str()).collect();
-        assert_eq!(names, ["face.ufo/glyphs/A_.glif", "face.ufo/metainfo.plist", "node.toml"], "{names:?}");
+        let all = ["face.ufo/.hidden/x", "face.ufo/glyphs/A_.glif", "face.ufo/metainfo.plist", "node.toml"];
+        assert_eq!(names, all, "{names:?}");
         // What a stored-file layer naming the folder reads.
         let node: &dyn crate::graph::exec::Node = &*index.assets[&tree("f")];
-        assert_eq!(node.file_names().len(), 3);
+        assert_eq!(node.file_names().len(), 4);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4717,7 +4746,15 @@ mod tests {
             let sha1 = crate::chunks::Store::local(root, crate::testing::io()).put_file(texels.as_bytes()).unwrap();
             let held = File { content: Some(Content::Stored { sha1, size: texels.len() as u64 }), base: None };
             let files = std::collections::BTreeMap::from([(rel("native.texels"), held)]);
-            let record = Record { op: Op::Override, kind: Kind::Node, parent: None, name: None, files, tree: None };
+            let record = Record {
+                op: Op::Override,
+                kind: Kind::Node,
+                parent: None,
+                name: None,
+                files,
+                tree: None,
+                local: false,
+            };
             let folder = &layer.records;
             let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
             let records = std::collections::BTreeMap::from([(uid("uid://a"), record)]);
@@ -4818,7 +4855,8 @@ mod tests {
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["code", "base", "top"]);
         let mut listed: Vec<String> = changeset(&root, "code").entries.into_values().map(|p| p.to_string()).collect();
         listed.sort();
-        assert_eq!(listed, ["code", "code/main.c", "code/x.node", "code/x.node/node.toml"]);
+        // Its `.gitignore` is a file of it, as any.
+        assert_eq!(listed, ["code", "code/.gitignore", "code/main.c", "code/x.node", "code/x.node/node.toml"]);
         assert_eq!(index.entries[&crate::testing::tree("code/main.c")].disk, tree.at("main.c"));
         assert!(!index.assets.contains_key(&crate::testing::tree("code/x")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);

@@ -439,6 +439,7 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
     if let Some(tree) = &record.tree {
         out.0.extend_from_slice(tree.bytes());
     }
+    out.u8(u8::from(record.local));
     if long {
         out.text(name);
     }
@@ -486,8 +487,9 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
         0 => None,
         _ => Some(sha1_in(&mut read)?),
     };
+    let local = read.u8()? != 0;
     let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
-    let record = Record { op, kind, parent, name, files, tree };
+    let record = Record { op, kind, parent, name, files, tree, local };
     read.0.is_empty().then_some(((Arc::new(record), modified, len), long))
 }
 
@@ -1145,6 +1147,7 @@ mod tests {
                 name: placed.then(|| pe2_path::Name::new(&format!("name {n}")).unwrap().to_owned()),
                 files,
                 tree: None,
+                local: false,
             };
             (uid(&format!("uid://{n:012}")), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
         };

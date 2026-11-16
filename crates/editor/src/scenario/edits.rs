@@ -57,6 +57,32 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
     editor.until("their records to be removed", |e| records(e).is_empty());
 }
 
+/// What a records layer keeps on this computer alone: its records' files in the project's local folder, by name.
+fn local_records(scenario: &mut Scenario) -> Vec<String> {
+    let at = scenario.workspace().project.root.at(".local/layers/top");
+    let mut found = walk(&at);
+    found.sort();
+    found
+}
+
+#[test]
+fn an_entry_kept_on_this_computer_is_greyed_its_records_local_and_undone_shared_again() {
+    let mut editor = Scenario::open(Fixture::notes_under_records());
+    let op = vfs::ops::Op::Folder { path: tree("mine") };
+    editor.workspace().apply_edit(&op, None).expect("made");
+    editor.until("the folder to be taken in", |e| e.workspace().index.entries.contains_key(&super::path("mine")));
+    editor.until("its record to be written", |e| records(e).len() == 1);
+    // Kept on this computer: its record moves to the local folder, and the index says so.
+    let op = vfs::ops::Op::Local { path: tree("mine"), local: true };
+    editor.workspace().apply_edit(&op, None).expect("kept here");
+    editor.until("it to be this computer's", |e| e.workspace().index.entries[&super::path("mine")].local);
+    editor.until("its record to move", |e| records(e).is_empty() && local_records(e).len() == 1);
+    // Undone: shared as it was.
+    editor.workspace().apply_edit(&vfs::ops::Op::Undo, None).expect("undone");
+    editor.until("it to be shared again", |e| !e.workspace().index.entries[&super::path("mine")].local);
+    editor.until("its record to move back", |e| records(e).len() == 1 && local_records(e).is_empty());
+}
+
 #[test]
 fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     let mut editor = Scenario::open(Fixture::notes_under_records());

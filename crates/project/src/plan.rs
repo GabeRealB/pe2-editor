@@ -926,6 +926,7 @@ fn write_records(project: &crate::Project, generated: &crate::Layer, record: &Re
             name: None,
             files: BTreeMap::new(),
             tree: None,
+            local: false,
         };
         records.entry(uid).or_insert_with(override_).files.insert(name, held);
     }

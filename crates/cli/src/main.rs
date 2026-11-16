@@ -420,6 +420,11 @@ enum ProjectCommand {
     KeepMine(KeepMineArgs),
     /// Give up the layer's version of an entry for the one below
     TakeBase(TakeBaseArgs),
+    /// Keep an entry, and all in it, on this computer alone: in the layer's part in the project's local folder, never
+    /// shared
+    Local(LocalArgs),
+    /// Share an entry kept on this computer alone, with the folders above it
+    Share(ShareArgs),
     /// Take an entry a layer lists and no longer holds out of its list (a problem's layer and path)
     Forget(ForgetArgs),
     /// List what a layer holds unlisted at and under a path of it (a problem's layer and path)
@@ -591,6 +596,22 @@ struct DropArgs {
 
 #[derive(clap::Args)]
 struct KeepMineArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct LocalArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct ShareArgs {
     #[arg(value_parser = tree)]
     path: Arc<project::TreePath>,
     #[command(flatten)]
@@ -1813,6 +1834,8 @@ fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> 
         ProjectCommand::Drop(DropArgs { path: p, at }) => (Op::Drop { path: p.clone() }, at),
         ProjectCommand::KeepMine(KeepMineArgs { path: p, at }) => (Op::KeepMine { path: p.clone() }, at),
         ProjectCommand::TakeBase(TakeBaseArgs { path: p, at }) => (Op::TakeBase { path: p.clone() }, at),
+        ProjectCommand::Local(LocalArgs { path: p, at }) => (Op::Local { path: p.clone(), local: true }, at),
+        ProjectCommand::Share(ShareArgs { path: p, at }) => (Op::Local { path: p.clone(), local: false }, at),
         ProjectCommand::Forget(ForgetArgs { of, path: p, at }) => {
             (Op::Forget { layer: of.clone(), path: p.clone() }, at)
         }

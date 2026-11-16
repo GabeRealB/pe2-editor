@@ -188,13 +188,14 @@ pub trait Owner: Send + Sync {
 }
 
 /// Files programs make for themselves beside what they edit - swap files, backups, lock files - which stay in the
-/// filesystem's staging while it serves and never reach a layer.
+/// filesystem's staging while it serves and never reach a layer: written every few seconds, they would be edits of
+/// the project's, and its history's steps, as often; and a file renamed to its backup while it is saved keeps its
+/// place in the project (`writes::put_aside`). Any other name - one starting with a dot among them - is a name. What is
+/// the project's and this machine's alone is said by its `[local]` patterns, not here.
 #[must_use]
 pub fn is_junk(path: &RelPath) -> bool {
     let name = path.name().unwrap_or_default();
-    // A name starting with `.` is none of the project's: the index leaves it out.
-    name.starts_with('.')
-        || name.ends_with('~')
+    name.ends_with('~')
         || name == "4913"
         || name.starts_with(".~lock.")
         || name.starts_with(".#")
@@ -429,19 +430,10 @@ mod tests {
 
     #[test]
     fn junk_is_what_editors_leave_beside_a_file() {
-        for junk in [
-            "a/.node.toml.swp",
-            "a/node.toml~",
-            "a/4913",
-            "a/.~lock.x.ods#",
-            "a/.#x",
-            "._x",
-            "a/.DS_Store",
-            "a/.gitignore",
-        ] {
+        for junk in ["a/.node.toml.swp", "a/node.toml~", "a/4913", "a/.~lock.x.ods#", "a/.#x", "._x", "a/.DS_Store"] {
             assert!(is_junk(pe2_path::RelPath::new(junk).unwrap()), "{junk}");
         }
-        for kept in ["a/node.toml", "a/x.swp.png", "a/settings.toml"] {
+        for kept in ["a/node.toml", "a/x.swp.png", "a/settings.toml", "a/.gitignore", ".clang-format"] {
             assert!(!is_junk(pe2_path::RelPath::new(kept).unwrap()), "{kept}");
         }
     }

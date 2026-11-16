@@ -25,7 +25,29 @@ listing gives it - and written as one set said in the log, only the records that
 layer back so. An override of a plain file holds a copy of it at once: its content is the file.
 
 A record says what it does to its entry, where the entry is (parent uid and name), and its files: text inline, other
-bytes by hash in the store. Each layer and record says its format; a format a program does not know is refused,
+bytes by hash in the store. A name is any a path takes: one starting with a dot is a name like another.
+
+## What is this machine's alone
+
+A layer has two parts: the shipped one (`layers/<layer>/`) and this machine's (`.local/layers/<layer>/`), which is
+never shipped. A record in this machine's part is over the shipped one of its uid (`Record::local`, which the record's
+place says, not its text); what it keeps by hash is in this machine's store. An entry is kept there:
+
+- made or moved where a name of the project's `[local] patterns` says (`project.toml`, as a `.gitignore`'s names: an
+  entry whose name or any folder's above it matches one; a new project's name editors' swap and lock files, backups
+  and systems' folder settings, the project's to change);
+- made or moved in an entry kept there - a shipped entry is never in one that is not;
+- made so: kept on this computer with all in it (`records::set_local`; `pe2-cli project local`, the Assets pane's
+  menu), or shared again with the folders above it the layer keeps there (`pe2-cli project share`), what it keeps by
+  hash put in the shipped store - one step of the history;
+- what a layer does (moves, overrides, deletes) to an entry kept there.
+
+The index marks such an entry (`Entry::local`): the Assets pane greys it, and can leave it out. A generated layer's
+records are all of this machine's part; a mount's are its listing, one part.
+
+Files programs make for themselves beside what they edit through the served folder - swap and lock files, backups -
+are none of these: they stay in what serves the folder (`vfs::write::is_junk`), never edits of the project's, so that
+neither its records nor its history change at each of their writes. Each layer and record says its format; a format a program does not know is refused,
 never guessed at. Everything reads a layer's content through `project::content`, never by path, so callers do not
 care how it is stored.
 
@@ -47,8 +69,8 @@ whole before anything of it is removed, so a sweep cut short loses nothing still
 
 ## Where a project keeps itself
 
-Beside `project.toml`, what is shipped with the project: `layers/` (each layer's folder, its changeset beside it, a
-generated layer's plan) and `store/`. And `.local/`, what of it is this machine's alone, which the `.gitignore` a new
+Beside `project.toml`, what is shipped with the project: `layers/` (each layer's records, beside them a generated
+layer's plan) and `store/`. And `.local/`, what of it is this machine's alone, which the `.gitignore` a new
 project is made with leaves out (`project::local`):
 
 | Part | What | Lasts |
@@ -57,8 +79,9 @@ project is made with leaves out (`project::local`):
 | `filesystem/` | the shared filesystem's log and the space its processes share | until applied, and as long as it says its own format |
 | `history/` | the session's history: steps, blobs, journal, trash | until the session closes cleanly |
 | `conflicts/` | what writes that met a change made meanwhile left aside | until the user settles it |
-| `layers/` | the records of the layers that are this machine's alone: a generated layer's | as long as the layer |
-| `store/` | what those records hold, by hash: what a plan made of the discs | as long as something names it |
+| `layers/` | each layer's part this machine's alone: a generated layer's records, and what another keeps here | as long as the layer |
+| `store/` | what those records hold, by hash: what a plan made of the discs, what is kept here | as long as something names it |
+| `temporary/` | the temporary files of writes, renamed into place in the project's trees and stores (`local::write_whole`) | until renamed; what a crash left, an hour |
 | `outputs/` | what is derived from the layers: the work graph's store, imports, merges, materialized files | until another schema or version opens it: the only part wiped |
 | `set-aside/` | what the served folder held that was not the project's | until the user removes it |
 | `settings.toml` | this machine's settings of the project (where its unmanaged mounts are, links to what builds deploy, how it is served) and the editor's view of it (`[editor.layers]`, `[editor.fill]`) | always |

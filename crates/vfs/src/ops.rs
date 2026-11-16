@@ -70,6 +70,12 @@ pub enum Op {
         layer: Arc<Name>,
         path: Arc<TreePath>,
     },
+    /// Keep an entry on this computer alone (`local`), with all in it - in the layer's local part, never shared - or
+    /// share it, with the folders above it (`records::set_local`).
+    Local {
+        path: Arc<TreePath>,
+        local: bool,
+    },
     /// Take back the last step, or do again the last taken back.
     Undo,
     Redo,
@@ -113,7 +119,8 @@ impl Op {
             | Op::TakeBase { path }
             | Op::Forget { path, .. }
             | Op::Adopt { path, .. }
-            | Op::RemoveUnlisted { path, .. } => vec![path],
+            | Op::RemoveUnlisted { path, .. }
+            | Op::Local { path, .. } => vec![path],
             Op::Undo | Op::Redo => Vec::new(),
         }
     }
@@ -170,6 +177,11 @@ pub fn apply(
         }
         Op::Adopt { layer: of, path } => edit::adopt(project, index, of, path, history)?,
         Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, path, history)?,
+        Op::Local { path, local } => {
+            let uid = uid_at(index, path)?;
+            let real = index.real_path(uid).with_context(|| format!("{path}: nothing is there"))?;
+            project::records::set_local(project, project.layer(layer)?, real, *local, history)?
+        }
         Op::Undo => {
             let step = history.undo(index, None, false).map_err(|e| anyhow::anyhow!("{e}"))?;
             return Ok((format!("Undid {}", step.label), step.paths()));

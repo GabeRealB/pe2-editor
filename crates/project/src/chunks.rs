@@ -71,24 +71,11 @@ fn written(path: &HostPath) {
     }
 }
 
-/// Put what the store keeps by its hash in its place: written aside, then moved there whole. Each write has its own
-/// file aside - two threads may be putting the same chunk at once, as two files sharing it do - and one finding it
-/// put there meanwhile lets its own go: what is there is the same, and may be read-only already.
+/// Put what the store keeps by its hash in its place, whole (`local::write_whole`): two threads may be putting the same
+/// chunk at once, as two files sharing it do, and one finding it put there meanwhile lets its own go - what is there is
+/// the same, and may be read-only already.
 fn put_in_place(fs: &dyn Filesystem, path: &HostPath, bytes: &[u8]) -> io::Result<()> {
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let aside = format!(".{}.{write}.tmp", std::process::id());
-    let aside = Name::new(&aside).map_err(io::Error::other)?;
-    let temporary = path.with_suffix(aside);
-    fs.write(&temporary, bytes)?;
-    match fs.rename(&temporary, path) {
-        Ok(()) => {}
-        Err(_) if fs.exists(path) => fs.remove_file(&temporary)?,
-        Err(e) => {
-            let _ = fs.remove_file(&temporary);
-            return Err(e);
-        }
-    }
+    crate::local::write_whole(fs, path, bytes, true)?;
     written(path);
     Ok(())
 }
@@ -486,7 +473,7 @@ impl Store {
     }
 
     /// Have a file kept whole in another store as well: its chunks, then its manifest naming them.
-    fn copy_file(&self, sha1: &Sha1, to: &Store) -> io::Result<()> {
+    pub(crate) fn copy_file(&self, sha1: &Sha1, to: &Store) -> io::Result<()> {
         let text = self.fs().read(&self.file_path(sha1)?)?;
         let manifest = Manifest::parse(std::str::from_utf8(&text).map_err(io::Error::other)?)?;
         for (hash, _) in &manifest.chunks {
@@ -756,8 +743,8 @@ fn named(project: &crate::Project) -> anyhow::Result<Named> {
     // A mount's records name no content: its files are its tree.
     for layer in project.layers.iter().filter(|layer| !layer.mounted) {
         let local = layer.records.starts_with(&local_layers);
-        for held in crate::records::read_records(fs, &layer.records, None)?.values() {
-            named.record(local, &held.record);
+        for held in crate::records::read_layer(fs, &layer.records, layer.local.as_ref(), None)?.values() {
+            named.record(local || held.record.local, &held.record);
         }
         if layer.kind == crate::LayerKind::Generated {
             named.local.files.extend(crate::plan::made(fs, layer)?);
@@ -965,6 +952,7 @@ mod tests {
             name: Some(pe2_path::Name::constant("x").to_owned()),
             files: std::collections::BTreeMap::new(),
             tree: Some(sha1),
+            local: false,
         };
         let layer = root.join(&crate::LAYERS).at("project");
         let named = crate::records::path_of(&layer, crate::testing::uid("uid://e1")).unwrap();
@@ -993,7 +981,15 @@ mod tests {
         let file = File { content: Some(Content::Stored { sha1, size: 1 }), base };
         let op = if base.is_some() { Op::Override } else { Op::Create };
         let name = base.is_none().then(|| pe2_path::Name::new(uid.trim_start_matches("uid://")).unwrap().to_owned());
-        let record = Record { op, kind: Kind::File, parent: None, name, files: [(root_file, file)].into(), tree: None };
+        let record = Record {
+            op,
+            kind: Kind::File,
+            parent: None,
+            name,
+            files: [(root_file, file)].into(),
+            tree: None,
+            local: false,
+        };
         let layer = root.join(&crate::LAYERS).at("project");
         let path = crate::records::path_of(&layer, crate::testing::uid(uid)).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

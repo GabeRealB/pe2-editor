@@ -34,6 +34,8 @@ Paths are as the project folder shows them. Edits go to the highest layer you ca
 | `pe2-cli project mv <from> <to>` | Renames or moves. |
 | `pe2-cli project override <path>` | Makes the layer's own version of an asset from below. |
 | `pe2-cli project drop <path>` | Gives up the layer's version of an asset. |
+| `pe2-cli project local <path>` | Keeps an entry, and all in it, on this computer only: never shared with the project. |
+| `pe2-cli project share <path>` | Shares an entry kept on this computer only, with the folders above it. |
 | `pe2-cli project keep-mine <path>`, `take-base <path>` | Settles an out-of-date override. |
 | `pe2-cli project undo`, `redo` | Takes back the last change, or does it again. |
 

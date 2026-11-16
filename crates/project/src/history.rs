@@ -1584,12 +1584,12 @@ mod tests {
         std::fs::read_to_string(path).ok()
     }
 
-    /// What a project's folder holds as the index sees it, each file by its bytes, each folder as none: what is
-    /// hidden (a name starting with `.`, its local folder, what an atomic write left half written) is none of it.
+    /// What a project's folder holds as the index sees it, each file by its bytes, each folder as none: its local
+    /// folder - and the temporary files of writes in it - is none of it.
     fn snapshot(root: &HostPath) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
         fn walk(dir: &std::path::Path, within: &str, into: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
-                if entry.file_name().to_string_lossy().starts_with('.') {
+                if within.is_empty() && entry.file_name() == ".local" {
                     continue;
                 }
                 let name = format!("{within}{}", entry.file_name().to_string_lossy());

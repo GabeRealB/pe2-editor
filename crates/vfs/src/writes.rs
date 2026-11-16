@@ -22,8 +22,8 @@
 //!   a file of its own.
 //! - A file removed is removed from the project a moment later, unless a file is made there meanwhile: removing
 //!   a file and writing it again is one save.
-//! - Junk (`write::is_junk`: swap files, backups, any name starting with `.`) is kept in memory, never due; it
-//!   goes with the serving. A name ending in `.node` - storage's mark of a node - is refused.
+//! - Junk (`write::is_junk`: swap files, backups, lock files) is kept in memory, never due; it goes with the
+//!   serving. A name ending in `.node` - storage's mark of a node - is refused.
 //! - A folder made in a node waits for what is written in it (`WAITS`): a `node.toml` makes it a node, other
 //!   files make it a folder of the node's files. Files written beside a new `node.toml` wait for the project to
 //!   show its folder a node, so they are its files.

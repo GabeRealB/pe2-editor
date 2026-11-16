@@ -1008,6 +1008,16 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
             if files.clicked() {
                 ws.browsing.show_files = !ws.browsing.show_files;
             }
+            let icon = if ws.browsing.hide_local { icons::EYE_SLASH } else { icons::EYE };
+            let hint = if ws.browsing.hide_local {
+                "Show what is this computer's alone, greyed: kept in the project's local folder, never shared"
+            } else {
+                "Hide what is this computer's alone: kept in the project's local folder, never shared"
+            };
+            let local = ui.add(egui::Button::new(icon).frame(false)).on_hover_text(hint);
+            if local.clicked() {
+                ws.browsing.hide_local = !ws.browsing.hide_local;
+            }
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let step = |ui: &mut egui::Ui, name: &str| {
@@ -1048,7 +1058,7 @@ fn assets_grid_ui(
     let Some(node) = ws.tree.at(folder) else { return };
     ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
     ui.horizontal_wrapped(|ui| {
-        for (key, child) in node.sorted_children() {
+        for (key, child) in node.sorted_children().into_iter().filter(|(_, child)| !hidden(ws, child)) {
             // An asset's looks are the tree's: the grid shows what is in the folder.
             let Some(path) = key.path_in(folder) else { continue };
             let name = key.as_str();
@@ -1147,7 +1157,7 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
     let mut job = egui::text::LayoutJob::simple_singleline(
         if unsaved { format!("{name} *") } else { name.to_string() },
         egui::TextStyle::Small.resolve(ui.style()),
-        theme::text(),
+        name_color(ws, node),
     );
     // Marked where a layer that can be edited holds it, as in the tree.
     let own = node.asset.as_ref().or(node.path.as_ref()).is_some_and(|path| ws.is_editable(path));
@@ -1158,6 +1168,9 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
     let galley = ui.painter().layout_job(job);
     let at = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.bottom() - galley.size().y - 4.0);
     ui.painter().galley(at, galley, theme::text());
+    if is_local(ws, node) {
+        return response.on_hover_text(format!("{name}: this computer's alone, never shared"));
+    }
     response.on_hover_text(name)
 }
 
@@ -1195,7 +1208,7 @@ impl TreeView<'_> {
         pick: &mut Option<Pick>,
         chosen: &mut Option<Entry>,
     ) {
-        for (key, child) in node.sorted_children() {
+        for (key, child) in node.sorted_children().into_iter().filter(|(_, child)| !hidden(self.ws, child)) {
             let name = key.as_str();
             let has_files = self.folders.is_none() && !self.files_of(child).is_empty();
             if child.children.is_empty() && !has_files {
@@ -1364,18 +1377,19 @@ impl TreeView<'_> {
         let thumbnail = found
             .filter(|a| self.ws.attached() && self.ws.extensions.has_thumbnail(a))
             .and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
-        let button = match thumbnail {
-            Some(texture) => {
-                let side = ui.text_style_height(&egui::TextStyle::Body);
-                let image = egui::Image::new((texture, egui::vec2(side, side))).maintain_aspect_ratio(true);
-                let font = egui::TextStyle::Body.resolve(ui.style());
-                let mut name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, theme::text());
-                if own {
-                    mark_own(&mut name, ui.style());
-                }
-                egui::Button::selectable(selected, (image, name))
+        let button = if let Some(texture) = thumbnail {
+            let side = ui.text_style_height(&egui::TextStyle::Body);
+            let image = egui::Image::new((texture, egui::vec2(side, side))).maintain_aspect_ratio(true);
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let mut name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, name_color(self.ws, node));
+            if own {
+                mark_own(&mut name, ui.style());
             }
-            None => egui::Button::selectable(selected, labelled(&self.ws.extensions, ui.style(), kind, name, own)),
+            egui::Button::selectable(selected, (image, name))
+        } else {
+            let (icon, tint) = icons::for_type(&self.ws.extensions, kind);
+            let job = icon_and_name(ui.style(), icon, tint, name_color(self.ws, node), name, own);
+            egui::Button::selectable(selected, job)
         };
         let response = ui.add(button.truncate().sense(egui::Sense::click_and_drag()));
         response.dnd_set_drag_payload(Dragged::Asset(asset.clone()));
@@ -1394,7 +1408,8 @@ impl TreeView<'_> {
     fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<Pick>) {
         let Some(path) = &node.path else { return };
         let icon = if node.file { icons::FILE } else { icons::FOLDER };
-        let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, self.ws.is_editable(path));
+        let job =
+            icon_and_name(ui.style(), icon, theme::weak(), name_color(self.ws, node), name, self.ws.is_editable(path));
         ui.horizontal(|ui| {
             let response = ui.add(egui::Button::selectable(self.ws.selected.as_ref() == Some(path), job).truncate());
             if self.reveal == Some(path) {
@@ -1427,6 +1442,21 @@ impl TreeView<'_> {
     }
 }
 
+/// Whether an entry is this machine's alone (`project::index::Entry::local`): greyed where it is shown.
+fn is_local(ws: &Workspace, node: &Node) -> bool {
+    node.path.as_ref().and_then(|path| ws.index.entries.get(path)).is_some_and(|entry| entry.local)
+}
+
+/// Whether an entry is left out: this machine's alone, while those are hidden.
+fn hidden(ws: &Workspace, node: &Node) -> bool {
+    ws.browsing.hide_local && is_local(ws, node)
+}
+
+/// The colour of an entry's name: greyed where it is this machine's alone.
+fn name_color(ws: &Workspace, node: &Node) -> Color32 {
+    if is_local(ws, node) { theme::weak() } else { theme::text() }
+}
+
 /// The edits of an entry (by its real path) the active layer can make: override, rename, delete, take back.
 fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &project::TreePath) -> Option<EditRequest> {
     let entry = ws.index.entries.get(real)?;
@@ -1454,6 +1484,18 @@ fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &project::TreePath) -> Op
     }
     if ui.button("Rename…").clicked() {
         request = Some(EditRequest::Rename(uid, real.to_owned()));
+    }
+    // Where the layer records it and keeps a part of this computer's alone: kept there, or shared.
+    let has_local = ws.project.layer(name).is_ok_and(|layer| layer.local.is_some());
+    if has_local && (own || overridden) {
+        let (label, hint) = if entry.local {
+            ("Share it", "Keep it in the project's shared layers again, with the folders above it")
+        } else {
+            ("Keep on this computer only", "Keep it, and all in it, in the project's local folder: never shared")
+        };
+        if ui.button(label).on_hover_text(hint).clicked() {
+            request = Some(EditRequest::Local(real.to_owned(), !entry.local));
+        }
     }
     let delete = if own { "Delete".to_string() } else { format!("Delete in {name}") };
     let hint = if own { "Remove it from the layer" } else { "The layer hides it: the layers below keep it" };

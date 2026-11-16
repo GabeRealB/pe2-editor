@@ -146,6 +146,7 @@ pub fn add_extension(
                 name: None,
                 files: removed(below.tree.as_deref(), &project.io, &tree, &project.root),
                 tree: Some(tree),
+                local: false,
             };
             writes.push((at(below.uid)?, record.render()));
         }
@@ -199,6 +200,7 @@ fn placed(
             name: Some(PLACED_IN.to_owned()),
             files: std::collections::BTreeMap::new(),
             tree: None,
+            local: false,
         };
         writes.push((at(folder)?, record.render()));
         folder
@@ -211,6 +213,7 @@ fn placed(
         name: Some(name.to_owned()),
         files: std::collections::BTreeMap::new(),
         tree: Some(tree),
+        local: false,
     };
     writes.push((at(uid())?, record.render()));
     Ok(writes)
@@ -268,6 +271,7 @@ pub fn remove_extension(project: &Project, id: &str, history: &mut History, labe
             name: None,
             files: std::collections::BTreeMap::new(),
             tree: None,
+            local: false,
         };
         tx.write(&crate::records::path_of(&layer.records, uid)?, record.render().as_bytes())?;
     }

@@ -99,6 +99,9 @@ pub struct Record {
     /// A sealed node's content: a tree of whole objects in the store (`chunks::Tree`), kept and replaced whole, never
     /// merged or edited - an extension, where it holds a manifest (`ext::folder::MANIFEST`), wherever it is.
     pub tree: Option<pe2_ext::Sha1>,
+    /// Where it is kept: in this machine's part of its layer (`.local/layers/<layer>`), never shipped - what its
+    /// file's place says, not its text.
+    pub local: bool,
 }
 
 /// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
@@ -314,7 +317,7 @@ impl Record {
         if tree.is_some() && kind != Kind::Node {
             bail!("a tree is a node's, not a {}'s", kind.name());
         }
-        Ok(Record { op, kind, parent, name, files, tree })
+        Ok(Record { op, kind, parent, name, files, tree, local: false })
     }
 
     /// Its text: its format first, what it does and where, then its files by name.
@@ -398,6 +401,8 @@ struct View {
     problems: Vec<String>,
     /// The trees of its sealed nodes (`Record::tree`), by hash, read once.
     trees: std::collections::HashMap<pe2_ext::Sha1, Arc<crate::chunks::Tree>>,
+    /// Where this machine's part of its records is (`Record::local`): none for a layer that has no such part.
+    local: Option<HostPath>,
 }
 
 impl View {
@@ -484,7 +489,14 @@ impl View {
             children: std::collections::HashMap::new(),
             problems: Vec::new(),
             trees: std::collections::HashMap::new(),
+            local: None,
         }
+    }
+
+    /// Where a record of it is kept: in its part (`Record::local`).
+    fn record_path(&self, uid: Uid, local: bool) -> Option<HostPath> {
+        let folder = if local { self.local.as_ref()? } else { &self.folder };
+        path_of(folder, uid).ok()
     }
 }
 
@@ -640,10 +652,18 @@ fn place(
 fn read_changed(
     fs: &dyn pe2_io::Filesystem,
     dir: &HostPath,
+    local: Option<&HostPath>,
     before: &Read,
     changed: &[HostPath],
 ) -> Option<Result<Read>> {
+    if local.is_some_and(|local| changed.iter().any(|path| path.starts_with(local))) {
+        return None;
+    }
     let ours: Vec<&HostPath> = changed.iter().filter(|path| path.starts_with(dir)).collect();
+    // What changed of a record a local one hides, or of the local part, is read with the layer whole.
+    if ours.iter().any(|path| uid_of(dir, path).is_some_and(|uid| before.get(&uid).is_some_and(|h| h.record.local))) {
+        return None;
+    }
     let records: Option<Vec<(Uid, &HostPath)>> = ours
         .iter()
         .map(|path| {
@@ -662,7 +682,7 @@ fn read_changed(
             match crate::storage::waiting_since(path) {
                 Some((at, Some(bytes))) => {
                     let text = String::from_utf8(bytes).with_context(|| path.display().to_string())?;
-                    waits(&mut read, uid, &text, at).with_context(|| path.display().to_string())?;
+                    waits(&mut read, uid, &text, at, false).with_context(|| path.display().to_string())?;
                     continue;
                 }
                 Some((_, None)) => {
@@ -697,8 +717,8 @@ fn read_changed(
 
 /// A record that waits to be written, among those read: as its text is, stamped as its file will be once written -
 /// its length, and the time it was said, which the file is given - so that the file written is the one read here.
-fn waits(read: &mut Read, uid: Uid, text: &str, at: std::time::SystemTime) -> Result<()> {
-    let record = Record::parse(text)?;
+fn waits(read: &mut Read, uid: Uid, text: &str, at: std::time::SystemTime, local: bool) -> Result<()> {
+    let record = Record { local, ..Record::parse(text)? };
     let record = match read.get(&uid) {
         Some(held) if *held.record == record => held.record.clone(),
         _ => std::sync::Arc::new(record),
@@ -715,6 +735,30 @@ fn no_time(path: &HostPath) -> std::io::Error {
 }
 
 pub(crate) fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>) -> Result<Read> {
+    read_part(fs, dir, before, false)
+}
+
+/// A layer's records, both its parts (`read_part`): the shipped one in `dir`, and this machine's in `local`, its records
+/// over the shipped one's of their uids.
+///
+/// # Errors
+/// As `read_part`.
+pub(crate) fn read_layer(
+    fs: &dyn pe2_io::Filesystem,
+    dir: &HostPath,
+    local: Option<&HostPath>,
+    before: Option<&Read>,
+) -> Result<Read> {
+    let mut read = read_part(fs, dir, before, false)?;
+    if let Some(local) = local {
+        read.extend(read_part(fs, local, before, true)?);
+    }
+    Ok(read)
+}
+
+/// One part of a layer's records (`local`, this machine's, or the shipped one), read on every core: those whose file
+/// is as it was when `before` read it, from the same part, taken from it.
+fn read_part(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>, local: bool) -> Result<Read> {
     // What waits is asked first: a record not waiting by now is in its file already, as it was last said - where
     // one read from its file first, and found waiting no more after, would be missed in both.
     let waiting = crate::storage::waiting_under(dir);
@@ -733,13 +777,14 @@ pub(crate) fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: 
             let Some(uid) = uid_of(dir, &path) else { continue };
             let stat = fs.stat_link(&path)?;
             let (modified, len) = (stat.modified.ok_or_else(|| no_time(&path))?, stat.size);
-            if let Some(held) = before.and_then(|b| b.get(&uid)).filter(|h| h.modified == modified && h.len == len) {
+            let same = |h: &&Held| h.modified == modified && h.len == len && h.record.local == local;
+            if let Some(held) = before.and_then(|b| b.get(&uid)).filter(same) {
                 out.push((uid, held.clone()));
                 continue;
             }
             let text = fs.read_to_string(&path)?;
             let record = Record::parse(&text).with_context(|| path.display().to_string())?;
-            out.push((uid, Held { record: std::sync::Arc::new(record), modified, len }));
+            out.push((uid, Held { record: std::sync::Arc::new(Record { local, ..record }), modified, len }));
         }
         Ok(out)
     };
@@ -764,7 +809,7 @@ pub(crate) fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: 
         match bytes {
             Some(bytes) => {
                 let text = String::from_utf8(bytes).with_context(|| path.display().to_string())?;
-                waits(&mut out, uid, &text, at).with_context(|| path.display().to_string())?;
+                waits(&mut out, uid, &text, at, local).with_context(|| path.display().to_string())?;
             }
             None => drop(out.remove(&uid)),
         }
@@ -820,9 +865,10 @@ impl Set {
         let mut below_changed = changed.is_none();
         let touched = |within: &HostPath| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
         for layer in &project.layers {
-            let folder = &layer.records;
+            let (folder, local) = (&layer.records, layer.local.as_ref());
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
-            if let Some(before) = before.filter(|_| !below_changed && !touched(folder)) {
+            let layer_touched = touched(folder) || local.is_some_and(touched);
+            if let Some(before) = before.filter(|_| !below_changed && !layer_touched) {
                 // As it was read: what it places is there for the layers above, as it was.
                 places.layers.push(before.named.clone());
                 views.push(before.clone());
@@ -832,7 +878,8 @@ impl Set {
             // A layer whose records are none yet - a generated one before its plan first ran - holds nothing.
             let settings = if fs.exists(folder) { settings(fs, folder)? } else { Settings::default() };
             // The records that changed read again, where the paths say which; else all of them looked at.
-            let after = before.zip(changed).and_then(|(view, paths)| read_changed(fs, folder, &view.records, paths));
+            let after =
+                before.zip(changed).and_then(|(view, paths)| read_changed(fs, folder, local, &view.records, paths));
             // What is known of the layer, as records read: what was read here before, where nothing else is.
             let known: Option<Read> = known.remove(&layer.path).map(|known| {
                 let held =
@@ -843,8 +890,8 @@ impl Set {
                 (Some(records), _) => records?,
                 // As known, each: no file is looked at.
                 (None, Some(known)) if taken => known,
-                (None, Some(known)) => read_records(fs, folder, Some(&known))?,
-                (None, None) => read_records(fs, folder, before.map(|v| &v.records))?,
+                (None, Some(known)) => read_layer(fs, folder, local, Some(&known))?,
+                (None, None) => read_layer(fs, folder, local, before.map(|v| &v.records))?,
             };
             // This machine's alone, where its records are in the local folder: what they keep is in the local store.
             let store = if folder.starts_with(&crate::local::part(&project.root, crate::local::LAYERS)) {
@@ -852,8 +899,12 @@ impl Set {
             } else {
                 crate::chunks::Store::at(&project.root, project.io.clone())
             };
-            let mut view =
-                View { settings, external: layer.mounted, ..View::new(layer.path.clone(), folder.clone(), store) };
+            let mut view = View {
+                settings,
+                external: layer.mounted,
+                local: layer.local.clone(),
+                ..View::new(layer.path.clone(), folder.clone(), store)
+            };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<Uid, Arc<TreePath>> = std::collections::HashMap::new();
@@ -931,6 +982,12 @@ impl Set {
             }
         }
         found
+    }
+
+    /// Whether a layer keeps an entry in this machine's part of it (`Record::local`).
+    #[must_use]
+    pub fn is_local(&self, uid: Uid) -> bool {
+        self.views.iter().any(|view| view.records.get(&uid).is_some_and(|held| held.record.local))
     }
 
     /// Whether an entry is a sealed node (`Record::tree`): kept whole, replaced or deleted, never written into.
@@ -1059,30 +1116,34 @@ impl Set {
     pub fn differing(&self) -> Vec<HostPath> {
         let mut differing = Vec::new();
         for view in &self.views {
-            let mut found = BTreeSet::new();
-            let records_dir = &view.folder;
-            let fs = self.store.io.filesystem();
-            let shards = fs.read_directory(records_dir).unwrap_or_default();
-            for shard in shards.iter().filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name)) {
-                let shard = records_dir.entry(&shard.name);
-                for file in fs.read_directory(&shard).unwrap_or_default() {
-                    let path = shard.entry(&file.name);
-                    let Some(uid) = uid_of(records_dir, &path) else { continue };
-                    let stamp = fs.stat_link(&path).ok().and_then(|stat| Some((stat.modified?, stat.size)));
-                    let same = view
-                        .records
-                        .get(&uid)
-                        .zip(stamp)
-                        .is_some_and(|(held, (modified, len))| held.modified == modified && held.len == len);
-                    if !same {
-                        differing.push(path);
+            // Each part of its records: the shipped one, and this machine's.
+            let parts = std::iter::once((&view.folder, false)).chain(view.local.iter().map(|local| (local, true)));
+            for (records_dir, local) in parts {
+                let mut found = BTreeSet::new();
+                let fs = self.store.io.filesystem();
+                let shards = fs.read_directory(records_dir).unwrap_or_default();
+                for shard in shards.iter().filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name)) {
+                    let shard = records_dir.entry(&shard.name);
+                    for file in fs.read_directory(&shard).unwrap_or_default() {
+                        let path = shard.entry(&file.name);
+                        let Some(uid) = uid_of(records_dir, &path) else { continue };
+                        let stamp = fs.stat_link(&path).ok().and_then(|stat| Some((stat.modified?, stat.size)));
+                        let same = view.records.get(&uid).zip(stamp).is_some_and(|(held, (modified, len))| {
+                            held.record.local == local && held.modified == modified && held.len == len
+                        });
+                        // A shipped record a local one hides is not what was read, and says nothing.
+                        let hidden = !local && view.records.get(&uid).is_some_and(|held| held.record.local);
+                        if !same && !hidden {
+                            differing.push(path);
+                        }
+                        found.insert(uid);
                     }
-                    found.insert(uid);
                 }
+                // A record read is of a uid whose file can be named: written so, read back so.
+                let gone =
+                    view.records.iter().filter(|(uid, held)| held.record.local == local && !found.contains(*uid));
+                differing.extend(gone.filter_map(|(uid, _)| path_of(records_dir, *uid).ok()));
             }
-            // A record read is of a uid whose file can be named: written so, read back so.
-            let gone = view.records.keys().filter(|uid| !found.contains(*uid));
-            differing.extend(gone.filter_map(|uid| path_of(&view.folder, *uid).ok()));
         }
         differing
     }
@@ -1146,7 +1207,8 @@ impl Set {
         let (uid, name) = view.files.get(&rel)?;
         Some(match view.content(*uid, name)? {
             Content::Text(_) => {
-                Source::RecordText { record: path_of(&view.folder, *uid).ok()?, name: name.to_string() }
+                let local = view.records.get(uid).is_some_and(|held| held.record.local);
+                Source::RecordText { record: view.record_path(*uid, local)?, name: name.to_string() }
             }
             Content::Stored { sha1, .. } => Source::Stored { sha1, store: view.store.dir.clone() },
             Content::Object { sha1, size } => Source::Object { sha1, size, store: view.store.dir.clone() },
@@ -1294,6 +1356,70 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     Ok(records.len())
 }
 
+/// Keep an entry of a layer in this machine's part of it (`local`), never shipped, with all that is in it - or share it
+/// (`!local`), with the folders above it the layer keeps this machine's: a shipped entry is never in one that is not.
+/// What a shared record keeps by hash is put in the shipped store. One step of the history; the paths written.
+///
+/// # Errors
+/// The layer has no part this machine's alone or no record of the entry, a folder above it is another layer's and this
+/// machine's, or the records cannot be written.
+pub fn set_local(
+    project: &crate::Project,
+    layer: &crate::Layer,
+    path: &TreePath,
+    local: bool,
+    history: &mut crate::history::History,
+) -> Result<Vec<HostPath>> {
+    let set = Set::current(&project.root).map_or_else(|| Set::open(project), Ok)?;
+    let view =
+        set.views.iter().find(|view| view.dir == layer.path).with_context(|| format!("{} is read", layer.name))?;
+    let at_path = |at: &TreePath| view.placed.iter().find(|(_, placed)| ***placed == *at).map(|(uid, _)| *uid);
+    let uid = at_path(path).with_context(|| format!("{} records nothing at {path}", layer.name))?;
+    let mut moved: Vec<Uid> = Vec::new();
+    if local {
+        // It, and all in it.
+        moved.extend(view.placed.iter().filter(|(_, placed)| placed.starts_with(path)).map(|(uid, _)| *uid));
+    } else {
+        moved.push(uid);
+        // The folders above it this machine's: the layer's, shared with it; another layer's cannot be.
+        let mut above = path.parent();
+        while let Some(folder) = above.filter(|folder| !folder.is_root()) {
+            match at_path(folder) {
+                Some(uid) if view.records.get(&uid).is_some_and(|held| held.record.local) => moved.push(uid),
+                None if set.placed_at(folder).is_some_and(|uid| set.is_local(uid)) => {
+                    bail!("{folder} is another layer's and this machine's alone: share it there first")
+                }
+                _ => {}
+            }
+            above = folder.parent();
+        }
+    }
+    let shipped = crate::chunks::Store::at(&project.root, project.io.clone());
+    let local_store = crate::chunks::Store::local(&project.root, project.io.clone());
+    let label = if local { format!("Keep {path} on this computer only") } else { format!("Share {path}") };
+    let mut tx = history.begin(label);
+    let mut written = Vec::new();
+    for uid in moved {
+        let Some(held) = view.records.get(&uid).filter(|held| held.record.local != local) else { continue };
+        if !local {
+            // What it keeps by hash, where it is shipped.
+            for file in held.record.files.values() {
+                if let Some(Content::Stored { sha1, .. }) = &file.content
+                    && !shipped.has_file(sha1)
+                {
+                    local_store.copy_file(sha1, &shipped)?;
+                }
+            }
+        }
+        let (from, to) = (layer.record_path(uid, !local)?, layer.record_path(uid, local)?);
+        tx.write(&to, Record { local, ..(*held.record).clone() }.render().as_bytes())?;
+        tx.remove(&from)?;
+        written.extend([from, to]);
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
 /// What an import makes (`records`), with the sealed nodes the layer holds (`old`) that it does not make - an extension
 /// added to the layer - and the folders each is placed in: one the import has at the same place is the import's.
 fn with_sealed(old: &Read, mut records: BTreeMap<Uid, Record>) -> BTreeMap<Uid, Record> {
@@ -1355,7 +1481,10 @@ pub fn listed(
         let (Some(kind), Some(name)) = (kind_of(path), path.last()) else { continue };
         let parent = path.parent().filter(|parent| !parent.is_root()).and_then(|parent| uid_at.get(parent).copied());
         let name = Some(name.to_owned());
-        records.insert(*uid, Record { op: Op::Create, kind, parent, name, files: BTreeMap::new(), tree: None });
+        records.insert(
+            *uid,
+            Record { op: Op::Create, kind, parent, name, files: BTreeMap::new(), tree: None, local: false },
+        );
     }
     records
 }
@@ -1538,14 +1667,30 @@ impl Staging<'_> {
                     let named = if node { crate::index::asset_named(&at)? } else { at.clone() };
                     let name = named.last().with_context(|| format!("{at}: no name"))?.to_owned();
                     let files = BTreeMap::new();
-                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files, tree: Some(tree) }
+                    Record {
+                        op: Op::Create,
+                        kind: Kind::Node,
+                        parent,
+                        name: Some(name),
+                        files,
+                        tree: Some(tree),
+                        local: false,
+                    }
                 }
                 pe2_io::Kind::Folder if at.as_str().ends_with(crate::index::BUNDLE_SUFFIX) => {
                     let mut files = BTreeMap::new();
                     self.files(&disk, RelPath::root(), &mut files)?;
                     let named = crate::index::asset_named(&at)?;
                     let name = named.last().with_context(|| format!("{at}: no name"))?.to_owned();
-                    Record { op: Op::Create, kind: Kind::Node, parent, name: Some(name), files, tree: None }
+                    Record {
+                        op: Op::Create,
+                        kind: Kind::Node,
+                        parent,
+                        name: Some(name),
+                        files,
+                        tree: None,
+                        local: false,
+                    }
                 }
                 pe2_io::Kind::Folder => {
                     self.folder(&disk, &at, Some(uid))?;
@@ -1556,6 +1701,7 @@ impl Staging<'_> {
                         name: Some(name.to_owned()),
                         files: BTreeMap::new(),
                         tree: None,
+                        local: false,
                     }
                 }
                 _ => {
@@ -1563,7 +1709,15 @@ impl Staging<'_> {
                         Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
                     let files =
                         BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content), base: None })]);
-                    Record { op: Op::Create, kind: Kind::File, parent, name: Some(name.to_owned()), files, tree: None }
+                    Record {
+                        op: Op::Create,
+                        kind: Kind::File,
+                        parent,
+                        name: Some(name.to_owned()),
+                        files,
+                        tree: None,
+                        local: false,
+                    }
                 }
             };
             self.records.insert(uid, record);
@@ -1673,6 +1827,7 @@ pub fn write_all(
 ///
 /// # Errors
 /// A file was written where no entry of the layer is, an entry's place names nothing, or content cannot be kept.
+#[expect(clippy::too_many_lines, reason = "each kind of record an edit makes, in its part, in turn")]
 pub fn records_for(
     project: &crate::Project,
     index: &crate::index::Index,
@@ -1682,7 +1837,13 @@ pub fn records_for(
     written: &BTreeMap<Arc<TreePath>, Option<Vec<u8>>>,
 ) -> Result<(BTreeMap<Uid, Record>, Vec<Uid>)> {
     use crate::changeset::Op as Did;
-    let store = crate::chunks::Store::at(&project.root, project.io.clone());
+    let shipped = crate::chunks::Store::at(&project.root, project.io.clone());
+    let local_store = crate::chunks::Store::local(&project.root, project.io.clone());
+    // What each record's content is kept in: the store of its part.
+    let store_of = |local: bool| if local { &local_store } else { &shipped };
+    // Whether an entry another layer has is this machine's.
+    let others = Set::current(&project.root);
+    let local_elsewhere = |uid: Uid| others.as_ref().is_some_and(|set| set.is_local(uid));
     // What the layers below resolve is asked, entry by entry: the layer's own are few beside it.
     let below = index.under(&layer.name);
     let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> = std::collections::HashMap::new();
@@ -1725,33 +1886,54 @@ pub fn records_for(
         crate::index::Kind::Folder => Kind::Folder,
         crate::index::Kind::File => Kind::File,
     };
-    let mut new = BTreeMap::new();
-    for (uid, path) in &changeset.entries {
+    let mut new: BTreeMap<Uid, Record> = BTreeMap::new();
+    // Whether an entry is this machine's by where it is: under one that is, or - made or moved there - named by a
+    // pattern of the project's `[local]`.
+    let local_at = |new: &BTreeMap<Uid, Record>, path: &TreePath, parent: Option<Uid>, placed: bool| {
+        let parent_local = parent.is_some_and(|parent| {
+            new.get(&parent).or_else(|| old.get(&parent)).map_or_else(|| local_elsewhere(parent), |r| r.local)
+        });
+        parent_local || (placed && crate::changeset::ignored(&project.local, path.as_str()))
+    };
+    // The layer's own entries from the top down: a folder's part is known before what is in it.
+    let mut entries: Vec<(&Uid, &Arc<TreePath>)> = changeset.entries.iter().collect();
+    entries.sort_by_key(|(_, path)| path.parts().count());
+    for (uid, path) in entries {
         let before = old.get(uid).filter(|r| r.op == Op::Create);
         let kind = before.map_or_else(|| new_kind(path, written), |r| r.kind);
+        let (parent, name) = place(path)?;
+        let placed = before.is_none_or(|r| (r.parent, r.name.as_ref()) != (parent, Some(&name)));
+        let local = before.is_some_and(|r| r.local) || local_at(&new, path, parent, placed);
         let mut files = before.map_or_else(BTreeMap::new, |r| r.files.clone());
         let tree = before.and_then(|r| r.tree);
-        for (name, bytes) in written_at(path, kind) {
+        for (file, bytes) in written_at(path, kind) {
             // A sealed node is replaced whole, never written into.
             anyhow::ensure!(tree.is_none(), "{path} is sealed - kept whole, as an extension is - and only read");
             match bytes {
-                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), base: None }),
-                None => files.remove(&name),
+                Some(bytes) => {
+                    let content = Content::of(&bytes, store_of(local))?;
+                    files.insert(file, File { content: Some(content), base: None })
+                }
+                None => files.remove(&file),
             };
         }
-        let (parent, name) = place(path)?;
-        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files, tree });
+        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files, tree, local });
     }
     for (uid, op) in &changeset.ops {
         let from = below.of(*uid);
         let kind = old.get(uid).map(|r| r.kind).or_else(|| from.map(|(_, k)| of_kind(k))).unwrap_or(Kind::File);
+        // What a layer does to an entry this machine's alone is this machine's too: shipped, it would name what others
+        // have not.
+        let theirs_local = old.get(uid).is_some_and(|r| r.local) || local_elsewhere(*uid);
         let record = match op {
             Did::Delete => {
-                Record { op: Op::Delete, kind, parent: None, name: None, files: BTreeMap::new(), tree: None }
+                let files = BTreeMap::new();
+                Record { op: Op::Delete, kind, parent: None, name: None, files, tree: None, local: theirs_local }
             }
             Did::Move { to } => {
                 let (parent, name) = place(to)?;
-                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new(), tree: None }
+                let local = theirs_local || local_at(&new, to, parent, true);
+                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new(), tree: None, local }
             }
             Did::Override { files: bases, to } => {
                 let at = to.as_deref().or(from.map(|(p, _)| p)).context("an override of nothing")?.to_owned();
@@ -1761,14 +1943,15 @@ pub fn records_for(
                 };
                 let now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
                 let held = old.get(uid).filter(|r| r.op == Op::Override);
+                let local = theirs_local || to.as_deref().is_some_and(|to| local_at(&new, to, parent, true));
                 // A sealed node's override keeps its tree, and what it removes of below's, as they were.
                 let tree = held.and_then(|r| r.tree);
                 anyhow::ensure!(tree.is_none() || now.is_empty(), "{at} is sealed - kept whole - and only read");
                 let files = match held.filter(|_| tree.is_some()) {
                     Some(sealed) => sealed.files.clone(),
-                    None => override_files(bases, now, held.map(|r| &r.files), &store)?,
+                    None => override_files(bases, now, held.map(|r| &r.files), store_of(local))?,
                 };
-                Record { op: Op::Override, kind, parent, name, files, tree }
+                Record { op: Op::Override, kind, parent, name, files, tree, local }
             }
         };
         new.insert(*uid, record);
@@ -1837,6 +2020,7 @@ mod tests {
             name: Some(name("box")),
             files: BTreeMap::default(),
             tree: None,
+            local: false,
         };
         for (name, content) in [
             ("node.toml", text("type = \"data\"\n[settings]\nsize = 3\n")),
@@ -1903,17 +2087,13 @@ mod tests {
         (root, tree)
     }
 
-    /// Every file under a folder, by its path within it, with its bytes - but what an atomic write left beside its file
-    /// as the disk failed (`.<name>.<process>.<n>.tmp`), until storage writes its temporary files out of the trees.
+    /// Every file under a folder, by its path within it, with its bytes.
     fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut out = std::collections::BTreeMap::new();
         let mut pending = vec![(dir.to_path_buf(), String::new())];
         while let Some((at, within)) = pending.pop() {
             for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && std::path::Path::new(&name).extension().is_some_and(|e| e == "tmp") {
-                    continue;
-                }
                 let path = if within.is_empty() { name } else { format!("{within}/{name}") };
                 if entry.file_type().unwrap().is_dir() {
                     out.insert(format!("{path}/"), Vec::new());
@@ -1967,6 +2147,7 @@ mod tests {
             name: Some(pe2_path::Name::new(name).unwrap().to_owned()),
             files: std::collections::BTreeMap::new(),
             tree: parent.map(|_| sealed),
+            local: false,
         };
         let records = root.at("layers/project");
         let write = |uid: &str, record: &super::Record| {

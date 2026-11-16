@@ -37,6 +37,8 @@ pub struct Node {
 pub struct Browsing {
     /// Each node's files inside it, beside what is inside it, as the project's filesystem shows them.
     pub show_files: bool,
+    /// What is this machine's alone (`project::index::Entry::local`) left out; shown, greyed, by default.
+    pub hide_local: bool,
 }
 
 /// Where a pane, a view or a reference asks to go: an asset, and a part of it to select; a part of what is shown; or,
@@ -456,6 +458,9 @@ pub enum EditRequest {
     /// Remove what a layer holds unlisted at a path from its folder: the layer and the path.
     RemoveUnlisted(Arc<Name>, Arc<TreePath>),
     Resolve(Uid, project::edit::Resolution),
+    /// Keep an entry (by its real path) on this computer alone, with all in it - or share it (`false`), with the
+    /// folders above it: in the active layer (`records::set_local`).
+    Local(Arc<TreePath>, bool),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
     /// An edit that could not be made, and why: said to the user.
@@ -2343,6 +2348,10 @@ impl Workspace {
                 EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, *uid, to, history)?,
                 EditRequest::Resolve(uid, resolution) => {
                     edit::resolve(project, index, &name, *uid, *resolution, history)?
+                }
+                EditRequest::Local(path, local) => {
+                    let layer = project.layer(&name)?;
+                    project::records::set_local(project, layer, path, *local, history)?
                 }
                 // An edit of a document: its working copy changes, saving writes it.
                 EditRequest::Write { uid, file, bytes, label, merge } => {
