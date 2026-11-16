@@ -152,3 +152,26 @@ backends, in `pe2-io`'s system parts (how a file is opened, mapped and locked, h
 started: `Processes` sets `CREATE_NO_WINDOW` on every one), and in how paths are handed to extensions (Windows drives
 become roots in an extension's filesystem, `/D:`). `PE2_TEST_SCOPES` runs the filesystem tests through a chosen
 backend, and `PE2_LICENSES_FOR` checks another platform's dependencies against the license policy.
+
+## Versions
+
+A version number counts what was released, never what changed in between.
+
+**Before the first release** nothing moves: the crates and the extension contract stay at 0.1.0, every format, schema
+and magic of the editor's own at 1. A format changes in place, and whatever an older build wrote is made again - a
+project made afresh, its `.local/` cleared - never told apart by a number, read by an old reader or converted.
+
+**From the first release on**, by kind:
+
+| Kind | What | Raised | How |
+|---|---|---|---|
+| The workspace | every crate, `pe2-editor`, `pe2-cli` (`[workspace.package] version`) | in the first commit after a release is tagged: the workspace always carries the version being worked toward | semver: the minor version raised after the tag; raised again before tagging where what changed asks for more (an incompatible change of a shipped format or of the command line: the major version), never lowered |
+| Shipped formats | a record's `format`, `layer.toml`, `project.toml`, a plan and its record, the store's headers | by the first change after a release that an older reader would misread; not again until the next release | an integer beside its reader and writer. A newer program reads every older shape, through one upgrade (`pe2-cli`, and offered by the editor); an older one refuses a newer shape, saying it was written by a newer pe2. What an older reader can pass over - an optional field - raises nothing |
+| This machine's caches | the model, the outputs' schema, the shared space | by any change of their shape after a release | an integer or magic; another is emptied and made again, never upgraded |
+| What processes say to each other | the host's, the server's, the agents' link, the lock's frames | never on its own | the build: processes of different builds refuse each other |
+| The extension contract | the WIT package, `component::CONTRACT` | at a release, where it changed since the last | semver of its own: the minor version for what is added, the major for what breaks; an extension says which it is built for |
+| A tool's extension | Python, GCC, binutils, aro | as the tool it packages changes | the tool's version; a package of it rebuilt is a revision of its setup, not another version |
+
+Each released shape of a shipped format keeps a sample in the tests, which the upgrade is held to - so an old project
+still opens - and which tells a release that changed a format without raising its number: the last release's sample
+no longer reads as that number.

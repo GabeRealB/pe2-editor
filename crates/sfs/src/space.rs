@@ -107,7 +107,9 @@ pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
 const PROBE: Duration = Duration::from_millis(100);
 
-const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x04");
+/// What a space's header begins with, its format last: 1 until the editor's first release - a space of an older shape
+/// is made again, never told apart.
+const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x01");
 
 /// Where each value of the shared header (page 0 of `head`) is.
 mod at {

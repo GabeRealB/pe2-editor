@@ -50,12 +50,15 @@ What holds whatever is being changed:
 
 - **The editor is standalone.** It knows nothing of how a project was made and runs the plan it is given.
 - **A layer's folder is storage, not a place to edit.** A project is edited through the editor, its served folder
-  (`assets/`) or `pe2-cli`; what a tree layer holds against its changeset is a problem the index reports, never an
-  edit.
+  (`assets/`) or `pe2-cli`; a layer's records are written by them alone. A mount's tree is the exception: worked on
+  with its own tools, what changes in it is listed in its records as it is found.
 - **A project is made by the editor's commands** (`pe2-cli project new`, `layer add`, `mount add`, `config add`,
   ...), never by writing its `project.toml`.
-- **No reader of an old format is kept before the first release**, and the contract stays 0.1.0: a format a
-  program does not know is refused, and `pe2-cli` converts one way.
+- **No version number moves before the first release.** Every format, schema and version of the editor's own - a
+  record's `format`, the model's, the outputs' schema, the shared space's, the crates', the contract's 0.1.0 - stays at
+  its first value; what is written in an older shape is made again (a project made afresh, its `.local/` cleared),
+  never told apart by a number, read by an old reader or converted. A format a program does not know is refused.
+  What is raised from the first release on, when and how: `design/engineering.md` (Versions).
 - **One thread holds a project** (`holder::core`): what the host and the editor both do of holding one is written
   there once, not in either.
 - **The editor's window displays and dispatches.** What changes the project is asked of its worker

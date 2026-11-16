@@ -75,11 +75,11 @@ pub const STACK: usize = 6;
 pub const ASSETS: usize = 7;
 pub const LINKS: usize = 12;
 
-/// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
-/// as is one of another schema of the project's outputs (`local::SCHEMA`), which is raised where what is derived
-/// of the files changes, and one whose names were compared by another version of Unicode
-/// (`pe2_path::UNICODE_VERSION`), by which names are one name.
-const FORMAT: u32 = 7;
+/// The model's format: a model of another is emptied, and filled again - as is one of another schema of the project's
+/// outputs (`local::SCHEMA`), and one whose names were compared by another version of Unicode
+/// (`pe2_path::UNICODE_VERSION`), by which names are one name. 1 until the editor's first release: a model of an older
+/// shape is made again, never told apart.
+const FORMAT: u32 = 1;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.

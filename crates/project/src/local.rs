@@ -45,8 +45,9 @@ pub const SETTINGS: &Name = Name::constant("settings.toml");
 /// The socket agents reach the editor holding the project by (`mcp::link`): listening from the moment it holds the
 /// project's lock, before it opens the outputs.
 pub const SOCKET: &Name = Name::constant("editor.sock");
-/// Raised whenever what the outputs hold changes shape.
-pub(crate) const SCHEMA: u32 = 2;
+/// The shape of what the outputs hold: outputs of another are wiped. 1 until the editor's first release: outputs of an
+/// older shape are made again, never told apart.
+pub(crate) const SCHEMA: u32 = 1;
 /// The schema and the tools that wrote the outputs.
 const VERSION: &Name = Name::constant("version");
 /// What has git ignore what it names.
