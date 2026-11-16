@@ -204,7 +204,7 @@ impl Fixture {
         let fixture = Fixture::new();
         fixture.write(
             "project.toml",
-            &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[mount]]\nat = \"code\"\npath = \"code\"\n"),
+            &format!("[[layer]]\nname = \"code\"\nmount = \"code\"\n\n[[layer]]\nname = \"{LAYER}\"\n"),
         );
         fixture.write("code/src/thing.c", "int thing;\n");
         fixture

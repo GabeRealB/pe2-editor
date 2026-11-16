@@ -1,6 +1,5 @@
 //! A project's layers watched for what changes by other means than its holder - a text editor's, git's, an
-//! extraction's: each layer's and mount's folder, and the folders of its changesets and `project.toml`, gathered
-//! into batches. A batch goes once the layers have been quiet for a moment, or after a second of steady change.
+//! extraction's: each layer's records, a mount's tree, and the folder of `project.toml`, gathered into batches. A batch goes once the layers have been quiet for a moment, or after a second of steady change.
 //! Not the project's, and left out: what is read (the filesystem served reads the layers all the time), its local
 //! folder but for this machine's settings, what its builds write, the folder it is served at, its unmanaged mounts
 //! (the discs), the temporary files of atomic writes, and what else sits in its own folder besides its
@@ -34,30 +33,34 @@ pub enum Change {
 /// # Errors
 /// The folders cannot be watched - the system's limit of watches reached.
 pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> anyhow::Result<Box<dyn Watching>> {
-    // Where each layer is on disk: a records layer's records, another's tree.
-    let roots: Vec<HostPath> = p.layers.iter().map(|l| l.folder().clone()).collect();
-    // Each layer's changeset sits beside its directory; `project.toml` in the project's own.
-    let mut shallow: Vec<HostPath> = p.layers.iter().filter_map(|l| l.changeset.parent()).collect();
-    shallow.push(p.root.clone());
+    // Where each layer is on disk: its records, and a mount's tree.
+    let roots: Vec<HostPath> = p
+        .layers
+        .iter()
+        .flat_map(|l| std::iter::once(&l.records).chain(l.mounted.then_some(&l.path)))
+        .cloned()
+        .collect();
+    // `project.toml`, in the project's own folder.
+    let mut shallow = vec![p.root.clone()];
     // This machine's settings of the project, in its local folder: none of the rest of that folder is the layers'.
     let settings = project::local::settings(&p.root);
     shallow.extend(settings.parent());
     let built = p.root.join(&pe2_path::Name::constant("build"));
     let mut ignore = vec![built, p.filesystem.at.clone()];
     ignore.extend(p.unmanaged.iter().map(|m| m.path.clone()));
-    let (root, changesets) = (p.root.clone(), p.layers.iter().map(|l| l.changeset.clone()).collect::<Vec<_>>());
+    let root = p.root.clone();
     let layers = roots.clone();
-    // Whether a path changing concerns the project: in a layer, a layer's changeset, one of its files at its root, or
-    // this machine's settings of it. What else sits in its folders (exports, a user's notes) does not.
+    // Whether a path changing concerns the project: in a layer, one of its files at its root, or this machine's
+    // settings of it. What else sits in its folders (exports, a user's notes) does not.
     let concerns = move |path: &HostPath| {
         let at_root = path.parent().is_some_and(|parent| parent == root)
             && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml"))
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
-        at_root || *path == settings || layers.iter().any(|layer| path.starts_with(layer)) || changesets.contains(path)
+        at_root || *path == settings || layers.iter().any(|layer| path.starts_with(layer))
     };
     // A records layer's shard - the folder of the records whose uids begin alike - is no change by itself: the records
     // in it are told of each, and it is made or removed as they are, after what said them.
-    let records: Vec<HostPath> = p.layers.iter().filter_map(|l| l.records.clone()).collect();
+    let records: Vec<HostPath> = p.layers.iter().map(|l| l.records.clone()).collect();
     let io = p.io.clone();
     let shard = move |path: &HostPath| {
         path.parent().is_some_and(|folder| records.contains(&folder))

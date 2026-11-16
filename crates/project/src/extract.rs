@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::changeset::Changeset;
 use crate::ext::Extensions;
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -377,22 +376,19 @@ impl crate::graph::exec::World for Layer<'_> {
 /// stack, as the project will - those movies, as written, joined - holding it to the disc's file, and keeping
 /// it in the store. Returns how many were made.
 /// What a container assembled from its movies is, joined by its stack from the layers as written: its file's sha1. The
-/// nodes are the first layer's, by its changeset (`<layer>.toml`), their files the second's (the generated layer
+/// nodes are the first layer's, by its records, their files the second's (the generated layer
 /// filling it) or, where it has none of a name, the first's.
 ///
 /// # Errors
-/// The changeset cannot be read, the node is not there, or its stack cannot join what it joins.
+/// The records cannot be read, the node is not there, or its stack cannot join what it joins.
 pub(crate) fn assembled_sha1(
     layers: [&HostPath; 2],
     node: &str,
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
 ) -> Result<pe2_ext::Sha1> {
-    // A records layer's changeset is what its records say.
-    let changeset = match crate::records::Set::changeset(layers[0]) {
-        Some(changeset) => changeset,
-        None => Changeset::load(extensions.io().filesystem(), &layers[0].with_suffix(crate::CHANGESET_SUFFIX))?,
-    };
+    let changeset = crate::records::Set::changeset(layers[0])
+        .with_context(|| format!("{}: its records are not read", layers[0].display()))?;
     let all = changeset
         .entries
         .iter()

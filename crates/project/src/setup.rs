@@ -110,25 +110,51 @@ pub fn add_mount(
         "{at} is where the project is served: an unmanaged mount there says where its tree is"
     );
     let mut document = read(project.io.filesystem(), &project.root)?;
-    let item = document.entry("mount").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
-    let mounts = item.as_array_of_tables_mut().with_context(|| format!("`mount` in {FILE} is no list of tables"))?;
-    let mut mount = Table::new();
-    mount.insert("at", value(at.as_str()));
-    if let Some(path) = path {
-        mount.insert("path", value(written(path)?));
-    }
-    if read_only {
-        mount.insert("read_only", value(true));
-    }
-    if unmanaged {
-        mount.insert("unmanaged", value(true));
-    }
-    mounts.push(mount);
     let mut tx = history.begin(format!("Mount {at}"));
-    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     if unmanaged {
+        // A place read by path alone: no layer.
+        let item = document.entry("mount").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+        let mounts =
+            item.as_array_of_tables_mut().with_context(|| format!("`mount` in {FILE} is no list of tables"))?;
+        let mut mount = Table::new();
+        mount.insert("at", value(at.as_str()));
+        if let Some(path) = path {
+            mount.insert("path", value(written(path)?));
+        }
+        mount.insert("unmanaged", value(true));
+        mounts.push(mount);
+        tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
         ignored(&mut tx, &project.root, &format!("/{at}/"))?;
+        return tx.commit().map(drop);
     }
+    // A layer whose files are the tree, at the bottom of the stack: what the rest builds on. Its records list the
+    // tree; its own rules of what is left out start with version control's folder.
+    let item = document.entry("layer").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+    let layers = item.as_array_of_tables_mut().with_context(|| format!("`layer` in {FILE} is no list of tables"))?;
+    let mut layer = Table::new();
+    layer.insert("name", value(at.as_str()));
+    layer.insert("mount", value(written(path.context("a mount says where its tree is")?)?));
+    if read_only {
+        layer.insert("read_only", value(true));
+    }
+    let mut all: Vec<Table> = layers.iter().cloned().collect();
+    // What the file opens with (its comment) stays where it opens, above the table now first.
+    if let Some(first) = all.first_mut() {
+        let prefix = first.decor().prefix().cloned();
+        if let Some(prefix) = prefix {
+            layer.decor_mut().set_prefix(prefix);
+            first.decor_mut().set_prefix("\n");
+        }
+    }
+    all.insert(0, layer);
+    layers.clear();
+    for table in all {
+        layers.push(table);
+    }
+    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
+    let settings = crate::records::Settings { read_only: false, ignore: vec![".git/".to_string()] };
+    let marker = project.root.join(&crate::LAYERS).join(at).join(&crate::records::MARKER);
+    tx.write(&marker, crate::records::marker(&settings).as_bytes())?;
     tx.commit().map(drop)
 }
 
@@ -284,6 +310,14 @@ mod tests {
         let at = |path: &str| dir.at(path);
         assert_eq!(files.plan(), at("layers/game-files.plan.jsonl"));
         assert_eq!(made.unmanaged[0].path, at("roms"));
+        // An indexed mount is a layer at the bottom of the stack, whose records leave out version control's folder.
+        let text = std::fs::read_to_string(dir.at("project.toml")).unwrap();
+        assert!(text.starts_with("# "), "the file's opening comment stays first:\n{text}");
+        let packages = &made.layers[0];
+        assert_eq!((packages.name.as_str(), packages.mounted, packages.read_only), ("packages", true, true));
+        assert_eq!(packages.records, at("layers/packages"));
+        let settings = crate::records::settings(&pe2_io::SystemFilesystem, &packages.records).unwrap();
+        assert_eq!(settings.ignore, [".git/"]);
         assert_eq!(made.resolve("res://roms/a.bin").unwrap(), at("roms/a.bin"));
         assert_eq!(made.configs[0].release.as_deref(), Some("USA"));
         let declaration: toml::Table = toml::from_str("values = [\"en\", \"fr\"]\ndefault = \"en\"").unwrap();

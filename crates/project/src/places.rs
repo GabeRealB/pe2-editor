@@ -35,12 +35,13 @@ pub enum Channel {
 #[derive(Debug, Serialize)]
 pub struct LayerPlaces {
     pub name: String,
-    /// Its folder.
+    /// Its folder: a mount's tree, worked on with its own tools; another's records, written and read through the
+    /// editor's commands alone.
     pub path: String,
     /// Its plan, where a plan fills it (whether or not it is written yet).
     pub plan: Option<String>,
-    /// Whether it is kept as records, written and read through the editor's commands alone.
-    pub records: bool,
+    /// Whether it is a mount.
+    pub mount: bool,
 }
 
 /// Where the project keeps what other programs reach of it.
@@ -61,7 +62,7 @@ pub fn places(project: &crate::Project) -> std::io::Result<Places> {
             name: layer.name.to_string(),
             path: text(layer.folder()),
             plan: (layer.kind == crate::LayerKind::Generated).then(|| text(&layer.plan())),
-            records: layer.records.is_some(),
+            mount: layer.mounted,
         })
         .collect();
     Ok(Places {

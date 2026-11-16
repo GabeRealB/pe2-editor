@@ -55,12 +55,13 @@ enum Says {
 
 /// The folder of a layer's records, where the extensions it holds are said.
 fn records_of(layer: &crate::Layer) -> Result<&HostPath> {
-    layer.records.as_ref().with_context(|| format!("{} holds no records, nor extensions", layer.name))
+    anyhow::ensure!(!layer.mounted, "{} is a mount: its records list its tree, and hold no extensions", layer.name);
+    Ok(&layer.records)
 }
 
 /// What a layer's records say of an extension; nothing where they say nothing of it.
 fn held_in(layer: &crate::Layer, id: &str, fs: &dyn pe2_io::Filesystem) -> Option<Says> {
-    let said = crate::records::extensions_of(fs, layer.records.as_ref()?).ok()?.remove(id)?;
+    let said = crate::records::extensions_of(fs, &layer.records).ok()?.remove(id)?;
     Some(said.map_or(Says::LeavesOff, Says::Holds))
 }
 

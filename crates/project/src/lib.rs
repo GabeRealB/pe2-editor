@@ -282,20 +282,25 @@ struct LayerFile {
     path: Option<String>,
     #[serde(default)]
     read_only: bool,
-    /// `files` for a layer of plain files only (code), `generated` for one its plan fills; an asset layer by default.
+    /// `generated` for one its plan fills; an asset layer by default.
     kind: Option<String>,
     /// The layer whose nodes a generated layer gives their files.
     fills: Option<String>,
+    /// A mount's tree: what it holds is where that folder is, worked on with its own tools - relative to the project or
+    /// absolute. Its records list it (each entry's uid, where it is), and hold none of its files.
+    mount: Option<String>,
+    /// Where a mount appears in the project: a name at its top (its own name by default).
+    at: Option<String>,
 }
 
+/// A place of the project read by path alone, never indexed (`res://<at>/...`) - the disc images - and read-only: a
+/// mount the project indexes is a layer (`LayerFile::mount`).
 #[derive(Deserialize)]
 struct MountFile {
     at: String,
-    /// The tree; an unmanaged mount's is this machine's (`.local/settings.toml`), else the folder of its name.
+    /// Its folder, where this machine says none (`.local/settings.toml`); else the folder of its name.
     path: Option<String>,
-    #[serde(default)]
-    read_only: bool,
-    /// Not indexed: a place files are read from by path (`res://<at>/...`) - the disc images - and nothing else.
+    /// Not indexed: what such a mount is, and said so.
     #[serde(default)]
     unmanaged: bool,
 }
@@ -412,18 +417,14 @@ pub struct Layer {
     pub kind: LayerKind,
     /// Where its content is addressed: a records layer's tree, on no disk (`records::TREE`); a mounted tree.
     pub path: HostPath,
-    /// The folder of its records, where it is a records layer: `layers/<name>/`, or - a generated layer's, this
-    /// machine's alone - `.local/layers/<name>/`.
-    pub records: Option<HostPath>,
+    /// The folder of its records: `layers/<name>/`, or - a generated layer's, this machine's alone -
+    /// `.local/layers/<name>/`.
+    pub records: HostPath,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
     pub at: Arc<TreePath>,
-    /// Its changeset, in `layers/`: `<path>.toml` beside a layer's directory, `layers/<name>.toml` for a mount.
-    pub changeset: HostPath,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
     pub read_only: bool,
-    /// Whether its changeset is the project's to write: a mount's is, though its tree may be read-only.
-    pub changeset_writable: bool,
-    /// A mount, which `project.toml` declares apart (`[[mount]]`) until mounts move into the stack.
+    /// A mount: its files are an external tree (`mount = ...`), its records listing it.
     pub mounted: bool,
     /// The layer a generated layer gives its nodes' files.
     pub fills: Option<Arc<Name>>,
@@ -444,10 +445,10 @@ impl Layer {
         records::shipped_of(&self.path).unwrap_or_else(|| self.path.clone()).with_suffix(PLAN_SUFFIX)
     }
 
-    /// Where it is on disk: a records layer's folder of records, another's tree.
+    /// Where it is on disk: a mount's tree, another's folder of records.
     #[must_use]
     pub fn folder(&self) -> &HostPath {
-        self.records.as_ref().unwrap_or(&self.path)
+        if self.mounted { &self.path } else { &self.records }
     }
 
     /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree; joined part
@@ -621,20 +622,24 @@ pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
 }
 
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`.local/settings.toml`).
-fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
-    let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
+fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<Vec<Mount>> {
+    let mut unmanaged = Vec::new();
     for m in declared {
         let at = TreePath::new(m.at.trim_matches('/')).with_context(|| format!("the mount {}", m.at))?;
-        let path = match (m.unmanaged, local.mounts.get(at.as_str()), &m.path) {
-            (true, Some(here), _) => resolve_path(root, here)?,
-            (_, _, Some(path)) => resolve_path(root, path)?,
-            (true, None, None) => root.join(&at),
-            (false, _, None) => bail!("{}: the mount {at} says no path", root.join(&FILE)),
+        // A mount the project indexes is a layer of its own (`[[layer]] mount = "<folder>"`).
+        anyhow::ensure!(
+            m.unmanaged,
+            "{}: the mount {at}: a mount the project indexes is a layer (`[[layer]] mount = ...`)",
+            root.join(&FILE)
+        );
+        let path = match (local.mounts.get(at.as_str()), &m.path) {
+            (Some(here), _) => resolve_path(root, here)?,
+            (None, Some(path)) => resolve_path(root, path)?,
+            (None, None) => root.join(&at),
         };
-        let mount = Mount { at: at.to_owned(), path, read_only: m.read_only || m.unmanaged };
-        if m.unmanaged { unmanaged.push(mount) } else { mounts.push(mount) }
+        unmanaged.push(Mount { at: at.to_owned(), path, read_only: true });
     }
-    Ok((mounts, unmanaged))
+    Ok(unmanaged)
 }
 
 impl Project {
@@ -657,34 +662,32 @@ impl Project {
         opened(&root);
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
         let local = read_local(io.filesystem(), &root)?;
-        let (mounts, unmanaged) = mounts_of(&root, file.mount, &local)?;
-        // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
-        let mut layers: Vec<Layer> = mounts
-            .iter()
-            .map(|m| -> Result<Layer> {
-                Ok(Layer {
-                    name: layer_name(m.at.as_str())?,
-                    kind: LayerKind::Files,
-                    path: m.path.clone(),
-                    at: m.at.clone(),
-                    changeset: root.join(&LAYERS).join(&layer_name(m.at.as_str())?).with_suffix(CHANGESET_SUFFIX),
-                    read_only: m.read_only,
-                    changeset_writable: true,
-                    mounted: true,
-                    fills: None,
-                    records: None,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let unmanaged = mounts_of(&root, file.mount, &local)?;
+        let mut layers: Vec<Layer> = Vec::new();
         for l in file.layer {
             let name = layer_name(&l.name)?;
             let folder = match l.path.as_deref() {
                 Some(path) => resolve_path(&root, path)?,
                 None => root.join(&LAYERS).join(&name),
             };
-            let changeset = folder.with_suffix(CHANGESET_SUFFIX);
             if layers.iter().any(|m| m.name == name) || unmanaged.iter().any(|m| m.at.parts().eq([&*name])) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
+            }
+            // A mount: a layer whose files are an external tree, listed by its records.
+            if let Some(tree) = l.mount.as_deref() {
+                let at =
+                    layer_name(l.at.as_deref().unwrap_or(&l.name)).with_context(|| format!("the mount {}", l.name))?;
+                layers.push(Layer {
+                    name,
+                    kind: LayerKind::Files,
+                    path: resolve_path(&root, tree)?,
+                    at: TreePath::root().join(&at),
+                    read_only: l.read_only,
+                    mounted: true,
+                    fills: None,
+                    records: folder,
+                });
+                continue;
             }
             let kind = match l.kind.as_deref() {
                 None | Some("assets") => LayerKind::Assets,
@@ -692,13 +695,14 @@ impl Project {
                 Some(other) => bail!("{}: the layer {}: no kind {other} (assets, generated)", root.join(&FILE), l.name),
             };
             let generated = kind == LayerKind::Generated;
-            // A layer is its records; only what a plan fills is a tree of files, until plans write records too.
+            // A layer is its records: one made by hand has them in its folder before it is opened; what a plan fills
+            // has them once it has run.
             if !generated && !records::is_records(io.filesystem(), &folder) {
                 bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, folder.display());
             }
             // What a plan fills is this machine's alone: its records are in the local folder.
             let records = if generated { local::part(&root, local::LAYERS).join(&name) } else { folder.clone() };
-            let (path, records) = (folder.join(records::TREE), Some(records));
+            let path = folder.join(records::TREE);
             if generated != l.fills.is_some() {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
@@ -709,15 +713,19 @@ impl Project {
                 kind,
                 path,
                 at: TreePath::root().to_owned(),
-                changeset,
                 read_only,
-                changeset_writable: !read_only,
                 mounted: false,
                 fills,
                 records,
             });
         }
         check_fills(&root, &layers)?;
+        // The mounts, as what resolves a path through them reads them.
+        let mounts = layers
+            .iter()
+            .filter(|l| l.mounted)
+            .map(|l| Mount { at: l.at.clone(), path: l.path.clone(), read_only: l.read_only })
+            .collect();
         let disabled_extensions = file.extensions.disabled;
         let requires = file.extension;
         let extension_settings = file
@@ -769,8 +777,7 @@ impl Project {
     pub fn held_extensions(&self) -> Vec<HostPath> {
         let mut held: std::collections::BTreeMap<String, Option<HostPath>> = std::collections::BTreeMap::new();
         for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            let Some(folder) = &layer.records else { continue };
-            let records = match records::extensions_of(self.io.filesystem(), folder) {
+            let records = match records::extensions_of(self.io.filesystem(), &layer.records) {
                 Ok(records) => records,
                 Err(e) => {
                     eprintln!("the extensions {} holds: {e:#}", layer.name);
@@ -908,23 +915,19 @@ pub(crate) mod testing {
         let (new, gone) =
             crate::records::records_for(&project, &index, layer, changeset, &old, &written).expect("records made");
         for (uid, record) in new {
-            let at = crate::records::path_of(layer.records.as_ref().unwrap(), uid).unwrap();
+            let at = crate::records::path_of(&layer.records, uid).unwrap();
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             std::fs::write(&at, record.render()).unwrap();
         }
         for uid in gone {
-            std::fs::remove_file(crate::records::path_of(layer.records.as_ref().unwrap(), uid).unwrap()).unwrap();
+            std::fs::remove_file(crate::records::path_of(&layer.records, uid).unwrap()).unwrap();
         }
     }
 
-    /// What a layer says it does, as a changeset: a records layer's records (`records::Set::changeset`), read afresh,
-    /// or a mount's changeset.
+    /// What a layer says it does, as a changeset: its records (`records::Set::changeset`), read afresh.
     pub fn changeset(root: &HostPath, layer: &str) -> crate::changeset::Changeset {
         let project = crate::Project::load(root).expect("a test's project");
         let layer = project.layer(&name(layer)).expect("the layer");
-        if layer.mounted {
-            return crate::changeset::Changeset::load(&pe2_io::SystemFilesystem, &layer.changeset).unwrap();
-        }
         let set = crate::records::Set::open(&project).expect("its records read");
         let found = crate::records::Set::changeset(&layer.path).expect("a records layer");
         drop(set);

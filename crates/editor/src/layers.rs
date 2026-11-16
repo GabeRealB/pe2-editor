@@ -228,7 +228,7 @@ fn drop_ui(ui: &egui::Ui, layer: &LayerInfo, row: egui::Rect, action: &mut Optio
 fn handle_ui(ui: &mut egui::Ui, layer: &LayerInfo) {
     if layer.mounted {
         ui.label(RichText::new(icons::PLUGS_CONNECTED).color(theme::weak()))
-            .on_hover_text("A mount: declared apart in project.toml ([[mount]]), at the bottom of the stack");
+            .on_hover_text("A mount: a folder of files from elsewhere, at the bottom of the stack");
     } else {
         ui.add(egui::Label::new(RichText::new(icons::DOTS_SIX_VERTICAL).color(theme::weak())).selectable(false));
     }
@@ -396,8 +396,10 @@ pub fn layer_ui(
     if let Some(definition) = definition {
         ui.label(RichText::new(summary(&layer)).small().color(theme::weak()));
         let line = |text: String| RichText::new(text).small().color(theme::weak());
-        theme::short(ui, line(format!("content  {}", definition.path.display())));
-        theme::short(ui, line(format!("changeset  {}", definition.changeset.display())));
+        if definition.mounted {
+            theme::short(ui, line(format!("tree  {}", definition.path.display())));
+        }
+        theme::short(ui, line(format!("records  {}", definition.records.display())));
     }
     let needs: Vec<String> = layer.depends_on.iter().map(|d| d.describe(&layer.name)).collect();
     let needed: Vec<String> = ws

@@ -87,9 +87,9 @@ fn holds(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
     io.filesystem().exists(path) || crate::content::exists(io, path) || crate::content::is_dir(io, path)
 }
 
-/// What an edit does to a layer's files and its list, through its step: on a layer stored as a tree, at once; on a
-/// records layer (`records`), what it writes of files is gathered, and written as its records with its changeset - one
-/// record an entry - so that undo takes back record files, as any.
+/// What an edit does to a layer's files and its list, through its step: on a mount, its files in its tree, at once, and
+/// its listing as its records; on any other layer (`records`), what it writes of files is gathered, and written as its
+/// records with its changeset - one record an entry - so that undo takes back record files, as any.
 struct Out<'a, 'h> {
     tx: &'a mut crate::history::Transaction<'h>,
     project: &'a Project,
@@ -106,7 +106,8 @@ impl<'a, 'h> Out<'a, 'h> {
         index: &'a Index,
         layer: &'a Layer,
     ) -> Self {
-        let records = layer.records.is_some().then(BTreeMap::new);
+        // A mount's files are its tree's: written there, its records listing them alone.
+        let records = (!layer.mounted).then(BTreeMap::new);
         Out { tx, project, index, layer, records }
     }
 
@@ -191,19 +192,17 @@ impl<'a, 'h> Out<'a, 'h> {
         Ok(())
     }
 
-    /// Write the layer's list: its changeset, or its records as the changeset and the files written make them.
+    /// Write the layer's list: its records, as the changeset and the files written make them - a mount's listing what
+    /// its tree holds.
     fn changeset(&mut self, changeset: &Changeset) -> Result<()> {
-        // A changeset is read as the file it is, as a record is: never kept as chunks, however much it lists.
-        let Some(written) = &self.records else {
-            return self.tx.write_stored(&self.layer.changeset, changeset.render().as_bytes());
-        };
+        let Some(written) = &self.records else { return self.listing(changeset) };
         let old = tracing::info_span!("edit: the layer's records copied")
             .in_scope(|| crate::records::Set::records_of(&self.layer.path).unwrap_or_default());
         let (new, gone) = tracing::info_span!("edit: the layer's records made")
             .in_scope(|| crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written))?;
         // As it is, whatever its length: a record is read as a record, never kept as chunks as a layer's long
         // files are - which one holding a long text was, and was then not found again.
-        let folder = self.layer.records.as_ref().context("a records layer's records written")?;
+        let folder = &self.layer.records;
         for (uid, record) in &new {
             let at = crate::records::path_of(folder, *uid).with_context(|| format!("{uid}: its record"))?;
             self.tx.write_stored(&at, record.render().as_bytes())?;
@@ -213,6 +212,35 @@ impl<'a, 'h> Out<'a, 'h> {
         }
         // What is written is in the records now.
         self.records = Some(BTreeMap::new());
+        Ok(())
+    }
+
+    /// A mount's records, as its changeset lists what its tree holds after this step's changes: each record that
+    /// differs written, each gone removed, its marker made where it has none.
+    fn listing(&mut self, changeset: &Changeset) -> Result<()> {
+        let folder = self.layer.records.clone();
+        let old = crate::records::Set::records_of(&self.layer.path).unwrap_or_default();
+        let kind_of = |path: &TreePath| {
+            let disk = self.layer.disk(path);
+            if self.tx.is_dir(&disk) {
+                Some(crate::records::Kind::Folder)
+            } else {
+                self.tx.is_file(&disk).then_some(crate::records::Kind::File)
+            }
+        };
+        let new = crate::records::listed(&changeset.entries, &kind_of);
+        for (uid, record) in new.iter().filter(|(uid, record)| old.get(*uid) != Some(*record)) {
+            let at = crate::records::path_of(&folder, *uid).with_context(|| format!("{uid}: its record"))?;
+            self.tx.write_stored(&at, record.render().as_bytes())?;
+        }
+        for uid in old.keys().filter(|uid| !new.contains_key(*uid)) {
+            self.tx.remove(&crate::records::path_of(&folder, *uid).with_context(|| format!("{uid}: its record"))?)?;
+        }
+        let marker = folder.join(&crate::records::MARKER);
+        if !self.tx.is_file(&marker) {
+            let settings = crate::records::Settings { read_only: false, ignore: changeset.ignore.clone() };
+            self.tx.write_stored(&marker, crate::records::marker(&settings).as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -241,7 +269,7 @@ fn own_copy(
     // A plain file is its content: its override holds a copy of it at once - code, edited where it is served, with its
     // own tools. A node's holds what it changes, as it changes it.
     if below.kind == Kind::File {
-        let store = crate::chunks::Store::at(&project_root(layer), index.io().clone());
+        let store = crate::chunks::Store::at(&out.project.root, index.io().clone());
         for (file, source) in &below.files {
             let bytes = crate::content::read(index.io(), source).with_context(|| source.display().to_string())?;
             let disk = if file.is_root() { layer.disk(&at) } else { layer.disk(&at).join(file) };
@@ -253,12 +281,6 @@ fn own_copy(
     changeset.ops.insert(uid, Op::Override { files, to });
     out.changeset(changeset)?;
     Ok(at)
-}
-
-/// The project a layer is of: the folder holding `layers`, where its changeset is.
-fn project_root(layer: &Layer) -> HostPath {
-    let layers = layer.changeset.parent().unwrap_or_else(|| layer.changeset.clone());
-    layers.parent().unwrap_or(layers)
 }
 
 /// Write a file of an entry in a layer - a bundle's file by its name, a plain file itself (an empty name) - in the
@@ -649,9 +671,9 @@ fn delete_in(
     Ok(())
 }
 
-/// Take an entry the layer lists but no longer holds out of its list: deleted outside the editor, it is kept listed (its
-/// uid held should its path come back) until this says it is gone. Nothing is written but the list, so a layer whose
-/// content is its maker's alone (a read-only mount) can forget too.
+/// Take an entry the layer lists but no longer holds out of its list: one its rules now leave out, kept listed (its uid
+/// held should they take it back) until this says it is gone. (What another program removes from a mount leaves its
+/// listing by itself.) Nothing is written but the list, so a layer whose content is its maker's alone can forget too.
 ///
 /// # Errors
 /// The layer does not list the uid, or still holds its path where the index does not leave it out.
@@ -913,7 +935,7 @@ pub fn resolve(
     reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
 )]
 mod tests {
-    use super::{Resolution, delete, forget, override_entry, rename, resolve};
+    use super::{Resolution, delete, override_entry, rename, resolve};
     use crate::Project;
     use crate::changeset::Op;
     use crate::history::History;
@@ -1795,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_mount_forgets_what_is_gone_from_it() {
+    fn what_is_gone_from_a_mount_is_gone_from_its_listing() {
         let root = project("forget");
         let mounted = root.at("mounted");
         std::fs::create_dir_all(&mounted).unwrap();
@@ -1803,32 +1825,76 @@ mod tests {
         std::fs::write(mounted.at("gone.c"), "gone").unwrap();
         std::fs::write(
             root.at("project.toml"),
-            "[[mount]]\nat = \"code\"\npath = \"mounted\"\nread_only = true\n\n[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n",
+            "[[layer]]\nname = \"code\"\nmount = \"mounted\"\nread_only = true\n\n[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n",
         )
         .unwrap();
         let mut o = open(&root);
         let (gone, kept) = (o.uid("code/gone.c"), o.uid("code/kept.c"));
+        // Removed from the tree by another program: its record goes with it, and nothing is missing.
         std::fs::remove_file(mounted.at("gone.c")).unwrap();
         o.refresh(&[mounted.at("gone.c")]);
-        assert!(
-            o.index.problems.contains(&Problem::Missing {
-                layer: crate::testing::name("code"),
-                path: "code/gone.c".into(),
-                left_out: false
-            }),
-            "{:?}",
-            o.index.problems
-        );
-        assert!(
-            forget(&o.project, &o.index, pe2_path::Name::constant("code"), kept, &mut o.history).is_err(),
-            "what is there is not forgotten"
-        );
-        let paths = forget(&o.project, &o.index, pe2_path::Name::constant("code"), gone, &mut o.history).unwrap();
-        o.refresh(&paths);
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
+        let listed = crate::testing::changeset(&root, "code");
+        assert!(!listed.entries.contains_key(&gone) && listed.entries.contains_key(&kept), "{listed:?}");
+        assert_eq!(o.uid("code/kept.c"), kept, "what is there keeps its uid");
         assert!(mounted.at("kept.c").exists());
         drop(o);
         crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn a_mount_lists_what_other_programs_make_and_move_in_it() {
+        let root = project("mount-listing");
+        let mounted = root.at("mounted");
+        std::fs::create_dir_all(mounted.at("src")).unwrap();
+        std::fs::write(mounted.at("src/a.c"), "int a;").unwrap();
+        std::fs::write(
+            root.at("project.toml"),
+            "[[layer]]\nname = \"code\"\nmount = \"mounted\"\n\n[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n",
+        )
+        .unwrap();
+        let mut o = open(&root);
+        let (a, src) = (o.uid("code/src/a.c"), o.uid("code/src"));
+        // Renamed and added by another program: the file moved keeps its uid, the new one is listed.
+        std::fs::rename(mounted.at("src/a.c"), mounted.at("src/b.c")).unwrap();
+        std::fs::write(mounted.at("src/new.c"), "int n;").unwrap();
+        o.refresh(&[mounted.at("src/a.c"), mounted.at("src/b.c"), mounted.at("src/new.c")]);
+        assert_eq!(o.uid("code/src/b.c"), a, "a file moved keeps its uid");
+        let new = o.uid("code/src/new.c");
+        assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
+        // The listing is the mount's records, in the project; nothing is written into the tree.
+        let listed = crate::testing::changeset(&root, "code");
+        let mut paths: Vec<String> = listed.entries.values().map(ToString::to_string).collect();
+        paths.sort();
+        assert_eq!(paths, ["code", "code/src", "code/src/b.c", "code/src/new.c"]);
+        let record = crate::records::path_of(&root.at("layers/code"), new).unwrap();
+        assert!(record.exists(), "{}", record.display());
+        let mut in_tree: Vec<String> = walk(&mounted);
+        in_tree.sort();
+        assert_eq!(in_tree, ["src/b.c", "src/new.c"]);
+        drop(o);
+        // Opened again, each keeps its uid.
+        let o = open(&root);
+        assert_eq!((o.uid("code/src"), o.uid("code/src/b.c"), o.uid("code/src/new.c")), (src, a, new));
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    /// The files under a folder, by their paths in it.
+    fn walk(folder: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut todo = vec![folder.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    found.push(path.strip_prefix(folder).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        found
     }
 
     #[test]

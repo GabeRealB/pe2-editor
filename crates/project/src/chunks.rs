@@ -636,8 +636,6 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     for part in [crate::local::HISTORY, crate::local::CONFLICTS] {
         files_under(fs, &crate::local::part(&project.root, part), &mut found);
     }
-    // The changesets name the files kept whole that overrides were made from; the history, those its steps can put back.
-    found.extend(project.layers.iter().map(|l| l.changeset.clone()));
     let mut kept = BTreeSet::new();
     for path in found {
         // A record, a changeset, a step's content: what names a file kept whole, by its hash - none of them large.

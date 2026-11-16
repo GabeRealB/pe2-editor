@@ -1360,7 +1360,8 @@ impl Transaction<'_> {
         })
     }
 
-    fn is_file(&self, path: &HostPath) -> bool {
+    /// Whether a file is at a path, as the changes so far leave it.
+    pub(crate) fn is_file(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::File(after) => after.is_some(),
             Seen::Disk(at) => crate::storage::is_file(self.history.io.filesystem(), &at),
@@ -1368,7 +1369,8 @@ impl Transaction<'_> {
         }
     }
 
-    fn is_dir(&self, path: &HostPath) -> bool {
+    /// Whether a folder is at a path, as the changes so far leave it.
+    pub(crate) fn is_dir(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::Folder => true,
             Seen::Disk(at) => self.history.io.filesystem().is_folder(&at),

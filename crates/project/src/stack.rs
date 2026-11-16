@@ -3,8 +3,8 @@
 //! layer stays above every layer it acts on or references. A layer removed leaves its files on disk. Each edit is a
 //! transaction of the project's history (`history.rs`), so it can be undone.
 //!
-//! The mounts (`[[mount]]`) are files layers at the bottom of the stack, apart until mounts move into the stack: they
-//! are neither reordered nor removed here.
+//! The mounts (`[[layer]] mount = ...`) stay at the bottom of the stack, where they are added: what the rest builds on.
+//! Reordering orders the layers above them.
 
 use anyhow::{Context, Result, bail};
 use sfs::HostPath;
@@ -66,10 +66,11 @@ pub fn reorder(
     }
     let mut document = read(project.io.filesystem(), &project.root)?;
     let tables = layer_tables(&mut document)?;
-    let mut current: Vec<Table> = tables.iter().cloned().collect();
+    // The mounts first, as they are; then the layers above them, in the order given.
+    let (mounts, mut current): (Vec<Table>, Vec<Table>) = tables.iter().cloned().partition(|t| t.contains_key("mount"));
     // Tables are written where their positions say: the new order takes the old positions, in turn.
-    let positions: Vec<Option<usize>> = current.iter().map(Table::position).collect();
-    let mut sorted = Vec::new();
+    let positions: Vec<Option<usize>> = mounts.iter().chain(&current).map(Table::position).collect();
+    let mut sorted = mounts;
     for name in order {
         let at = current
             .iter()
@@ -154,13 +155,10 @@ pub fn add_at(project: &Project, name: &Name, bottom: bool, history: &mut Histor
 /// Take a layer out of the stack; its directory and changeset stay on disk.
 ///
 /// # Errors
-/// It is a mount, a generated layer fills it, another layer needs it, or `project.toml` cannot be rewritten.
+/// A generated layer fills it, another layer needs it, or `project.toml` cannot be rewritten.
 pub fn remove(project: &Project, layers: &[LayerInfo], name: &Name, history: &mut History) -> Result<()> {
     if let Some(generated) = project.layers.iter().find(|l| l.fills.as_deref() == Some(name)) {
         bail!("{} fills {name}'s nodes with their files", generated.name);
-    }
-    if layers.iter().any(|l| *l.name == *name && l.mounted) {
-        bail!("{name} is a mount, declared apart in project.toml ([[mount]])");
     }
     if let Some((layer, dependency)) =
         layers.iter().find_map(|l| Some((l, l.depends_on.iter().find(|d| *d.layer == *name)?)))

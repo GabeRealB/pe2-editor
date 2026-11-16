@@ -371,7 +371,7 @@ pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) 
 }
 
 /// The text of a layer's marker: the format of its records, and its settings.
-fn marker(settings: &Settings) -> String {
+pub(crate) fn marker(settings: &Settings) -> String {
     let mut doc = toml_edit::DocumentMut::new();
     doc["format"] = toml_edit::value(FORMAT);
     if settings.read_only {
@@ -574,6 +574,9 @@ struct View {
     folder: HostPath,
     /// Where what they keep by hash is: the project's store, or - for records this machine's alone - its local one.
     store: crate::chunks::Store,
+    /// A mount's: its records list its tree - each entry's uid, where it is - and hold none of its files, which are read
+    /// where the tree is, never through the records.
+    external: bool,
     settings: Settings,
     records: Read,
     /// Each file by its path in the layer: its entry's uid and its name in the entry (the root for a plain file).
@@ -632,6 +635,7 @@ impl View {
             dir,
             folder,
             store,
+            external: false,
             settings: Settings::default(),
             records: Read::default(),
             files: BTreeMap::new(),
@@ -763,35 +767,6 @@ impl Below {
     fn get(&self, uid: Uid) -> Option<&TreePath> {
         self.layers.iter().rev().find_map(|layer| layer.get(&uid)).map(|path| &**path)
     }
-}
-
-/// Where a tree layer's changeset places the entries it names, kept by its file's stamp: read again only when the
-/// file changed.
-fn tree_places(
-    fs: &dyn pe2_io::Filesystem,
-    changeset: &HostPath,
-) -> std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>> {
-    type Kept = (Option<(std::time::SystemTime, u64)>, std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>>);
-    static KEPT: std::sync::Mutex<Vec<(HostPath, Kept)>> = std::sync::Mutex::new(Vec::new());
-    let stamp = fs.stat(changeset).ok().and_then(|stat| Some((stat.modified?, stat.size)));
-    let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, (was, places))) = kept.iter().find(|(path, _)| path == changeset)
-        && *was == stamp
-    {
-        return places.clone();
-    }
-    let read = crate::changeset::Changeset::load(fs, changeset).unwrap_or_default();
-    let mut places = read.entries;
-    for (uid, op) in read.ops {
-        if let crate::changeset::Op::Move { to } | crate::changeset::Op::Override { to: Some(to), .. } = op {
-            places.insert(uid, to);
-        }
-    }
-    let places: std::sync::Arc<std::collections::HashMap<Uid, Arc<TreePath>>> =
-        std::sync::Arc::new(places.into_iter().collect());
-    kept.retain(|(path, _)| path != changeset);
-    kept.push((changeset.clone(), (stamp, places.clone())));
-    places
 }
 
 /// Where a record's entry is - through its parent, in its layer or below, or where it is below - remembered in
@@ -1006,11 +981,7 @@ impl Set {
         let mut below_changed = changed.is_none();
         let touched = |within: &HostPath| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
         for layer in &project.layers {
-            let Some(folder) = &layer.records else {
-                below_changed |= changed.is_some_and(|paths| paths.contains(&layer.changeset));
-                places.layers.push(tree_places(fs, &layer.changeset));
-                continue;
-            };
+            let folder = &layer.records;
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
             if let Some(before) = before.filter(|_| !below_changed && !touched(folder)) {
                 // As it was read: what it places is there for the layers above, as it was.
@@ -1042,7 +1013,8 @@ impl Set {
             } else {
                 crate::chunks::Store::at(&project.root, project.io.clone())
             };
-            let mut view = View { settings, ..View::new(layer.path.clone(), folder.clone(), store) };
+            let mut view =
+                View { settings, external: layer.mounted, ..View::new(layer.path.clone(), folder.clone(), store) };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<Uid, Arc<TreePath>> = std::collections::HashMap::new();
@@ -1058,7 +1030,7 @@ impl Set {
                 if record.name.is_some() {
                     named.insert(*uid, at.clone());
                 }
-                if record.op == Op::Delete || record.op == Op::Move {
+                if record.op == Op::Delete || record.op == Op::Move || view.external {
                     continue;
                 }
                 view.shows(*uid, at, record);
@@ -1213,6 +1185,9 @@ impl Set {
     pub fn shown(dir: &HostPath) -> Option<Shown> {
         let (set, i) = Set::view_at(dir)?;
         let view = &set.views[i];
+        if view.external {
+            return None;
+        }
         Some(Shown {
             nodes: view.nodes.clone(),
             folders: view.folders.iter().cloned().collect(),
@@ -1230,7 +1205,7 @@ impl Set {
     fn view_of(path: &HostPath) -> Option<(std::sync::Arc<Set>, usize, Arc<TreePath>)> {
         let sets = SETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         for set in sets.iter() {
-            for (i, view) in set.views.iter().enumerate() {
+            for (i, view) in set.views.iter().enumerate().filter(|(_, view)| !view.external) {
                 match path.within(&view.dir) {
                     Ok(rel) => return Some((set.clone(), i, TreePath::shared(rel))),
                     Err(sfs::NotWithin::Outside) => {}
@@ -1386,9 +1361,27 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     let said = Settings { read_only: listing.read_only, ignore: listing.ignore.clone() };
     // What changes, and only that: each record that differs from what the layer has, those it no longer has gone, its
     // settings where they differ.
-    let folder = layer.records.as_ref().with_context(|| format!("{name} is no records layer"))?;
-    replace(project, folder, &said, &records, &format!("Import the layer {name}"))?;
+    replace(project, &layer.records, &said, &records, &format!("Import the layer {name}"))?;
     Ok(records.len())
+}
+
+/// A mount's records, as its listing makes them: each entry it lists by its uid, where it is - its parent's uid, its
+/// name - and what it is (`kind_of` its path; one that is nothing there is left out), holding none of its files, which
+/// are the mount's tree's.
+#[must_use]
+pub fn listed(
+    entries: &BTreeMap<Uid, Arc<TreePath>>,
+    kind_of: &dyn Fn(&TreePath) -> Option<Kind>,
+) -> BTreeMap<Uid, Record> {
+    let uid_at: std::collections::HashMap<&TreePath, Uid> = entries.iter().map(|(uid, at)| (&**at, *uid)).collect();
+    let mut records = BTreeMap::new();
+    for (uid, path) in entries {
+        let (Some(kind), Some(name)) = (kind_of(path), path.last()) else { continue };
+        let parent = path.parent().filter(|parent| !parent.is_root()).and_then(|parent| uid_at.get(parent).copied());
+        let name = Some(name.to_owned());
+        records.insert(*uid, Record { op: Op::Create, kind, parent, name, files: BTreeMap::new() });
+    }
+    records
 }
 
 /// Make the records in `folder` these, with these settings: each record that differs from what the folder has
@@ -1479,7 +1472,10 @@ pub fn import_trees(root: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<()> {
     let layers = said.get("layer").and_then(toml::Value::as_array).cloned().unwrap_or_default();
     let staging = root.join(&Name::constant("staging"));
     let mut staged = Vec::new();
-    for layer in layers.iter().filter(|l| l.get("kind").and_then(toml::Value::as_str) != Some("generated")) {
+    // A generated layer is its plan's to fill; a mount's files are its tree.
+    let made_by_hand =
+        |l: &&toml::Value| l.get("kind").and_then(toml::Value::as_str) != Some("generated") && l.get("mount").is_none();
+    for layer in layers.iter().filter(made_by_hand) {
         let name = layer.get("name").and_then(toml::Value::as_str).context("a layer with no name")?;
         let name = Name::new(name)?.to_owned();
         let folder = root.join(&crate::LAYERS).join(&name);

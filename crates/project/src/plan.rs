@@ -41,10 +41,10 @@ pub const RECORD: &Name = Name::constant("plan.record.jsonl");
 /// Where a generated layer's plan keeps the record of its last run: beside the layer's records, in the local folder.
 ///
 /// # Errors
-/// The layer is no generated one: it has no records' folder.
+/// The layer is no generated one: no plan fills it.
 pub fn record_of(layer: &crate::Layer) -> Result<HostPath> {
-    let folder = layer.records.as_ref().with_context(|| format!("{} has no records", layer.name))?;
-    Ok(folder.join(RECORD))
+    anyhow::ensure!(layer.kind == crate::LayerKind::Generated, "{} is filled by no plan", layer.name);
+    Ok(layer.records.join(RECORD))
 }
 
 /// A release a plan reads: where its discs are looked for (`res://`), and each disc's image, by name, size and sha1 -
@@ -904,7 +904,7 @@ fn write_records(project: &crate::Project, generated: &crate::Layer, record: &Re
         };
         records.entry(uid).or_insert_with(override_).files.insert(name, held);
     }
-    let folder = generated.records.as_ref().with_context(|| format!("{} has no records", generated.name))?;
+    let folder = &generated.records;
     let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
     crate::records::replace(project, folder, &settings, &records, &format!("Fill {}", generated.name))?;
     crate::records::Set::open(project)?;

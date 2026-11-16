@@ -45,14 +45,14 @@ pub const BELOW: &str = "below:";
 /// Whether a path is in a records layer's folder: one of its records, its marker, or the record of an extension it
 /// holds.
 fn in_records(layers: &[LayerState], path: &HostPath) -> bool {
-    layers.iter().filter_map(|layer| layer.records.as_ref()).any(|folder| path.starts_with(folder))
+    layers.iter().any(|layer| path.starts_with(&layer.records))
 }
 
 /// Whether a path is a layer's record of an extension it holds: no entry, nothing of the index's.
 fn of_extensions(layers: &[LayerState], path: &HostPath) -> bool {
     let Some(folder) = path.parent() else { return false };
     folder.file_name().is_some_and(|n| n == crate::records::EXTENSIONS)
-        && folder.parent().is_some_and(|records| layers.iter().any(|layer| layer.records.as_ref() == Some(&records)))
+        && folder.parent().is_some_and(|records| layers.iter().any(|layer| layer.records == records))
 }
 
 /// A file an override merged over the one below, in the outputs (`.local/outputs/merged/<sha1>/<name>`), written where it is not
@@ -1382,8 +1382,6 @@ pub fn asset_of(path: &TreePath) -> Arc<TreePath> {
 enum Listing {
     /// As it is found: a mounted tree, worked on with its own tools.
     Always,
-    /// The first time it is indexed: a layer folder with no changeset yet.
-    Once,
     /// Only as the user adopts it (`edit::adopt`): a layer folder, the editor's storage.
     Adopted,
 }
@@ -1394,9 +1392,8 @@ struct LayerState {
     name: Arc<Name>,
     kind: LayerKind,
     place: Place,
-    /// The folder of its records, where it is a records layer.
-    records: Option<HostPath>,
-    changeset_path: HostPath,
+    /// The folder of its records.
+    records: HostPath,
     changeset: Changeset,
     /// Names its tree's own rules leave out (a mount's `.gitignore`s), beside its changeset's.
     tree_ignore: Vec<String>,
@@ -1424,8 +1421,8 @@ impl LayerState {
         taken: bool,
         io: &Arc<dyn pe2_io::Io>,
     ) -> Result<(LayerState, Option<Scan>)> {
-        let records = layer.records.is_some();
-        let changeset = LayerState::changeset_of(layer, io.filesystem())?;
+        let changeset = crate::records::Set::changeset(&layer.path)
+            .with_context(|| format!("{}: its records are not read", layer.name))?;
         let tree_ignore = if layer.mounted { tree_ignores(io.filesystem(), &layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
         ignore.extend(tree_ignore.iter().cloned());
@@ -1444,41 +1441,22 @@ impl LayerState {
             kind: layer.kind,
             place,
             records: layer.records.clone(),
-            changeset_path: layer.changeset.clone(),
-            writable: layer.changeset_writable && !changeset.read_only,
+            // A read-only mount's listing is still the project's to keep.
+            writable: (layer.mounted || !layer.read_only) && !changeset.read_only,
             changeset,
             tree_ignore,
             read_only: layer.read_only,
             mounted: layer.mounted,
-            listing: if layer.mounted {
-                Listing::Always
-            } else if records || io.filesystem().exists(&layer.changeset) {
-                Listing::Adopted
-            } else {
-                Listing::Once
-            },
+            listing: if layer.mounted { Listing::Always } else { Listing::Adopted },
             fills: layer.fills.clone(),
             scan: Arc::new(scan),
         };
         Ok((state, walked))
     }
 
-    /// A layer's changeset: as its file says, or, for a records layer, as its records say (`records::Set::changeset`).
-    fn changeset_of(layer: &Layer, fs: &dyn pe2_io::Filesystem) -> Result<Changeset> {
-        if layer.records.is_some() {
-            return crate::records::Set::changeset(&layer.path)
-                .with_context(|| format!("{}: its records are not read", layer.name));
-        }
-        Changeset::load(fs, &layer.changeset)
-    }
-
     /// Its changeset read again, and the names it leaves out with it.
     fn reload_changeset(&mut self) -> Result<()> {
-        self.changeset = if self.records.is_some() {
-            crate::records::Set::changeset(&self.place.root).context("its records are not read")?
-        } else {
-            Changeset::load(self.place.io.filesystem(), &self.changeset_path)?
-        };
+        self.changeset = crate::records::Set::changeset(&self.place.root).context("its records are not read")?;
         self.place.ignore = self.changeset.ignore.iter().chain(&self.tree_ignore).cloned().collect();
         Ok(())
     }
@@ -1626,14 +1604,13 @@ fn stack_made_of(project: &Project) -> String {
     project.layers.iter().fold(String::new(), |mut made_of, layer| {
         let _ = writeln!(
             made_of,
-            "{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}",
+            "{}|{:?}|{}|{}|{}|{}|{}|{:?}",
             layer.name,
             layer.kind,
             layer.path.display(),
+            layer.records.display(),
             layer.at,
-            layer.changeset.display(),
             layer.read_only,
-            layer.changeset_writable,
             layer.mounted,
             layer.fills
         );
@@ -1834,6 +1811,9 @@ pub struct Index {
     stack_said: Arc<[Vec<u8>; 3]>,
     /// Whether its opening took the stack as the model had it, where it applied none.
     stack_taken: bool,
+    /// What applying the stack wrote of mounts' listings, as records, for the project's model to be told with what
+    /// the opening or the refresh changed (`write_listing`).
+    listed: crate::model::Delta,
     resolved: Shared<Resolved>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
@@ -1922,6 +1902,7 @@ impl Index {
             made_of: self.made_of.clone(),
             stack_said: self.stack_said.clone(),
             stack_taken: self.stack_taken,
+            listed: crate::model::Delta::default(),
             hidden: self.hidden.clone(),
             ops: self.ops.clone(),
             dependencies: self.dependencies.clone(),
@@ -2216,6 +2197,7 @@ impl Index {
             made_of: stack_made_of(project),
             stack_said: Arc::default(),
             stack_taken: false,
+            listed: crate::model::Delta::default(),
             resolved: Shared::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -2271,11 +2253,12 @@ impl Index {
         if !taken {
             {
                 let _span = tracing::info_span!("index apply stack").entered();
-                index.apply_stack()?;
+                index.apply_stack(project)?;
             }
             // And what differs of it from what was known is said.
             let mut differs = std::mem::take(&mut index.opened);
             index.stack_differs(known_stack.as_ref(), &mut differs);
+            differs.and(std::mem::take(&mut index.listed));
             index.opened = differs;
         }
         report("Assembling the assets", 0, 0);
@@ -2495,6 +2478,7 @@ impl Index {
     /// What a refresh changed of the stack, said of the project's model: the entries it touched, as they are now,
     /// and those gone; and what the stack says besides, where that differs from what was last said.
     fn say_stack(&mut self, refreshed: &mut Refreshed) {
+        refreshed.model.and(std::mem::take(&mut self.listed));
         for path in &refreshed.touched {
             let node = self.full.get(path).map(|node| node.written(&self.root));
             refreshed.model.node(path.as_str(), node.as_deref());
@@ -2642,7 +2626,7 @@ impl Index {
         let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             // A layer whose records are as they were says of itself what it said.
-            if layer.records.is_none() || differences.same.contains(&layer.place.root) {
+            if differences.same.contains(&layer.place.root) {
                 continue;
             }
             let was = layer.changeset.clone();
@@ -2657,10 +2641,8 @@ impl Index {
         }
         if placed && let Some(lowest) = lowest_changed {
             let paths: BTreeSet<&TreePath> = changed.iter().flat_map(|(_, paths)| paths).map(|path| &**path).collect();
-            for (i, layer) in self.layers.iter().enumerate().skip(lowest + 1) {
-                if layer.records.is_some() {
-                    wanted.extend(paths.iter().map(|path| (i, (*path).to_owned())));
-                }
+            for i in lowest + 1..self.layers.len() {
+                wanted.extend(paths.iter().map(|path| (i, (*path).to_owned())));
             }
         }
         Ok(any)
@@ -2682,11 +2664,6 @@ impl Index {
                 continue;
             }
             for (i, layer) in self.layers.iter_mut().enumerate() {
-                if *path == layer.changeset_path {
-                    layer.reload_changeset()?;
-                    changesets = true;
-                    continue;
-                }
                 let Some(rel) = layer.place.looked_at(path) else { continue };
                 // A change inside a bundle rescans the bundle; anything else, what is at the path (the whole layer at
                 // a mount's point).
@@ -2777,7 +2754,7 @@ impl Index {
         let whole_before = self.full.clone();
         // What says an asset cannot be read is the link's to say; where no asset changed, it says what it said.
         let unreadable = self.problems.iter().filter(|p| matches!(p, Problem::Unreadable { .. })).cloned().collect();
-        tracing::info_span!("index apply stack").in_scope(|| self.apply_stack())?;
+        tracing::info_span!("index apply stack").in_scope(|| self.apply_stack(project))?;
         self.after_restack(&regions, (&before, &whole_before), unreadable, &mut refreshed);
         Ok(refreshed)
     }
@@ -2816,7 +2793,6 @@ impl Index {
             || was.read_only != now.read_only
             || was.ignore != now.ignore
             || layer.kind == LayerKind::Generated
-            || layer.records.is_none()
             || self.filled_by(at).is_some()
             || !self.layers[at + 1..].iter().all(silent)
         {
@@ -3360,9 +3336,9 @@ impl Index {
     /// Apply the stack: each layer's creates, then its operations, bottom to top. What a writable layer holds unlisted
     /// is listed in its changeset first (written), so applying never meets it again. Problems, statuses and
     /// dependencies are the whole stack's; the view leaves out the hidden layers.
-    fn apply_stack(&mut self) -> Result<()> {
+    fn apply_stack(&mut self, project: &Project) -> Result<()> {
         self.beneath = Arc::default();
-        tracing::info_span!("stack: unlisted").in_scope(|| self.list_unlisted())?;
+        tracing::info_span!("stack: unlisted").in_scope(|| self.list_unlisted(project))?;
         let full = tracing::info_span!("stack: resolved").in_scope(|| self.resolve_stack(&HashSet::new()));
         self.stack_problems.clone_from(&full.problems);
         self.problems = full.problems;
@@ -3943,7 +3919,7 @@ impl Index {
     /// otherwise storage, written by the editor: what it holds unlisted is a problem (`Problem::Unlisted`), which the
     /// user adopts or removes (`edit::adopt`, `edit::remove_unlisted`) - never taken as an edit. The changesets of what
     /// is listed are written.
-    fn list_unlisted(&mut self) -> Result<()> {
+    fn list_unlisted(&mut self, project: &Project) -> Result<()> {
         for i in 0..self.layers.len() {
             let layer = &self.layers[i];
             if !layer.writable || layer.listing == Listing::Adopted {
@@ -3951,16 +3927,57 @@ impl Index {
             }
             let listing = self.listing(i, None);
             let layer = &mut self.layers[i];
-            if layer.listing == Listing::Once {
-                layer.listing = Listing::Adopted;
-            }
-            if listing.is_empty() {
+            // A mount's tree is worked on where it is: what is gone from it is gone from its listing.
+            let gone = |layer: &LayerState| {
+                layer.listing == Listing::Always
+                    && layer.changeset.entries.values().any(|p| layer.scan.kind(p).is_none())
+            };
+            if listing.is_empty() && !gone(layer) {
                 continue;
             }
             layer.changeset.entries.extend(listing);
-            layer.changeset.save(self.io.filesystem(), &layer.changeset_path)?;
+            if layer.listing == Listing::Always {
+                let scan = &layer.scan;
+                layer.changeset.entries.retain(|_, path| scan.kind(path).is_some());
+            }
+            self.write_listing(project, i)?;
         }
         Ok(())
+    }
+
+    /// Write a mount's listing as its records (`records::listed`), what differs, as one set; read again.
+    fn write_listing(&mut self, project: &Project, i: usize) -> Result<()> {
+        let layer = &self.layers[i];
+        let folder = &layer.records;
+        let kind_of = |path: &TreePath| {
+            layer.scan.kind(path).map(|kind| match kind {
+                Kind::Asset => crate::records::Kind::Node,
+                Kind::Folder => crate::records::Kind::Folder,
+                Kind::File => crate::records::Kind::File,
+            })
+        };
+        let records = crate::records::listed(&layer.changeset.entries, &kind_of);
+        let settings =
+            crate::records::Settings { read_only: layer.changeset.read_only, ignore: layer.changeset.ignore.clone() };
+        let label = format!("List {}", layer.name);
+        let written: Vec<HostPath> = {
+            let old = crate::records::Set::records_of(&layer.place.root).unwrap_or_default();
+            let changed = records.iter().filter(|(uid, record)| old.get(*uid) != Some(*record)).map(|(uid, _)| uid);
+            let gone = old.keys().filter(|uid| !records.contains_key(*uid));
+            changed.chain(gone).filter_map(|uid| crate::records::path_of(folder, *uid).ok()).collect()
+        };
+        crate::records::replace(project, folder, &settings, &records, &label)?;
+        // Read again, and what that changed of the records said to the project's model, as a refresh says it.
+        let before = crate::records::Set::current(&project.root);
+        let now = crate::records::Set::open_after(project, &written)?;
+        let differences = crate::records::Set::differences(before.as_deref(), &now);
+        let name = self.layers[i].name.clone();
+        for (dir, uid) in differences.records.iter().filter(|(dir, _)| *dir == self.layers[i].place.root) {
+            let recorded =
+                now.recorded(dir, *uid).map(|(record, modified, len)| (record, crate::model::stamp_of(modified), len));
+            self.listed.record(&name, *uid, recorded.as_ref());
+        }
+        self.layers[i].reload_changeset()
     }
 
     /// How a layer would list what it holds unlisted - all of it, or what is at and under the paths given - each by its
@@ -4626,8 +4643,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tree);
         write(&tree, "g/notes", "notes");
         let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
-        let mount = format!("[[mount]]\nat = \"code\"\npath = '{}'\n", tree.display());
-        std::fs::write(root.at("project.toml"), format!("{text}\n{mount}")).unwrap();
+        // At the bottom of the stack, where a mount is added.
+        let mount = format!("[[layer]]\nname = \"code\"\nmount = '{}'\n", tree.display());
+        std::fs::write(root.at("project.toml"), format!("{mount}\n{text}")).unwrap();
         tree
     }
 
@@ -4725,7 +4743,7 @@ mod tests {
             let held = File { content: Some(Content::Stored { sha1, size: texels.len() as u64 }), base: None };
             let files = std::collections::BTreeMap::from([(rel("native.texels"), held)]);
             let record = Record { op: Op::Override, kind: Kind::Node, parent: None, name: None, files };
-            let folder = layer.records.as_ref().unwrap();
+            let folder = &layer.records;
             let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };
             let records = std::collections::BTreeMap::from([(uid("uid://a"), record)]);
             crate::records::replace(&project, folder, &settings, &records, "fill").unwrap();
@@ -4819,8 +4837,8 @@ mod tests {
         write(&tree, ".gitignore", "*.o\n");
         let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
         // Its place as it is written on this system, taken as it is: no character of it escapes another.
-        let mount = format!("[[mount]]\nat = \"code\"\npath = '{}'\nread_only = true\n", tree.display());
-        std::fs::write(root.at("project.toml"), format!("{text}\n{mount}")).unwrap();
+        let mount = format!("[[layer]]\nname = \"code\"\nmount = '{}'\nread_only = true\n", tree.display());
+        std::fs::write(root.at("project.toml"), format!("{mount}\n{text}")).unwrap();
         let (project, index) = open(&root);
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["code", "base", "top"]);
         let mut listed: Vec<String> = changeset(&root, "code").entries.into_values().map(|p| p.to_string()).collect();
