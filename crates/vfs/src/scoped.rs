@@ -441,6 +441,7 @@ mod tests {
             files,
             tree: None,
             local: false,
+            theirs: None,
         };
         let layer = p.layer(pe2_path::Name::constant("project")).expect("its own layer");
         let uid = pe2_path::Uid::new("uid://1a2b3c4d5e6f7").expect("a uid");

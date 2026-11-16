@@ -76,6 +76,12 @@ pub enum Op {
         path: Arc<TreePath>,
         local: bool,
     },
+    /// Settle a layer's record a merge left with both sides: keep this one, or take the other (`theirs`).
+    Settle {
+        layer: Arc<Name>,
+        uid: pe2_path::Uid,
+        theirs: bool,
+    },
     /// Take back the last step, or do again the last taken back.
     Undo,
     Redo,
@@ -121,7 +127,7 @@ impl Op {
             | Op::Adopt { path, .. }
             | Op::RemoveUnlisted { path, .. }
             | Op::Local { path, .. } => vec![path],
-            Op::Undo | Op::Redo => Vec::new(),
+            Op::Undo | Op::Redo | Op::Settle { .. } => Vec::new(),
         }
     }
 
@@ -177,6 +183,9 @@ pub fn apply(
         }
         Op::Adopt { layer: of, path } => edit::adopt(project, index, of, path, history)?,
         Op::RemoveUnlisted { layer: of, path } => edit::remove_unlisted(project, index, of, path, history)?,
+        Op::Settle { layer: of, uid, theirs } => {
+            project::records::settle(project, project.layer(of)?, *uid, *theirs, history)?
+        }
         Op::Local { path, local } => {
             let uid = uid_at(index, path)?;
             let real = index.real_path(uid).with_context(|| format!("{path}: nothing is there"))?;

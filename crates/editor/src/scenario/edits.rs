@@ -102,6 +102,8 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     assert!(!vfs::due::any(&space.read().unwrap()));
     let became = vfs::due::settle(&space, &numbers, false).expect("read");
     assert!(matches!(&became[..], [Some(Ok(_)), Some(Ok(_)), Some(Ok(so))] if so.contains("already")), "{became:?}");
+    // Their records said in the log first, and written behind it.
+    editor.until("their records to be written", |e| records(e).len() >= 2);
     let said = records(&mut editor);
     assert_eq!(said.len(), 2, "a step each, and none for what was so already: {said:?} {became:?}");
     // Said due again - by a serving after one that ended: so already, and no edit made of it.

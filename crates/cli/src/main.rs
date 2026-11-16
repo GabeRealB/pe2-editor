@@ -393,8 +393,15 @@ enum ProjectCommand {
     Extract(ExtractArgs),
     /// Build a project's packages for a config
     Build(BuildArgs),
-    /// Make an empty project: a `project.toml` naming a layer of its own
+    /// Make an empty project: a `project.toml` naming a layer of its own; in a git repository, its merge driver
+    /// registered
     New(NewArgs),
+    /// Have git merge the project's records by what they say (`.gitattributes`, and git's configuration)
+    GitSetup(GitSetupArgs),
+    /// Merge a file of the project's as git's merge driver does: `%O %A %B %P` (what git registers, `git-setup`)
+    Merge(MergeArgs),
+    /// Settle a layer's record a merge left with both sides: keep this one, or take the other (`--theirs`)
+    Settle(SettleArgs),
     /// The project's layers
     Layer(LayerArgs),
     /// The trees mounted into the project
@@ -514,6 +521,40 @@ struct BuildArgs {
 struct NewArgs {
     /// The directory to make it in (made where missing)
     directory: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct GitSetupArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct MergeArgs {
+    /// The version both sides were made from (`%O`)
+    base: PathBuf,
+    /// Ours (`%A`), where the merge is written
+    ours: PathBuf,
+    /// Theirs (`%B`)
+    theirs: PathBuf,
+    /// The file's path in the repository (`%P`)
+    path: String,
+}
+
+#[derive(clap::Args)]
+struct SettleArgs {
+    /// The layer whose record it is, as the problem names it
+    #[arg(value_name = "LAYER", value_parser = name)]
+    of: Arc<pe2_path::Name>,
+    /// The record's uid, as the problem names it
+    #[arg(value_parser = uid)]
+    uid: pe2_path::Uid,
+    /// Take the other side, where this one is kept by default
+    #[arg(long)]
+    theirs: bool,
+    #[command(flatten)]
+    at: EditAt,
 }
 
 #[derive(clap::Args)]
@@ -916,6 +957,11 @@ fn name(text: &str) -> Result<Arc<pe2_path::Name>, pe2_path::PathError> {
 
 /// A path of the project's tree an argument gives, as the served folder shows it (`packages/aya`, `/` around it
 /// allowed).
+/// A uid an argument gives, checked as it comes in.
+fn uid(text: &str) -> Result<pe2_path::Uid, String> {
+    pe2_path::Uid::new(text).map_err(|e| e.to_string())
+}
+
 fn tree(text: &str) -> Result<Arc<project::TreePath>, pe2_path::PathError> {
     project::TreePath::new(text.trim_matches('/')).map(ToOwned::to_owned)
 }
@@ -1644,6 +1690,18 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
         ProjectCommand::New(NewArgs { directory }) => {
             project::create(&directory, io.filesystem())?;
             println!("an empty project in {}", directory.display());
+            let root = sfs::HostPath::new(&directory)?;
+            if project::gitmerge::register(io, &root, &host::this_program()?)? {
+                println!("git merges its records by what they say");
+            }
+        }
+        ProjectCommand::GitSetup(GitSetupArgs { project }) => {
+            let root = sfs::HostPath::new(&project)?;
+            if project::gitmerge::register(io, &root, &host::this_program()?)? {
+                println!("git merges {}'s records by what they say", project.display());
+            } else {
+                println!("{}: .gitattributes written; in no git repository, nothing registered", project.display());
+            }
         }
         ProjectCommand::Layer(LayerArgs {
             command: LayerCommand::Add { name, bottom, generated: _, fills, project },
@@ -1835,6 +1893,9 @@ fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> 
         ProjectCommand::KeepMine(KeepMineArgs { path: p, at }) => (Op::KeepMine { path: p.clone() }, at),
         ProjectCommand::TakeBase(TakeBaseArgs { path: p, at }) => (Op::TakeBase { path: p.clone() }, at),
         ProjectCommand::Local(LocalArgs { path: p, at }) => (Op::Local { path: p.clone(), local: true }, at),
+        ProjectCommand::Settle(SettleArgs { of, uid, theirs, at }) => {
+            (Op::Settle { layer: of.clone(), uid: *uid, theirs: *theirs }, at)
+        }
         ProjectCommand::Share(ShareArgs { path: p, at }) => (Op::Local { path: p.clone(), local: false }, at),
         ProjectCommand::Forget(ForgetArgs { of, path: p, at }) => {
             (Op::Forget { layer: of.clone(), path: p.clone() }, at)
@@ -2187,6 +2248,21 @@ fn verify_layer(project: &Path, only: Option<&pe2_path::Name>) -> Result<()> {
     Ok(())
 }
 
+/// Merge a file of a project as git's merge driver does (`project::gitmerge`), run in the repository's folder; a
+/// conflict ends the program with what git takes for one (1), the merge written.
+fn merge_file(io: &Arc<dyn pe2_io::Io>, MergeArgs { base, ours, theirs, path }: &MergeArgs) -> Result<()> {
+    // Git runs its driver in the repository's folder, `path` within it: the project's stores, where it has them.
+    let at = sfs::HostPath::new(Path::new("."))?;
+    let stores = project::gitmerge::root_of(&at, path).map_or_else(Vec::new, |root| {
+        vec![project::chunks::Store::at(&root, io.clone()), project::chunks::Store::local(&root, io.clone())]
+    });
+    let file = |path: &Path| sfs::HostPath::new(path).with_context(|| path.display().to_string());
+    if project::gitmerge::driver(io.filesystem(), &file(base)?, &file(ours)?, &file(theirs)?, path, &stores)? {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// The project's extensions' registry, as JSON: of those that load, the rest said.
 fn print_registry(project: &Path) -> Result<()> {
     let p = project::Project::load(project)?;
@@ -2207,6 +2283,7 @@ fn observe_plan(plan: &Path, roms: &Path, keep: Option<&Path>, keep_kinds: &[Str
     Ok(())
 }
 
+#[expect(clippy::too_many_lines, reason = "the program's commands, an arm each")]
 fn run(cli: Cli) -> Result<()> {
     // The I/O what this run does that no project gives is done through.
     let io = pe2_io::system();
@@ -2238,6 +2315,7 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project {
             command:
                 command @ (ProjectCommand::New(NewArgs { .. })
+                | ProjectCommand::GitSetup(GitSetupArgs { .. })
                 | ProjectCommand::Layer(LayerArgs { .. })
                 | ProjectCommand::Mount(MountArgs { .. })
                 | ProjectCommand::Config(ConfigArgs { .. })
@@ -2248,6 +2326,7 @@ fn run(cli: Cli) -> Result<()> {
             verify_layer(&project, layer.as_deref())?;
         }
         Tool::Project { command: ProjectCommand::Registry(RegistryArgs { project }) } => print_registry(&project)?,
+        Tool::Project { command: ProjectCommand::Merge(args) } => merge_file(&io, &args)?,
         Tool::Project { command: ProjectCommand::Output(OutputArgs { assets, r#type, output, config, project }) } => {
             outputs(&project, &assets, r#type.as_deref(), &output, config.as_deref())?;
         }

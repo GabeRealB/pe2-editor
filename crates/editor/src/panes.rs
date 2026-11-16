@@ -2208,6 +2208,20 @@ fn unlisted_repairs(
 }
 
 /// A stale override's repairs, where it is the active layer's (what a resolution applies to): kept, or given up for
+/// What settles a record a merge left with both sides: this one kept, or the other taken.
+fn merge_repairs(ui: &mut egui::Ui, problem: &project::index::Problem, edit: &mut Option<EditRequest>) {
+    let project::index::Problem::Merged { layer, uid, .. } = problem else { return };
+    let Ok(uid) = pe2_path::Uid::new(uid) else { return };
+    ui.horizontal(|ui| {
+        if ui.small_button("Keep this one").on_hover_text("Keep the layer's side of the merge").clicked() {
+            *edit = Some(EditRequest::Settle(layer.clone(), uid, false));
+        }
+        if ui.small_button("Take the other").on_hover_text("Take the side merged in, whole").clicked() {
+            *edit = Some(EditRequest::Settle(layer.clone(), uid, true));
+        }
+    });
+}
+
 /// the version below; and what changed below since it was made.
 fn stale_repairs(ui: &mut egui::Ui, ws: &Workspace, problem: &project::index::Problem, edit: &mut Option<EditRequest>) {
     use project::edit::Resolution;
@@ -2313,6 +2327,7 @@ fn problems_ui(
                 }
                 unlisted_repairs(ui, ws, problem, edit);
                 stale_repairs(ui, ws, problem, edit);
+                merge_repairs(ui, problem, edit);
                 ui.add_space(4.0);
             });
         }

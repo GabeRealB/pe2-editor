@@ -170,6 +170,10 @@ impl Core {
         if let Err(e) = self.says.took(&self.project.root, &mut self.index) {
             eprintln!("{e}");
         }
+        // Kept in git without its merge driver: said, once, as it is taken.
+        if project::gitmerge::unregistered(&self.project) {
+            self.index.note(project::index::Problem::Driver);
+        }
         let verify = self.index.verification();
         let verifying = std::thread::Builder::new().name("verify".into()).spawn(move || {
             let differing = verify();

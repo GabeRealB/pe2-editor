@@ -1957,6 +1957,7 @@ mod tests {
             files: std::collections::BTreeMap::new(),
             tree: Some(sealed_tree(&root, &[("readme.txt", "just text")])),
             local: false,
+            theirs: None,
         };
         let written = recorded(&root, "base", crate::testing::uid("uid://p1a1n"), &plain);
         o.refresh(&[written]);
@@ -2007,6 +2008,7 @@ mod tests {
             files: removed,
             tree: Some(newer),
             local: false,
+            theirs: None,
         };
         let written = recorded(&root, "top", uid, &over);
         o.refresh(std::slice::from_ref(&written));
@@ -2024,6 +2026,7 @@ mod tests {
             files: std::collections::BTreeMap::new(),
             tree: None,
             local: false,
+            theirs: None,
         };
         recorded(&root, "top", uid, &gone);
         o.refresh(&[written]);

@@ -117,6 +117,9 @@ pub struct Record {
     /// Where it is kept: in this machine's part of its layer (`.local/layers/<layer>`), never shipped - what its
     /// file's place says, not its text.
     pub local: bool,
+    /// A merge that could not be made (`gitmerge`): the other side's record, whole, beside this one (`[merge] theirs`),
+    /// until the user keeps this or takes that (`settle`).
+    pub theirs: Option<String>,
 }
 
 /// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
@@ -359,6 +362,18 @@ pub fn made(content: &Content, store: &crate::chunks::Store) -> std::io::Result<
 /// # Errors
 /// It is none of its form, a field's value is no TOML, or a bytes delta is in no store.
 fn apply(base: &[u8], delta: &Delta, store: &crate::chunks::Store) -> Result<Vec<u8>> {
+    apply_with(base, delta, &|sha1| store.get_file(sha1).ok())
+}
+
+/// A delta applied to its base's bytes, a bytes delta read by `read`.
+///
+/// # Errors
+/// It is none of its form, a field's value is no TOML, or a bytes delta is not to be read.
+pub(crate) fn apply_with(
+    base: &[u8],
+    delta: &Delta,
+    read: &dyn Fn(&pe2_ext::Sha1) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
     match delta {
         Delta::Fields(sets) => {
             let base = std::str::from_utf8(base).context("a base that is no text")?;
@@ -375,8 +390,34 @@ fn apply(base: &[u8], delta: &Delta, store: &crate::chunks::Store) -> Result<Vec
             let base = std::str::from_utf8(base).context("a base that is no text")?;
             Ok(crate::delta::apply_lines(base, text)?.into_bytes())
         }
-        Delta::Bytes(sha1) => crate::delta::apply_bytes(base, &store.get_file(sha1)?),
+        Delta::Bytes(sha1) => {
+            crate::delta::apply_bytes(base, &read(sha1).with_context(|| format!("its delta {sha1}"))?)
+        }
     }
+}
+
+/// A file as a record holds it inline (`Content::of`), where it can be: none where it would be kept in a store.
+pub(crate) fn inline(bytes: &[u8]) -> Option<Content> {
+    let text = std::str::from_utf8(bytes)
+        .ok()
+        .filter(|text| bytes.len() <= INLINE && !bytes.contains(&0) && inline_as_it_is(text))?;
+    Some(Content::Text(text.to_string()))
+}
+
+/// What a file changes of its base (`base`, whose bytes these are), kept as a record keeps it with nothing new in a
+/// store - its fields or lines, or the file inline (`Content::over`); none where it would be kept in a store.
+pub(crate) fn delta_without_store(bytes: &[u8], base: pe2_ext::Sha1, from: &[u8], name: &str) -> Option<Content> {
+    let (Ok(from), Ok(to)) = (std::str::from_utf8(from), std::str::from_utf8(bytes)) else { return None };
+    let toml = std::path::Path::new(name).extension().is_some_and(|e| e == "toml");
+    let fields = toml.then(|| crate::delta::fields(from, to)).flatten().map(|sets| {
+        Delta::Fields(sets.into_iter().map(|set| (set.at, set.to.map(|value| value.to_string()))).collect())
+    });
+    let delta = fields.unwrap_or_else(|| Delta::Lines(crate::delta::lines_of(from, to)));
+    if delta_len(&delta) * 2 >= bytes.len() || matches!(&delta, Delta::Lines(text) if !inline_as_it_is(text)) {
+        return inline(bytes);
+    }
+    let (sha1, size) = (crate::extract::sha1_of(bytes), bytes.len() as u64);
+    Some(Content::Delta { sha1, size, base, delta })
 }
 
 /// A value, from the TOML it is written as.
@@ -539,7 +580,8 @@ impl Record {
         if tree.is_some() && kind != Kind::Node {
             bail!("a tree is a node's, not a {}'s", kind.name());
         }
-        Ok(Record { op, kind, parent, name, files, tree, local: false })
+        let theirs = table.get("merge").and_then(|merge| merge.get("theirs")).and_then(toml::Value::as_str);
+        Ok(Record { op, kind, parent, name, files, tree, local: false, theirs: theirs.map(str::to_string) })
     }
 
     /// Its text: its format first, what it does and where, then its files by name.
@@ -582,6 +624,11 @@ impl Record {
                 files.insert(name.as_str(), toml_edit::Item::Table(table));
             }
             doc["files"] = toml_edit::Item::Table(files);
+        }
+        if let Some(theirs) = &self.theirs {
+            let mut merge = toml_edit::Table::new();
+            merge["theirs"] = toml_edit::value(theirs.as_str());
+            doc["merge"] = toml_edit::Item::Table(merge);
         }
         doc.to_string()
     }
@@ -997,11 +1044,17 @@ fn read_part(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>,
         .filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name))
         .map(|shard| records_dir.entry(&shard.name))
         .collect();
+    // What waits is taken as it waits, never from its file - which the storage may be replacing as it is read, and
+    // which, on Windows, cannot be opened meanwhile.
+    let waiting_at: std::collections::HashSet<HostPath> = waiting.iter().map(|(path, ..)| path.clone()).collect();
     let read_shard = |shard: &HostPath| -> Result<Vec<(Uid, Held)>> {
         let mut out = Vec::new();
         for file in fs.read_directory(shard)? {
             let path = shard.entry(&file.name);
             let Some(uid) = uid_of(dir, &path) else { continue };
+            if waiting_at.contains(&path) {
+                continue;
+            }
             let stat = fs.stat_link(&path)?;
             let (modified, len) = (stat.modified.ok_or_else(|| no_time(&path))?, stat.size);
             let same = |h: &&Held| h.modified == modified && h.len == len && h.record.local == local;
@@ -1209,6 +1262,15 @@ impl Set {
             }
         }
         found
+    }
+
+    /// The records of the layer whose tree is at `dir` that a merge left with both sides (`Record::theirs`), each with
+    /// where its entry is.
+    #[must_use]
+    pub fn merging(&self, dir: &HostPath) -> Vec<(Uid, Option<Arc<TreePath>>)> {
+        let Some(view) = self.views.iter().find(|view| view.dir == *dir) else { return Vec::new() };
+        let merging = view.records.iter().filter(|(_, held)| held.record.theirs.is_some());
+        merging.map(|(uid, _)| (*uid, view.placed.get(uid).cloned())).collect()
     }
 
     /// Whether a layer keeps an entry in this machine's part of it (`Record::local`).
@@ -1588,6 +1650,38 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     Ok(records.len())
 }
 
+/// Settle a record a merge left with both sides (`Record::theirs`): keep this one, or take the other (`theirs`), whole.
+/// One step of the history; the record's path.
+///
+/// # Errors
+/// The layer has no such record, or none a merge left so, or the other side is no record this program reads.
+pub fn settle(
+    project: &crate::Project,
+    layer: &crate::Layer,
+    uid: Uid,
+    theirs: bool,
+    history: &mut crate::history::History,
+) -> Result<Vec<HostPath>> {
+    let set = Set::current(&project.root).map_or_else(|| Set::open(project), Ok)?;
+    let view =
+        set.views.iter().find(|view| view.dir == layer.path).with_context(|| format!("{} is read", layer.name))?;
+    let held = view.records.get(&uid).with_context(|| format!("{} has no record of {uid}", layer.name))?;
+    let other = held.record.theirs.as_deref().with_context(|| format!("{uid}: no merge left both sides of it"))?;
+    let text = if theirs {
+        // Read as a record is, or refused: what is written is one.
+        Record::parse(other).with_context(|| format!("{uid}: the other side"))?;
+        other.to_string()
+    } else {
+        Record { theirs: None, ..(*held.record).clone() }.render()
+    };
+    let path = layer.record_path(uid, held.record.local)?;
+    let label = if theirs { format!("Take the other side of {uid}") } else { format!("Keep this side of {uid}") };
+    let mut tx = history.begin(label);
+    tx.write(&path, text.as_bytes())?;
+    tx.commit()?;
+    Ok(vec![path])
+}
+
 /// Keep an entry of a layer in this machine's part of it (`local`), never shipped, with all that is in it - or share it
 /// (`!local`), with the folders above it the layer keeps this machine's: a shipped entry is never in one that is not.
 /// What a shared record keeps by hash is put in the shipped store. One step of the history; the paths written.
@@ -1715,7 +1809,16 @@ pub fn listed(
         let name = Some(name.to_owned());
         records.insert(
             *uid,
-            Record { op: Op::Create, kind, parent, name, files: BTreeMap::new(), tree: None, local: false },
+            Record {
+                op: Op::Create,
+                kind,
+                parent,
+                name,
+                files: BTreeMap::new(),
+                tree: None,
+                local: false,
+                theirs: None,
+            },
         );
     }
     records
@@ -1907,6 +2010,7 @@ impl Staging<'_> {
                         files,
                         tree: Some(tree),
                         local: false,
+                        theirs: None,
                     }
                 }
                 pe2_io::Kind::Folder if at.as_str().ends_with(crate::index::BUNDLE_SUFFIX) => {
@@ -1922,6 +2026,7 @@ impl Staging<'_> {
                         files,
                         tree: None,
                         local: false,
+                        theirs: None,
                     }
                 }
                 pe2_io::Kind::Folder => {
@@ -1934,6 +2039,7 @@ impl Staging<'_> {
                         files: BTreeMap::new(),
                         tree: None,
                         local: false,
+                        theirs: None,
                     }
                 }
                 _ => {
@@ -1949,6 +2055,7 @@ impl Staging<'_> {
                         files,
                         tree: None,
                         local: false,
+                        theirs: None,
                     }
                 }
             };
@@ -2149,7 +2256,7 @@ pub fn records_for(
                 None => files.remove(&file),
             };
         }
-        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files, tree, local });
+        new.insert(*uid, Record { op: Op::Create, kind, parent, name: Some(name), files, tree, local, theirs: None });
     }
     for (uid, op) in &changeset.ops {
         let from = below.of(*uid);
@@ -2160,12 +2267,30 @@ pub fn records_for(
         let record = match op {
             Did::Delete => {
                 let files = BTreeMap::new();
-                Record { op: Op::Delete, kind, parent: None, name: None, files, tree: None, local: theirs_local }
+                Record {
+                    op: Op::Delete,
+                    kind,
+                    parent: None,
+                    name: None,
+                    files,
+                    tree: None,
+                    local: theirs_local,
+                    theirs: None,
+                }
             }
             Did::Move { to } => {
                 let (parent, name) = place(to)?;
                 let local = theirs_local || local_at(&new, to, parent, true);
-                Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new(), tree: None, local }
+                Record {
+                    op: Op::Move,
+                    kind,
+                    parent,
+                    name: Some(name),
+                    files: BTreeMap::new(),
+                    tree: None,
+                    local,
+                    theirs: None,
+                }
             }
             Did::Override { files: bases, to } => {
                 let at = to.as_deref().or(from.map(|(p, _)| p)).context("an override of nothing")?.to_owned();
@@ -2183,7 +2308,7 @@ pub fn records_for(
                     Some(sealed) => sealed.files.clone(),
                     None => override_files(bases, now, held.map(|r| &r.files), store_of(local))?,
                 };
-                Record { op: Op::Override, kind, parent, name, files, tree, local }
+                Record { op: Op::Override, kind, parent, name, files, tree, local, theirs: None }
             }
         };
         new.insert(*uid, record);
@@ -2260,6 +2385,7 @@ mod tests {
             files: BTreeMap::default(),
             tree: None,
             local: false,
+            theirs: None,
         };
         for (name, content) in [
             ("node.toml", text("type = \"data\"\n[settings]\nsize = 3\n")),
@@ -2387,6 +2513,7 @@ mod tests {
             files: std::collections::BTreeMap::new(),
             tree: parent.map(|_| sealed),
             local: false,
+            theirs: None,
         };
         let records = root.at("layers/project");
         let write = |uid: &str, record: &super::Record| {

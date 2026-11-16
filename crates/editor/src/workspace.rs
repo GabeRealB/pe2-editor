@@ -461,6 +461,8 @@ pub enum EditRequest {
     /// Keep an entry (by its real path) on this computer alone, with all in it - or share it (`false`), with the
     /// folders above it: in the active layer (`records::set_local`).
     Local(Arc<TreePath>, bool),
+    /// Settle a layer's record a merge left with both sides: keep this one, or take the other (`true`).
+    Settle(Arc<Name>, Uid, bool),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
     /// An edit that could not be made, and why: said to the user.
@@ -2348,6 +2350,9 @@ impl Workspace {
                 EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, *uid, to, history)?,
                 EditRequest::Resolve(uid, resolution) => {
                     edit::resolve(project, index, &name, *uid, *resolution, history)?
+                }
+                EditRequest::Settle(layer, uid, theirs) => {
+                    project::records::settle(project, project.layer(layer)?, *uid, *theirs, history)?
                 }
                 EditRequest::Local(path, local) => {
                     let layer = project.layer(&name)?;

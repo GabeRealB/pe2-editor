@@ -10,7 +10,10 @@ While the editor has the project open, changes made with `pe2-cli` go through th
 
 | Command | What it does |
 |---|---|
-| `pe2-cli project new <folder>` | Makes an empty project. |
+| `pe2-cli project new <folder>` | Makes an empty project; in a git repository, set up for it. |
+| `pe2-cli project git-setup` | Sets up the project's git repository to merge its files by what they say. |
+| `pe2-cli project settle <layer> <uid> [--theirs]` | Settles what a merge left with both sides: keeps yours, or takes theirs. |
+| `pe2-cli project merge %O %A %B %P` | What git runs to merge the project's files (registered by `git-setup`). |
 | `pe2-cli project extract` | Fills the project from your discs. `--releases` chooses which. |
 | `pe2-cli project status` | Says whether the project is filled. |
 | `pe2-cli project verify` | Checks every filled file, without the discs. |

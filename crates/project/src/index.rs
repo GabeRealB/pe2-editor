@@ -443,6 +443,13 @@ pub enum Problem {
     /// What a layer holds by a name no path takes - one some system refuses, or that is not text - at its path as it
     /// shows: none of the project's, nor anything in it, until it is renamed.
     Refused { layer: Arc<Name>, path: String, why: String },
+    /// The project is kept in a git repository whose merges of its records are not its driver's (`gitmerge`): git
+    /// would merge them as text.
+    Driver,
+    /// A layer's record a merge of version control could not make (`gitmerge`): this side, with the other whole beside
+    /// it, until the user keeps this one or takes the other (`records::settle`). By its entry's path (its uid where it
+    /// has none).
+    Merged { layer: Arc<Name>, path: String, uid: String },
 }
 
 impl Problem {
@@ -455,7 +462,8 @@ impl Problem {
             Problem::Unlisted { layer: of, path }
             | Problem::Missing { layer: of, path, .. }
             | Problem::Stale { layer: of, path }
-            | Problem::Refused { layer: of, path, .. } => of == layer || paths.contains(path.as_str()),
+            | Problem::Refused { layer: of, path, .. }
+            | Problem::Merged { layer: of, path, .. } => of == layer || paths.contains(path.as_str()),
             Problem::Unbound { layer: of, .. } => of == layer,
             _ => false,
         }
@@ -477,10 +485,11 @@ impl Problem {
             | Problem::Conflict { path, .. }
             | Problem::Unlisted { path, .. }
             | Problem::Missing { path, .. }
+            | Problem::Merged { path, .. }
             | Problem::Stale { path, .. }
             | Problem::Refused { path, .. } => vec![path],
             Problem::DuplicateUid { paths, .. } => paths.iter().map(String::as_str).collect(),
-            Problem::Unbound { .. } | Problem::Property { .. } => vec![],
+            Problem::Unbound { .. } | Problem::Property { .. } | Problem::Driver => vec![],
         }
     }
 
@@ -522,6 +531,12 @@ impl Problem {
             Problem::Refused { layer, why, .. } => {
                 format!("held by {layer} by a name no path takes ({why}): none of the project's until it is renamed")
             }
+            Problem::Merged { layer, .. } => {
+                format!("a merge left {layer}'s record of it with both sides: keep this one, or take the other")
+            }
+            Problem::Driver => "the project is in a git repository, which merges its records as text: \
+                                `pe2-cli project git-setup` has it merge them by what they say"
+                .to_string(),
         }
     }
 
@@ -534,7 +549,8 @@ impl Problem {
             | Problem::Missing { layer, .. }
             | Problem::Unbound { layer, .. }
             | Problem::Stale { layer, .. }
-            | Problem::Refused { layer, .. } => vec![&**layer],
+            | Problem::Refused { layer, .. }
+            | Problem::Merged { layer, .. } => vec![&**layer],
             Problem::Unreadable { .. }
             | Problem::DuplicateUid { .. }
             | Problem::Import { .. }
@@ -545,7 +561,8 @@ impl Problem {
             | Problem::MissingOutput { .. }
             | Problem::Taken { .. }
             | Problem::Property { .. }
-            | Problem::Extension { .. } => vec![],
+            | Problem::Extension { .. }
+            | Problem::Driver => vec![],
         }
     }
 
@@ -1784,7 +1801,8 @@ pub struct Index {
     /// References whose uid or path names no asset of the project.
     pub dangling: Vec<Reference>,
     pub problems: Vec<Problem>,
-    /// What is wrong with the project's config properties, as of its loading: among the problems.
+    /// What is wrong with the project itself as it is loaded - its config properties, its merge driver: among the
+    /// problems.
     properties: Vec<Problem>,
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
@@ -3391,8 +3409,18 @@ impl Index {
             })
     }
 
+    /// Say a problem of the project as a whole that whoever holds it found (`Problem::Driver`): kept among the
+    /// problems as the stack is applied again, as its properties' are.
+    pub fn note(&mut self, problem: Problem) {
+        if !self.properties.contains(&problem) {
+            self.properties.push(problem.clone());
+            self.problems.push(problem);
+        }
+    }
+
     /// The stack applied without the layers in `skip`.
     fn resolve_stack(&self, skip: &HashSet<usize>) -> Resolution {
+        let set = crate::records::Set::current(&self.root);
         let mut resolved: Resolved = BTreeMap::new();
         let mut where_is: HashMap<Uid, Arc<TreePath>> = HashMap::new();
         let mut problems = Vec::new();
@@ -3403,6 +3431,11 @@ impl Index {
             }
             // What it holds by a name no path takes, whatever it is: none of the project's until it is renamed.
             problems.extend(layer.scan.refused_problems(&layer.name));
+            // What a merge left with both sides.
+            for (uid, at) in set.as_ref().map_or_else(Vec::new, |set| set.merging(&layer.place.root)) {
+                let path = at.map_or_else(|| uid.to_string(), |at| at.to_string());
+                problems.push(Problem::Merged { layer: layer.name.clone(), path, uid: uid.to_string() });
+            }
             // A generated layer makes no entries: what it holds is the files of another's.
             if layer.kind == LayerKind::Generated {
                 continue;
@@ -4762,6 +4795,7 @@ mod tests {
                 files,
                 tree: None,
                 local: false,
+                theirs: None,
             };
             let folder = &layer.records;
             let settings = crate::records::Settings { read_only: true, ignore: Vec::new() };

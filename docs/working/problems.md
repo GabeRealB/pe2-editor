@@ -14,5 +14,8 @@ many there are; click it to open the pane. Click a problem to go to the asset it
 | **A build failed**, or an output is out of date. | The problem says why; fix the asset and build again. See [Building](building.md). |
 | **A configuration's setting is not what it can be.** | Change it in **Settings ▸ Configurations**. See [Configurations](../making/configurations.md). |
 | **A stack or graph does not add up**, such as a wire between things that do not fit. | Fix it in the Inspector's Stack tab or the graph editor. See [Stacks](../making/stacks.md). |
+| **A merge left both sides**: you and someone else changed the same thing in different ways. | **Keep this one** or **Take the other**, then commit. See [Version control](version-control.md). |
+| **The project's git repository merges its files as plain text.** | Run `pe2-cli project git-setup`. See [Version control](version-control.md). |
+| **An override's original version is missing**: the project is not filled from your discs on this computer. | Fill the project, or take the version below. |
 
 Problems disappear on their own once fixed.

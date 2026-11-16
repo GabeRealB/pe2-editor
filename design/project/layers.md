@@ -111,6 +111,22 @@ again of the version below now - or drops it. Merges are cached by what they wer
 A text a record holds inline is at most 64 KiB, and one written and read back as it is (`records::INLINE`); any other
 is kept in the store.
 
+## Version control
+
+What a project ships - `project.toml`, `layers/`, `store/` - is made to be kept in git; `.local/` and the served
+folder are left out by the `.gitignore` a new project has. Its `.gitattributes` has git merge `layers/**` and
+`project.toml` with the project's driver (`gitmerge`, `pe2-cli project merge %O %A %B %P`), which git keeps in a
+repository's own configuration - registered as a project is made in a repository, or by `pe2-cli project git-setup`;
+the index says where a project kept in a repository has it not (`Problem::Driver`).
+
+The driver merges a record by what it says: each field three ways, a file both sides changed by its contents - its
+base, ours and theirs, a delta applied to its base where the stores have it - as the index merges an override over
+the version below, kept again over the same base. `project.toml` and `layer.toml` merge by field, any other file of
+the layers by line. A merge writes nothing but the file merged, since what git commits of a merge is the files it
+merged: one whose result would be a new object in a store is a conflict. A record that conflicts keeps ours, with
+theirs whole beside it (`[merge] theirs`, `Record::theirs`) - valid TOML, which the model keeps and the index says
+(`Problem::Merged`) - until the user keeps one side (`records::settle`: the Problems pane, `pe2-cli project settle`).
+
 ## Sealed nodes and extensions
 
 A node's record may hold a tree in place of files (`tree = "<sha1>"`, `Record::tree`): a sealed node, kept whole as

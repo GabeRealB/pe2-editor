@@ -15,6 +15,7 @@ pub mod edit;
 pub mod events;
 pub mod ext;
 pub mod extract;
+pub mod gitmerge;
 pub mod graph;
 pub mod history;
 pub mod host;
@@ -685,7 +686,9 @@ pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
             text = format!("{text}{separator}/{folder}/\n");
         }
     }
-    fs.write(&ignore, text.as_bytes()).with_context(|| ignore.to_string())
+    fs.write(&ignore, text.as_bytes()).with_context(|| ignore.to_string())?;
+    // What its own merge driver merges (`gitmerge`): registered where it is in a git repository.
+    gitmerge::attributes(fs, &directory)
 }
 
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`.local/settings.toml`).

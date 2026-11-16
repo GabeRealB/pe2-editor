@@ -971,6 +971,7 @@ mod tests {
             files: std::collections::BTreeMap::new(),
             tree: Some(sha1),
             local: false,
+            theirs: None,
         };
         let layer = root.join(&crate::LAYERS).at("project");
         let named = crate::records::path_of(&layer, crate::testing::uid("uid://e1")).unwrap();
@@ -1007,6 +1008,7 @@ mod tests {
             files: [(root_file, file)].into(),
             tree: None,
             local: false,
+            theirs: None,
         };
         let layer = root.join(&crate::LAYERS).at("project");
         let path = crate::records::path_of(&layer, crate::testing::uid(uid)).unwrap();

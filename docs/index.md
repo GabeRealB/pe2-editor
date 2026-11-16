@@ -28,6 +28,7 @@ editor fills from discs you own.
 - [Importing and exporting](working/import-export.md)
 - [Building](working/building.md)
 - [Problems](working/problems.md)
+- [Version control](working/version-control.md)
 
 **4. How assets are made**
 
