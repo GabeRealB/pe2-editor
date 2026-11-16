@@ -952,8 +952,8 @@ mod tests {
 
     #[test]
     fn an_extension_is_added_whole_updated_and_removed_as_steps() {
-        use project::cache::Cache;
         use project::history::History;
+        use project::local::Local;
         use project::lock::Lock;
         use project::switches::{add_extension, remove_extension};
         let dir = scratch("add");
@@ -964,24 +964,24 @@ mod tests {
         for layer in ["game", "mine"] {
             project::records::mark(
                 &pe2_io::SystemFilesystem,
-                &root.at(".layers").at(layer),
+                &root.at("layers").at(layer),
                 &project::records::Settings::default(),
             )
             .unwrap();
         }
         let project = project::Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let index = project::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
+        let index = project::index::Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
         let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
         assert_eq!(about.id, "pe2.events");
         let project = project::Project::load(&root).unwrap();
         // Held by a record of the layer's: its files read where its folder was, from its tree, on no disk.
-        let record = root.at(".layers/mine/.records/extensions/pe2.events.toml");
+        let record = root.at("layers/mine/.records/extensions/pe2.events.toml");
         let [held] = project.held_extensions().try_into().unwrap();
-        assert_eq!(held, root.at(".layers/mine/extensions/pe2.events.extension"));
-        assert!(record.is_file() && !held.exists() && !root.at(".cache/extensions").exists());
-        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at(".layers/mine"));
+        assert_eq!(held, root.at("layers/mine/extensions/pe2.events.extension"));
+        assert!(record.is_file() && !held.exists() && !root.at(".local/outputs/extensions").exists());
+        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at("layers/mine"));
         assert_eq!(project.requires, [project::Requirement { id: "pe2.events".into(), version: Some("^0.1".into()) }]);
         // Trusted as the folder it came from was: the hash read from its tree is the folder's.
         let trust = |folder: &HostPath| {
@@ -995,7 +995,7 @@ mod tests {
         else {
             panic!("no program found")
         };
-        assert!(tool.starts_with(&root.at(".layers/.store/objects")), "{tool}");
+        assert!(tool.starts_with(&root.at("store/objects")), "{tool}");
         assert!(std::fs::metadata(&tool).unwrap().permissions().readonly());
         #[cfg(unix)]
         {
@@ -1033,7 +1033,7 @@ mod tests {
         assert!(!record.exists(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
         add_extension(&project, &source, Some(pe2_path::Name::constant("game")), &mut history, "add".into()).unwrap();
-        let in_game = root.at(".layers/game/.records/extensions/pe2.events.toml");
+        let in_game = root.at("layers/game/.records/extensions/pe2.events.toml");
         assert!(in_game.is_file());
         let project = project::Project::load(&root).unwrap();
         std::fs::write(source.at(&shipped_tool()), "#!/bin/sh\necho newer\n").unwrap();
@@ -1164,9 +1164,9 @@ mod tests {
         project::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let p = super::Project::load(&dir).unwrap();
         let lock = project::lock::Lock::try_acquire(&p.root, "a test", &pe2_io::System).unwrap();
-        let cache = project::cache::Cache::open(&p, &lock).unwrap();
-        let (mut history, _) = project::history::History::open(&cache).unwrap();
-        let index = project::index::Index::open(&p, &cache).unwrap();
+        let local = project::local::Local::open(&p, &lock).unwrap();
+        let (mut history, _) = project::history::History::open(&local).unwrap();
+        let index = project::index::Index::open(&p, &local).unwrap();
         // An operation passing on what it is given, and a template importing a text file through it.
         let group = "uid = \"uid://group\"\n\n[[stack]]\nop = \"pe2.graph@operation\"\nlabel = \"Passed\"\n\
                      ops.given = { op = \"input\", name = \"text\" }\nops.out = { op = \"output\", name = \"text\", from = { value = \"given\" } }\n";
@@ -1193,7 +1193,7 @@ mod tests {
             &mut history,
         )
         .unwrap();
-        let index = project::index::Index::open(&p, &cache).unwrap();
+        let index = project::index::Index::open(&p, &local).unwrap();
         let extensions = super::for_project(&p);
         assert_eq!(extensions.take_definitions(&index), []);
         let offered: Vec<String> = extensions.templates_for("notes.TXT").into_iter().map(|t| t.label).collect();
@@ -1214,7 +1214,7 @@ mod tests {
             &mut history,
         )
         .unwrap();
-        let index = project::index::Index::open(&p, &cache).unwrap();
+        let index = project::index::Index::open(&p, &local).unwrap();
         let _ = extensions.take_definitions(&index);
         let engine = extensions.engine();
         let given = extensions

@@ -1,6 +1,6 @@
 //! What a project is set up with, edited in its `project.toml` in place as the stack is (`stack`), each edit a
 //! transaction of its history: its generated layers, each filling another's nodes by its plan, the trees mounted into
-//! it - unmanaged ones read by path alone, each where this machine says (`project.local.toml`) - and the builds it can
+//! it - unmanaged ones read by path alone, each where this machine says (`.local/settings.toml`) - and the builds it can
 //! be.
 
 use anyhow::{Context, Result, bail};
@@ -60,7 +60,7 @@ pub fn add_generated(project: &Project, name: &Name, fills: &Name, history: &mut
 /// Have the project's `.gitignore` leave out a path, where it does not already (read as the transaction's writes so
 /// far leave it, so a second entry reads the first).
 fn ignored(tx: &mut crate::history::Transaction<'_>, root: &HostPath, entry: &str) -> Result<()> {
-    let file = root.join(&crate::cache::GITIGNORE);
+    let file = root.join(&crate::local::GITIGNORE);
     let text = tx.read(&file)?.and_then(|bytes| String::from_utf8(bytes).ok()).unwrap_or_default();
     if text.lines().any(|line| line.trim() == entry) {
         return Ok(());
@@ -69,12 +69,12 @@ fn ignored(tx: &mut crate::history::Transaction<'_>, root: &HostPath, entry: &st
     tx.write(&file, format!("{text}{separator}{entry}\n").as_bytes())
 }
 
-/// A place as `project.toml` and `project.local.toml` write it: as it was given, relative to the project or absolute.
+/// A place as `project.toml` and `.local/settings.toml` write it: as it was given, relative to the project or absolute.
 fn written(path: &Path) -> Result<&str> {
     path.to_str().with_context(|| format!("{}: a place written as no text is", path.display()))
 }
 
-/// Where an unmanaged mount is on this machine: written to `project.local.toml` (`[mounts] <at> = "<path>"`), which is
+/// Where an unmanaged mount is on this machine: written to `.local/settings.toml` (`[mounts] <at> = "<path>"`), which is
 /// this machine's alone and no step of the project's history.
 ///
 /// # Errors
@@ -82,10 +82,10 @@ fn written(path: &Path) -> Result<&str> {
 pub fn locate(project: &Project, at: &crate::TreePath, path: &Path) -> Result<()> {
     anyhow::ensure!(project.unmanaged.iter().any(|m| *m.at == *at), "the project has no unmanaged mount {at}");
     let path = written(path)?;
-    let file = project.root.join(&crate::LOCAL);
+    let file = crate::local::settings(&project.root);
     let mut document: DocumentMut = project.io.filesystem().read_to_string(&file).unwrap_or_default().parse()?;
     table(&mut document, "mounts")?.insert(at.as_str(), value(path));
-    project.io.filesystem().write(&file, document.to_string().as_ref()).with_context(|| file.display().to_string())
+    crate::local::write_settings(project.io.filesystem(), &file, &document)
 }
 
 /// Mount a tree into the project at `at` (`path`, relative to the project or absolute): a files layer at the bottom
@@ -129,13 +129,12 @@ pub fn add_mount(
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     if unmanaged {
         ignored(&mut tx, &project.root, &format!("/{at}/"))?;
-        ignored(&mut tx, &project.root, &format!("/{}", crate::LOCAL))?;
     }
     tx.commit().map(drop)
 }
 
 /// Link a file of the project (`at`, relative to it) to a file its builds deploy (`deployed`, relative to the
-/// project), on this machine: `[build.links]` of `project.local.toml`, made once the file is deployed - where a
+/// project), on this machine: `[build.links]` of `.local/settings.toml`, made once the file is deployed - where a
 /// language server looks for it, the project not being the root of what it is edited in (a build's
 /// `compile_commands.json` one folder up).
 ///
@@ -144,14 +143,14 @@ pub fn add_mount(
 pub fn add_link(project: &Project, at: &Path, deployed: &Path) -> Result<()> {
     let (at, deployed) = (written(at)?, written(deployed)?);
     anyhow::ensure!(!project.links.contains_key(at), "the project links {at} already");
-    let file = project.root.join(&crate::LOCAL);
+    let file = crate::local::settings(&project.root);
     let mut document: DocumentMut = project.io.filesystem().read_to_string(&file).unwrap_or_default().parse()?;
     let build = table(&mut document, "build")?;
     build.set_implicit(true);
     let links = build.entry("links").or_insert(Item::Table(Table::new()));
-    let links = links.as_table_mut().with_context(|| format!("`build.links` in {} is not a table", crate::LOCAL))?;
+    let links = links.as_table_mut().with_context(|| format!("`build.links` in {} is not a table", file.display()))?;
     links.insert(at, value(deployed));
-    project.io.filesystem().write(&file, document.to_string().as_ref()).with_context(|| file.display().to_string())
+    crate::local::write_settings(project.io.filesystem(), &file, &document)
 }
 
 /// Add a build the project can be: `[config.<name>]`, a release and the target building it.
@@ -251,8 +250,8 @@ pub fn declare_property(project: &Project, name: &str, declaration: &toml::Table
 )]
 mod tests {
     use crate::Project;
-    use crate::cache::Cache;
     use crate::history::History;
+    use crate::local::Local;
     use crate::testing::At as _;
 
     #[test]
@@ -262,7 +261,7 @@ mod tests {
         crate::create(&dir, &pe2_io::SystemFilesystem).unwrap();
         let project = || Project::load(&dir).unwrap();
         let lock = crate::lock::Lock::try_acquire(&dir, "a test", &pe2_io::System).unwrap();
-        let (mut history, _) = History::open(&Cache::open(&project(), &lock).unwrap()).unwrap();
+        let (mut history, _) = History::open(&Local::open(&project(), &lock).unwrap()).unwrap();
         crate::stack::add_at(
             &project(),
             pe2_path::Name::constant("game"),
@@ -291,7 +290,7 @@ mod tests {
             (crate::LayerKind::Generated, Some(game), true)
         );
         let at = |path: &str| dir.at(path);
-        assert_eq!(files.plan(), at(".layers/game-files.plan.jsonl"));
+        assert_eq!(files.plan(), at("layers/game-files.plan.jsonl"));
         assert_eq!(made.unmanaged[0].path, at("roms"));
         assert_eq!(made.resolve("res://roms/a.bin").unwrap(), at("roms/a.bin"));
         assert_eq!(made.configs[0].release.as_deref(), Some("USA"));
@@ -315,8 +314,8 @@ mod tests {
         assert!(at("game") < at("project"), "the game's layer is below the project's own");
         assert_eq!(at("game-files"), at("game") + 1, "a generated layer is right above the layer it fills");
         let ignored = std::fs::read_to_string(dir.at(".gitignore")).unwrap();
-        assert!(ignored.contains("/.layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
-        assert!(ignored.contains("/project.local.toml"), "{ignored}");
+        assert!(ignored.contains("/layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
+        assert!(ignored.contains("/.local/"), "{ignored}");
         // Where the discs are is this machine's.
         let elsewhere = dir.with_suffix(pe2_path::Name::constant(".elsewhere"));
         super::locate(&made, crate::TreePath::constant("roms"), std::path::Path::new(&elsewhere.to_string())).unwrap();

@@ -104,7 +104,7 @@ pub fn check_name(project: &Project, name: &Name) -> Result<()> {
     Ok(())
 }
 
-/// Add a new, empty layer of a kind at the top of the stack: `.layers/<name>/` and its entry in `project.toml`.
+/// Add a new, empty layer of a kind at the top of the stack: `layers/<name>/` and its entry in `project.toml`.
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
@@ -189,9 +189,9 @@ pub fn remove(project: &Project, layers: &[LayerInfo], name: &Name, history: &mu
 )]
 mod tests {
     use crate::Project;
-    use crate::cache::Cache;
     use crate::history::History;
     use crate::index::{Dependency, LayerInfo};
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use crate::{LayerKind, stack};
@@ -227,8 +227,8 @@ mod tests {
         std::fs::write(root.at("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
+        let index = crate::index::Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
         let history = &mut history;
         let layers = [info("game", &[]), info("mod", &["game"])];
         let order = [crate::testing::name("mod"), crate::testing::name("game")];
@@ -248,21 +248,21 @@ mod tests {
         stack::reorder(&project, &layers, &order, history).unwrap();
         let project = Project::load(&root).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["game", "fixes", "mod"]);
-        assert!(root.at(".layers/fixes").is_dir());
+        assert!(root.at("layers/fixes").is_dir());
         // Comments travel with their tables.
         let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
         assert!(text.starts_with("# the stack\n") && text.contains("# mine\n[[layer]]\nname = \"mod\""), "{text}");
         assert!(stack::remove(&project, &layers, pe2_path::Name::constant("game"), history).is_err());
         stack::remove(&project, &layers, pe2_path::Name::constant("fixes"), history).unwrap();
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
-        assert!(root.at(".layers/fixes").is_dir());
+        assert!(root.at("layers/fixes").is_dir());
         // Undone: taken out, reordered, added - back to the two layers, and the new layer's folder gone.
         for _ in 0..3 {
             history.undo(&index, None, false).unwrap();
         }
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
-        assert!(!root.at(".layers/fixes").exists());
+        assert!(!root.at("layers/fixes").exists());
         drop(lock);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 }

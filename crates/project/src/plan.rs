@@ -542,7 +542,7 @@ fn write_record(fs: &dyn pe2_io::Filesystem, path: &HostPath, plan: &Plan, recor
         text.push_str(&json!({"check": check, "key": key}).to_string());
         text.push('\n');
     }
-    crate::cache::write_atomic(fs, path, text.as_bytes())
+    crate::local::write_atomic(fs, path, text.as_bytes())
 }
 
 /// What an operation made.

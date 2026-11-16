@@ -3352,8 +3352,8 @@ mod tests {
 mod calling {
     use super::{Extensions, Lens, Loadable};
     use crate::Project as Opened;
-    use crate::cache::Cache;
     use crate::index::Index;
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use pe2_ext::{Extension, Image, Project, Registry, Result, Table, Value, anyhow, ty};
@@ -3391,8 +3391,7 @@ mod calling {
         let root = crate::testing::scratch("calling");
         let _ = std::fs::remove_dir_all(&root);
         let canvas = "[[stack]]\nop = \"test.paint@canvas\"\n";
-        for (path, text) in
-            [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.node/node.toml", canvas)]
+        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), ("layers/base/a.node/node.toml", canvas)]
         {
             let path = root.at(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3423,7 +3422,7 @@ mod calling {
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let project = Opened::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let index = Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
         let lens = Lens { index: &index, extensions: &extensions, selection: None, revision: 0, chosen: None };
         let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();
         assert_eq!(answer.as_str(), Some("red 1x1"));

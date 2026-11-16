@@ -3147,7 +3147,7 @@ fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Compone
             let _ = io.filesystem().create_folder_all(&dir);
             sweep(&dir, io);
         }
-        let _ = crate::cache::write_atomic(io.filesystem(), &file, &kept);
+        let _ = crate::local::write_atomic(io.filesystem(), &file, &kept);
     }
     Ok(component)
 }

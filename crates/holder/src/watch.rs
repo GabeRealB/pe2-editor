@@ -1,9 +1,10 @@
 //! A project's layers watched for what changes by other means than its holder - a text editor's, git's, an
 //! extraction's: each layer's and mount's folder, and the folders of its changesets and `project.toml`, gathered
 //! into batches. A batch goes once the layers have been quiet for a moment, or after a second of steady change.
-//! Not the project's, and left out: what is read (the filesystem served reads the layers all the time), its cache,
-//! what its builds write, the folder it is served at, its unmanaged mounts (the discs), the temporary files of
-//! atomic writes, and what else sits in its own folder besides its `project*.toml`.
+//! Not the project's, and left out: what is read (the filesystem served reads the layers all the time), its local
+//! folder but for this machine's settings, what its builds write, the folder it is served at, its unmanaged mounts
+//! (the discs), the temporary files of atomic writes, and what else sits in its own folder besides its
+//! `project*.toml`.
 
 use sfs::HostPath;
 use std::collections::BTreeSet;
@@ -37,18 +38,21 @@ pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> a
     // Each layer's changeset sits beside its directory; `project.toml` in the project's own.
     let mut shallow: Vec<HostPath> = p.layers.iter().filter_map(|l| l.changeset.parent()).collect();
     shallow.push(p.root.clone());
+    // This machine's settings of the project, in its local folder: none of the rest of that folder is the layers'.
+    let settings = project::local::settings(&p.root);
+    shallow.extend(settings.parent());
     let built = p.root.join(&pe2_path::Name::constant("build"));
-    let mut ignore = vec![p.root.join(&project::cache::DIR), built, p.filesystem.at.clone()];
+    let mut ignore = vec![built, p.filesystem.at.clone()];
     ignore.extend(p.unmanaged.iter().map(|m| m.path.clone()));
     let (root, changesets) = (p.root.clone(), p.layers.iter().map(|l| l.changeset.clone()).collect::<Vec<_>>());
     let layers = roots.clone();
-    // Whether a path changing concerns the project: in a layer, a layer's changeset, or one of its files at its
-    // root. What else sits in its folders (exports, a user's notes) does not.
+    // Whether a path changing concerns the project: in a layer, a layer's changeset, one of its files at its root, or
+    // this machine's settings of it. What else sits in its folders (exports, a user's notes) does not.
     let concerns = move |path: &HostPath| {
         let at_root = path.parent().is_some_and(|parent| parent == root)
             && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml"))
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
-        at_root || layers.iter().any(|layer| path.starts_with(layer)) || changesets.contains(path)
+        at_root || *path == settings || layers.iter().any(|layer| path.starts_with(layer)) || changesets.contains(path)
     };
     let wanted = move |path: &HostPath| !ignore.iter().any(|i| path.starts_with(i)) && concerns(path);
     watch(&p.io, &roots, &shallow, wanted, taken)
@@ -115,7 +119,7 @@ fn debounce(
     wanted: &dyn Fn(&HostPath) -> bool,
     taken: &dyn Fn(Change) -> bool,
 ) {
-    // The temporary files of atomic writes (`.<name>.<pid>.tmp`, `project::cache::write_atomic`) are nobody's.
+    // The temporary files of atomic writes (`.<name>.<pid>.tmp`, `project::local::write_atomic`) are nobody's.
     let atomic = |path: &HostPath| {
         path.extension().is_some_and(|e| e == "tmp")
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
@@ -195,23 +199,25 @@ mod tests {
         let root = sfs::testing::scratch("watch");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.at("a.node")).unwrap();
-        std::fs::create_dir_all(root.at(".cache")).unwrap();
+        std::fs::create_dir_all(root.at(".local/outputs")).unwrap();
         let (seen, batches) = mpsc::channel();
-        let cache = root.at(".cache");
+        let outputs = root.at(".local/outputs");
         let taken = move |change| match change {
             Change::Paths(paths) => seen.send(paths).is_ok(),
             Change::Error(_) => true,
         };
         let _watching =
-            watch(&pe2_io::system(), std::slice::from_ref(&root), &[], move |path| !path.starts_with(&cache), taken)
+            watch(&pe2_io::system(), std::slice::from_ref(&root), &[], move |path| !path.starts_with(&outputs), taken)
                 .unwrap();
-        std::fs::write(root.at(".cache/index.json"), "{}").unwrap();
+        std::fs::write(root.at(".local/outputs/index.json"), "{}").unwrap();
         std::fs::write(root.at("a.node/.node.toml.1.tmp"), "x").unwrap();
         let declaration = root.at("a.node/node.toml");
         std::fs::write(&declaration, "uid = \"uid://a\"\n").unwrap();
         let seen = collect(&batches, |seen| seen.contains(&declaration));
         assert!(seen.contains(&declaration), "{seen:?}");
-        assert!(seen.iter().all(|p| !p.starts_with(&root.at(".cache")) && p.extension().is_none_or(|e| e != "tmp")));
+        assert!(
+            seen.iter().all(|p| !p.starts_with(&root.at(".local/outputs")) && p.extension().is_none_or(|e| e != "tmp"))
+        );
         // A rename reports both names.
         std::fs::rename(root.at("a.node"), root.at("b.node")).unwrap();
         let seen = collect(&batches, |seen| seen.contains(&root.at("b.node")));
@@ -317,12 +323,12 @@ mod tests {
     fn what_is_read_written_aside_or_not_wanted_and_what_came_or_went_in_a_folder_is_no_change() {
         let root = sfs::testing::scratch("watch-left-out");
         std::fs::create_dir_all(root.at("folder.node")).unwrap();
-        let cache = root.at(".cache");
-        let driven = Driven::new(&root, move |path| !path.starts_with(&cache), usize::MAX);
+        let outputs = root.at(".local/outputs");
+        let driven = Driven::new(&root, move |path| !path.starts_with(&outputs), usize::MAX);
         let file = root.at("folder.node/node.toml");
         driven.tell(pe2_io::ChangeKind::Read, &[&file]);
         driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node/.node.toml.1.tmp")]);
-        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at(".cache/index.json")]);
+        driven.tell(pe2_io::ChangeKind::Changed, &[&root.at(".local/outputs/index.json")]);
         driven.tell(pe2_io::ChangeKind::Changed, &[&root.at("folder.node")]);
         driven.passes(1_000);
         assert_eq!(driven.gone(), [] as [Vec<HostPath>; 0], "none of them changes the project");

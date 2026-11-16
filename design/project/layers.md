@@ -15,7 +15,7 @@ below is copied or changed.
 
 | Kind | Storage | Why |
 |---|---|---|
-| Asset layers | **Records**: one file per entry it touches, by uid, in `.layers/<layer>/.records/` | Nobody edits them by hand; renaming a folder of thousands of entries is one record; text stays text in version control. |
+| Asset layers | **Records**: one file per entry it touches, by uid, in `layers/<layer>/.records/` | Nobody edits them by hand; renaming a folder of thousands of entries is one record; text stays text in version control. |
 | Code layers, mounts | Plain trees of files | Worked on with their own tools. |
 | Generated layers | **Packed**: one journaled listing, contents in the store | Written only by their plan; nothing to scan. |
 
@@ -26,10 +26,30 @@ care how it is stored.
 
 ## The store
 
-Large files (1 MiB and over) are split into content-defined chunks, kept once by hash in the project's store, so an
-edit stores only what changed and identical data is kept once across layers and releases. Whole objects and trees of
-objects (an extension) are kept by hash too. Garbage collection removes what no record, listing or history step
-names.
+Large files (1 MiB and over) are split into content-defined chunks, kept once by hash in the project's store
+(`store/`, at its root), so an edit stores only what changed and identical data is kept once across layers and
+releases. Whole objects and trees of objects (an extension) are kept by hash too. Garbage collection removes what no
+record, listing, history step or conflict kept aside names.
+
+## Where a project keeps itself
+
+Beside `project.toml`, what is shipped with the project: `layers/` (each layer's folder, its changeset beside it, a
+generated layer's plan) and `store/`. And `.local/`, what of it is this machine's alone, which the `.gitignore` a new
+project is made with leaves out (`project::local`):
+
+| Part | What | Lasts |
+|---|---|---|
+| `processes/` | the project lock and its owner, the sockets, locks and logs of the host and the server, the editor's socket for agents, the scopes and access records of what is served | as long as the processes |
+| `filesystem/` | the shared filesystem's log and the space its processes share | until applied, and as long as it says its own format |
+| `history/` | the session's history: steps, blobs, journal, trash | until the session closes cleanly |
+| `conflicts/` | what writes that met a change made meanwhile left aside | until the user settles it |
+| `outputs/` | what is derived from the layers: the work graph's store, imports, merges, materialized files | until another schema or version opens it: the only part wiped |
+| `set-aside/` | what the served folder held that was not the project's | until the user removes it |
+| `settings.toml` | this machine's settings of the project (where its unmanaged mounts are, links to what builds deploy, how it is served) and the editor's view of it (`[editor.layers]`, `[editor.fill]`) | always |
+
+What finds the project a file of a layer is in (its store, its outputs) asks the projects the process opened
+(`project::holding`), never the names of the folders between: a folder of a tree may be named as a project's are.
+Programs outside the editor ask `pe2-cli project paths` where a project keeps what they reach of it.
 
 ## Overrides and merges
 

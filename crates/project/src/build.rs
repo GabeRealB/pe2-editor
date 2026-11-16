@@ -185,7 +185,7 @@ impl Site<'_> {
                 self.project.io.filesystem().create_folder_all(&folder).with_context(|| folder.to_string())?;
             }
             if self.project.io.filesystem().read(&to).ok().as_deref() != Some(&bytes) {
-                crate::cache::write_atomic(self.project.io.filesystem(), &to, &bytes)?;
+                crate::local::write_atomic(self.project.io.filesystem(), &to, &bytes)?;
             }
             for (link, target) in &self.project.links {
                 if RelPath::new(target).is_ok_and(|target| *target == *relative) {

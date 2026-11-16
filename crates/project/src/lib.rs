@@ -5,7 +5,6 @@
 pub type TreePath = pe2_path::VfsPath<pe2_path::Tree>;
 
 pub mod build;
-pub mod cache;
 pub mod changeset;
 pub mod chunks;
 pub mod content;
@@ -20,6 +19,7 @@ pub mod history;
 pub mod host;
 pub mod imports;
 pub mod index;
+pub mod local;
 pub mod lock;
 pub mod merge;
 pub mod model;
@@ -66,7 +66,32 @@ use std::sync::Arc;
 
 pub const FILE: &Name = Name::constant("project.toml");
 /// Where a project's layers live, each a directory with its changeset beside it.
-pub const LAYERS: &Name = Name::constant(".layers");
+pub const LAYERS: &Name = Name::constant("layers");
+/// Where a project's content is kept by its hash (`chunks::Store`), beside its layers.
+pub const STORE: &Name = Name::constant("store");
+
+/// The projects this process opened, by their roots: what finds the project a file of a layer is in (`holding`),
+/// which no name of the folders between says - a folder of a tree may be named as a project's folders are.
+static OPENED: std::sync::RwLock<Vec<HostPath>> = std::sync::RwLock::new(Vec::new());
+
+/// The project, of those this process opened, whose layers hold a path: the innermost, where one lies in another's.
+#[must_use]
+pub fn holding(path: &HostPath) -> Option<HostPath> {
+    let opened = OPENED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    opened
+        .iter()
+        .filter(|root| path.starts_with(&root.join(&LAYERS)))
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
+}
+
+/// Say a project opened, for `holding` to find.
+fn opened(root: &HostPath) {
+    let mut opened = OPENED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !opened.contains(root) {
+        opened.push(root.clone());
+    }
+}
 /// What follows a layer's folder's name in its changeset's.
 pub const CHANGESET_SUFFIX: &Name = Name::constant(".toml");
 /// What follows a generated layer's folder's name in its plan's.
@@ -222,7 +247,7 @@ struct ConfigFile {
     properties: toml::Table,
 }
 
-/// `[build]` of `project.local.toml`: where this machine also wants a build's results.
+/// `[build]` of `.local/settings.toml`: where this machine also wants a build's results.
 #[derive(Default, Deserialize)]
 struct BuildFile {
     /// `[build.links]`: a link, relative to the project, for a deployed file - where a language server looks for it,
@@ -254,7 +279,7 @@ struct ExtensionsFile {
 #[derive(Deserialize)]
 struct LayerFile {
     name: String,
-    /// The layer's directory; by default `.layers/<name>`.
+    /// The layer's directory; by default `layers/<name>`.
     path: Option<String>,
     #[serde(default)]
     read_only: bool,
@@ -270,7 +295,7 @@ struct LayerFile {
 #[derive(Deserialize)]
 struct MountFile {
     at: String,
-    /// The tree; an unmanaged mount's is this machine's (`project.local.toml`), else the folder of its name.
+    /// The tree; an unmanaged mount's is this machine's (`.local/settings.toml`), else the folder of its name.
     path: Option<String>,
     #[serde(default)]
     read_only: bool,
@@ -279,7 +304,7 @@ struct MountFile {
     unmanaged: bool,
 }
 
-/// `project.local.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
+/// `.local/settings.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
 /// "<path>"`), the links it wants to what builds deploy (`[build.links]`), and how it serves the project as a
 /// filesystem (`[filesystem]`). It is kept out of the project's history and of version control.
 #[derive(Default, Deserialize)]
@@ -292,7 +317,7 @@ struct LocalFile {
     filesystem: FilesystemFile,
 }
 
-/// `[filesystem]` of `project.local.toml`: what serves the project's merged layers at its folder while it is open -
+/// `[filesystem]` of `.local/settings.toml`: what serves the project's merged layers at its folder while it is open -
 /// in the editor, or with `pe2-cli project serve` - and what serves the files programs are given (`scopes`): each
 /// `auto`, `none` or a backend's name; `address` where the backend serves at one, whether its host serves on with
 /// nobody keeping it (`keep`), and two budgets of bytes: what laying files out for a program may write (`copies`)
@@ -312,11 +337,8 @@ struct FilesystemFile {
 
 /// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
 pub const SERVED: &Name = Name::constant("assets");
-/// Where what that folder held that was not the project's is set aside before it is served (`vfs::strays`), a folder a
-/// time: the only copy of it, so not in the cache.
-pub const SET_ASIDE: &Name = Name::constant("assets.set-aside");
 
-/// How this machine serves a project as a filesystem, as far as the project says (`project.local.toml`): what serves
+/// How this machine serves a project as a filesystem, as far as the project says (`.local/settings.toml`): what serves
 /// is chosen where it is served (`vfs::backend`), which knows the backends - a name is not judged here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filesystem {
@@ -358,7 +380,7 @@ impl Filesystem {
     }
 }
 
-/// How this machine serves the project at a folder, read from its `project.local.toml` alone: for what serves a
+/// How this machine serves the project at a folder, read from its `.local/settings.toml` alone: for what serves a
 /// project's files without loading it. One that cannot be read says nothing.
 #[must_use]
 pub fn local_filesystem(root: &HostPath, fs: &dyn pe2_io::Filesystem) -> Filesystem {
@@ -366,15 +388,12 @@ pub fn local_filesystem(root: &HostPath, fs: &dyn pe2_io::Filesystem) -> Filesys
 }
 
 fn read_local(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<LocalFile> {
-    let path = root.join(&LOCAL);
+    let path = local::settings(root);
     match fs.read_to_string(&path) {
         Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
         Err(_) => Ok(LocalFile::default()),
     }
 }
-
-/// The file what of a project is this machine's is kept in.
-pub const LOCAL: &Name = Name::constant("project.local.toml");
 
 /// What a layer may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,14 +411,14 @@ pub(crate) use schedule::parallel;
 
 #[derive(Clone, PartialEq)]
 pub struct Layer {
-    /// Its name, which names its folder in `.layers/` and its changeset.
+    /// Its name, which names its folder in `layers/` and its changeset.
     pub name: Arc<Name>,
     pub kind: LayerKind,
-    /// Its content's directory: in `.layers/`, or a mounted tree.
+    /// Its content's directory: in `layers/`, or a mounted tree.
     pub path: HostPath,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
     pub at: Arc<TreePath>,
-    /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
+    /// Its changeset, in `layers/`: `<path>.toml` beside a layer's directory, `layers/<name>.toml` for a mount.
     pub changeset: HostPath,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
     pub read_only: bool,
@@ -457,11 +476,11 @@ pub struct Project {
     pub properties: Vec<Property>,
     /// What is wrong with the properties' declarations and the configs' values of them.
     pub property_problems: Vec<PropertyProblem>,
-    /// Links this machine wants to what is deployed (`project.local.toml`): where each goes, relative to the project,
+    /// Links this machine wants to what is deployed (`.local/settings.toml`): where each goes, relative to the project,
     /// by the deployed file it stands for.
     pub links: build::Links,
     /// How this machine serves the project as a filesystem while it is open, at its `assets` folder
-    /// (`project.local.toml`).
+    /// (`.local/settings.toml`).
     pub filesystem: Filesystem,
     /// The I/O what works on the project reads the outside world through: the system's, but where a test gives
     /// another (`load_with`).
@@ -544,7 +563,7 @@ fn properties_of(declared: &toml::Table, configs: &[Config]) -> (Vec<Property>, 
     (properties, problems)
 }
 
-/// A place `project.toml` or `project.local.toml` names: as it is where it is absolute, else within the project's folder.
+/// A place `project.toml` or `.local/settings.toml` names: as it is where it is absolute, else within the project's folder.
 pub(crate) fn resolve_path(directory: &HostPath, value: &str) -> Result<HostPath> {
     directory.resolve(Path::new(value)).with_context(|| format!("{value}: the place it names"))
 }
@@ -568,7 +587,7 @@ fn check_fills(root: &HostPath, layers: &[Layer]) -> Result<()> {
 }
 
 /// What a new project is: a layer of its own, and nothing else.
-const EMPTY: &str = "# A project. `res://` paths are absolute from this directory.\n\n[[layer]]\nname = \"project\"\npath = \".layers/project\"\n";
+const EMPTY: &str = "# A project. `res://` paths are absolute from this directory.\n\n[[layer]]\nname = \"project\"\npath = \"layers/project\"\n";
 
 /// Make an empty project in `directory`: its `project.toml`, naming a layer of its own, and that layer's folder. What
 /// else a project holds - a game, its layers, extensions - is added to it, or written by whatever makes projects whole.
@@ -586,10 +605,10 @@ pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
     // Its own layer is records (`records`).
     records::mark(fs, &own, &records::Settings::default())?;
     fs.write(&file, EMPTY.as_bytes()).with_context(|| file.to_string())?;
-    // Where it is served is no part of it, nor what was set aside from there.
+    // What is this machine's alone is no part of it, nor where it is served.
     let ignore = directory.join(&IGNORE);
     let mut text = fs.read_to_string(&ignore).unwrap_or_default();
-    for folder in [SERVED, SET_ASIDE] {
+    for folder in [local::DIR, SERVED] {
         if !text.lines().any(|l| l.trim() == format!("/{folder}/")) {
             let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
             text = format!("{text}{separator}/{folder}/\n");
@@ -630,7 +649,7 @@ fn storage_of(
     Ok(storage)
 }
 
-/// A project's mounts, and its unmanaged ones apart, each where this machine says (`project.local.toml`).
+/// A project's mounts, and its unmanaged ones apart, each where this machine says (`.local/settings.toml`).
 fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
     let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
     for m in declared {
@@ -664,6 +683,7 @@ impl Project {
         let root = HostPath::new(directory).with_context(|| format!("{}", directory.display()))?;
         let path = root.join(&FILE);
         let text = io.filesystem().read_to_string(&path).with_context(|| format!("{}", path.display()))?;
+        opened(&root);
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
         let local = read_local(io.filesystem(), &root)?;
         let (mounts, unmanaged) = mounts_of(&root, file.mount, &local)?;
@@ -865,6 +885,15 @@ pub(crate) mod testing {
     use sfs::HostPath;
     pub use sfs::testing::{At, scratch};
     use std::sync::Arc;
+
+    /// A test's own empty project, made afresh and opened: what finds the store of a file of its layers.
+    pub fn opened(name: &str) -> HostPath {
+        let root = scratch(name);
+        let _ = std::fs::remove_dir_all(&root);
+        crate::create(&root, &pe2_io::SystemFilesystem).expect("a test's project made");
+        crate::Project::load(&root).expect("a test's project opened");
+        root
+    }
 
     /// A uid a test writes, checked.
     pub fn uid(text: &str) -> pe2_path::Uid {

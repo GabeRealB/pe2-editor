@@ -299,7 +299,7 @@ pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usi
         let (tree, _) = store.put_folder(&folder)?;
         let at = extension_path(layer, &id)?;
         fs.create_folder_all(&layer.join(&DIR).join(&EXTENSIONS))?;
-        crate::cache::write_atomic(fs, &at, extension_record(Some(&tree)).as_bytes())?;
+        crate::local::write_atomic(fs, &at, extension_record(Some(&tree)).as_bytes())?;
         project.io.filesystem().remove_all(&folder)?;
         count += 1;
     }
@@ -360,7 +360,7 @@ pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) 
     }
     fs.create_folder_all(&layer.join(&DIR))?;
     let at = layer.join(&DIR).join(&MARKER);
-    crate::cache::write_atomic(fs, &at, doc.to_string().as_bytes())
+    crate::local::write_atomic(fs, &at, doc.to_string().as_bytes())
 }
 
 /// A records layer's settings, its format checked: one this program knows.
@@ -1417,7 +1417,7 @@ fn records_of_tree(
 /// The tree or its changeset cannot be read, or the records cannot be written.
 pub fn import(
     project: &crate::Project,
-    cache: &crate::cache::Cache,
+    local: &crate::local::Local,
     name: &Name,
     from: &std::path::Path,
 ) -> Result<usize> {
@@ -1429,7 +1429,7 @@ pub fn import(
     let changeset =
         crate::changeset::Changeset::load(project.io.filesystem(), &from.with_suffix(crate::CHANGESET_SUFFIX))?;
     let records = {
-        let index = crate::index::Index::open(project, cache)?;
+        let index = crate::index::Index::open(project, local)?;
         let disk = |path: &TreePath| from.join(path);
         records_of_tree(project, &index, name, &disk, &changeset)?
     };
@@ -1525,7 +1525,7 @@ pub fn write_all(
         if let Some(shard) = at.parent() {
             fs.create_folder_all(&shard)?;
         }
-        crate::cache::write_atomic(fs, &at, record.render().as_bytes())?;
+        crate::local::write_atomic(fs, &at, record.render().as_bytes())?;
     }
     mark(fs, dir, settings)
 }
@@ -1704,7 +1704,7 @@ fn shown(index: &crate::index::Index) -> BTreeMap<Arc<TreePath>, String> {
 /// # Errors
 /// The layer is a records layer holding no extensions as folders, mounted or generated; what it holds cannot be read;
 /// or the project shows otherwise once converted.
-pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &Name) -> Result<Converted> {
+pub fn convert(project: &crate::Project, local: &crate::local::Local, name: &Name) -> Result<Converted> {
     let layer = project.layer(name)?;
     if is_records(project.io.filesystem(), &layer.path) {
         // What it still holds as folders, of what it held before records: its extensions.
@@ -1718,7 +1718,7 @@ pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &Nam
         bail!("{name}: a mounted or generated layer stays a tree");
     }
     let (before, settings, records) = {
-        let index = crate::index::Index::open(project, cache)?;
+        let index = crate::index::Index::open(project, local)?;
         let (settings, records) = of_tree(project, &index, layer)?;
         (shown(&index), settings, records)
     };
@@ -1751,7 +1751,7 @@ pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &Nam
         Ok(())
     };
     let written = write_all(project.io.filesystem(), &layer.path, &settings, &records)
-        .and_then(|()| Ok(shown(&crate::index::Index::open(project, cache)?)));
+        .and_then(|()| Ok(shown(&crate::index::Index::open(project, local)?)));
     let after = match written {
         Ok(after) => after,
         Err(e) => {
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn a_record_is_placed_by_its_uid() {
-        let layer = &crate::testing::scratch("record-place").at(".layers/top");
+        let layer = &crate::testing::scratch("record-place").at("layers/top");
         let at = super::path_of(layer, uid("uid://1hwweozpa40d9")).unwrap();
         assert_eq!(at, layer.at(".records/1h/1hwweozpa40d9.toml"));
         assert_eq!(super::uid_of(&at), Some(uid("uid://1hwweozpa40d9")));

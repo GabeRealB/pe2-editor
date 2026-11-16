@@ -99,14 +99,15 @@ impl Tried {
     /// What the server and the host said, in their logs.
     fn said(&self) -> (String, String) {
         let log = |role: &project::role::Role| {
-            std::fs::read_to_string(self.project().join(&project::cache::DIR).join(&role.log)).unwrap_or_default()
+            std::fs::read_to_string(project::local::part(&self.project(), project::local::PROCESSES).join(&role.log))
+                .unwrap_or_default()
         };
         (log(&project::server::ROLE), log(&project::host::ROLE))
     }
 
     /// Whether the host said this of what it did, in its log.
     fn host_said(&self, what: &str) -> bool {
-        let log = self.project().join(&project::cache::DIR).join(&project::host::ROLE.log);
+        let log = project::local::part(&self.project(), project::local::PROCESSES).join(&project::host::ROLE.log);
         std::fs::read_to_string(log).is_ok_and(|said| said.lines().any(|line| line == what))
     }
 
@@ -214,9 +215,9 @@ impl StandIn {
     fn take(root: &HostPath) -> StandIn {
         let p = project::Project::load(root).unwrap();
         let lock = project::lock::Lock::acquire(root, "a stand-in", &pe2_io::System, |_| {}).unwrap();
-        let cache = project::cache::Cache::open(&p, &lock).unwrap();
-        let (history, _) = project::history::History::open(&cache).unwrap();
-        let index = project::index::Index::open(&p, &cache).unwrap();
+        let local = project::local::Local::open(&p, &lock).unwrap();
+        let (history, _) = project::history::History::open(&local).unwrap();
+        let index = project::index::Index::open(&p, &local).unwrap();
         let says = Arc::new(holder::says::Says::of(&p));
         let mut core = holder::core::Core::new(p.clone(), index, says.clone());
         core.took(|| {});

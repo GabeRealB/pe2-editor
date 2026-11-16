@@ -11,16 +11,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::cache::DIR;
+use crate::local::{PROCESSES, part};
 
 /// One of a project's processes: what `pe2-cli project` starts it as, and what it is known by.
 #[derive(Debug)]
 pub struct Role {
     /// The command it runs as (`pe2-cli project <command>`), and what it is called where one is said.
     pub command: &'static str,
-    /// Its socket, in the cache (Unix).
+    /// Its socket, in the processes' folder (Unix).
     pub socket: &'static pe2_path::Name,
-    /// What its pipe's name starts with (Windows), and its socket's where the cache's path is too long for one.
+    /// What its pipe's name starts with (Windows), and its socket's where that folder's path is too long for one.
     pub pipe: &'static str,
     /// The file it locks for as long as it runs: one a project.
     pub lock: &'static pe2_path::Name,
@@ -48,7 +48,7 @@ impl Role {
         reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
     )]
     pub fn running(&self, root: &HostPath) -> bool {
-        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(&DIR).join(&self.lock)) else {
+        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(part(root, PROCESSES).join(&self.lock)) else {
             return false;
         };
         let free = lock.try_lock().is_ok();
@@ -67,12 +67,12 @@ impl Role {
         reason = "how this project's processes find each other - its lock, its roles and their logs - which every process reads as the system has it"
     )]
     pub fn claim(&self, root: &HostPath) -> Result<std::fs::File> {
-        crate::cache::make(&pe2_io::SystemFilesystem, root)?;
+        crate::local::processes(&pe2_io::SystemFilesystem, root)?;
         let one = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(root.join(&DIR).join(&self.lock))?;
+            .open(part(root, PROCESSES).join(&self.lock))?;
         if one.try_lock().is_err() {
             bail!("{root}: a {} runs for it already", self.command);
         }
@@ -97,7 +97,7 @@ impl Role {
 
     /// Start one for the project in `root`, on its own - not ended with this process, nor with its terminal - and
     /// connect to it once it listens: `program` being `pe2-cli`, given `args` after `project <command>`. What it says
-    /// goes to its log in the cache.
+    /// goes to its log in the processes' folder.
     ///
     /// # Errors
     /// It could not be started, or did not listen in time.
@@ -112,8 +112,8 @@ impl Role {
         args: &[String],
         io: &dyn pe2_io::Io,
     ) -> Result<Link> {
-        crate::cache::make(&pe2_io::SystemFilesystem, root)?;
-        let log = root.join(&DIR).join(&self.log);
+        crate::local::processes(&pe2_io::SystemFilesystem, root)?;
+        let log = part(root, PROCESSES).join(&self.log);
         // A group of its own: a Ctrl-C in the terminal that started it is not its, nor is that terminal's closing.
         let started = pe2_io::Program::new(program)
             .args(["project", self.command, "--project"])
@@ -135,7 +135,7 @@ impl Role {
                 if let Some(link) = self.connect(root, io) {
                     return Ok(link);
                 }
-                let said = std::fs::read_to_string(root.join(&DIR).join(&self.log)).unwrap_or_default();
+                let said = std::fs::read_to_string(part(root, PROCESSES).join(&self.log)).unwrap_or_default();
                 bail!("the {} ended ({status}): {}", self.command, said.trim());
             }
             if clock.now().saturating_duration_since(started) > STARTING {

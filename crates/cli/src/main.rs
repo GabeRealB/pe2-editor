@@ -213,7 +213,7 @@ enum ConvertCommand {
 
 #[derive(Subcommand)]
 enum LayerCommand {
-    /// Add an empty layer at the top of the stack (`.layers/<name>`)
+    /// Add an empty layer at the top of the stack (`layers/<name>`)
     Add {
         #[arg(value_parser = name)]
         name: Arc<pe2_path::Name>,
@@ -223,7 +223,7 @@ enum LayerCommand {
         /// Below every other layer, as one the rest build on (the game's)
         #[arg(long)]
         bottom: bool,
-        /// A generated layer, filled by its plan (`.layers/<name>.plan.jsonl`, written beside it by whoever makes it)
+        /// A generated layer, filled by its plan (`layers/<name>.plan.jsonl`, written beside it by whoever makes it)
         /// with the files of the nodes of the layer it fills
         #[arg(long, requires = "fills", conflicts_with_all = ["files", "bottom"])]
         generated: bool,
@@ -278,7 +278,7 @@ enum MountCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Say where an unmanaged mount is on this machine (`project.local.toml`)
+    /// Say where an unmanaged mount is on this machine (`.local/settings.toml`)
     Locate {
         #[arg(value_parser = tree)]
         at: Arc<project::TreePath>,
@@ -426,7 +426,7 @@ enum StoreCommand {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// Fill a project's generated layers by their plans (`.layers/<layer>.plan.jsonl`), reading the discs where the
+    /// Fill a project's generated layers by their plans (`layers/<layer>.plan.jsonl`), reading the discs where the
     /// plans say: only what changed or is gone is made, and what a plan no longer gives is removed
     Extract {
         /// The project's directory
@@ -472,7 +472,7 @@ enum ProjectCommand {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Links this machine wants to what the project's builds deploy (`project.local.toml`)
+    /// Links this machine wants to what the project's builds deploy (`.local/settings.toml`)
     Link {
         #[command(subcommand)]
         command: LinkCommand,
@@ -613,7 +613,7 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// What serves it - a backend's name (`project backends` lists them), or `auto` for the best suited - in
-        /// place of what `project.local.toml` (`[filesystem] serve`) and then this machine's settings say
+        /// place of what `.local/settings.toml` (`[filesystem] serve`) and then this machine's settings say
         #[arg(long)]
         backend: Option<String>,
         /// WebDAV's address (`127.0.0.1:4918`; port 0 for any), in place of `[filesystem] address`
@@ -625,7 +625,7 @@ enum ProjectCommand {
         /// Stop what serves it, and the host holding it, whoever keeps them
         #[arg(long)]
         stop: bool,
-        /// Where its folder holds files that are not the project's, move them beside it (`assets.set-aside`)
+        /// Where its folder holds files that are not the project's, move them aside (`.local/set-aside`)
         #[arg(long, conflicts_with = "take_in")]
         set_aside: bool,
         /// Where its folder holds files that are not the project's, write them into the project
@@ -1000,14 +1000,14 @@ fn signal(project: &Path, config: Option<&pe2_path::Name>, events: &[&str]) -> a
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
-    let cache = project::cache::Cache::open(&p, &lock)?;
-    let index = project::index::Index::open(&p, &cache)?;
+    let local = project::local::Local::open(&p, &lock)?;
+    let index = project::index::Index::open(&p, &local)?;
     let extensions = extensions::for_project(&p);
     for problem in &extensions.problems {
         eprintln!("warning: {problem}");
     }
     whole(&extensions)?;
-    let store = project::graph::store::Store::open(&cache)?;
+    let store = project::graph::store::Store::open(&local)?;
     extensions.keep_in(store.clone());
     let wiring = project::build::wiring(&index, &extensions, &chosen);
     for (at, why) in &wiring.problems {
@@ -1374,7 +1374,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
-    let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
+    let (mut history, _) = project::history::History::open(&project::local::Local::open(&p, &lock)?)?;
     match command {
         ExtensionCommand::List { .. } => list_extensions(&p),
         ExtensionCommand::Add { what, layer, .. } => {
@@ -1558,8 +1558,8 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", &*p.io, |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
             })?;
-            let cache = project::cache::Cache::open(&p, &lock)?;
-            let count = project::records::import(&p, &cache, &name, &from)?;
+            let local = project::local::Local::open(&p, &lock)?;
+            let count = project::records::import(&p, &local, &name, &from)?;
             println!("{name}: {count} records");
         }
         ProjectCommand::Layer { command: LayerCommand::Export { name, to, project } } => {
@@ -1609,7 +1609,7 @@ fn edit_project(
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
-    let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
+    let (mut history, _) = project::history::History::open(&project::local::Local::open(&p, &lock)?)?;
     edit(&p, &mut history)
 }
 
@@ -1640,8 +1640,8 @@ fn run_plan(
         plan.display()
     );
     let extensions = project_extensions(p);
-    let cache = project::cache::Cache::open(p, lock)?;
-    let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
+    let local = project::local::Local::open(p, lock)?;
+    let engine = project::imports::Imports::open(&local)?.engine(&extensions);
     let ran = project::plan::run(p, layer, &engine, &extensions, &project::plan::Progress::default(), releases)?;
     println!(
         "{} ({}): {} files written and {} kept as they were ({} operations run), {} removed, {} of releases not read left, \
@@ -1793,8 +1793,8 @@ fn dump(project: &Path) -> Result<()> {
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project dump", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
-    let cache = project::cache::Cache::open(&p, &lock)?;
-    let index = project::index::Index::open(&p, &cache)?;
+    let local = project::local::Local::open(&p, &lock)?;
+    let index = project::index::Index::open(&p, &local)?;
     println!("{}", serde_json::to_string_pretty(&project::dump::dump(&index)?)?);
     Ok(())
 }
@@ -1813,8 +1813,8 @@ fn outputs(
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
-    let cache = project::cache::Cache::open(&p, &lock)?;
-    let mut index = project::index::Index::open(&p, &cache)?;
+    let local = project::local::Local::open(&p, &lock)?;
+    let mut index = project::index::Index::open(&p, &local)?;
     let extensions = project_extensions(&p);
     let chosen = match config {
         Some(name) => Some(p.configs.iter().find(|c| *c.name == *name).with_context(|| format!("no config {name}"))?),
@@ -1823,8 +1823,8 @@ fn outputs(
     if let Some(chosen) = chosen {
         extensions.set_config(Some(project::build::build_config(&p, chosen)), &chosen.disabled);
     }
-    let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
-    extensions.keep_in(project::graph::store::Store::open(&cache)?);
+    let _ = project::imports::Imports::open(&local)?.attach(&mut index, &extensions);
+    extensions.keep_in(project::graph::store::Store::open(&local)?);
     let engine = extensions.engine();
     let mut paths: Vec<Arc<project::TreePath>> = Vec::new();
     for name in assets {
@@ -1887,8 +1887,8 @@ fn store(command: &StoreCommand) -> Result<()> {
     let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
     match command {
         StoreCommand::Migrate { .. } => {
-            let cache = project::cache::Cache::open(&p, &lock)?;
-            let index = project::index::Index::open(&p, &cache)?;
+            let local = project::local::Local::open(&p, &lock)?;
+            let index = project::index::Index::open(&p, &local)?;
             let pass = project::chunks::migrate(&p, &index)?;
             println!(
                 "{} files stored as chunks: {} MiB whole, {} MiB in the store and their manifests",
@@ -1906,9 +1906,9 @@ fn store(command: &StoreCommand) -> Result<()> {
             println!("{layer}: {count} files unpacked");
         }
         StoreCommand::Convert { layer, .. } => {
-            let cache = project::cache::Cache::open(&p, &lock)?;
+            let local = project::local::Local::open(&p, &lock)?;
             let started = std::time::Instant::now();
-            let converted = project::records::convert(&p, &cache, layer)?;
+            let converted = project::records::convert(&p, &local, layer)?;
             let took = started.elapsed().as_secs_f64();
             if converted.records > 0 {
                 println!("{layer}: {} records, the project showing the same ({took:.1}s)", converted.records);
@@ -2068,7 +2068,7 @@ fn backends(project: &Path) -> Result<()> {
     );
     for (job, key, project_says, machine_says, needs, at, how) in jobs {
         let (says, who) = match (project_says, machine_says) {
-            (Some(says), _) => (says.as_str(), format!("`{key} = \"{says}\"` in {}", project::LOCAL)),
+            (Some(says), _) => (says.as_str(), format!("`{key} = \"{says}\"` in the project's .local/settings.toml")),
             (None, Some(says)) => (says.as_str(), format!("`{key} = \"{says}\"` in this machine's settings")),
             (None, None) => ("auto", "nothing says otherwise".to_string()),
         };
@@ -2210,12 +2210,12 @@ fn run(cli: Cli) -> Result<()> {
             }
             // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted:
             // indexed only then.
-            let _ = project::cache::Cache::open(&p, &lock).and_then(|cache| {
-                let store = project::graph::store::Store::open(&cache)?;
+            let _ = project::local::Local::open(&p, &lock).and_then(|local| {
+                let store = project::graph::store::Store::open(&local)?;
                 if !store.sweep_due(project::imports::SWEEP_EVERY) {
                     return Ok(None);
                 }
-                let index = project::index::Index::open(&p, &cache)?;
+                let index = project::index::Index::open(&p, &local)?;
                 Ok(project::imports::sweep_if_due(&store, &index))
             });
         }

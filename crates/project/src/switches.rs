@@ -244,8 +244,8 @@ pub fn set_setting(
 mod tests {
     use super::{add_extension, remove_extension, set_disabled, set_setting};
     use crate::Project;
-    use crate::cache::Cache;
     use crate::history::History;
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use sfs::HostPath;
@@ -259,8 +259,8 @@ mod tests {
         std::fs::write(root.at("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
+        let index = crate::index::Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
         let depth = toml::Value::Integer(8);
         set_setting(&project, "pe2.images", "depth", Some(&depth), &mut history, "depth".into()).unwrap();
         set_disabled(&project, &["pe2.game".to_string()], &mut history, "off".into()).unwrap();
@@ -281,7 +281,7 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(root.at("project.toml")).unwrap(), text);
         drop(lock);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// A folder the way an extension is kept, its manifest beside a component carrying another: what the check
@@ -301,17 +301,17 @@ mod tests {
         std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"base\"\n").unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let (mut history, _) = History::open(&Local::open(&project, &lock).unwrap()).unwrap();
         let source = root.at("kept/my.tool.extension");
         kept(&source, "my.tool");
         // Its component carries no manifest: nothing is copied, nothing required.
         let refused = add_extension(&project, &source, None, &mut history, "add".into()).unwrap_err();
         assert!(format!("{refused:#}").contains("carries no manifest"), "{refused:#}");
-        assert!(!root.at(".layers/base/extensions").exists());
+        assert!(!root.at("layers/base/extensions").exists());
         assert_eq!(Project::load(&root).unwrap().requires, []);
         // Neither held nor required, it cannot go.
         assert!(remove_extension(&project, "my.tool", &mut history, "remove".into()).is_err());
         drop(lock);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 }

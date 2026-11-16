@@ -1,5 +1,5 @@
 //! The editor's link: a local socket through which a running editor answers the requests made of the project it has
-//! open - a Unix domain socket at `.cache/editor.sock`, a named pipe on Windows. One CBOR request a frame, one CBOR reply
+//! open - a Unix domain socket at `.local/processes/editor.sock`, a named pipe on Windows. One CBOR request a frame, one CBOR reply
 //! a frame (`project::wire`). Only the process holding the project lock listens, so a socket left by an editor that crashed is
 //! taken over, never shared.
 
@@ -15,7 +15,7 @@ use crate::{Reply, Request};
 const PATIENCE: Duration = Duration::from_secs(20);
 
 fn name(root: &HostPath) -> std::io::Result<pe2_io::ChannelName> {
-    project::host::local_name(root, project::cache::SOCKET, "pe2-editor")
+    project::host::local_name(root, project::local::SOCKET, "pe2-editor")
 }
 
 /// Whether anything listens on the holder's link of the project in `root`: an editor or a host that answers.

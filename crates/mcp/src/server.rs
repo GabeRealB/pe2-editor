@@ -3,8 +3,8 @@
 
 use anyhow::Context as _;
 use project::Project;
-use project::cache::Cache;
 use project::index::Index;
+use project::local::Local;
 use project::lock::{Lock, LockError};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, InitializeResult, ListResourceTemplatesResult,
@@ -100,12 +100,12 @@ pub fn execute(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>, request: &R
         return Reply::Declined;
     }
     let opened = Project::load_with(root, io.clone()).and_then(|project| {
-        let cache = Cache::open(&project, &lock)?;
-        let mut index = Index::open(&project, &cache)?;
+        let local = Local::open(&project, &lock)?;
+        let mut index = Index::open(&project, &local)?;
         // The extensions as the project has them: those it holds and the built-ins, without those it leaves off.
         let extensions = extensions::for_project(&project);
-        let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
-        let store = project::graph::store::Store::open(&cache)?;
+        let _ = project::imports::Imports::open(&local)?.attach(&mut index, &extensions);
+        let store = project::graph::store::Store::open(&local)?;
         extensions.keep_in(store.clone());
         Ok((project, index, extensions, store))
     });
@@ -191,13 +191,13 @@ fn edit_here(
     }
     let done = (|| {
         let project = Project::load_with(root, io.clone())?;
-        let cache = Cache::open(&project, lock)?;
-        let index = Index::open(&project, &cache)?;
+        let local = Local::open(&project, lock)?;
+        let index = Index::open(&project, &local)?;
         let layer = match layer {
             Some(layer) => layer.to_owned(),
             None => vfs::write::writable_layer(&index).context("no layer of the project can be written")?,
         };
-        let (mut history, _) = project::history::History::open(&cache)?;
+        let (mut history, _) = project::history::History::open(&local)?;
         let done = vfs::ops::apply(op, &project, &index, &layer, &mut history);
         history.let_go();
         done

@@ -7,7 +7,7 @@ use sfs::HostPath;
 
 /// What a records layer holds: its records' files, by name.
 fn records(scenario: &mut Scenario) -> Vec<String> {
-    let at = scenario.workspace().project.root.at(".layers/top/.records");
+    let at = scenario.workspace().project.root.at("layers/top/.records");
     let mut found: Vec<String> = walk(&at).into_iter().filter(|name| name != "layer.toml").collect();
     found.sort();
     found
@@ -136,8 +136,8 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
 #[test]
 fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
-    let kept = editor.workspace().cache_path(pe2_path::RelPath::constant("editor/layers.toml"));
-    editor.workspace().toggle_lock(pe2_path::Name::constant("top")).expect("locked");
+    let kept = project::local::settings(&editor.workspace().project.root);
+    editor.workspace().toggle_lock(pe2_path::Name::constant("top"));
     // Written by the worker's thread, aside: there a moment after, with no frame waited for.
     editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
 }

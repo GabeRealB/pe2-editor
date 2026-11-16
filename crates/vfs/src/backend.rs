@@ -7,7 +7,7 @@
 //! Projected File System, then the Cloud Files API, which every Windows has.
 //!
 //! What is chosen is a setting (`Setting`): `auto`, a backend by name - refused, with why, where it cannot do the job or
-//! is not available - or `none`. Whoever asks says it, then the project (`project.local.toml`), then the machine
+//! is not available - or `none`. Whoever asks says it, then the project (`.local/settings.toml`), then the machine
 //! (`setting`).
 //!
 //! A backend's own ways stay in its module: what it mounts is a `Mount`, told of what is served by path where the
@@ -354,7 +354,7 @@ pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + S
 }
 
 /// Where what is kept apart of a folder served is: as its project says (`[filesystem] cache` of the
-/// `project.local.toml` beside the folder), else the machine, else the user's local data on Windows
+/// `.local/settings.toml` beside the folder), else the machine, else the user's local data on Windows
 /// (`%LOCALAPPDATA%\pe2-editor\served`: this machine's, not what roams with the user). None where nothing says and
 /// the system has no such place.
 #[must_use]

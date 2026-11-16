@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged, ProjectOpened};
 use pe2_path::{Name, RelPath, Uid};
-use project::cache::Cache;
 use project::ext::{Extensions, Lens};
 use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
+use project::local::Local;
 use project::lock::Lock;
 use project::{Project, TreePath};
 use sfs::HostPath;
@@ -177,7 +177,7 @@ pub struct Shown {
     pub size: egui::Vec2,
 }
 
-/// One user's view of the stack, kept in the project cache (`editor/layers.toml`), so toggling a layer never changes a
+/// One user's view of the stack, kept in this machine's settings of the project (`[editor.layers]`), so toggling a layer never changes a
 /// tracked file: the layers hidden from the view (the eyes), the layers locked by hand, the active layer, and the
 /// layer shown alone, if one is - a mode over the others, which leaves them as they were when it ends.
 #[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -246,7 +246,8 @@ fn names(layers: &[Arc<Name>]) -> String {
     layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>().join(", ")
 }
 
-const LAYER_VIEW: &pe2_path::RelPath = pe2_path::RelPath::constant("editor/layers.toml");
+/// Where this machine's settings of the project keep the view of the layers.
+const LAYER_VIEW: &[&str] = &["editor", "layers"];
 
 /// How many of the history's kept contents are held as the History pane showed them.
 const KEPT: usize = 512;
@@ -323,12 +324,11 @@ pub struct Workspace {
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     lock: Lock,
-    cache_dir: HostPath,
     /// The watcher on the layers, started with the first frame (it wakes the window).
     watch: Option<Box<dyn pe2_io::Watching>>,
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
-    /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
+    /// The project served as a filesystem, where this machine says (`.local/settings.toml`): started with the watcher.
     pub files: Option<Arc<crate::files::Files>>,
     /// The host standing by told that the editor is letting go of the project: it takes it the moment this goes.
     handing: Option<project::host::Lease>,
@@ -622,7 +622,6 @@ fn show(ctx: &egui::Context, path: &TreePath, chosen: usize, upscale: Upscale, i
 pub struct Opened {
     project: Project,
     lock: Lock,
-    cache: Cache,
     history: History,
     /// The label of an edit a crash left half done, rolled back.
     pub recovered: Option<String>,
@@ -792,7 +791,6 @@ impl Loaded {
     pub fn of(
         project: Project,
         mut index: Index,
-        cache: &Cache,
         store: &project::graph::store::Store,
         report: &project::index::Report<'_>,
     ) -> Loaded {
@@ -802,13 +800,8 @@ impl Loaded {
         let extensions = extensions::for_project(&project);
         // What they are asked in passing reads and keeps what the project's store holds.
         extensions.keep_in(store.clone());
-        let layer_view: LayerView = project
-            .io
-            .filesystem()
-            .read_to_string(&cache.dir.join(&LAYER_VIEW))
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default();
+        let layer_view: LayerView =
+            project::local::setting(project.io.filesystem(), &project.root, LAYER_VIEW).unwrap_or_default();
         // The view first: hiding layers assembles the assets again, so the imports are attached to what it shows.
         index.set_hidden(&layer_view.hidden(&index.layers()));
         Loaded { project, index, extensions, found, layer_view }
@@ -852,16 +845,16 @@ impl Workspace {
         if link.is_ok() {
             await_agent(report);
         }
-        let cache = Cache::open(&project, &lock)?;
+        let local = Local::open(&project, &lock)?;
         // The history first: a transaction a crash left half done is rolled back before the index reads the files.
         // Journaled: a session a crash ends is offered back on the next opening.
-        let (history, recovered) = History::open(&cache)?;
+        let (history, recovered) = History::open(&local)?;
         // It holds the project to stay: what its first edit would wait for is made ahead of it.
         history.prepare();
         let history = history.journaled();
         // Over the files as the project's model has them: held to that by the worker, behind what shows first and
         // before the first edit (`TakeIn::verify`).
-        let mut index = Index::open_behind(&project, &cache, report)?;
+        let mut index = Index::open_behind(&project, &local, report)?;
         let verify = Box::new(index.verification());
         // The project's model, where its processes share it, holds what the opening read.
         if let Err(e) = says.took(&project.root, &mut index) {
@@ -873,16 +866,12 @@ impl Workspace {
             files.show(Arc::new(listing.clone()));
             listing
         });
-        // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
-        let store = project::graph::store::Store::open(&cache)?;
-        let old = cache.path(pe2_path::Name::constant("artifacts"));
-        if io.filesystem().exists(&old) {
-            io.filesystem().remove_all(&old).with_context(|| old.display().to_string())?;
-        }
+        // The work graph's store; attaching the imports sweeps it.
+        let store = project::graph::store::Store::open(&local)?;
         let Loaded { project, index, extensions, found: extensions_found, layer_view } =
-            Loaded::of(project, index, &cache, &store, report);
+            Loaded::of(project, index, &store, report);
         // What the assets' importers made of their sources, seen as their files.
-        let imports = project::imports::Imports::open(&cache)?;
+        let imports = project::imports::Imports::open(&local)?;
         report("Building the tree", 0, 0);
         let tree = Arc::new(Node::build(&index, &extensions));
         // What the window shows from the start: a snapshot with maps of its own, so that the worker changes its
@@ -892,7 +881,6 @@ impl Workspace {
         Ok(Opened {
             project,
             lock,
-            cache,
             history,
             recovered,
             index,
@@ -923,7 +911,6 @@ impl Workspace {
         let Opened {
             project,
             lock,
-            cache,
             history,
             index,
             shown,
@@ -952,7 +939,6 @@ impl Workspace {
         let outputs = project::ext::requests::Requests::start(shown.clone(), project.io.clone());
         outputs.set_extensions(&extensions);
         extensions.serve_requests(Some(outputs.clone()));
-        let cache_dir = cache.dir.clone();
         let mut core = holder::core::Core::new(project.clone(), index, says);
         core.files.clone_from(&files);
         core.listing = listing;
@@ -978,7 +964,6 @@ impl Workspace {
             showing: showing.clone(),
             pending: pending.clone(),
             runner: runner.clone(),
-            cache,
             store: store.clone(),
             imports,
             extensions: extensions.clone(),
@@ -1030,7 +1015,6 @@ impl Workspace {
             layer_view,
             index: shown,
             lock,
-            cache_dir,
             watch: None,
             files,
             handing: None,
@@ -1450,11 +1434,6 @@ impl Workspace {
     /// An epoch is running or waiting.
     pub fn in_epoch(&self) -> bool {
         self.runner().busy()
-    }
-
-    /// A file of the project's cache, by name.
-    pub fn cache_path(&self, within: &pe2_path::RelPath) -> HostPath {
-        self.cache_dir.join(within)
     }
 
     /// What the epoch running does, as the status bar says it: by the events it was signaled by.
@@ -1971,30 +1950,24 @@ impl Workspace {
         (!home.mounted && !Self::locked_by_nature(home)).then(|| entry.home.to_string())
     }
 
-    /// The user's view of the layers kept, in the project's cache: written by the worker's thread, aside.
-    fn save_layer_view(&self) -> Result<()> {
-        let path = self.cache_dir.join(&LAYER_VIEW);
-        let text = toml::to_string(&self.layer_view)?;
-        let io = self.project.io.clone();
+    /// The user's view of the layers kept, in this machine's settings of the project: written by the worker's thread,
+    /// aside.
+    fn save_layer_view(&self) {
+        let view = self.layer_view.clone();
+        let (io, root) = (self.project.io.clone(), self.project.root.clone());
         self.takein.aside(move || {
-            let fs = io.filesystem();
-            let written = path.parent().map_or(Ok(()), |folder| fs.create_folder_all(&folder));
-            let written = written
-                .map_err(anyhow::Error::from)
-                .and_then(|()| project::cache::write_atomic(fs, &path, text.as_bytes()));
-            if let Err(e) = written {
+            if let Err(e) = project::local::set_setting(io.filesystem(), &root, LAYER_VIEW, &view) {
                 eprintln!("the view of the layers is not kept: {e:#}");
             }
         });
-        Ok(())
     }
 
     /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
-    fn apply_eyes(&mut self) -> Result<()> {
+    fn apply_eyes(&mut self) {
         // The worker assembles the view again; its snapshot brings the tree and forgets the pictures.
         self.takein.hidden(self.layer_view.hidden(&self.layers));
         self.refresh_editable();
-        self.save_layer_view()
+        self.save_layer_view();
     }
 
     /// Which entries can be modified: those whose content comes from a layer that is not locked - by nature, by hand
@@ -2028,55 +2001,44 @@ impl Workspace {
 
     /// Toggle a layer's eye.
     ///
-    /// # Errors
-    /// The user's view cannot be saved.
     /// While a layer is soloed, the solo decides what is shown: the eyes wait until it ends.
-    pub fn toggle_eye(&mut self, name: &Name) -> Result<()> {
+    pub fn toggle_eye(&mut self, name: &Name) {
         if self.layer_view.solo.is_some() {
-            return Ok(());
+            return;
         }
         if !self.layer_view.hidden.remove(name) {
             self.layer_view.hidden.insert(name.to_owned());
         }
-        self.apply_eyes()
+        self.apply_eyes();
     }
 
     /// Show a layer alone - the layers above it hidden, those below shown (its entries stand on them), every other
     /// layer locked, it the active one - or, when it is shown alone already, end that: the eyes, locks and active
     /// layer are as they were.
-    ///
-    /// # Errors
-    /// The user's view cannot be saved.
-    pub fn solo(&mut self, name: &Name) -> Result<()> {
+    pub fn solo(&mut self, name: &Name) {
         self.layer_view.solo = if self.layer_view.solo.as_deref() == Some(name) { None } else { Some(name.to_owned()) };
-        self.apply_eyes()
+        self.apply_eyes();
     }
 
     /// Lock a layer by hand, or unlock it.
-    ///
-    /// # Errors
-    /// The user's view cannot be saved.
-    pub fn toggle_lock(&mut self, name: &Name) -> Result<()> {
+    pub fn toggle_lock(&mut self, name: &Name) {
         if self.layer_view.solo.is_some() {
-            return Ok(());
+            return;
         }
         if !self.layer_view.locked.remove(name) {
             self.layer_view.locked.insert(name.to_owned());
         }
         self.refresh_editable();
-        self.save_layer_view()
+        self.save_layer_view();
     }
 
     /// Make a layer the active one: where new entries, edits and overrides go.
-    ///
-    /// # Errors
-    /// The user's view cannot be saved.
-    pub fn activate(&mut self, name: &Name) -> Result<()> {
+    pub fn activate(&mut self, name: &Name) {
         if self.layer_view.solo.is_some() {
-            return Ok(());
+            return;
         }
         self.layer_view.active = Some(name.to_owned());
-        self.save_layer_view()
+        self.save_layer_view();
     }
 
     /// The layer edits go to: the active one, if it can be written now.

@@ -67,7 +67,7 @@ pub fn places(project: &crate::Project) -> std::io::Result<Places> {
         .collect();
     Ok(Places {
         root: text(&project.root),
-        local: text(&project.root.join(&crate::cache::DIR)),
+        local: text(&project.root.join(&crate::local::DIR)),
         lock: text(&lock),
         owner: text(&owner),
         host,

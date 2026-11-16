@@ -31,8 +31,8 @@ Some files are not edited through the `assets` folder: code you edit in its own 
 tool changes. The editor takes these changes in when you come back to its window, or as they happen; choose which
 in **Settings ▸ Files**. **View ▸ Refresh** (`F5`) takes them in right away.
 
-The folders under `.layers` are the project's storage. Do not edit them by hand; if you do, the editor lists what it
-finds in [Problems](problems.md).
+The folders `layers` and `store` are the project's storage, and `.local` is what of it is this computer's alone. Do
+not edit them by hand; if you do, the editor lists what it finds in [Problems](problems.md).
 
 ## Files left in the folder
 

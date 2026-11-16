@@ -158,7 +158,7 @@ pub struct Agents {
     pub drive: bool,
 }
 
-/// What serves projects as filesystems on this machine, where a project's own `project.local.toml` does not say
+/// What serves projects as filesystems on this machine, where a project's own `.local/settings.toml` does not say
 /// (`[filesystem]`, which `pe2-cli` reads too): each a backend's name, `none`, or nothing for the best suited.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

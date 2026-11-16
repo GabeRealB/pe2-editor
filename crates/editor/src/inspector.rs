@@ -2172,16 +2172,16 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 });
                 ui.label(RichText::new(size_text(f.size)).small().color(theme::weak()));
                 match &f.made_by {
-                    // Made of the source, kept in the cache: not the layer's to edit.
+                    // Made of the source, kept in the outputs: not the layer's to edit.
                     Some(importer) if has_import => {
                         ui.label(RichText::new("imported").small().color(theme::weak())).on_hover_text(format!(
-                            "Made of the source by {importer}, kept in the project cache; edit the source instead"
+                            "Made of the source by {importer}, kept in the project's outputs; edit the source instead"
                         ));
                     }
-                    // Made by its stack of what it reads: kept in the cache.
+                    // Made by its stack of what it reads: kept in the outputs.
                     Some(maker) => {
                         ui.label(RichText::new("made").small().color(theme::weak())).on_hover_text(format!(
-                            "Made by its stack ({maker}), kept in the project cache; edit what it is made of instead"
+                            "Made by its stack ({maker}), kept in the project's outputs; edit what it is made of instead"
                         ));
                     }
                     None => {

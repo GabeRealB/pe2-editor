@@ -255,7 +255,7 @@ fn own_copy(
     Ok(at)
 }
 
-/// The project a layer is of: the folder holding `.layers`, where its changeset is.
+/// The project a layer is of: the folder holding `layers`, where its changeset is.
 fn project_root(layer: &Layer) -> HostPath {
     let layers = layer.changeset.parent().unwrap_or_else(|| layer.changeset.clone());
     layers.parent().unwrap_or(layers)
@@ -915,10 +915,10 @@ pub fn resolve(
 mod tests {
     use super::{Resolution, delete, forget, override_entry, rename, resolve};
     use crate::Project;
-    use crate::cache::Cache;
     use crate::changeset::Op;
     use crate::history::History;
     use crate::index::{Index, Problem};
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use crate::testing::{rel, tree, uid};
@@ -935,10 +935,10 @@ mod tests {
             std::fs::write(path, text).unwrap();
         };
         write("project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(".layers/base/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        write(".layers/base/g/a.node/native.texels", "texels");
-        write(".layers/base/n", "notes");
-        std::fs::create_dir_all(root.at(".layers/top")).unwrap();
+        write("layers/base/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        write("layers/base/g/a.node/native.texels", "texels");
+        write("layers/base/n", "notes");
+        std::fs::create_dir_all(root.at("layers/top")).unwrap();
         root
     }
 
@@ -962,9 +962,9 @@ mod tests {
         };
         let project = Project::load_with(root, std::sync::Arc::new(io)).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        let cache = Cache::open(&project, &lock).unwrap();
-        let index = Index::open(&project, &cache).unwrap();
-        let (history, _) = History::open(&cache).unwrap();
+        let local = Local::open(&project, &lock).unwrap();
+        let index = Index::open(&project, &local).unwrap();
+        let (history, _) = History::open(&local).unwrap();
         // What it serves, said whole in a shared filesystem of this test's own.
         let shared = sfs::Space::private().unwrap();
         let mut txn = shared.write().unwrap();
@@ -1198,14 +1198,14 @@ mod tests {
         // One entry still, now spelled as it was renamed: what the index holds, and what the layer's folder does.
         let held = o.index.entries.get_key_value(&tree("n")).map(|(path, _)| path.as_str());
         assert_eq!(held, Some("N"));
-        let listed: Vec<String> = std::fs::read_dir(root.at(".layers/top").as_path())
+        let listed: Vec<String> = std::fs::read_dir(root.at("layers/top").as_path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| !name.starts_with('.'))
             .collect();
         assert!(!listed.iter().any(|name| name == "n"), "{listed:?}");
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1213,14 +1213,14 @@ mod tests {
         let root = project("unlisted");
         let mut o = open(&root);
         // Put in the layer's folder by other means than the editor: no entry, a problem.
-        let new = root.at(".layers/top/x.node/node.toml");
+        let new = root.at("layers/top/x.node/node.toml");
         std::fs::create_dir_all(new.parent().unwrap()).unwrap();
         std::fs::write(&new, "uid = \"uid://xxxxxxxxxxxx\"\nstack = []\n").unwrap();
-        let junk = root.at(".layers/top/junk/a.bin");
+        let junk = root.at("layers/top/junk/a.bin");
         std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
         std::fs::write(&junk, "junk").unwrap();
         // As a watcher reports them: the folders made, with what is in them.
-        o.refresh(&[root.at(".layers/top/x.node"), root.at(".layers/top/junk")]);
+        o.refresh(&[root.at("layers/top/x.node"), root.at("layers/top/junk")]);
         assert!(!o.index.assets.contains_key(&tree("x")));
         let unlisted = |o: &Open| -> Vec<String> {
             o.index
@@ -1254,7 +1254,7 @@ mod tests {
         o.refresh(&paths);
         assert!(junk.exists());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1277,19 +1277,19 @@ mod tests {
         o.refresh(&paths);
         assert_eq!(std::fs::read_to_string(&o.index.entries[&tree("n")].disk).unwrap(), "mine");
         // Its copy deleted by another program: the file is what is below again, and the override says it is missing.
-        std::fs::remove_file(root.at(".layers/top/n")).unwrap();
-        o.refresh(&[root.at(".layers/top/n")]);
+        std::fs::remove_file(root.at("layers/top/n")).unwrap();
+        o.refresh(&[root.at("layers/top/n")]);
         let entry = o.index.entries.get(&tree("n")).expect("still there");
         assert_eq!(std::fs::read_to_string(&entry.disk).unwrap(), "notes");
         assert!(o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn a_node_and_its_folder_of_children_go_together() {
         let root = project("pair");
-        let child = root.at(".layers/base/g/a/b.node/node.toml");
+        let child = root.at("layers/base/g/a/b.node/node.toml");
         std::fs::create_dir_all(child.parent().unwrap()).unwrap();
         std::fs::write(&child, "stack = []\n").unwrap();
         let mut o = open(&root);
@@ -1315,7 +1315,7 @@ mod tests {
         o.refresh(&paths);
         assert!(o.index.assets.contains_key(&tree("g/c/b")));
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1325,7 +1325,7 @@ mod tests {
         let uid = o.uid("g/a.node");
         let declared = |o: &Open| o.index.assets[&tree("g/a")].text().to_string();
         let stale = |o: &Open| o.index.problems.iter().any(|p| matches!(p, Problem::Stale { .. }));
-        let below = root.at(".layers/base/g/a.node/node.toml");
+        let below = root.at("layers/base/g/a.node/node.toml");
         std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\nname = \"a\"\n").unwrap();
         o.refresh(std::slice::from_ref(&below));
         let mine = "stack = [{ op = \"t.image\" }]\nsize = 3\nname = \"a\"\n";
@@ -1346,12 +1346,12 @@ mod tests {
         };
         write(&mut o, "node.toml", mine.as_bytes());
         // It holds the file whole, with what it was made from; the texels are below's still.
-        let held = root.at(".layers/top/g/a.node/node.toml");
+        let held = root.at("layers/top/g/a.node/node.toml");
         assert_eq!(std::fs::read_to_string(&held).unwrap(), mine);
         let Some(Op::Override { files, .. }) = o.op("g/a.node") else { panic!("no override") };
         assert_eq!(files.keys().map(|file| file.as_str()).collect::<Vec<_>>(), ["node.toml"]);
         assert!(files[&rel("node.toml")].was.is_some());
-        assert!(!root.at(".layers/top/g/a.node/native.texels").exists());
+        assert!(!root.at("layers/top/g/a.node/native.texels").exists());
         assert!(o.index.assets[&tree("g/a")].files.iter().any(|f| *f.name == *"native.texels" && *f.layer == "base"));
         // Another field changed below reaches it, and it is not stale.
         std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\nname = \"b\"\n").unwrap();
@@ -1374,7 +1374,7 @@ mod tests {
         let kept = std::fs::read_to_string(&held).unwrap();
         assert!(kept.contains("size = 3") && kept.contains("name = \"b\""), "{kept}");
         // Text that is no TOML merges by line.
-        let notes = root.at(".layers/base/g/a.node/notes.txt");
+        let notes = root.at("layers/base/g/a.node/notes.txt");
         std::fs::write(&notes, "one\ntwo\nthree\n").unwrap();
         o.refresh(std::slice::from_ref(&notes));
         write(&mut o, "notes.txt", b"ONE\ntwo\nthree\n");
@@ -1385,9 +1385,9 @@ mod tests {
         assert!(!stale(&o), "{:?}", o.index.problems);
         // Written as it is below, it holds nothing of it.
         write(&mut o, "notes.txt", b"one\ntwo\nTHREE\n");
-        assert!(!root.at(".layers/top/g/a.node/notes.txt").exists());
+        assert!(!root.at("layers/top/g/a.node/notes.txt").exists());
         assert!(matches!(o.op("g/a.node"), Some(Op::Override { files, .. }) if !files.contains_key(&rel("notes.txt"))));
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1416,13 +1416,13 @@ mod tests {
         assert!(!o.index.entries.contains_key(&tree("h/made.node")));
         assert_eq!(o.index.served(), served);
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn an_edit_to_a_records_layer_refreshes_what_it_changed_alone() {
         let root = project("records-refresh");
-        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at("layers/top"), &crate::records::Settings::default())
             .unwrap();
         let mut o = open(&root);
         let declaration = "stack = [{ op = \"t.file\" }]\n";
@@ -1472,18 +1472,18 @@ mod tests {
         assert!(o.index.assets.contains_key(&tree("h/won")) && !o.index.assets.contains_key(&tree("h/one")));
         assert!(o.index.assets.contains_key(&tree("h/two")));
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn nodes_that_come_and_go_leave_the_links_as_a_fresh_reading_makes_them() {
         let root = project("links");
         std::fs::write(
-            root.at(".layers/base/g/a.node/node.toml"),
+            root.at("layers/base/g/a.node/node.toml"),
             "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n",
         )
         .unwrap();
-        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at("layers/top"), &crate::records::Settings::default())
             .unwrap();
         let mut o = open(&root);
         let node = |text: &str| format!("stack = [{{ op = \"t.file\" }}]\n{text}");
@@ -1553,13 +1553,13 @@ mod tests {
         }
         assert!(!o.index.assets.contains_key(&tree("h/one")));
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn a_long_text_in_a_records_layer_is_read_back() {
         let root = project("long");
-        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at("layers/top"), &crate::records::Settings::default())
             .unwrap();
         let mut o = open(&root);
         // Text is kept in its record whatever its length: here longer than what a layer keeps as chunks.
@@ -1583,17 +1583,17 @@ mod tests {
         let entry = o.index.entries.get(&tree("long.txt")).expect("read again, it is there");
         assert_eq!(crate::content::read(&crate::testing::io(), &entry.disk).unwrap().len(), long.len());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn a_records_layer_is_edited_as_a_tree_is() {
         let root = project("records");
-        crate::records::mark(&pe2_io::SystemFilesystem, &root.at(".layers/top"), &crate::records::Settings::default())
+        crate::records::mark(&pe2_io::SystemFilesystem, &root.at("layers/top"), &crate::records::Settings::default())
             .unwrap();
         let mut o = open(&root);
         let only_records = |root: &HostPath| {
-            let held: Vec<String> = std::fs::read_dir(root.at(".layers/top"))
+            let held: Vec<String> = std::fs::read_dir(root.at("layers/top"))
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
@@ -1652,7 +1652,7 @@ mod tests {
         .unwrap();
         o.refresh(&paths);
         assert_eq!(o.index.assets[&tree("g/a")].text(), mine);
-        let below = root.at(".layers/base/g/a.node/node.toml");
+        let below = root.at("layers/base/g/a.node/node.toml");
         std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\n").unwrap();
         o.refresh(std::slice::from_ref(&below));
         let text = o.index.assets[&tree("g/a")].text().to_string();
@@ -1660,12 +1660,12 @@ mod tests {
         only_records(&root);
         // Renamed: one record changes, what is inside follows.
         let folder = o.uid("h");
-        let records_before = crate::records::Set::records_of(&root.at(".layers/top")).unwrap();
+        let records_before = crate::records::Set::records_of(&root.at("layers/top")).unwrap();
         let paths =
             rename(&o.project, &o.index, pe2_path::Name::constant("top"), folder, &tree("k"), &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(o.index.assets.contains_key(&tree("k/made")) && !o.index.assets.contains_key(&tree("h/made")));
-        let records_after = crate::records::Set::records_of(&root.at(".layers/top")).unwrap();
+        let records_after = crate::records::Set::records_of(&root.at("layers/top")).unwrap();
         let changed = records_after.iter().filter(|(uid, r)| records_before.get(*uid) != Some(*r)).count();
         assert_eq!(changed, 1, "a rename is one record");
         // Deleted, its own and one below.
@@ -1682,7 +1682,7 @@ mod tests {
             let paths = step.paths();
             o.refresh(&paths);
         }
-        assert!(crate::records::Set::records_of(&root.at(".layers/top")).unwrap().is_empty());
+        assert!(crate::records::Set::records_of(&root.at("layers/top")).unwrap().is_empty());
         assert_eq!(
             o.index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
             ["base"]
@@ -1690,7 +1690,7 @@ mod tests {
         assert!(o.index.entries.contains_key(&tree("n")) && !o.index.entries.contains_key(&tree("h")));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1705,8 +1705,8 @@ mod tests {
             o.index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
             ["base", "top"]
         );
-        assert!(!root.at(".layers/top/g/a.node").exists());
-        assert!(!root.at(".layers/top/g/a.node/native.texels").exists());
+        assert!(!root.at("layers/top/g/a.node").exists());
+        assert!(!root.at("layers/top/g/a.node/native.texels").exists());
         assert!(o.index.assets[&tree("g/a")].files.iter().any(|f| *f.name == *"native.texels" && *f.layer == "base"));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         // Renamed: the move goes with the override, its copy moved too.
@@ -1725,7 +1725,7 @@ mod tests {
         let paths = delete(&o.project, &o.index, pe2_path::Name::constant("top"), a, &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(!o.index.assets.contains_key(&tree("g/a")));
-        assert!(!root.at(".layers/top/g/a.node").exists());
+        assert!(!root.at("layers/top/g/a.node").exists());
         // Everything undone: the top as it began.
         for _ in 0..4 {
             let step = o.history.undo(&o.index, None, false).unwrap();
@@ -1733,14 +1733,14 @@ mod tests {
             o.refresh(&paths);
         }
         assert!(o.index.changeset(pe2_path::Name::constant("top")).unwrap().ops.is_empty());
-        assert!(!root.at(".layers/top/g").exists());
+        assert!(!root.at("layers/top/g").exists());
         assert_eq!(
             o.index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
             ["base"]
         );
         assert_eq!(o.uid("n"), n);
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1789,9 +1789,9 @@ mod tests {
             o.index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
             ["base"]
         );
-        assert!(!root.at(".layers/top/g").exists());
+        assert!(!root.at("layers/top/g").exists());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1802,7 +1802,7 @@ mod tests {
         let paths = override_entry(&o.project, &o.index, pe2_path::Name::constant("top"), a, &mut o.history).unwrap();
         o.refresh(&paths);
         // A file it does not hold changes below: that reaches it.
-        let texels = root.at(".layers/base/g/a.node/native.texels");
+        let texels = root.at("layers/base/g/a.node/native.texels");
         std::fs::write(&texels, "retouched").unwrap();
         o.refresh(std::slice::from_ref(&texels));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
@@ -1839,7 +1839,7 @@ mod tests {
         );
         assert!(o.op("g/a.node").is_none());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1876,18 +1876,18 @@ mod tests {
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         assert!(mounted.at("kept.c").exists());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn what_a_layer_lists_of_an_extension_is_forgotten() {
         let root = project("forget-extension");
-        let held = root.at(".layers/top/extensions/a.extension");
+        let held = root.at("layers/top/extensions/a.extension");
         std::fs::create_dir_all(&held).unwrap();
         std::fs::write(held.at("extension.toml"), "id = \"a\"\n").unwrap();
         let mut o = open(&root);
         // As an older editor listed it, before an extension's folder was left out.
-        let listed = ".layers/top.toml";
+        let listed = "layers/top.toml";
         let text = std::fs::read_to_string(root.at(listed)).unwrap_or_default();
         let entry = "\"uid://1an72qda531m5\" = \"extensions/a.extension/extension.toml\"\n";
         let text = if text.contains("[entries]") {
@@ -1908,14 +1908,14 @@ mod tests {
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         assert!(held.at("extension.toml").exists(), "only the list is written");
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn deletes_what_the_layer_makes() {
         let root = project("own");
-        std::fs::create_dir_all(root.at(".layers/top/mine/x.node")).unwrap();
-        std::fs::write(root.at(".layers/top/mine/x.node/node.toml"), "stack = [{ op = \"t.file\" }]\n").unwrap();
+        std::fs::create_dir_all(root.at("layers/top/mine/x.node")).unwrap();
+        std::fs::write(root.at("layers/top/mine/x.node/node.toml"), "stack = [{ op = \"t.file\" }]\n").unwrap();
         let mut o = open(&root);
         let mine = o.uid("mine");
         let paths =
@@ -1926,8 +1926,8 @@ mod tests {
         o.refresh(&paths);
         // A create then a delete: nothing recorded, nothing left.
         assert!(o.index.changeset(pe2_path::Name::constant("top")).unwrap().entries.is_empty());
-        assert!(!root.at(".layers/top/ours").exists());
+        assert!(!root.at("layers/top/ours").exists());
         drop(o);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 }

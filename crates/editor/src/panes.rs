@@ -2541,7 +2541,7 @@ fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, proje
             RichText::new(
                 "A program is given copies of what writes little to lay out, and is served the rest where it is. A \
                  backend that keeps what is read lets go of what was read longest ago beyond what it may keep. A \
-                 project says otherwise in its project.local.toml ([filesystem]); a change holds from when a \
+                 project says otherwise in its .local/settings.toml ([filesystem]); a change holds from when a \
                  project is next served.",
             )
             .small()

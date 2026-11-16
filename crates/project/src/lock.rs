@@ -1,6 +1,6 @@
 //! The project lock: one process at a time works on a project - the editor, an extraction, a build. Each holds an
-//! exclusive OS lock on `.cache/lock` for as long as it runs (`flock` on Unix, `LockFileEx` on Windows), so the OS
-//! releases it when the process ends, however it ends: a lock is never left behind. Beside it, `.cache/lock.owner`
+//! exclusive OS lock on `.local/processes/lock` for as long as it runs (`flock` on Unix, `LockFileEx` on Windows), so the OS
+//! releases it when the process ends, however it ends: a lock is never left behind. Beside it, `.local/processes/lock.owner`
 //! names the process holding it, for whoever finds the project locked.
 //!
 //! A process holding the lock passes it to the processes it starts: `PE2_PROJECT_LOCKED` names the project, and a
@@ -21,7 +21,7 @@ use sfs::HostPath;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::time::Duration;
 
-use crate::cache::DIR;
+use crate::local::{PROCESSES, part};
 
 const LOCK: &Name = Name::constant("lock");
 const OWNER: &Name = Name::constant("lock.owner");
@@ -65,7 +65,7 @@ impl std::error::Error for LockError {}
 /// The project in `root`'s lock file, and the file beside it naming who holds it.
 #[must_use]
 pub fn paths(root: &HostPath) -> (HostPath, HostPath) {
-    let dir = root.join(&DIR);
+    let dir = part(root, PROCESSES);
     (dir.join(&LOCK), dir.join(&OWNER))
 }
 
@@ -75,7 +75,7 @@ pub fn paths(root: &HostPath) -> (HostPath, HostPath) {
 )]
 fn open(root: &HostPath) -> Result<File> {
     let (lock, _) = paths(root);
-    crate::cache::make(&pe2_io::SystemFilesystem, root)?;
+    crate::local::processes(&pe2_io::SystemFilesystem, root)?;
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -275,8 +275,8 @@ mod tests {
         let root = crate::testing::scratch("lock");
         let _ = std::fs::remove_dir_all(&root);
         let held = Lock::try_acquire(&root, "the first", &pe2_io::System).unwrap();
-        // Locking a project with no cache yet makes one that git ignores.
-        assert_eq!(std::fs::read_to_string(root.at(".cache/.gitignore")).unwrap(), "*\n");
+        // Locking a project makes the folder its processes find each other in.
+        assert!(root.at(".local/processes/lock").is_file());
         // A second handle on the file is a second holder to the OS, as another process would be.
         match Lock::try_acquire(&root, "the second", &pe2_io::System) {
             Err(LockError::Held(owner)) => assert!(owner.starts_with("the first"), "{owner}"),
@@ -292,12 +292,12 @@ mod tests {
     fn a_file_system_without_locks_holds_unprotected() {
         let root = crate::testing::scratch("unlockable");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.at(".cache")).unwrap();
+        std::fs::create_dir_all(root.at(".local/processes")).unwrap();
         let e = std::io::Error::from(std::io::ErrorKind::Unsupported);
         assert!(super::unsupported(&e));
         assert!(!super::unsupported(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-        let held =
-            super::unprotected(&root, &root.at(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
+        let held = super::unprotected(&root, &root.at(".local/processes/lock"), "the editor", &e)
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(held.unprotected().is_some_and(|why| why.contains("nothing keeps another editor")));
         drop(held);
         std::fs::remove_dir_all(&root).unwrap();

@@ -80,31 +80,42 @@ impl Action {
                 editor.say(made.map_or_else(|e| format!("{e:#}"), |()| done));
             }
         };
-        let result = match self {
-            Action::Eye(name) => ws.toggle_eye(&name).map(|()| None),
-            Action::Solo(name) => ws.solo(&name).map(|()| None),
-            Action::Lock(name) => ws.toggle_lock(&name).map(|()| None),
-            Action::Activate(name) => ws.activate(&name).map(|()| Some(format!("{name} is the active layer"))),
+        match self {
+            Action::Eye(name) => {
+                ws.toggle_eye(&name);
+                None
+            }
+            Action::Solo(name) => {
+                ws.solo(&name);
+                None
+            }
+            Action::Lock(name) => {
+                ws.toggle_lock(&name);
+                None
+            }
+            Action::Activate(name) => {
+                ws.activate(&name);
+                Some(format!("{name} is the active layer"))
+            }
             Action::Move { layer, target, above } => {
                 let mut order = ws.stack_order();
                 order.retain(|n| *n != layer);
                 let at = order.iter().position(|n| *n == target).map_or(order.len(), |i| if above { i + 1 } else { i });
                 order.insert(at, layer.clone());
                 ws.reorder(&order, said(format!("{layer} moved")));
-                Ok(None)
+                None
             }
             Action::Add(name, files) => {
                 let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
                 ws.add_layer(&name, kind, said(format!("{name} added at the top of the stack")));
                 state.new_layer = None;
-                Ok(None)
+                None
             }
             Action::Remove(name) => {
                 ws.remove_layer(&name, said(format!("{name} taken out of the stack; its files are kept")));
-                Ok(None)
+                None
             }
-        };
-        result.unwrap_or_else(|e| Some(format!("{e:#}")))
+        }
     }
 }
 

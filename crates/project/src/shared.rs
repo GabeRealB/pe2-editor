@@ -45,7 +45,7 @@ const NOT_YET: u32 = NEW | WAITS | JUNK;
 /// by, in the order moves were made - to where it was and where it is now.
 pub const MOVES: usize = 11;
 
-/// The shared space's folder, in the cache's folder of what serving keeps.
+/// The shared space's folder, in the local folder's part of what serving keeps.
 pub const SPACE: &pe2_path::Name = pe2_path::Name::constant("space");
 
 /// The space the processes of the project in `root` share, attached here.
@@ -59,7 +59,7 @@ pub fn space(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> std::io::R
 /// Where a project's shared space is kept.
 #[must_use]
 pub fn space_at(root: &HostPath) -> HostPath {
-    root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&SPACE)
+    crate::local::part(root, crate::local::STAGING).join(&SPACE)
 }
 
 /// The pages kept of what is read of the files of the project in `root` (`sfs::ring`), of about this many bytes:
@@ -820,7 +820,7 @@ mod tests {
         let record = Source::RecordText { record, name: "node.toml".into() };
         let stored = Source::Stored {
             sha1: crate::extract::sha1_of(b""),
-            store: layers.join(&pe2_path::Name::constant(".store")),
+            store: layers.join(&pe2_path::Name::constant("store")),
         };
         Listing::from([
             (t("rooms"), Shown::Folder),

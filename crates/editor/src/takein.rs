@@ -18,7 +18,6 @@
 use holder::core::{Core, Queue};
 use pe2_path::{Name, Uid};
 use project::Project;
-use project::cache::Cache;
 use project::ext::Extensions;
 use project::history::History;
 use project::imports::Imports;
@@ -275,7 +274,6 @@ pub struct Worker {
     /// When each generated layer's plan and record last changed, as last looked at: what the window works its
     /// plans out from.
     plans: Arc<Mutex<Option<Vec<Option<std::time::SystemTime>>>>>,
-    pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
     pub extensions: Arc<Extensions>,
@@ -306,7 +304,6 @@ pub struct Start {
     pub showing: Arc<Mutex<Showing>>,
     pub pending: Arc<Mutex<BTreeSet<HostPath>>>,
     pub runner: Arc<Mutex<holder::runner::Runner>>,
-    pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
     pub extensions: Arc<Extensions>,
@@ -322,8 +319,7 @@ impl TakeIn {
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
         let stage: Arc<Mutex<String>> = Arc::default();
         let stop = start.imports.stopper();
-        let Start { core, shown, history, showing, pending, runner, cache, store, imports, extensions, found, tree } =
-            start;
+        let Start { core, shown, history, showing, pending, runner, store, imports, extensions, found, tree } = start;
         let project_shown = Arc::new(core.project.clone());
         let reading = Reading { project: project_shown.clone(), index: shown.clone(), extensions: extensions.clone() };
         let last = Arc::new(Mutex::new(Some(reading)));
@@ -345,7 +341,6 @@ impl TakeIn {
             failed: None,
             looked: found.clone(),
             plans: plans.clone(),
-            cache,
             store,
             imports,
             extensions,
@@ -939,7 +934,7 @@ impl Worker {
         // extensions make of it is attached anew, and an index knows nothing of them.
         let read = whole || project.layers != self.core.project.layers;
         let index = if read { self.core.index.again(&project, &report)? } else { self.core.index.clone() };
-        let loaded = Loaded::of(project, index, &self.cache, &self.store, &report);
+        let loaded = Loaded::of(project, index, &self.store, &report);
         self.core.project = loaded.project;
         self.found = loaded.found;
         if !read && Arc::ptr_eq(&loaded.extensions, &self.extensions) {

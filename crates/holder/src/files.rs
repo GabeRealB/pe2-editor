@@ -1,5 +1,5 @@
 //! The project served as a filesystem while something holds it, at its `assets` folder, by the backend this machine
-//! says (`project.local.toml`, `[filesystem] serve`) - by the server (`pe2-cli project server`, `project::server`),
+//! says (`.local/settings.toml`, `[filesystem] serve`) - by the server (`pe2-cli project server`, `project::server`),
 //! which the holder starts where none runs, keeps while it has the project and feeds: the holder has the project's
 //! only index, and the server serves what the holder lists of it (`Index::served`), said after each refresh in the
 //! filesystem the project's processes share (`project::shared`) - all of it the first time, then what changed -

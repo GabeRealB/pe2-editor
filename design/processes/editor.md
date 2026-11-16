@@ -43,8 +43,8 @@ A pane is a kind and an instance; a document pane shows an entry in one of sever
 Graph, or one an extension registers. **Modes** are saved layouts; switching carries the open documents over.
 
 Layouts are saved through eframe's storage; preferences in the user's `settings.toml`; the user's view of a
-project's layers (eyes, locks, active layer) in the project's cache, so toggling a layer never changes a tracked
-file.
+project's layers (eyes, locks, active layer) in this machine's settings of the project (`.local/settings.toml`), so
+toggling a layer never changes a shipped file.
 
 ## Commands
 

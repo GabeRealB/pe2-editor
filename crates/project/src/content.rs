@@ -4,7 +4,7 @@
 //! calls for. Code reading or writing what a layer holds - an asset's files, a generated layer's, a plain file of the
 //! project - goes through here rather than to the path.
 //!
-//! What is not a layer's content keeps its own access: the cache's stores (the graph's blobs, the history's), the
+//! What is not a layer's content keeps its own access: the local folder's stores (the graph's blobs, the history's), the
 //! project's own files (`project.toml`, changesets), and temporary files. The history keeps what is on disk as it is - a
 //! manifest, not the chunks it names - so undo restores a large file by its manifest.
 
@@ -472,7 +472,7 @@ pub fn write(io: &Io, path: &HostPath, bytes: &[u8]) -> io::Result<()> {
         Some(text) => (manifest.clone(), text.into_bytes(), path.clone()),
         None => (path.clone(), bytes.to_vec(), manifest),
     };
-    crate::cache::write_atomic(fs, &to, &content).map_err(io::Error::other)?;
+    crate::local::write_atomic(fs, &to, &content).map_err(io::Error::other)?;
     match fs.remove_file(&other) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -520,7 +520,7 @@ impl Drop for Exposing {
     }
 }
 
-/// Have `exposer` serve the chunked contents of a store (`.layers/.store`), or of every store for none, to programs, for
+/// Have `exposer` serve the chunked contents of a store (`store/`), or of every store for none, to programs, for
 /// as long as what this returns is held; the latest registered for a store serves it.
 pub fn expose_with(
     store: Option<&HostPath>,
@@ -667,7 +667,7 @@ impl Drop for Removed {
 }
 
 /// A path a program can open for a content, as a file: the file itself where a layer holds it whole; for a chunked one,
-/// where an exposer serves it (`expose_with`), else a copy assembled in the cache (`materialize`).
+/// where an exposer serves it (`expose_with`), else a copy assembled in the outputs (`materialize`).
 ///
 /// # Errors
 /// It cannot be found, or neither served nor assembled.
@@ -700,7 +700,7 @@ fn materialized(project: &HostPath, sha1: &pe2_ext::Sha1, path: &HostPath) -> io
     const MATERIALIZED: &Name = Name::constant("materialized");
     let hash = sha1.to_string();
     let hash = Name::new(&hash).map_err(io::Error::other)?;
-    let folder = project.join(&crate::cache::DIR).join(&MATERIALIZED).join(&hash);
+    let folder = crate::local::part(project, crate::local::OUTPUTS).join(&MATERIALIZED).join(&hash);
     Ok(folder.entry(path.file_name().ok_or_else(|| not_in_a_project(path))?))
 }
 
@@ -709,37 +709,36 @@ fn not_in_a_project(path: &HostPath) -> io::Error {
 }
 
 /// A path a program can open for a content, as a file: the file itself where it is one; a chunked one assembled once,
-/// by its hash, in the project's cache (`.cache/materialized/<sha1>/<name>`), its name kept for what reads names.
+/// by its hash, in the project's outputs (`.local/outputs/materialized/<sha1>/<name>`), its name kept for what reads names.
 ///
 /// # Errors
-/// It cannot be read, or the cache cannot be written.
+/// It cannot be read, or the outputs cannot be written.
 pub fn materialize(io: &Io, path: &HostPath) -> io::Result<HostPath> {
     let fs = io.filesystem();
     match form(io, path)? {
         // A whole object is a file already: never copied.
         Form::Plain(path) | Form::Object { path, .. } => Ok(path),
         Form::Inline { bytes, .. } => {
-            let layers = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == crate::LAYERS));
-            let project = layers.and_then(|layers| layers.parent()).ok_or_else(|| not_in_a_project(path))?;
+            let project = crate::holding(path).ok_or_else(|| not_in_a_project(path))?;
             let out = materialized(&project, &crate::extract::sha1_of(&bytes), path)?;
             if !fs.is_file(&out) {
                 if let Some(parent) = out.parent() {
                     fs.create_folder_all(&parent)?;
                 }
-                crate::cache::write_atomic(fs, &out, &bytes).map_err(io::Error::other)?;
+                crate::local::write_atomic(fs, &out, &bytes).map_err(io::Error::other)?;
             }
             Ok(out)
         }
         Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
-            let project =
-                store.dir.parent().and_then(|layers| layers.parent()).ok_or_else(|| not_in_a_project(path))?;
+            // The store is at the project's root.
+            let project = store.dir.parent().ok_or_else(|| not_in_a_project(path))?;
             let out = materialized(&project, &manifest.sha1, path)?;
             if !fs.is_file(&out) {
                 let bytes = manifest.read_range(&store, 0, usize::try_from(manifest.size).unwrap_or(usize::MAX))?;
                 if let Some(parent) = out.parent() {
                     fs.create_folder_all(&parent)?;
                 }
-                crate::cache::write_atomic(fs, &out, &bytes).map_err(io::Error::other)?;
+                crate::local::write_atomic(fs, &out, &bytes).map_err(io::Error::other)?;
             }
             Ok(out)
         }
@@ -799,12 +798,12 @@ mod tests {
 
     #[test]
     fn a_large_content_in_a_layer_is_chunked_and_read_as_itself() {
-        let root = crate::testing::scratch("content-chunked");
-        let path = root.at(".layers/top/a.node/native.str");
+        let root = crate::testing::opened("content-chunked");
+        let path = root.at("layers/top/a.node/native.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         write(&crate::testing::io(), &path, &bytes).expect("written");
         assert!(!path.exists() && exists(&crate::testing::io(), &path), "stored as its manifest");
-        assert_eq!(stored(&crate::testing::io(), &path), Some(root.at(".layers/top/a.node/native.str.chunks")));
+        assert_eq!(stored(&crate::testing::io(), &path), Some(root.at("layers/top/a.node/native.str.chunks")));
         assert_eq!(read(&crate::testing::io(), &path).expect("read"), bytes);
         assert_eq!(
             read_range(&crate::testing::io(), &path, 1_000_000, 16).expect("range"),

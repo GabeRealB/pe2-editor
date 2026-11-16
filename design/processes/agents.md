@@ -9,7 +9,7 @@ value (`mcp::Request`: a tool call, a resource read, an edit, a signal) and one 
 (`mcp::answer`). Who answers depends on who holds the project:
 
 1. If an editor or a host holds it, the request is forwarded to it over the **holder's link**: a local socket in the
-   project's cache, one CBOR message per frame.
+   project's local folder, one CBOR message per frame.
 2. If nothing holds it, a host is started and the request forwarded to it.
 3. Where no host can be started, the server takes the project lock for that request alone and answers itself.
 

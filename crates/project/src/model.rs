@@ -76,7 +76,7 @@ pub const ASSETS: usize = 7;
 pub const LINKS: usize = 12;
 
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
-/// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
+/// as is one of another schema of the project's outputs (`local::SCHEMA`), which is raised where what is derived
 /// of the files changes, and one whose names were compared by another version of Unicode
 /// (`pe2_path::UNICODE_VERSION`), by which names are one name.
 const FORMAT: u32 = 7;
@@ -648,7 +648,7 @@ fn is_begun(pages: &impl Pages) -> Result<bool> {
     let said = said.as_deref().and_then(In::after_stamp);
     let said = said.and_then(|mut said| Some((said.u32()?, said.u32()?, said.text()?)));
     Ok(said.is_some_and(|(format, schema, unicode)| {
-        (format, schema, unicode.as_str()) == (FORMAT, crate::cache::SCHEMA, pe2_path::UNICODE_VERSION)
+        (format, schema, unicode.as_str()) == (FORMAT, crate::local::SCHEMA, pe2_path::UNICODE_VERSION)
     }))
 }
 
@@ -676,7 +676,7 @@ fn meta(generation: u64) -> Vec<u8> {
     let mut out = Out::new();
     out.0[..8].copy_from_slice(&generation.to_le_bytes());
     out.u32(FORMAT);
-    out.u32(crate::cache::SCHEMA);
+    out.u32(crate::local::SCHEMA);
     out.text(pe2_path::UNICODE_VERSION);
     out.0
 }
@@ -1007,7 +1007,7 @@ mod tests {
         let mut files: HashMap<HostPath, Record> = (0..count)
             .map(|n| {
                 (
-                    root.at(&format!(".layers/game/{}/n{n}.node", n % 17)).at(if n % 3 == 0 {
+                    root.at(&format!("layers/game/{}/n{n}.node", n % 17)).at(if n % 3 == 0 {
                         "node.toml"
                     } else {
                         "a.bin"
@@ -1024,7 +1024,7 @@ mod tests {
 
     /// What two layers hold, as a walk of them finds it: folders, plain files, bundles - one of a name no key holds.
     fn held_by(root: &HostPath) -> Layers {
-        let game = root.at(".layers/game");
+        let game = root.at("layers/game");
         let bundle = |n: u64| -> BTreeMap<Arc<pe2_path::RelPath>, HostPath> {
             let folder = game.at(&format!("rooms/r{n}.node"));
             (0..=n % 3).map(|f| (rel(&format!("file{f}.bin")), folder.at(&format!("file{f}.bin")))).collect()
@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(layers(&space.read().unwrap(), root).unwrap(), now);
         // A bundle's files change, a folder goes, a layer's listing is made by something else, and a layer is no more.
         let mut delta = Delta::default();
-        let changed = Held::Bundle([(rel("only.bin"), root.at(".layers/game/rooms/r7.node/only.bin"))].into());
+        let changed = Held::Bundle([(rel("only.bin"), root.at("layers/game/rooms/r7.node/only.bin"))].into());
         delta.held(root, pe2_path::Name::constant("game"), "rooms/r7.node", Some(&changed));
         delta.held(root, pe2_path::Name::constant("game"), &format!("deep/{}", "long/".repeat(200)), None);
         delta.layer(pe2_path::Name::constant("game"), Some("made by another"));
@@ -1336,7 +1336,7 @@ mod tests {
                 if let Some(declaration) = &mut record.declaration {
                     declaration.text = Arc::from("x".repeat(1400));
                 }
-                let folder = format!(".layers/game/stages/stage{}/rooms/room{}/n{n}.node", n % 7, n % 31);
+                let folder = format!("layers/game/stages/stage{}/rooms/room{}/n{n}.node", n % 7, n % 31);
                 (root.at(&folder).at(if n % 2 == 0 { "node.toml" } else { "native.bin" }), record)
             })
             .collect();
@@ -1401,9 +1401,9 @@ mod tests {
     #[test]
     fn a_file_is_named_by_where_it_is_in_the_project_wherever_that_is() {
         let (here, there) = (crate::testing::scratch("model-here"), crate::testing::scratch("model-there"));
-        let file = here.at(".layers/game/a.node/node.toml");
-        assert_eq!(name(&here, &file), "/.layers/game/a.node/node.toml");
-        assert_eq!(named(&there, &name(&here, &file)), Some(there.at(".layers/game/a.node/node.toml")));
+        let file = here.at("layers/game/a.node/node.toml");
+        assert_eq!(name(&here, &file), "/layers/game/a.node/node.toml");
+        assert_eq!(named(&there, &name(&here, &file)), Some(there.at("layers/game/a.node/node.toml")));
         let elsewhere = crate::testing::scratch("model-elsewhere").at("x.c");
         assert_eq!(named(&here, &name(&here, &elsewhere)), Some(elsewhere));
         // The keys of files are apart from those of their texts, and from the model's word of itself.
@@ -1419,7 +1419,7 @@ mod tests {
         // As a format before this one left it: its word of itself another, and keys this one knows nothing of.
         let mut said = Out::new();
         said.u32(FORMAT + 1);
-        said.u32(crate::cache::SCHEMA);
+        said.u32(crate::local::SCHEMA);
         said.text(pe2_path::UNICODE_VERSION);
         sfs::tree::put(&mut txn, INPUTS, &[META], &said.0).unwrap();
         sfs::tree::put(&mut txn, INPUTS, b"f/old", b"what it held").unwrap();

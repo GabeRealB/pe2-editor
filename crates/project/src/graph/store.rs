@@ -1,9 +1,9 @@
-//! The store: retained outputs, kept by content in the project cache (`.cache/store`). A value is kept under its hash
+//! The store: retained outputs, kept by content in the project's outputs (`.local/outputs/store`). A value is kept under its hash
 //! (`values/<hash>.cbor`, which says its type and holds or names its contents), its bytes as blobs by their own hashes
 //! (`blobs/<aa>/<sha1>`), shared by every value holding them - an import made twice of one source is kept once. An
 //! output's trace (`traces/<key>.cbor`) names its value and what it read, under the key of what makes it. Both are CBOR:
 //! nobody reads them but the store, and settings read back as the values the editor holds (`pe2_value`). Like the rest
-//! of the cache, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
+//! of the outputs, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
 //! a trace never names what is not there.
 
 use pe2_path::{Name, RelPath};
@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::exec::Reads;
 use super::{Content, File, Image, Pcm, Typed, Value};
-use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_of;
+use crate::local::{Local, write_atomic};
 use pe2_ext::Sha1;
 
 const DIR: &Name = Name::constant("store");
@@ -178,8 +178,8 @@ impl Store {
     ///
     /// # Errors
     /// Its folder cannot be made.
-    pub fn open(cache: &Cache) -> Result<Store> {
-        Store::at(cache.path(DIR), cache.io.clone())
+    pub fn open(local: &Local) -> Result<Store> {
+        Store::at(local.output(DIR), local.io.clone())
     }
 
     /// A store in a folder of its own, of a project whose I/O is `io`.
@@ -260,11 +260,14 @@ impl Store {
         Ok(Blob { sha1, size: bytes.len() as u64 })
     }
 
-    /// The project whose cache holds it (`<project>/.cache/store`), where it is one's.
+    /// The project whose outputs hold it (`<project>/.local/outputs/store`), where it is one's.
     #[must_use]
     pub fn project(&self) -> Option<HostPath> {
-        let cache = self.dir.parent()?;
-        (cache.file_name()? == crate::cache::DIR).then(|| cache.parent()).flatten()
+        let outputs = self.dir.parent()?;
+        let local = outputs.parent()?;
+        (outputs.file_name()? == crate::local::OUTPUTS && local.file_name()? == crate::local::DIR)
+            .then(|| local.parent())
+            .flatten()
     }
 
     /// Where what is written for the while is kept (`spill`).

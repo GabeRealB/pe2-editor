@@ -26,9 +26,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cache::Cache;
 use crate::changeset::{self, Base, Changeset, Op};
 use crate::extract::sha1_hex;
+use crate::local::Local;
 pub use crate::model::Stamp;
 use crate::model::{Declaration, Declared, Record};
 use crate::{FILE, Layer, LayerKind, Project, TreePath, uid};
@@ -54,7 +54,7 @@ fn of_extensions(path: &HostPath) -> bool {
         && folder.parent().is_some_and(|records| records.file_name().is_some_and(|n| n == crate::records::DIR))
 }
 
-/// A file an override merged over the one below, in the cache (`.cache/merged/<sha1>/<name>`), written where it is not
+/// A file an override merged over the one below, in the outputs (`.local/outputs/merged/<sha1>/<name>`), written where it is not
 /// yet: its folder is named by its content's SHA-1.
 fn merged_file(fs: &dyn pe2_io::Filesystem, dir: &HostPath, name: &str, bytes: &[u8]) -> std::io::Result<HostPath> {
     let at = dir
@@ -62,7 +62,7 @@ fn merged_file(fs: &dyn pe2_io::Filesystem, dir: &HostPath, name: &str, bytes: &
         .join(&RelPath::new(name).map_err(std::io::Error::other)?);
     if !fs.is_file(&at) {
         fs.create_folder_all(&at.parent().expect("in a folder"))?;
-        crate::cache::write_atomic(fs, &at, bytes).map_err(std::io::Error::other)?;
+        crate::local::write_atomic(fs, &at, bytes).map_err(std::io::Error::other)?;
     }
     Ok(at)
 }
@@ -89,7 +89,7 @@ pub struct BundleFile {
     pub layer: Arc<Name>,
     /// The hash of its content.
     pub sha1: pe2_ext::Sha1,
-    /// The importer that made it of the asset's source, kept in the cache (`imports`); none for a file of the bundle.
+    /// The importer that made it of the asset's source, kept in the outputs (`imports`); none for a file of the bundle.
     pub made_by: Option<String>,
 }
 
@@ -1442,7 +1442,7 @@ impl LayerState {
 fn tree_ignores(fs: &dyn pe2_io::Filesystem, tree: &HostPath) -> Vec<String> {
     let mut names = Vec::new();
     let mut read = |dir: &HostPath| {
-        if let Ok(text) = fs.read_to_string(&dir.join(&crate::cache::GITIGNORE)) {
+        if let Ok(text) = fs.read_to_string(&dir.join(&crate::local::GITIGNORE)) {
             names.extend(changeset::gitignore_names(&text));
         }
     };
@@ -1893,19 +1893,19 @@ impl Index {
 
     /// Index a project's layers, over what the project's model holds of their files (`model::known`): only files
     /// whose stamp changed are read. Unlisted entries of the layers that can be written are listed in their
-    /// changesets. By whoever holds the project, as its cache says.
+    /// changesets. By whoever holds the project, as its local folder says.
     ///
     /// # Errors
     /// A changeset cannot be read or written.
-    pub fn open(project: &Project, cache: &Cache) -> Result<Index> {
-        Index::open_reporting(project, cache, &|_, _, _| {})
+    pub fn open(project: &Project, local: &Local) -> Result<Index> {
+        Index::open_reporting(project, local, &|_, _, _| {})
     }
 
     /// Open the index as `open` does, saying how far it is: a stage, and how many of how many it has done.
     ///
     /// # Errors
     /// As `open`.
-    pub fn open_reporting(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
+    pub fn open_reporting(project: &Project, _cache: &Local, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
         report("Reading what is known of the files", 0, 0);
         Index::over(crate::model::known(&project.root, project.io.filesystem()), true, project, report)
@@ -1917,7 +1917,7 @@ impl Index {
     ///
     /// # Errors
     /// As `open`.
-    pub fn open_behind(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
+    pub fn open_behind(project: &Project, _cache: &Local, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
         report("Reading what is known of the files", 0, 0);
         Index::over(crate::model::known(&project.root, project.io.filesystem()), false, project, report)
@@ -2161,7 +2161,7 @@ impl Index {
                 .collect(),
             layers,
             records: Shared::default(),
-            merged: project.root.join(&crate::cache::DIR).join(&Name::constant("merged")),
+            merged: crate::local::part(&project.root, crate::local::OUTPUTS).join(&Name::constant("merged")),
             objects: crate::chunks::Store::at(&project.root, project.io.clone()),
             opened,
             root: project.root.clone(),
@@ -3152,7 +3152,7 @@ impl Index {
         }
     }
 
-    /// A file's SHA-1: as recorded, or, for one merged in the cache, the name of its folder.
+    /// A file's SHA-1: as recorded, or, for one merged in the outputs, the name of its folder.
     fn sha1_of(&self, path: &HostPath) -> Option<pe2_ext::Sha1> {
         if let Some(record) = self.records.get(path) {
             return Some(record.sha1);
@@ -3270,7 +3270,7 @@ impl Index {
     }
 
     /// `mine`, made of the version `was` (kept in the store), merged over `now`: where the result is - `mine` itself
-    /// where it is unchanged, else in the cache - and its conflicts; none where `was` is not kept, or a file cannot be
+    /// where it is unchanged, else in the outputs - and its conflicts; none where `was` is not kept, or a file cannot be
     /// read. A merge is remembered by its inputs, so the stack is applied again without merging again.
     fn merged(
         &self,
@@ -3311,7 +3311,7 @@ impl Index {
         let remembered = Memo { sha1, conflicts: merged.conflicts };
         if let Ok(text) = serde_json::to_string(&remembered) {
             let _ = self.io.filesystem().create_folder_all(&memo.parent().expect("in a folder"));
-            let _ = crate::cache::write_atomic(self.io.filesystem(), &memo, text.as_bytes());
+            let _ = crate::local::write_atomic(self.io.filesystem(), &memo, text.as_bytes());
         }
         Some((path, remembered.conflicts))
     }
@@ -4093,7 +4093,7 @@ impl Index {
         if !paths.is_empty() {
             self.versions = Arc::default();
         }
-        // Each asset's files, and those of them nothing was read of yet: what overrides merged, in the cache.
+        // Each asset's files, and those of them nothing was read of yet: what overrides merged, in the outputs.
         let listing = tracing::info_span!("assemble: the assets' files").entered();
         let files = each(paths, |path| {
             let node = self.resolved.get(path).filter(|n| n.kind == Kind::Asset)?;
@@ -4381,8 +4381,8 @@ impl Index {
 mod tests {
     use super::{Index, Problem};
     use crate::Project;
-    use crate::cache::Cache;
     use crate::changeset::{Base, Changeset, Op};
+    use crate::local::Local;
     use crate::testing::At as _;
     use crate::testing::{rel, tree, uid};
     use sfs::HostPath;
@@ -4391,7 +4391,7 @@ mod tests {
     fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
         let below = index.below(pe2_path::Name::constant("top"), crate::testing::uid(uid)).expect("below top");
         let store = crate::chunks::Store::at(
-            &index.merged.parent().and_then(|cache| cache.parent()).expect("a project"),
+            &index.merged.parent().and_then(|local| local.parent()).expect("a project"),
             crate::testing::io(),
         );
         let files = files.iter().map(|name| {
@@ -4406,33 +4406,33 @@ mod tests {
 
     use crate::lock::Lock;
 
-    /// A project of two layers, `base` and `top`, in `.layers/`; `base` holds the bundle `a` (its `node.toml` naming
+    /// A project of two layers, `base` and `top`, in `layers/`; `base` holds the bundle `a` (its `node.toml` naming
     /// `uid://a`, as declarations did before changesets) in the folder `g`, and `b` and `f`.
     fn project(name: &str) -> HostPath {
         let root = crate::testing::scratch(&format!("index-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(&root, ".layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n");
-        write(&root, ".layers/base/g/a.node/native.texels", "texels");
+        write(&root, "layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n");
+        write(&root, "layers/base/g/a.node/native.texels", "texels");
         write(
             &root,
-            ".layers/base/b.node/node.toml",
+            "layers/base/b.node/node.toml",
             "stack = [{ op = \"t.file\" }]\nslot = \"uid://a/palettes/default\"\n",
         );
         write(
             &root,
-            ".layers/base/f.node/node.toml",
+            "layers/base/f.node/node.toml",
             "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\", path = \"res://g/a.node\" }\n",
         );
-        std::fs::create_dir_all(root.at(".layers/top")).unwrap();
+        std::fs::create_dir_all(root.at("layers/top")).unwrap();
         root
     }
 
     #[test]
     fn what_a_layer_holds_of_extensions_is_no_asset() {
         let root = project("extensions");
-        write(&root, ".layers/top/extensions/my.tool.extension/extension.wasm", "code");
-        write(&root, ".layers/top/extensions/old.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
+        write(&root, "layers/top/extensions/my.tool.extension/extension.wasm", "code");
+        write(&root, "layers/top/extensions/old.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         let (_, index) = open(&root);
         assert!(index.assets.keys().all(|path| !path.starts_with(&tree("extensions"))), "{:?}", index.assets.keys());
         assert!(index.base_hash(&tree("extensions")).is_none(), "not even a folder");
@@ -4450,7 +4450,7 @@ mod tests {
         let project = Project::load(root).unwrap();
         // Held while opening; released for the test's next opening.
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        let mut index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let mut index = Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap();
         // As whoever holds a project does: what the opening read is said in the project's model, and the space
         // it is in left in order.
         crate::model::took(root, &mut index).unwrap();
@@ -4459,7 +4459,7 @@ mod tests {
     }
 
     fn changeset(root: &HostPath, layer: &str) -> Changeset {
-        Changeset::load(&pe2_io::SystemFilesystem, &root.at(&format!(".layers/{layer}.toml"))).unwrap()
+        Changeset::load(&pe2_io::SystemFilesystem, &root.at(&format!("layers/{layer}.toml"))).unwrap()
     }
 
     #[test]
@@ -4482,10 +4482,10 @@ mod tests {
     #[test]
     fn a_bundle_holds_folders() {
         let root = project("folders");
-        write(&root, ".layers/base/f.node/node.toml", "stack = [{ op = \"file\", file = \"face.ufo\" }]\n");
-        write(&root, ".layers/base/f.node/face.ufo/metainfo.plist", "<plist/>");
-        write(&root, ".layers/base/f.node/face.ufo/glyphs/A_.glif", "<glyph/>");
-        write(&root, ".layers/base/f.node/face.ufo/.hidden/x", "left out");
+        write(&root, "layers/base/f.node/node.toml", "stack = [{ op = \"file\", file = \"face.ufo\" }]\n");
+        write(&root, "layers/base/f.node/face.ufo/metainfo.plist", "<plist/>");
+        write(&root, "layers/base/f.node/face.ufo/glyphs/A_.glif", "<glyph/>");
+        write(&root, "layers/base/f.node/face.ufo/.hidden/x", "left out");
         let (_, index) = open(&root);
         let names: Vec<&str> = index.assets[&tree("f")].files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(names, ["face.ufo/glyphs/A_.glif", "face.ufo/metainfo.plist", "node.toml"], "{names:?}");
@@ -4505,9 +4505,9 @@ mod tests {
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml", "native.texels"]));
         top.ops.insert(uid_of("b.node"), Op::Move { to: tree("c.node") });
         top.ops.insert(uid_of("f.node"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        write(&root, ".layers/top/g/a.node/native.texels", "repainted");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        write(&root, "layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
         assert_eq!(index.assets.keys().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["c", "g/a"]);
         assert_eq!(
@@ -4526,7 +4526,7 @@ mod tests {
         assert!(below.files.iter().all(|f| *f.layer == "base"));
         assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
-        write(&root, ".layers/base/g/a.node/native.texels", "retouched");
+        write(&root, "layers/base/g/a.node/native.texels", "retouched");
         let (_, index) = open(&root);
         assert_eq!(index.problems, [Problem::Stale { layer: crate::testing::name("top"), path: "g/a.node".into() }]);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4539,13 +4539,13 @@ mod tests {
         let mut top = Changeset::default();
         top.entries.insert(uid("uid://again"), tree("g"));
         top.entries.insert(uid("uid://beside"), tree("g/beside.node"));
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
         assert!(index.assets.contains_key(&tree("g/a")) && index.assets.contains_key(&tree("g/beside")));
         drop(index);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// What a layer holds by a name no path takes is a problem of its - scanned, opened again from the model, and come
@@ -4560,7 +4560,7 @@ mod tests {
             why: index_why(path),
         };
         // `:` is a name Windows takes for something else: made here, where the system lets it be.
-        std::fs::write(root.at(".layers/base/g").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
+        std::fs::write(root.at("layers/base/g").entry(std::ffi::OsStr::new("a:b.txt")), "x").unwrap();
         let (project, index) = open(&root);
         assert!(index.problems.contains(&refused("g/a:b.txt")), "{:?}", index.problems);
         assert!(index.assets.contains_key(&tree("g/a")), "what is beside it is as it was");
@@ -4571,13 +4571,13 @@ mod tests {
         drop(index);
         // Come since, in a bundle: its bundle is the project's as it was, the file none of it.
         let (_, mut index) = open(&root);
-        let file = root.at(".layers/base/g/a.node").entry(std::ffi::OsStr::new("x:y.bin"));
+        let file = root.at("layers/base/g/a.node").entry(std::ffi::OsStr::new("x:y.bin"));
         std::fs::write(&file, "y").unwrap();
         index.refresh(&project, &[file]).unwrap();
         assert!(index.problems.contains(&refused("g/a.node/x:y.bin")), "{:?}", index.problems);
         assert!(!index.assets[&tree("g/a")].files.iter().any(|file| file.name.as_str().contains(':')));
         drop(index);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// Two of a folder named alike - one name in both its normal forms, as a system keeping either writes them - are
@@ -4588,7 +4588,7 @@ mod tests {
     fn names_alike_beside_each_other_are_each_a_problem() {
         let root = project("alike");
         let (composed, decomposed) = ("caf\u{e9}.txt", "cafe\u{301}.txt");
-        for folder in [".layers/base/g", ".layers/base/g/a.node"] {
+        for folder in ["layers/base/g", "layers/base/g/a.node"] {
             for (name, text) in [(composed, "a"), (decomposed, "b")] {
                 std::fs::write(root.at(folder).entry(std::ffi::OsStr::new(name)), text).unwrap();
             }
@@ -4607,7 +4607,7 @@ mod tests {
             assert!(!index.entries.contains_key(&*tree(&format!("g/{composed}"))), "neither is taken");
             assert!(!index.assets[&tree("g/a")].files.iter().any(|file| file.name.as_str().starts_with("caf")));
         }
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// Why a path the tests make is refused, as the index says it.
@@ -4624,9 +4624,9 @@ mod tests {
         let mut top = Changeset { read_only: true, ..Changeset::default() };
         top.entries.insert(uid("uid://gone"), tree("nowhere"));
         top.ops.insert(uid("uid://unknown"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/b.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
-        write(&root, ".layers/top/new.node/node.toml", "kind = [unclosed\n");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/b.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
+        write(&root, "layers/top/new.node/node.toml", "kind = [unclosed\n");
         let (_, index) = open(&root);
         let has = |p: &Problem| index.problems.contains(p);
         assert!(has(&Problem::Conflict {
@@ -4645,14 +4645,14 @@ mod tests {
         let (project, mut index) = open(&root);
         let folder = *changeset(&root, "base").entries.iter().find(|(_, p)| ***p == *"g").unwrap().0;
         // A file of a bundle changed: that bundle, its file read again.
-        let texels = write(&root, ".layers/base/g/a.node/native.texels", "repainted");
+        let texels = write(&root, "layers/base/g/a.node/native.texels", "repainted");
         let refreshed = index.refresh(&project, &[texels]).unwrap();
         assert_eq!(refreshed.assets.iter().map(|asset| asset.as_str()).collect::<Vec<_>>(), ["g/a"]);
         assert_eq!(index.read, 1);
         // A folder renamed in the layer's folder, by other means than the editor: no edit, a problem - what it holds now
         // is unlisted, what it listed missing - until it is adopted, which follows the move: the uids are kept.
-        std::fs::rename(root.at(".layers/base/g"), root.at(".layers/base/h")).unwrap();
-        index.refresh(&project, &[root.at(".layers/base/g"), root.at(".layers/base/h")]).unwrap();
+        std::fs::rename(root.at("layers/base/g"), root.at("layers/base/h")).unwrap();
+        index.refresh(&project, &[root.at("layers/base/g"), root.at("layers/base/h")]).unwrap();
         assert!(!index.assets.contains_key(&tree("h/a")));
         assert!(index.problems.contains(&Problem::Unlisted { layer: crate::testing::name("base"), path: "h".into() }));
         let adopted = index.adoption(pe2_path::Name::constant("base"), &tree("h")).unwrap();
@@ -4660,13 +4660,13 @@ mod tests {
         assert!(adopted.contains(&(folder, tree("h"))), "{adopted:?}");
         let mut base = changeset(&root, "base");
         base.entries.extend(adopted);
-        base.save(&pe2_io::SystemFilesystem, &root.at(".layers/base.toml")).unwrap();
-        index.refresh(&project, &[root.at(".layers/base.toml")]).unwrap();
+        base.save(&pe2_io::SystemFilesystem, &root.at("layers/base.toml")).unwrap();
+        index.refresh(&project, &[root.at("layers/base.toml")]).unwrap();
         assert_eq!(index.assets[&tree("h/a")].uid, Some(uid("uid://a")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // A bundle removed: its entry is missing until it is dropped from the changeset.
-        std::fs::remove_dir_all(root.at(".layers/base/f.node")).unwrap();
-        index.refresh(&project, &[root.at(".layers/base/f.node")]).unwrap();
+        std::fs::remove_dir_all(root.at("layers/base/f.node")).unwrap();
+        index.refresh(&project, &[root.at("layers/base/f.node")]).unwrap();
         assert!(!index.assets.contains_key(&tree("f")));
         assert!(index.problems.contains(&Problem::Missing {
             layer: crate::testing::name("base"),
@@ -4689,9 +4689,9 @@ mod tests {
         // The nodes are base's; what their plan made, base-files' - without a node of its own, and its record beside.
         let text = "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"base-files\"\nkind = \"generated\"\nfills = \"base\"\n\n[[layer]]\nname = \"top\"\n";
         write(&root, "project.toml", text);
-        std::fs::remove_file(root.at(".layers/base/g/a.node/native.texels")).unwrap();
-        write(&root, ".layers/base-files/g/a.node/native.texels", "texels");
-        write(&root, ".layers/base-files/extraction.record.jsonl", "{}");
+        std::fs::remove_file(root.at("layers/base/g/a.node/native.texels")).unwrap();
+        write(&root, "layers/base-files/g/a.node/native.texels", "texels");
+        write(&root, "layers/base-files/extraction.record.jsonl", "{}");
         let (project, mut index) = open(&root);
         let a = &index.assets[&tree("g/a")];
         let held: Vec<(&str, &str)> = a.files.iter().map(|f| (f.name.as_str(), f.layer.as_str())).collect();
@@ -4705,7 +4705,7 @@ mod tests {
         );
         // What the plan writes again is taken in as the node's.
         let (_, fresh) = open(&root);
-        let texels = write(&root, ".layers/base-files/g/a.node/native.texels", "repainted");
+        let texels = write(&root, "layers/base-files/g/a.node/native.texels", "repainted");
         index.refresh(&project, std::slice::from_ref(&texels)).unwrap();
         assert_ne!(shown(&index), shown(&fresh));
         let (_, again) = open(&root);
@@ -4713,11 +4713,11 @@ mod tests {
         // An override of the node's declaration sees the files the plan makes, and what it makes otherwise reaches it.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let below = index.below(pe2_path::Name::constant("top"), uid("uid://a")).unwrap();
         assert!(below.files.iter().any(|(name, _)| **name == *"native.texels"), "{:?}", below.files);
-        write(&root, ".layers/base-files/g/a.node/native.texels", "extracted otherwise");
+        write(&root, "layers/base-files/g/a.node/native.texels", "extracted otherwise");
         let (_, after) = open(&root);
         assert!(!after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
         let texels = after.assets[&tree("g/a")].files.iter().find(|f| *f.name == *"native.texels").unwrap();
@@ -4735,47 +4735,47 @@ mod tests {
             let (_, fresh) = open(&root);
             assert_eq!(shown(index), shown(&fresh), "after {what}");
         };
-        let base = |p: &str| root.at(".layers/base").at(p);
+        let base = |p: &str| root.at("layers/base").at(p);
         // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
-        write(&root, ".layers/base/g/a.node/native.texels", "repainted");
+        write(&root, "layers/base/g/a.node/native.texels", "repainted");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "a file of a bundle", false);
         write(
             &root,
-            ".layers/base/b.node/node.toml",
+            "layers/base/b.node/node.toml",
             "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n",
         );
         check(&mut index, &project, &[base("b.node/node.toml")], "references changed", false);
-        write(&root, ".layers/base/f.node/node.toml", "kind = [unclosed\n");
+        write(&root, "layers/base/f.node/node.toml", "kind = [unclosed\n");
         check(&mut index, &project, &[base("f.node/node.toml")], "an unreadable declaration", false);
-        write(&root, ".layers/base/f.node/node.toml", "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\" }\n");
+        write(&root, "layers/base/f.node/node.toml", "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\" }\n");
         check(&mut index, &project, &[base("f.node/node.toml")], "readable again", false);
         // A file added to a bundle: its content changes, its paths stay.
-        write(&root, ".layers/base/g/a.node/extra.bin", "more");
+        write(&root, "layers/base/g/a.node/extra.bin", "more");
         check(&mut index, &project, &[base("g/a.node/extra.bin")], "a file added to a bundle", false);
         // Structure: a new bundle, listed in its changeset; one removed.
-        write(&root, ".layers/base/n.node/node.toml", "stack = [{ op = \"t.file\" }]\nto = \"uid://a\"\n");
+        write(&root, "layers/base/n.node/node.toml", "stack = [{ op = \"t.file\" }]\nto = \"uid://a\"\n");
         check(&mut index, &project, &[base("n.node/node.toml")], "a new bundle", true);
         std::fs::remove_dir_all(base("n.node")).unwrap();
         check(&mut index, &project, &[base("n.node")], "a bundle removed", true);
         // An override in top, then what is below it changed: merged again, though only contents changed.
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         check(
             &mut index,
             &project,
-            &[root.at(".layers/top.toml"), root.at(".layers/top/g/a.node/node.toml")],
+            &[root.at("layers/top.toml"), root.at("layers/top/g/a.node/node.toml")],
             "an override",
             true,
         );
-        write(&root, ".layers/base/g/a.node/native.texels", "retouched");
+        write(&root, "layers/base/g/a.node/native.texels", "retouched");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "an override's base changed", true);
-        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n");
+        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n");
         check(
             &mut index,
             &project,
-            &[root.at(".layers/top/g/a.node/node.toml")],
+            &[root.at("layers/top/g/a.node/node.toml")],
             "the override's own content, merged again",
             true,
         );
@@ -4816,8 +4816,8 @@ mod tests {
         let mut top = Changeset::default();
         top.ops.insert(uid("uid://a"), overriding(&index, "uid://a", &["node.toml"]));
         top.ops.insert(uid("uid://nothing"), Op::Delete);
-        top.save(&pe2_io::SystemFilesystem, &root.at(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        top.save(&pe2_io::SystemFilesystem, &root.at("layers/top.toml")).unwrap();
+        write(&root, "layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let (_, mut index) = open(&root);
         let info = index.layers();
         assert_eq!((info[1].overrides, info[1].deletes, info[1].problems), (1, 1, 1));
@@ -4845,17 +4845,17 @@ mod tests {
     }
 
     #[test]
-    fn what_is_known_of_the_files_outlasts_a_cache_wiped() {
+    fn what_is_known_of_the_files_outlasts_outputs_wiped() {
         let root = project("foreign");
         assert_eq!(open(&root).1.read, 4);
         assert!(crate::shared::space_at(&root).at("clean").exists());
         assert_eq!(open(&root).1.read, 0);
-        // A cache another wrote is wiped, but for what the project's processes share - which says its own format,
-        // and of which schema of the cache it is: what is known of the files is known still.
-        std::fs::write(root.at(".cache/version"), "schema 0\n").unwrap();
-        std::fs::write(root.at(".cache/left.before"), "").unwrap();
+        // Outputs another wrote are wiped, and nothing else is - not what the project's processes share, which says
+        // its own format, and of which schema of the outputs it is: what is known of the files is known still.
+        std::fs::write(root.at(".local/outputs/version"), "schema 0\n").unwrap();
+        std::fs::write(root.at(".local/outputs/left.before"), "").unwrap();
         assert_eq!(open(&root).1.read, 0);
-        assert!(!root.at(".cache/left.before").exists());
+        assert!(!root.at(".local/outputs/left.before").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

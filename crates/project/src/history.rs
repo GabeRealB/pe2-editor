@@ -22,11 +22,11 @@
 //! since outside the editor, or a working copy taken from disk since, blocks it unless forced - and a forced step
 //! records what it overwrote, so the opposite brings that back. A new step drops what was undone of what it touches.
 //!
-//! What a change overwrites or deletes is kept in the cache: a content by its hash (`.cache/history/blobs/<sha1>`,
-//! once), a folder deleted moved whole into `.cache/history/trash/`. A working copy's files are kept there too.
+//! What a change overwrites or deletes is kept in the history's folder: a content by its hash (`.local/history/blobs/<sha1>`,
+//! once), a folder deleted moved whole into `.local/history/trash/`. A working copy's files are kept there too.
 //!
 //! The log lasts the session. Where it is journaled (`journaled`, as the editor's is), it is written as it changes
-//! (`.cache/history/session.jsonl`): a step made, or joined to the one before it, is appended with the documents it
+//! (`.local/history/session.jsonl`): a step made, or joined to the one before it, is appended with the documents it
 //! edited - the session written whole only where it changed otherwise (an undo, a save), and when what was appended
 //! has grown long. A clean close (`close`) wipes it all; one a crash left behind is found on the
 //! next opening (`left`) and taken up again (`resume`) or let go (`discard_left`).
@@ -42,10 +42,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::TreePath;
-use crate::cache::{Cache, write_atomic};
 use crate::index::{Index, Working, WorkingFile};
+use crate::local::{Local, write_atomic};
 
-pub(crate) const DIR: &Name = Name::constant("history");
 const SESSION: &Name = Name::constant("session.jsonl");
 /// Where it keeps the contents it may put back, by their hashes.
 const BLOBS: &Name = Name::constant("blobs");
@@ -405,27 +404,27 @@ impl History {
     }
 
     /// The project's log for this session: a session a crash ended is kept aside (`left`), and otherwise what an
-    /// earlier session kept is wiped. Returns it and what was written again from the log as the cache was opened,
+    /// earlier session kept is wiped. Returns it and what was written again from the log as the local folder was opened,
     /// if anything was - changes whoever held the project before had not had in its files.
     ///
     /// # Errors
     /// The history's folder cannot be read, cleared or made.
-    pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
-        let dir = cache.path(DIR);
-        let fs = cache.io.filesystem();
+    pub fn open(local: &Local) -> Result<(History, Option<String>)> {
+        let dir = local.part(crate::local::HISTORY);
+        let fs = local.io.filesystem();
         let mut history = History {
-            view: View::new(dir.clone(), cache.io.clone()),
+            view: View::new(dir.clone(), local.io.clone()),
             merge_within: MERGE_WITHIN,
-            io: cache.io.clone(),
+            io: local.io.clone(),
             revision: std::cell::Cell::new(0),
             journaled: false,
             appended: std::cell::Cell::new(None),
             author: "user".into(),
             trashed: 0,
             written: vec![],
-            storage: cache.dir.parent().and_then(|root| crate::storage::Storage::open(&root, cache.io.clone())),
+            storage: local.dir.parent().and_then(|root| crate::storage::Storage::open(&root, local.io.clone())),
         };
-        let recovered = cache.recovered.clone();
+        let recovered = local.recovered.clone();
         let left = fs
             .read_to_string(&dir.join(&SESSION))
             .ok()
@@ -1566,8 +1565,8 @@ fn current_hash(fs: &dyn pe2_io::Filesystem, path: &HostPath) -> Option<pe2_ext:
 mod tests {
     use super::{History, Kind, StepError};
     use crate::Project;
-    use crate::cache::Cache;
     use crate::index::Index;
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use crate::testing::{rel, tree, uid};
@@ -1585,14 +1584,14 @@ mod tests {
     fn history(root: &HostPath) -> (History, Option<String>) {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        History::open(&Cache::open(&project, &lock).unwrap()).unwrap()
+        History::open(&Local::open(&project, &lock).unwrap()).unwrap()
     }
 
     /// The index of a project, for what undo reads of documents.
     fn index(root: &HostPath) -> Index {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap()
+        Index::open(&project, &Local::open(&project, &lock).unwrap()).unwrap()
     }
 
     fn read(path: &HostPath) -> Option<String> {
@@ -1600,7 +1599,7 @@ mod tests {
     }
 
     /// What a project's folder holds as the index sees it, each file by its bytes, each folder as none: what is
-    /// hidden (a name starting with `.`, its cache, what an atomic write left half written) is none of it.
+    /// hidden (a name starting with `.`, its local folder, what an atomic write left half written) is none of it.
     fn snapshot(root: &HostPath) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
         fn walk(dir: &std::path::Path, within: &str, into: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -1625,7 +1624,7 @@ mod tests {
     fn history_through(root: &HostPath, io: std::sync::Arc<dyn pe2_io::Io>) -> History {
         let project = Project::load_with(root, io).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        History::open(&Cache::open(&project, &lock).unwrap()).unwrap().0
+        History::open(&Local::open(&project, &lock).unwrap()).unwrap().0
     }
 
     /// One edit of every kind a transaction makes: a file written over, one written new in a folder made for it, a
@@ -1661,7 +1660,7 @@ mod tests {
         let (changes, after) = (fs.changes() - counted, snapshot(&root));
         assert!(changes > 4 && before != after, "{changes} changes");
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
         for how in [pe2_io::Fault::Once, pe2_io::Fault::From] {
             for nth in 1..=changes + 1 {
                 let root = fixture(&format!("faults-{how:?}-{nth}"));
@@ -1685,9 +1684,9 @@ mod tests {
                 fs.heal();
                 let project = Project::load(&root).unwrap();
                 let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-                let cache = Cache::open(&project, &lock)
+                let local = Local::open(&project, &lock)
                     .unwrap_or_else(|e| panic!("{how:?} at change {nth}: opened again: {e:#}; left {left:?}"));
-                let (history, _) = super::History::open(&cache).unwrap();
+                let (history, _) = super::History::open(&local).unwrap();
                 drop(history);
                 let opened = snapshot(&root);
                 assert!(
@@ -1697,7 +1696,7 @@ mod tests {
                 if how == pe2_io::Fault::Once {
                     assert_eq!(opened, left, "{how:?} at change {nth}: a set given up is not made again");
                 }
-                crate::cache::remove_all(&root);
+                crate::local::remove_all(&root);
             }
         }
     }
@@ -1727,7 +1726,7 @@ mod tests {
         history.redo(&index, None, false).unwrap();
         assert!(!one.exists() && root.at("layer/d/c/two").exists());
         assert!(history.redo(&index, None, false).is_err());
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1735,7 +1734,7 @@ mod tests {
         let root = project("chunked");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let file = root.at(".layers/top/a.node/native.bin");
+        let file = root.at("layers/top/a.node/native.bin");
         let manifest = crate::chunks::manifest_path(&file);
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         let mut tx = history.begin("write");
@@ -1756,7 +1755,7 @@ mod tests {
         assert!(!crate::content::exists(&crate::testing::io(), &file));
         history.undo(&index, None, false).unwrap();
         assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1778,7 +1777,7 @@ mod tests {
         // Redo brings back what the forced undo overwrote.
         history.redo(&index, None, false).unwrap();
         assert_eq!(read(&one).as_deref(), Some("theirs"));
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1810,7 +1809,7 @@ mod tests {
         assert_eq!(read(&root.at("layer/moved/one")).as_deref(), Some("whole"));
         assert!(!root.at("layer/a").exists());
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1831,7 +1830,7 @@ mod tests {
             // Another, cut short before it was whole: nothing.
             sfs::storage::began(
                 &sfs::Log::shared(
-                    &root.at(".cache/filesystem/sfs"),
+                    &root.at(".local/filesystem/sfs"),
                     sfs::log::Config::default(),
                     &pe2_io::SystemFilesystem,
                 )
@@ -1853,13 +1852,13 @@ mod tests {
         let (history, recovered) = self::history(&root);
         assert_eq!(recovered, None);
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
     /// layer's is: only a record and the folder of its first two letters are written behind.
     fn record(root: &HostPath, uid: &str) -> HostPath {
-        let records = root.at(".layers/top/.records");
+        let records = root.at("layers/top/.records");
         std::fs::create_dir_all(&records).unwrap();
         records.at(&uid[..2]).at(&format!("{uid}.toml"))
     }
@@ -1915,7 +1914,7 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!((read(&a).as_deref(), read(&root.at("layer/a/one")).as_deref()), (Some("last"), Some("ONE")));
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1934,10 +1933,10 @@ mod tests {
         history.hold_back(false);
         history.settle();
         assert_eq!(read(&a).as_deref(), Some("theirs"), "not written over");
-        assert_eq!(read(&root.at(".cache/conflicts/.layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
+        assert_eq!(read(&root.at(".local/conflicts/layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
         assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1959,7 +1958,7 @@ mod tests {
         assert_eq!(read(&a).as_deref(), Some("one"));
         assert!(crate::storage::waiting(&a).is_none(), "nothing waits of what was written again");
         drop(history);
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -1976,18 +1975,18 @@ mod tests {
         assert_eq!(history.done().len(), 1);
         history.undo(&index, None, false).unwrap();
         assert_eq!(read(&one).as_deref(), Some("one"));
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     /// A project of one layer holding the assets `a` and `b`.
     fn documents_project(name: &str) -> HostPath {
         let root = crate::testing::scratch(&format!("history-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.at(".layers/top/a.node")).unwrap();
-        std::fs::create_dir_all(root.at(".layers/top/b.node")).unwrap();
+        std::fs::create_dir_all(root.at("layers/top/a.node")).unwrap();
+        std::fs::create_dir_all(root.at("layers/top/b.node")).unwrap();
         std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"top\"\n").unwrap();
-        std::fs::write(root.at(".layers/top/a.node/node.toml"), "uid = \"uid://a\"\nx = 1\n").unwrap();
-        std::fs::write(root.at(".layers/top/b.node/node.toml"), "uid = \"uid://b\"\ny = 1\n").unwrap();
+        std::fs::write(root.at("layers/top/a.node/node.toml"), "uid = \"uid://a\"\nx = 1\n").unwrap();
+        std::fs::write(root.at("layers/top/b.node/node.toml"), "uid = \"uid://b\"\ny = 1\n").unwrap();
         root
     }
 
@@ -2011,7 +2010,7 @@ mod tests {
         assert!(edit(&mut history, "uid://a", "uid = \"uid://a\"\nx = 3\n"));
         // Nothing is written: the working copies hold the edits, and the index shows them.
         assert_eq!(
-            std::fs::read_to_string(root.at(".layers/top/a.node/node.toml")).unwrap(),
+            std::fs::read_to_string(root.at("layers/top/a.node/node.toml")).unwrap(),
             "uid = \"uid://a\"\nx = 1\n"
         );
         let mut shown = index.clone();
@@ -2034,7 +2033,7 @@ mod tests {
         assert!(history.document(uid("uid://a")).is_none());
         history.undo(&index, None, false).unwrap();
         assert!(history.document(uid("uid://b")).is_none());
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -2042,7 +2041,7 @@ mod tests {
         let root = documents_project("save");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let a = root.at(".layers/top/a.node/node.toml");
+        let a = root.at("layers/top/a.node/node.toml");
         history
             .edit(
                 &index,
@@ -2076,7 +2075,7 @@ mod tests {
         assert!(history.document(uid("uid://a")).unwrap().stale.is_none());
         history.revert(uid("uid://a"), "Revert a".into());
         assert!(history.document(uid("uid://a")).is_none());
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -2107,14 +2106,14 @@ mod tests {
         assert_eq!(history.done().len(), steps + 1);
         history.undo(&index, None, false).unwrap();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 3"));
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
     fn a_journaled_session_is_appended_to_and_read_back_as_it_was() {
         let root = documents_project("appended");
         let index = index(&root);
-        let session = root.at(".cache/history/session.jsonl");
+        let session = root.at(".local/history/session.jsonl");
         {
             let (history, _) = history(&root);
             let mut history = history.journaled();
@@ -2156,7 +2155,7 @@ mod tests {
         history.resume();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 5"));
         history.close();
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 
     #[test]
@@ -2185,6 +2184,6 @@ mod tests {
         history.close();
         let (history, _) = self::history(&root);
         assert!(history.left().is_none());
-        crate::cache::remove_all(&root);
+        crate::local::remove_all(&root);
     }
 }

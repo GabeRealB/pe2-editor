@@ -153,7 +153,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
 pub enum Strays {
     /// It is not served over them: they are said, and stay.
     Refuse,
-    /// They are moved beside it, to `assets.set-aside/<time>`.
+    /// They are moved beside it, to `.local/set-aside/<time>`.
     SetAside,
     /// They are written into the project, as edits through the folder are.
     TakeIn,
@@ -181,7 +181,7 @@ pub fn served_name(p: &Project) -> String {
 }
 
 /// What serves a project's folder, written through, and the address it does at where it serves at one: as asked, then
-/// as the project says (`project.local.toml`), then the machine - else the backend best suited here. A project or
+/// as the project says (`.local/settings.toml`), then the machine - else the backend best suited here. A project or
 /// machine saying `none` is only not served by itself: asked to be, it is, by the best suited.
 fn serving_of(
     p: &Project,
@@ -325,7 +325,7 @@ impl Server {
     /// then mounted. What it holds while it serves, where that is, and what is to be known of how.
     fn mount(self: &Arc<Self>) -> Result<(Mounted, String, Option<String>)> {
         let (p, serving) = (&self.project, self.serving);
-        let staging = p.root.join(&project::cache::DIR).join(&project::cache::STAGING);
+        let staging = project::local::part(&p.root, project::local::STAGING);
         let owner: Arc<dyn vfs::write::Owner> = self.clone();
         if serving.can().folder {
             // What another backend left there of its own serving is no stray: it goes first.
@@ -598,7 +598,7 @@ impl vfs::write::Owner for Server {
         let now = self.project.io.clock().wall();
         let seconds = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string();
         let Ok(when) = pe2_path::Name::new(&seconds) else { return };
-        let aside = self.project.root.join(&project::SET_ASIDE).join(when).join(path.rel());
+        let aside = project::local::part(&self.project.root, project::local::SET_ASIDE).join(when).join(path.rel());
         let kept = aside
             .parent()
             .map_or(Ok(()), |folder| self.project.io.filesystem().create_folder_all(&folder))
@@ -640,7 +640,8 @@ fn clear_strays(
         return Ok(());
     }
     let seconds = p.io.clock().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let aside = p.root.join(&project::SET_ASIDE).join(&pe2_path::Name::new(&seconds.to_string())?);
+    let aside =
+        project::local::part(&p.root, project::local::SET_ASIDE).join(&pe2_path::Name::new(&seconds.to_string())?);
     let shown = at.to_string();
     match strays {
         Strays::Refuse => {
@@ -656,7 +657,7 @@ fn clear_strays(
                 files(found.len()),
                 if found.len() == 1 { "is" } else { "are" },
                 listed.join(", "),
-                p.root.join(&project::SET_ASIDE),
+                project::local::part(&p.root, project::local::SET_ASIDE),
             );
         }
         Strays::SetAside => {

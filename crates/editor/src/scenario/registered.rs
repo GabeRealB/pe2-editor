@@ -41,7 +41,7 @@ fn a_test_failing_says_why() {
 #[test]
 fn a_project_runs_the_tests_of_its_extensions_and_is_left_as_it_was() {
     let fixture = Fixture::with_tests();
-    let layer = fixture.root().at(".layers/base");
+    let layer = fixture.root().at("layers/base");
     let count = || std::fs::read_dir(&layer).expect("its layer").count();
     let untouched = count();
     assert!(super::run(fixture.root(), &[]));

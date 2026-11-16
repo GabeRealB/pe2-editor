@@ -44,14 +44,14 @@ impl Fixture {
     /// A node, by its path, of this declaration.
     #[must_use]
     pub fn node(self, path: &str, declaration: &str) -> Fixture {
-        self.write(&format!(".layers/{LAYER}/{path}.node/node.toml"), declaration);
+        self.write(&format!("layers/{LAYER}/{path}.node/node.toml"), declaration);
         self
     }
 
     /// A file of a node, whole.
     #[must_use]
     pub fn bytes(self, path: &str, file: &str, bytes: &[u8]) -> Fixture {
-        let at = self.root.at(&format!(".layers/{LAYER}/{path}.node/{file}"));
+        let at = self.root.at(&format!("layers/{LAYER}/{path}.node/{file}"));
         std::fs::create_dir_all(at.parent().expect("a bundle")).expect("a folder");
         std::fs::write(at, bytes).expect("a file");
         self
@@ -60,7 +60,7 @@ impl Fixture {
     /// A plain file, in a node of it.
     #[must_use]
     pub fn stored(self, path: &str, file: &str) -> Fixture {
-        self.write(&format!(".layers/{LAYER}/{path}.node/{file}"), "held\n");
+        self.write(&format!("layers/{LAYER}/{path}.node/{file}"), "held\n");
         self
     }
 
@@ -71,7 +71,7 @@ impl Fixture {
         fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"top\"\n"));
         project::records::mark(
             &pe2_io::SystemFilesystem,
-            &fixture.root.at(".layers/top"),
+            &fixture.root.at("layers/top"),
             &project::records::Settings::default(),
         )
         .expect("a records layer");
@@ -92,7 +92,7 @@ impl Fixture {
     /// Its folder, for what else it is to have.
     fn hold(&self, layer: &str, component: &[u8]) -> HostPath {
         let about = project::ext::component::about(component).expect("who it is");
-        let at = self.root.at(&format!(".layers/{layer}/extensions/{}.extension", about.id));
+        let at = self.root.at(&format!("layers/{layer}/extensions/{}.extension", about.id));
         std::fs::create_dir_all(&at).expect("its folder");
         std::fs::write(at.at("extension.wasm"), component).expect("a component");
         let manifest = project::ext::component::manifest_text(component).expect("its manifest");
@@ -123,7 +123,7 @@ impl Fixture {
     /// Make a layer hold the extensions `hold` put in it, as a project holds them: each named by a record of the layer's,
     /// its tree in the store.
     fn settle(&self, layer: &str) {
-        let at = self.root.at(".layers").at(layer);
+        let at = self.root.at("layers").at(layer);
         let project = project::Project::load(&self.root).expect("the project");
         project::records::hold_extensions(&project, &at).expect("its extensions held");
     }
@@ -138,7 +138,7 @@ impl Fixture {
         let mut file = String::new();
         for layer in &layers {
             let _ = writeln!(file, "[[layer]]\nname = \"{layer}\"\n");
-            std::fs::create_dir_all(fixture.root.at(".layers").at(layer)).expect("a layer");
+            std::fs::create_dir_all(fixture.root.at("layers").at(layer)).expect("a layer");
         }
         for config in &declared.configs {
             let _ = writeln!(file, "[config.{config}]\n");
@@ -200,8 +200,8 @@ impl Fixture {
             "project.toml",
             &format!("[[layer]]\nname = \"code\"\nkind = \"files\"\n\n[[layer]]\nname = \"{LAYER}\"\n"),
         );
-        fixture.write(&format!(".layers/{LAYER}/.keep"), "");
-        fixture.write(".layers/code/src/thing.c", "int thing;\n");
+        fixture.write(&format!("layers/{LAYER}/.keep"), "");
+        fixture.write("layers/code/src/thing.c", "int thing;\n");
         fixture
     }
 
@@ -291,7 +291,7 @@ name = "played"
     /// Where a node's declaration is.
     #[must_use]
     pub fn node_file(&self, path: &str) -> HostPath {
-        self.root().at(&format!(".layers/{LAYER}/{path}.node/node.toml"))
+        self.root().at(&format!("layers/{LAYER}/{path}.node/node.toml"))
     }
 }
 

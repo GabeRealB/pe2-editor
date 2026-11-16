@@ -15,7 +15,7 @@ project involves up to three kinds of process:
                    │         the shared space: log, pages and trees, ring of pages            │
                    └──────────────────────────────┬───────────────────────────────────────────┘
                                                    ▼
-                                    the project's files: layers, store, cache
+                                    the project's files: layers, store, local folder
 ```
 
 - **The holder** has the project: its lock, its only index that changes, its history, its extensions, its builds.
@@ -26,7 +26,7 @@ project involves up to three kinds of process:
 - **Clients** - commands, agents, the folder's programs - ask the holder, through a local socket or through the
   folder.
 
-They share state through memory-mapped files in the project's cache rather than messages. See [The shared
+They share state through memory-mapped files in the project's local folder rather than messages. See [The shared
 filesystem](filesystem/shared.md).
 
 ## Crates
@@ -83,7 +83,7 @@ on the paths that are hot.
 
 The programs make one, as they start: the command line's `run`, the editor's `main` (handed to the window through
 `Start`), the agents' server, `xtask`. Owners carry it from there: a `Project` (`Project::load_with`), and through it
-the index, history, storage, the cache, the store, the extensions and what runs unsandboxed; the writes, the served
+the index, history, storage, the local folder, the store, the extensions and what runs unsandboxed; the writes, the served
 tree, a holder, the host and the server. Code given none reaches nothing: the build refuses the system's own calls
 (`clippy.toml`), and where one is right - a measurement, the window's pace, what the processes of a machine find each
 other by, the program's own files, what only the system's own calls reach (a backend's mount points), a test's

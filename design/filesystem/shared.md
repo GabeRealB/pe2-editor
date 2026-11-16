@@ -5,7 +5,7 @@
 ## The idea
 
 A project's processes - the holder, the server, a command - share their state through memory-mapped files in the
-project's cache rather than by sending it to each other. One library, linked by all of them, provides three things:
+project's local folder (`.local/filesystem/`) rather than by sending it to each other. One library, linked by all of them, provides three things:
 
 - a **write-ahead log**, which makes every change durable;
 - **pages and trees**, a copy-on-write store holding the served tree and the project's model;

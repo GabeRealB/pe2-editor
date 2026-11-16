@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use holder::core::{Core, Queue};
 use project::Project;
-use project::cache::Cache;
 use project::history::History;
 use project::host::{FromHost, ROLE, ToHost};
 use project::index::Index;
+use project::local::Local;
 use project::lock::{Lock, LockError};
 
 const WHO: &str = "pe2-cli project host";
@@ -209,17 +209,17 @@ fn core(p: &Project, index: Index, says: &Arc<holder::says::Says>) -> Core {
     core
 }
 
-/// The project held: its index, over the cache's store, and a history of its own.
+/// The project held: its index, over the outputs' store, and a history of its own.
 fn hold(p: &Project, lock: &Lock) -> Result<(Index, History)> {
-    let cache = Cache::open(p, lock)?;
-    let (history, recovered) = History::open(&cache)?;
+    let local = Local::open(p, lock)?;
+    let (history, recovered) = History::open(&local)?;
     // It holds the project to stay: what its first edit would wait for is made ahead of it.
     history.prepare();
     if let Some(recovered) = recovered {
         println!("{recovered}");
     }
     // Over the files as the project's model has them: held to that behind what is asked first (`Host::took`).
-    Ok((Index::open_behind(p, &cache, &|_, _, _| {})?, history))
+    Ok((Index::open_behind(p, &local, &|_, _, _| {})?, history))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -316,10 +316,10 @@ impl Host {
         let Some(held) = held.as_mut() else { return Err(mcp::Reply::Declined) };
         if reading.is_none() {
             let made = (|| {
-                let cache = Cache::open(&self.project, &held.lock)?;
+                let local = Local::open(&self.project, &held.lock)?;
                 let extensions = extensions::for_project(&self.project);
-                let _ = project::imports::Imports::open(&cache)?.attach(&mut held.core.index, &extensions);
-                let store = project::graph::store::Store::open(&cache)?;
+                let _ = project::imports::Imports::open(&local)?.attach(&mut held.core.index, &extensions);
+                let store = project::graph::store::Store::open(&local)?;
                 extensions.keep_in(store.clone());
                 anyhow::Ok(Reading { extensions, store, last: self.now() })
             })();
@@ -601,14 +601,14 @@ impl Host {
             let taken = Lock::try_take(&host.project.root, WHO, &*host.project.io).ok()?;
             let found = Instant::now();
             let held = (|| {
-                let cache = Cache::open(&host.project, &taken)?;
-                let (history, recovered) = History::open(&cache)?;
+                let local = Local::open(&host.project, &taken)?;
+                let (history, recovered) = History::open(&local)?;
                 // It holds the project to stay: what its first edit would wait for is made ahead of it.
                 history.prepare();
                 if let Some(recovered) = recovered {
                     println!("{recovered}");
                 }
-                let index = Index::open_behind(&host.project, &cache, &|_, _, _| {})?;
+                let index = Index::open_behind(&host.project, &local, &|_, _, _| {})?;
                 anyhow::Ok((history, index))
             })();
             match held {

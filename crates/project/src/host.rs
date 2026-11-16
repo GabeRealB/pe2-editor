@@ -9,7 +9,7 @@
 //! the lock, its history, its index and its link, and no longer feeds the server - whoever holds the project does -
 //! until the borrower lets go and it takes the project back.
 //!
-//! What a process says to the host goes over a local socket - `.cache/host.sock`, a named pipe on Windows - one CBOR
+//! What a process says to the host goes over a local socket - `.local/processes/host.sock`, a named pipe on Windows - one CBOR
 //! message a frame (`ToHost`, `FromHost`, `wire`). A connection asking to keep the folder served (`Keep`) or borrowing
 //! the project (`Lend`) is a lease while it stays open.
 
@@ -89,8 +89,8 @@ fn hashed(root: &HostPath) -> String {
     })
 }
 
-/// A name for a local socket of the project in `root`: a file of its cache on Unix - or of the temporary folder, named by
-/// `prefix` and its path, hashed, where the cache's is longer than a socket's path can be - and a pipe named so on
+/// A name for a local socket of the project in `root`: a file of its processes' folder on Unix - or of the temporary folder, named by
+/// `prefix` and its path, hashed, where that one is longer than a socket's path can be - and a pipe named so on
 /// Windows, where a pipe's name is global.
 ///
 /// # Errors
@@ -99,7 +99,7 @@ pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::
     #[cfg(unix)]
     {
         // `sun_path`: 108 bytes on Linux, 104 on macOS, its terminating zero among them.
-        let path = root.join(&crate::cache::DIR).join(file);
+        let path = crate::local::part(root, crate::local::PROCESSES).join(file);
         let path = if path.as_os_str().len() < 100 {
             path
         } else {
@@ -277,7 +277,7 @@ pub fn answers(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
 }
 
 /// Start a host for the project in `root`, on its own - not ended with this process, nor with its terminal - and
-/// connect to it once it listens. What it says goes to its log in the cache.
+/// connect to it once it listens. What it says goes to its log in the processes' folder.
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.

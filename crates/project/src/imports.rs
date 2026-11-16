@@ -1,4 +1,4 @@
-//! Imports: what an asset's importer makes of its source, kept in the project cache (`.cache/imports/<key>/`) and seen
+//! Imports: what an asset's importer makes of its source, kept in the project's outputs (`.local/outputs/imports/<key>/`) and seen
 //! by every reader as the asset's own - the bundle holds the source, the native form is made from it.
 //!
 //! An import makes native files, and type settings it derives from the source (an image's size, its cells'
@@ -12,7 +12,7 @@
 //! through its importer to the `native` output, kept in the project's store by content with its trace, which records
 //! what the import read (its source's hash, the declaration's). A changed source, a changed setting or a new importer
 //! makes it again, and anything else finds it made. Extraction makes the imports it checks through the same engine,
-//! so a project opens without importing. Like the rest of the cache, any of it may be deleted at the cost of time only.
+//! so a project opens without importing. Like the rest of the outputs, any of it may be deleted at the cost of time only.
 
 use anyhow::{Context, Result};
 use pe2_path::RelPath;
@@ -23,13 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::TreePath;
-use crate::cache::Cache;
 use crate::ext::{Extensions, Origin, Status};
 use crate::extract::sha1_hex;
 use crate::graph::exec::{Engine, Reads};
 use crate::graph::store::{Blob, Kept, Store};
 use crate::graph::{self, Plan};
 use crate::index::{Asset, BundleFile, Imported, Index, Problem, Report};
+use crate::local::Local;
 
 /// Where imports were kept before the store, removed on opening.
 const OLD: &pe2_path::Name = pe2_path::Name::constant("imports");
@@ -53,7 +53,7 @@ pub struct Imports {
     /// The nodes each asset's last import read outputs of (as traces name them), by its path.
     read_from: Mutex<HashMap<Arc<TreePath>, BTreeSet<String>>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from: kept
-    /// in the cache (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
+    /// in the outputs (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
     addresses: Mutex<HashMap<String, Listed>>,
     /// Where they are kept.
     listed_at: HostPath,
@@ -64,7 +64,7 @@ pub struct Imports {
 /// An asset's addresses, with the hash of the settings they were listed from.
 type Listed = (String, Arc<HashSet<String>>);
 
-/// Where the addresses listed are kept, in the cache, with the extensions that listed them.
+/// Where the addresses listed are kept, in the outputs, with the extensions that listed them.
 const LISTED: &pe2_path::Name = pe2_path::Name::constant("listed.json");
 
 /// What tells the extensions loaded apart from others: each one's id, version and build.
@@ -78,7 +78,7 @@ fn builds_of(extensions: &Extensions) -> String {
     sha1_hex(builds.join("\n").as_bytes())
 }
 
-/// The addresses kept in the cache, where these extensions listed them.
+/// The addresses kept in the outputs, where these extensions listed them.
 fn listed_kept(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str) -> HashMap<String, Listed> {
     let Ok(text) = fs.read_to_string(at) else { return HashMap::new() };
     let Ok(kept) = serde_json::from_str::<serde_json::Value>(&text) else { return HashMap::new() };
@@ -95,7 +95,7 @@ fn listed_kept(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str) -> Hash
         .collect()
 }
 
-/// Keep the addresses listed in the cache, for the extensions that listed them.
+/// Keep the addresses listed in the outputs, for the extensions that listed them.
 fn keep_listed(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str, listed: &HashMap<String, Listed>) {
     let mut sorted: Vec<(&String, &Listed)> = listed.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -106,7 +106,7 @@ fn keep_listed(fs: &dyn pe2_io::Filesystem, at: &HostPath, builds: &str, listed:
         entries.insert(target.clone(), serde_json::json!([digest, addresses]));
     }
     let kept = serde_json::json!({ "builds": builds, "listed": entries });
-    let _ = crate::cache::write_atomic(fs, at, kept.to_string().as_bytes());
+    let _ = crate::local::write_atomic(fs, at, kept.to_string().as_bytes());
 }
 
 /// What there is of an asset's import, found without making anything.
@@ -169,17 +169,17 @@ impl Imports {
     ///
     /// # Errors
     /// The store cannot be opened.
-    pub fn open(cache: &Cache) -> Result<Imports> {
-        let old = cache.path(OLD);
-        if cache.io.filesystem().exists(&old) {
-            cache.io.filesystem().remove_all(&old).with_context(|| old.display().to_string())?;
+    pub fn open(local: &Local) -> Result<Imports> {
+        let old = local.output(OLD);
+        if local.io.filesystem().exists(&old) {
+            local.io.filesystem().remove_all(&old).with_context(|| old.display().to_string())?;
         }
         Ok(Imports {
-            store: Store::open(cache)?,
+            store: Store::open(local)?,
             known: Mutex::default(),
             read_from: Mutex::default(),
             addresses: Mutex::default(),
-            listed_at: cache.path(LISTED),
+            listed_at: local.output(LISTED),
             stop: Arc::default(),
         })
     }
@@ -943,9 +943,9 @@ op = "pe2.images@ora"
 mod attaching {
     use super::Imports;
     use crate::Project;
-    use crate::cache::Cache;
     use crate::ext::{Extensions, Loadable};
     use crate::index::{Index, Problem};
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use crate::testing::tree;
@@ -1028,9 +1028,9 @@ mod attaching {
     fn open(root: &HostPath, extensions: &Extensions) -> (Index, super::Attached) {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        let cache = Cache::open(&project, &lock).unwrap();
-        let mut index = Index::open(&project, &cache).unwrap();
-        let attached = Imports::open(&cache).unwrap().attach(&mut index, extensions);
+        let local = Local::open(&project, &lock).unwrap();
+        let mut index = Index::open(&project, &local).unwrap();
+        let attached = Imports::open(&local).unwrap().attach(&mut index, extensions);
         (index, attached)
     }
 
@@ -1091,11 +1091,7 @@ mod attaching {
             let stack = format!(
                 "[[stack]]\nop = \"test.strips@link\"\n{next}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n"
             );
-            write(
-                &root,
-                &format!(".layers/base/n{at:02}.node/node.toml"),
-                &format!("uid = \"uid://n{at}\"\n\n{stack}"),
-            );
+            write(&root, &format!("layers/base/n{at:02}.node/node.toml"), &format!("uid = \"uid://n{at}\"\n\n{stack}"));
         }
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
@@ -1146,11 +1142,11 @@ mod attaching {
         let root: HostPath = crate::testing::scratch("imports-readers");
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
-        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
-        write(&root, ".layers/base/s.node/source.txt", "a b");
+        write(&root, "layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
+        write(&root, "layers/base/s.node/source.txt", "a b");
         let copy = "[[stack]]\nop = \"test.strips@copy\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n";
         // Read through another: `c` copies `uid://s`, which nothing of its declaration names.
-        write(&root, ".layers/base/c.node/node.toml", &format!("uid = \"uid://c\"\n{copy}"));
+        write(&root, "layers/base/c.node/node.toml", &format!("uid = \"uid://c\"\n{copy}"));
         let extension = Extension {
             id: "test.strips",
             version: "0.1.0",
@@ -1168,20 +1164,20 @@ mod attaching {
         let (mut index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.failed.len()), (2, 0), "{:?}", attached.failed);
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let imports = Imports::open(&Local::open(&project, &lock).unwrap()).unwrap();
         drop(lock);
         // Its first attach is what it learns what each read from.
         imports.attach(&mut index, &extensions);
-        write(&root, ".layers/base/s.node/source.txt", "a b c");
-        let refreshed = index.refresh(&project, &[root.at(".layers/base/s.node/source.txt")]).unwrap();
+        write(&root, "layers/base/s.node/source.txt", "a b c");
+        let refreshed = index.refresh(&project, &[root.at("layers/base/s.node/source.txt")]).unwrap();
         assert!(!refreshed.assets.contains(&tree("c")), "c's own files did not change");
         imports.attach_changed(&mut index, &extensions, &refreshed.assets);
         let (fresh, _) = open(&root, &extensions);
         assert_eq!(shown(&index), shown(&fresh));
         // What it reads emptied, it fails; filled again, it is made again, though its failure read nothing.
         for (text, fails) in [("", true), ("a", false)] {
-            write(&root, ".layers/base/s.node/source.txt", text);
-            let refreshed = index.refresh(&project, &[root.at(".layers/base/s.node/source.txt")]).unwrap();
+            write(&root, "layers/base/s.node/source.txt", text);
+            let refreshed = index.refresh(&project, &[root.at("layers/base/s.node/source.txt")]).unwrap();
             imports.attach_changed(&mut index, &extensions, &refreshed.assets);
             let failed = index.problems.iter().any(|p| matches!(p, Problem::Import { asset, .. } if asset == "c"));
             assert_eq!(failed, fails, "{text:?}: {:?}", index.problems);
@@ -1204,7 +1200,7 @@ mod attaching {
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         for (path, declaration) in nodes {
-            write(&root, &format!(".layers/base/{path}.node/node.toml"), declaration);
+            write(&root, &format!("layers/base/{path}.node/node.toml"), declaration);
         }
         let extension = Extension {
             id: "test.staged",
@@ -1411,12 +1407,12 @@ mod attaching {
         Ok(read)
     }
 
-    fn opened(root: &HostPath) -> (Lock, Cache, Index) {
+    fn opened(root: &HostPath) -> (Lock, Local, Index) {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
-        let cache = Cache::open(&project, &lock).unwrap();
-        let index = Index::open(&project, &cache).unwrap();
-        (lock, cache, index)
+        let local = Local::open(&project, &lock).unwrap();
+        let index = Index::open(&project, &local).unwrap();
+        (lock, local, index)
     }
 
     #[test]
@@ -1429,11 +1425,11 @@ mod attaching {
             ("b", staged_node("reader", reads, "transient")),
         ];
         let (root, extensions) = staged("lasting", &nodes);
-        let (_lock, cache, index) = opened(&root);
+        let (_lock, local, index) = opened(&root);
         let make = |engine: &crate::graph::exec::Engine, at: &str| {
             extensions.output(engine, &index, &index.assets[&tree(at)], pe2_ext::NATIVE, true).unwrap()
         };
-        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let store = crate::graph::store::Store::open(&local).unwrap();
         let run = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone())).for_a_run();
         drop((make(&run, "a"), make(&run, "b")));
         assert_eq!(runs_of("lasting"), 1, "one run shares it");
@@ -1454,10 +1450,10 @@ mod attaching {
             ("two", staged_node("counted", "arrived = \"yes\"", "transient")),
         ];
         let (root, extensions) = staged("hops", &nodes);
-        let (_lock, cache, index) = opened(&root);
+        let (_lock, local, index) = opened(&root);
         let engine = crate::graph::exec::Engine::new(
             extensions.operations(),
-            Some(crate::graph::store::Store::open(&cache).unwrap()),
+            Some(crate::graph::store::Store::open(&local).unwrap()),
         );
         let given = extensions.output(&engine, &index, &index.assets[&tree("hop")], pe2_ext::NATIVE, true).unwrap();
         let value = format!("{:?}", given.value.unwrap());
@@ -1477,8 +1473,8 @@ mod attaching {
             ("three", staged_node("counted", "last = \"yes\"", "transient")),
         ];
         let (root, extensions) = staged("chained", &nodes);
-        let (_lock, cache, index) = opened(&root);
-        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let (_lock, local, index) = opened(&root);
+        let store = crate::graph::store::Store::open(&local).unwrap();
         let make = |at: &str| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
             extensions.output(&engine, &index, &index.assets[&tree(at)], pe2_ext::NATIVE, true)
@@ -1493,10 +1489,10 @@ mod attaching {
         // A loop, a step a turn: one, then two, which names three, which names none.
         write(
             &root,
-            ".layers/base/two.node/node.toml",
+            "layers/base/two.node/node.toml",
             &staged_node("counted", "arrived = \"yes\"\nnext = \"three\"", "transient"),
         );
-        let index = Index::open(&Project::load(&root).unwrap(), &cache).unwrap();
+        let index = Index::open(&Project::load(&root).unwrap(), &local).unwrap();
         let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
         let followed =
             extensions.output(&engine, &index, &index.assets[&tree("followed")], pe2_ext::NATIVE, true).unwrap();
@@ -1521,10 +1517,10 @@ mod attaching {
             ("c", staged_node("reader", "reads = [\"a\"]", "transient")),
         ];
         let (root, extensions) = staged("circle", &nodes);
-        let (_lock, cache, index) = opened(&root);
+        let (_lock, local, index) = opened(&root);
         let engine = crate::graph::exec::Engine::new(
             extensions.operations(),
-            Some(crate::graph::store::Store::open(&cache).unwrap()),
+            Some(crate::graph::store::Store::open(&local).unwrap()),
         );
         let why = extensions
             .output(&engine, &index, &index.assets[&tree("a")], pe2_ext::NATIVE, true)
@@ -1538,8 +1534,8 @@ mod attaching {
     fn a_split_keeps_its_pieces_and_makes_only_what_changed() {
         let settings = |pieces: &str| staged_node("whole", &format!("pieces = [{pieces}]"), "transient");
         let (root, extensions) = staged("split", &[("whole", settings("\"s1\", \"s2\", \"s3\""))]);
-        let (_lock, cache, index) = opened(&root);
-        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let (_lock, local, index) = opened(&root);
+        let store = crate::graph::store::Store::open(&local).unwrap();
         let make = |index: &Index| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
             let value = extensions
@@ -1555,9 +1551,9 @@ mod attaching {
         drop(make(&index));
         assert_eq!(runs_of("piece s"), 3, "kept");
         // One more piece: only it is made.
-        write(&root, ".layers/base/whole.node/node.toml", &settings("\"s1\", \"s2\", \"s3\", \"s4\""));
+        write(&root, "layers/base/whole.node/node.toml", &settings("\"s1\", \"s2\", \"s3\", \"s4\""));
         let project = Project::load(&root).unwrap();
-        let again = Index::open(&project, &cache).unwrap();
+        let again = Index::open(&project, &local).unwrap();
         assert!(make(&again).contains("s1s2s3s4"));
         assert_eq!(runs_of("piece s"), 4);
         let _ = std::fs::remove_dir_all(&root);
@@ -1575,8 +1571,8 @@ mod attaching {
         let root: HostPath = crate::testing::scratch("imports-stopped");
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
-        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
-        write(&root, ".layers/base/s.node/source.txt", "a b");
+        write(&root, "layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
+        write(&root, "layers/base/s.node/source.txt", "a b");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1593,9 +1589,9 @@ mod attaching {
         );
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let cache = Cache::open(&project, &lock).unwrap();
-        let mut index = Index::open(&project, &cache).unwrap();
-        let imports = Imports::open(&cache).unwrap();
+        let local = Local::open(&project, &lock).unwrap();
+        let mut index = Index::open(&project, &local).unwrap();
+        let imports = Imports::open(&local).unwrap();
         imports.stopper().store(true, std::sync::atomic::Ordering::Relaxed);
         let attached = imports.attach(&mut index, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (0, 0, 0));
@@ -1614,13 +1610,13 @@ mod attaching {
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         write(
             &root,
-            ".layers/base/s.node/node.toml",
+            "layers/base/s.node/node.toml",
             &format!(
                 "uid = \"uid://s\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"
             ),
         );
-        write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
+        write(&root, "layers/base/s.node/source.txt", "a b");
+        write(&root, "layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1657,15 +1653,15 @@ mod attaching {
         // Opened again: found made. The source changed: made again, its old import swept.
         let (_, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (0, 1));
-        write(&root, ".layers/base/s.node/source.txt", "a b z");
+        write(&root, "layers/base/s.node/source.txt", "a b z");
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (1, 0));
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingOutput { .. })));
         // Swept, the old import goes.
-        let store = crate::graph::store::Store::at(root.at(".cache/store"), pe2_io::system()).unwrap();
+        let store = crate::graph::store::Store::at(root.at(".local/outputs/store"), pe2_io::system()).unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         let _ = store.sweep_older(&super::live_nodes(&index), &std::collections::HashSet::new(), later);
-        let kept = |sub: &str| std::fs::read_dir(root.at(".cache/store").at(sub)).unwrap().count();
+        let kept = |sub: &str| std::fs::read_dir(root.at(".local/outputs/store").at(sub)).unwrap().count();
         assert_eq!((kept("traces"), kept("values")), (1, 1));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1678,11 +1674,11 @@ mod attaching {
         let stack = STACK.replace("test.strips@line", "test.strips@silent_line");
         write(
             &root,
-            ".layers/base/s.node/node.toml",
+            "layers/base/s.node/node.toml",
             &format!("uid = \"uid://s\"\ncells.a = {{ palette = \"warm\" }}\n{stack}"),
         );
-        write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
+        write(&root, "layers/base/s.node/source.txt", "a b");
+        write(&root, "layers/base/r.node/node.toml", "fine = \"uid://s/cells/b\"\nbad = \"uid://s/cells/z\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1732,11 +1728,11 @@ mod attaching {
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         let declared = format!("cells.a = {{}}\n{STACK}");
-        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{declared}"));
-        write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
-        write(&root, ".layers/base/t.node/source.txt", "a");
-        write(&root, ".layers/base/r.node/node.toml", "one = \"uid://s/cells/b\"\ntwo = \"uid://t/cells/b\"\n");
+        write(&root, "layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{declared}"));
+        write(&root, "layers/base/s.node/source.txt", "a b");
+        write(&root, "layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
+        write(&root, "layers/base/t.node/source.txt", "a");
+        write(&root, "layers/base/r.node/node.toml", "one = \"uid://s/cells/b\"\ntwo = \"uid://t/cells/b\"\n");
         let extensions = Extensions::load(
             vec![Loadable::from(Extension {
                 id: "test.strips",
@@ -1754,16 +1750,16 @@ mod attaching {
         let project = Project::load(&root).unwrap();
         let (mut index, _) = open(&root, &extensions);
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let imports = Imports::open(&Local::open(&project, &lock).unwrap()).unwrap();
         drop(lock);
-        let base = |p: &str| root.at(".layers/base").at(p);
+        let base = |p: &str| root.at("layers/base").at(p);
         // A source repainted (a part gone and one come), a declaration naming another part, both at once.
         for (path, text) in [
             ("s.node/source.txt", "a"),
             ("t.node/source.txt", "a b"),
             ("r.node/node.toml", "one = \"uid://s/cells/a\"\ntwo = \"uid://t/cells/c\"\n"),
         ] {
-            write(&root, &format!(".layers/base/{path}"), text);
+            write(&root, &format!("layers/base/{path}"), text);
             let refreshed = index.refresh(&project, &[base(path)]).unwrap();
             imports.attach_changed(&mut index, &extensions, &refreshed.assets);
             let (fresh, _) = open(&root, &extensions);

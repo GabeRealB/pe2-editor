@@ -1,13 +1,13 @@
 //! Scoped filesystems: the few files a program is given, served for it alone. A program reads files by path, and a
 //! layer holds a large file as chunks (`project::chunks`); rather than assemble one into a copy, a scope serves it where
-//! it is asked for, at `<project>/.cache/scope/<process>/<sha1>/<name>`, read-only, as long as the process runs.
+//! it is asked for, at `<project>/.local/processes/scope/<process>/<sha1>/<name>`, read-only, as long as the process runs.
 //!
 //! `Scopes::install` registers them with `project::content` (`content::expose_with`), so whatever hands a layer's file
 //! to a program (`content::for_program`) gets a path in its project's scope; nothing is mounted until the first file
-//! is. Where nothing serves one, `content::for_program` falls back on a copy in the cache.
+//! is. Where nothing serves one, `content::for_program` falls back on a copy in the project's outputs.
 //!
 //! What serves a scope is the backend best suited to it (`backend`): one serving at a folder, read by path - as the
-//! project says (`[filesystem] scopes` of its `project.local.toml`), else the machine, else the best there is here.
+//! project says (`[filesystem] scopes` of its `.local/settings.toml`), else the machine, else the best there is here.
 //! What a backend leaves at the folder is the backend's to clear, when the scope is let go of and, where its process
 //! ended without, by the next to sweep the project's scopes.
 //!
@@ -91,7 +91,7 @@ impl Scopes {
         const SCOPE: &pe2_path::Name = pe2_path::Name::constant("scope");
         let process = std::process::id().to_string();
         let process = pe2_path::Name::new(&process).expect("a number is a name");
-        root.join(&project::cache::DIR).join(&SCOPE).join(&process)
+        project::local::part(root, project::local::PROCESSES).join(&SCOPE).join(&process)
     }
 }
 
@@ -110,9 +110,9 @@ impl Drop for Scopes {
     }
 }
 
-/// The project whose store holds a layer's file: the folder holding the `.layers` it lies in.
+/// The project whose store holds a layer's file: of those this process opened, the one whose layers it lies in.
 fn project_of(disk: &HostPath) -> Option<HostPath> {
-    disk.ancestors().find(|a| a.file_name().is_some_and(|n| n == project::LAYERS)).and_then(|layers| layers.parent())
+    project::holding(disk)
 }
 
 /// Serve a layer's file in its project's scope, mounting it first where it is not: its path there.
@@ -423,7 +423,10 @@ mod tests {
     fn a_chunked_file_is_given_to_programs_in_its_scope() {
         let root = sfs::testing::scratch("scope");
         let _ = std::fs::remove_dir_all(&root);
-        let file = root.at(".layers/top/a.node/movie.str");
+        // A file of a project's layers, its content in that project's store.
+        project::create(&root, &pe2_io::SystemFilesystem).expect("made");
+        project::Project::load(&root).expect("opened");
+        let file = root.at("layers/top/a.node/movie.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         project::content::write(&pe2_io::system(), &file, &bytes).expect("written");
         let scopes = scopes();
@@ -435,10 +438,10 @@ mod tests {
             // As a program reads it: a file, by path, its name kept.
             assert_eq!(given.file_name().unwrap(), "movie.str");
             assert_eq!(std::fs::read(&given).expect("read through the scope"), bytes);
-            assert!(!root.at(".cache/materialized").exists(), "nothing copied");
+            assert!(!root.at(".local/outputs/materialized").exists(), "nothing copied");
         } else {
-            // No FUSE here: a copy in the cache.
-            assert!(given.starts_with(&root.at(".cache/materialized")));
+            // No FUSE here: a copy in the outputs.
+            assert!(given.starts_with(&root.at(".local/outputs/materialized")));
         }
         drop(scopes);
         assert!(!Scopes::at(&root).exists(), "unmounted and gone");
@@ -499,7 +502,7 @@ mod tests {
         use project::content::Given;
         let root = sfs::testing::scratch("scope-folder");
         let _ = std::fs::remove_dir_all(&root);
-        let chunked = root.at(".layers/top/a.node/big.bin");
+        let chunked = root.at("layers/top/a.node/big.bin");
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         project::content::write(&pe2_io::system(), &chunked, &big).expect("written");
         let plain = root.at("plain.h");

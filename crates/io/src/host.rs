@@ -94,7 +94,7 @@ impl HostPath {
         format!("{folder}{separator}{within}")
     }
 
-    /// The place beside it named as it is with `suffix` after: `.layers/top` and `.toml`, `.layers/top.toml`.
+    /// The place beside it named as it is with `suffix` after: `layers/top` and `.toml`, `layers/top.toml`.
     #[must_use]
     pub fn with_suffix(&self, suffix: &Name) -> HostPath {
         let mut text = self.0.as_os_str().to_owned();

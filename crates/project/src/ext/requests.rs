@@ -253,8 +253,8 @@ impl Asking for Requests {
 mod tests {
     use super::*;
     use crate::Project;
-    use crate::cache::Cache;
     use crate::ext::Loadable;
+    use crate::local::Local;
     use crate::lock::Lock;
     use crate::testing::At as _;
     use pe2_ext::ty::Registered as _;
@@ -303,13 +303,13 @@ mod tests {
         };
         write("project.toml", "[[layer]]\nname = \"base\"\n");
         write(
-            ".layers/base/n.node/node.toml",
+            "layers/base/n.node/node.toml",
             "[[stack]]\nop = \"test.requested@slow\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"transient\"\n",
         );
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
-        let cache = Cache::open(&project, &lock).unwrap();
-        let index = crate::index::Index::open(&project, &cache).unwrap();
+        let local = Local::open(&project, &lock).unwrap();
+        let index = crate::index::Index::open(&project, &local).unwrap();
         let extension = Extension {
             id: "test.requested",
             version: "0.1.0",
@@ -322,7 +322,7 @@ mod tests {
             register,
         };
         let extensions = Arc::new(Extensions::load(vec![Loadable::from(extension)], true));
-        extensions.keep_in(crate::graph::store::Store::open(&cache).unwrap());
+        extensions.keep_in(crate::graph::store::Store::open(&local).unwrap());
         let requests = Requests::start(Arc::new(index), pe2_io::system());
         requests.set_extensions(&extensions);
         (root, lock, requests, extensions)

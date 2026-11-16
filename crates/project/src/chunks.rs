@@ -1,5 +1,5 @@
 //! Large files' content as chunks: a file a layer holds above `THRESHOLD` is stored as a manifest (`<name>.chunks`)
-//! naming its chunks in the project's store (`.layers/.store/<aa>/<hash>`), where each chunk is kept once, by its
+//! naming its chunks in the project's store (`store/<aa>/<hash>`), where each chunk is kept once, by its
 //! BLAKE3 hash. Chunks are cut where the content says (`FastCDC`, about 64 KiB each), so an edit to a large file stores
 //! only the chunks around it, and what layers, releases and the history hold alike is held once.
 //!
@@ -107,8 +107,6 @@ pub fn sync_written(fs: &dyn Filesystem, root: &HostPath) {
 }
 /// The name a manifest adds to its file's.
 pub const SUFFIX: &Name = Name::constant(".chunks");
-/// The store, among a project's layers.
-pub const STORE: &Name = Name::constant(".store");
 /// Where the store keeps whole files by their SHA-1 - a manifest of chunks each, whatever their size: the versions an
 /// override was made from (`changeset::Base`), what a layer holds of its own.
 const FILES: &Name = Name::constant("files");
@@ -301,7 +299,7 @@ impl Store {
     /// The store of the project in `root`, whose I/O is `io`.
     #[must_use]
     pub fn at(root: &HostPath, io: Arc<dyn pe2_io::Io>) -> Store {
-        Store { dir: root.join(&crate::LAYERS).join(&STORE), io }
+        Store { dir: root.join(&crate::STORE), io }
     }
 
     fn fs(&self) -> &dyn Filesystem {
@@ -490,11 +488,11 @@ impl Store {
         self.kept_in(FILES)
     }
 
-    /// The store of the project whose layers hold a path: none for a path in no project's `.layers`.
+    /// The store of the project whose layers hold a path: none for a path in the layers of no project this process
+    /// opened (`crate::holding`).
     #[must_use]
     pub fn of(path: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Option<Store> {
-        let layers = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == crate::LAYERS))?;
-        Some(Store { dir: layers.join(&STORE), io: io.clone() })
+        crate::holding(path).map(|root| Store::at(&root, io.clone()))
     }
 
     fn path(&self, hash: &str) -> io::Result<HostPath> {
@@ -584,12 +582,12 @@ pub struct Pass {
     pub after: u64,
 }
 
-/// Every file of a folder, recursively, its hidden ones too (`.chunks` manifests are not hidden; the store is not walked).
+/// Every file of a folder, recursively, its hidden ones too.
 fn files_under(fs: &dyn Filesystem, dir: &HostPath, out: &mut Vec<HostPath>) {
     for entry in fs.read_directory(dir).unwrap_or_default() {
         let path = dir.entry(&entry.name);
         match entry.kind {
-            pe2_io::Kind::Folder if entry.name != *STORE => files_under(fs, &path, out),
+            pe2_io::Kind::Folder => files_under(fs, &path, out),
             pe2_io::Kind::File => out.push(path),
             _ => {}
         }
@@ -597,7 +595,7 @@ fn files_under(fs: &dyn Filesystem, dir: &HostPath, out: &mut Vec<HostPath>) {
 }
 
 /// Store a project's large files as chunks: each file the index lists - an asset's, or a plain file - in its layers in
-/// `.layers/` (not its mounts), as long as `THRESHOLD` or longer and kept as itself until now, is put in the store and
+/// `layers/` (not its mounts), as long as `THRESHOLD` or longer and kept as itself until now, is put in the store and
 /// replaced by its manifest. What a layer holds that is not its content (a generated layer's record of its plan) stays
 /// as it is. The content is the same, so nothing that recorded it changes. Returns how many files moved, and the bytes
 /// they held and hold now.
@@ -624,7 +622,7 @@ pub fn migrate(project: &crate::Project, index: &crate::index::Index) -> io::Res
         let Some(store) = Store::of(&path, &project.io) else { continue };
         let bytes = fs.read(&path)?;
         let manifest = store.put(&bytes)?.render();
-        crate::cache::write_atomic(fs, &manifest_path(&path), manifest.as_bytes()).map_err(io::Error::other)?;
+        crate::local::write_atomic(fs, &manifest_path(&path), manifest.as_bytes()).map_err(io::Error::other)?;
         fs.remove_file(&path)?;
         pass.files += 1;
         pass.before += len;
@@ -643,9 +641,9 @@ fn named_by(text: &[u8]) -> Vec<String> {
     manifest.map_or_else(Vec::new, |m| m.chunks.into_iter().map(|(h, _)| h).collect())
 }
 
-/// Remove the chunks nothing names: no manifest of any layer, nor any content the history keeps (a manifest a step
-/// can put back). Returns how many went, and the bytes they held. Only where nothing writes the project meanwhile (under
-/// its lock): a write stores its chunks before the manifest naming them.
+/// Remove the chunks nothing names: no manifest of any layer, nor any content the history or the conflicts keep (a
+/// manifest a step can put back). Returns how many went, and the bytes they held. Only where nothing writes the
+/// project meanwhile (under its lock): a write stores its chunks before the manifest naming them.
 ///
 /// # Errors
 /// The store cannot be read.
@@ -657,7 +655,7 @@ pub fn sweep(project: &crate::Project) -> io::Result<(usize, u64)> {
 /// names: longer than any write takes from storing it to naming it.
 pub const SWEEP_EVERY: Duration = Duration::from_hours(24);
 pub const SETTLED: Duration = Duration::from_hours(1);
-/// When it was swept last, in the cache.
+/// When it was swept last, in the outputs.
 const SWEPT: &Name = Name::constant("chunks.swept");
 
 /// Sweep the store where it was not swept for `SWEEP_EVERY`, of chunks nothing names and stored longer ago than
@@ -665,7 +663,7 @@ const SWEPT: &Name = Name::constant("chunks.swept");
 #[must_use = "what was swept is the sweep's report"]
 pub fn sweep_if_due(project: &crate::Project) -> Option<io::Result<(usize, u64)>> {
     let fs = project.io.filesystem();
-    let marker = project.root.join(&crate::cache::DIR).join(&SWEPT);
+    let marker = crate::local::part(&project.root, crate::local::OUTPUTS).join(&SWEPT);
     let now = project.io.clock().wall();
     let age = fs.stat(&marker).ok().and_then(|m| m.modified).and_then(|t| now.duration_since(t).ok());
     if age.is_some_and(|age| age < SWEEP_EVERY) {
@@ -689,7 +687,9 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     for layer in project.layers.iter().filter(|l| !l.mounted) {
         files_under(fs, &layer.path, &mut found);
     }
-    files_under(fs, &project.root.join(&crate::cache::DIR).join(&crate::history::DIR), &mut found);
+    for part in [crate::local::HISTORY, crate::local::CONFLICTS] {
+        files_under(fs, &crate::local::part(&project.root, part), &mut found);
+    }
     // The changesets name the files kept whole that overrides were made from; the history, those its steps can put back.
     found.extend(project.layers.iter().map(|l| l.changeset.clone()));
     let mut kept = BTreeSet::new();
@@ -875,7 +875,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
         let project = crate::Project::load(&root).unwrap();
-        let store = Store { dir: root.join(&crate::LAYERS).join(&super::STORE), io: crate::testing::io() };
+        let store = Store::at(&root, crate::testing::io());
         let (old, fresh, again) = (content(200_000, 1), content(200_000, 2), content(200_000, 3));
         let age = |m: &Manifest, by: Duration| {
             for (hash, _) in &m.chunks {

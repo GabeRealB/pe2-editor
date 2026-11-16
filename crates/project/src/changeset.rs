@@ -1,4 +1,4 @@
-//! A layer's changeset: `<layer>.toml` beside the layer's directory in `.layers/`, the layer's net effect on the layers
+//! A layer's changeset: `<layer>.toml` beside the layer's directory in `layers/`, the layer's net effect on the layers
 //! below it. `[entries]` lists what the layer creates - every asset, folder and plain file it owns, by uid; `[ops]`
 //! what it does to entries from below, one record per uid: an override (the files it changes - a plain file itself,
 //! by an empty name - each with the SHA-1 of the version below it was made from, kept in the store, or removed), a
@@ -25,7 +25,7 @@ use sfs::HostPath;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::cache::write_atomic;
+use crate::local::write_atomic;
 
 /// What an override does to one file of the entry below.
 #[derive(Clone, Debug, PartialEq, Eq)]

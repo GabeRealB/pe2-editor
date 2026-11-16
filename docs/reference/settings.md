@@ -26,7 +26,8 @@ The bottom of each page says where your settings are saved.
 | **Layers and mounts** | The project's layers, bottom to top, and folders brought into it from elsewhere. |
 | **Configurations** | The ways the project can be built, and their properties, to set. See [Configurations](../making/configurations.md). |
 
-The project's settings belong to the project and are shared with everyone who uses it. Where your discs are, and
-which configuration you work in, are kept for you on this computer only.
+The project's settings belong to the project and are shared with everyone who uses it. Where your discs are, which
+configuration you work in, and how you view its layers are kept for you on this computer only, in the project's
+`.local/settings.toml`.
 
 Extensions have settings of their own, in the **Extensions** pane. See [Extensions](../extending/extensions.md).

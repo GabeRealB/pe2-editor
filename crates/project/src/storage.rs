@@ -16,7 +16,7 @@
 //! takes them out of what waits. Whoever reads such a file meanwhile - whoever holds the project taking in its own
 //! change, the server reading a record's text - asks what waits first (`waiting`), in whichever process. A file
 //! that is not as the set found it when its turn comes - changed by someone else in between - is not written over:
-//! said, ours kept aside (`.cache/conflicts`), and the file left for the project to take in as it is. A set that
+//! said, ours kept aside (`.local/conflicts`), and the file left for the project to take in as it is. A set that
 //! changes anything else waits for all that is behind to be written, and is written as it is said.
 
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ const HELD_LONG: Duration = Duration::from_secs(600);
 /// The log's folder, in the project's.
 fn log_dir(root: &HostPath) -> HostPath {
     const LOG: &Name = Name::constant("sfs");
-    root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&LOG)
+    crate::local::part(root, crate::local::STAGING).join(&LOG)
 }
 
 /// The tree of the shared space that holds what waits to be written: a file's path in the project, to the set
@@ -404,9 +404,8 @@ impl Shared {
             return;
         }
         if now != file.before {
-            const CONFLICTS: &Name = Name::constant("conflicts");
             // Kept aside by its path within the project, which every file written behind has (`defers`).
-            let conflicts = self.root.join(&crate::cache::DIR).join(&CONFLICTS);
+            let conflicts = crate::local::part(&self.root, crate::local::CONFLICTS);
             let kept = file.after.as_ref().map(|bytes| -> std::io::Result<HostPath> {
                 let aside = conflicts.join(&file.path.within(&self.root).map_err(std::io::Error::other)?);
                 if let Some(folder) = aside.parent() {
@@ -433,7 +432,7 @@ impl Shared {
             return;
         }
         let done = match &file.after {
-            Some(bytes) => crate::cache::write_atomic(self.io.filesystem(), &file.path, bytes)
+            Some(bytes) => crate::local::write_atomic(self.io.filesystem(), &file.path, bytes)
                 .map_err(|e| format!("{e:#}"))
                 .map(|()| {
                     if let Ok(written) =
@@ -820,7 +819,7 @@ pub fn redo(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) -> Result<Opti
 /// was written again from the log: what the shared space still keeps as waiting, where a process has it attached
 /// still, is taken out.
 fn forget_waiting(root: &HostPath, filesystem: &dyn pe2_io::Filesystem) {
-    let dir = root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&crate::shared::SPACE);
+    let dir = crate::local::part(root, crate::local::STAGING).join(&crate::shared::SPACE);
     if !filesystem.is_folder(&dir) {
         return;
     }
@@ -863,7 +862,7 @@ fn again(
             if let Some(folder) = path.parent() {
                 fs.create_folder_all(&folder).with_context(|| folder.to_string())?;
             }
-            crate::cache::write_atomic(fs, &path, bytes)?;
+            crate::local::write_atomic(fs, &path, bytes)?;
             written.insert(path);
         }
         Stored::Delete { path } => {

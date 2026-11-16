@@ -258,7 +258,7 @@ impl Pack {
             text.push_str(&put_line(rel, entry));
             text.push('\n');
         }
-        crate::cache::write_atomic(self.fs(), &self.root.join(&FILE), text.as_bytes()).map_err(io::Error::other)?;
+        crate::local::write_atomic(self.fs(), &self.root.join(&FILE), text.as_bytes()).map_err(io::Error::other)?;
         *journal = Journal { file: None, lines: entries.len() };
         Ok(())
     }
@@ -400,7 +400,7 @@ fn set_storage(project: &crate::Project, layer: &Name, storage: Option<&str>) ->
             table.remove("storage");
         }
     }
-    crate::cache::write_atomic(fs, &at, doc.to_string().as_bytes()).map_err(io::Error::other)
+    crate::local::write_atomic(fs, &at, doc.to_string().as_bytes()).map_err(io::Error::other)
 }
 
 /// The layer of a project to pack or unpack: a generated one, as only those are packed so far.
@@ -477,8 +477,8 @@ pub fn unpack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> 
         let at = layer.path.join(&RelPath::new(rel).map_err(io::Error::other)?);
         fs.create_folder_all(&at.parent().unwrap_or_else(|| layer.path.clone()))?;
         match crate::content::chunked(&project.io, &at, &bytes)? {
-            Some(manifest) => crate::cache::write_atomic(fs, &crate::chunks::manifest_path(&at), manifest.as_bytes()),
-            None => crate::cache::write_atomic(fs, &at, &bytes),
+            Some(manifest) => crate::local::write_atomic(fs, &crate::chunks::manifest_path(&at), manifest.as_bytes()),
+            None => crate::local::write_atomic(fs, &at, &bytes),
         }
         .map_err(io::Error::other)?;
     }
@@ -510,9 +510,8 @@ mod tests {
 
     #[test]
     fn a_packed_layer_holds_its_files_and_reads_back_after_a_restart_of_its_journal() {
-        let root = crate::testing::scratch("pack");
-        let _ = std::fs::remove_dir_all(&root);
-        let layer = root.at(".layers/gen");
+        let root = crate::testing::opened("pack");
+        let layer = root.at("layers/gen");
         let pack = Pack::open(&layer, &crate::testing::io()).unwrap();
         pack.put("a.node/native.bin", b"native").unwrap();
         pack.put("a.node/node.toml", b"x = 1\n").unwrap();

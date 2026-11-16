@@ -110,7 +110,7 @@ fn code_is_overridden_in_a_layer_made_for_it() {
     editor.type_into("new files layer", "mine");
     editor.click("Create and override");
     assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    let copy = root.at(".layers/mine/src/thing.c");
+    let copy = root.at("layers/mine/src/thing.c");
     assert_eq!(std::fs::read_to_string(&copy).expect("the copy"), "int thing;\n");
     assert!(editor.workspace().layers.iter().any(|layer| *layer.name == "mine"), "the project has it");
 }
@@ -128,7 +128,7 @@ fn code_overridden_while_the_project_is_read_waits_its_turn() {
     assert!(!editor.project_file().contains("name = \"mine\""), "nothing is written while the project is read");
     editor.release_reading().expect("let go");
     assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    assert!(root.at(".layers/mine/src/thing.c").is_file());
+    assert!(root.at("layers/mine/src/thing.c").is_file());
 }
 
 #[test]

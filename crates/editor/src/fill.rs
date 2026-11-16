@@ -1,6 +1,6 @@
 //! Filling a project's generated layers, the step of its onboarding after what it asks to trust: where a layer is empty,
 //! or not as its plan says, whoever opened the project is shown what its plan makes the layer's files from - each disc,
-//! found or not, and where they are looked for, which they may change (`project.local.toml`) - and asked to run it, its
+//! found or not, and where they are looked for, which they may change (`.local/settings.toml`) - and asked to run it, its
 //! progress shown, stopped where they like (what was written stays, and the next run goes on from there). Not now, it is
 //! not asked again while the layer stays as it was put off - kept in the project's cache (`fill-put-off.toml`) - but is
 //! once its state changes; the command asks it whatever the layers' states.
@@ -33,7 +33,7 @@ struct Running {
 pub struct Fill {
     /// Not now: asked again when the project is opened again.
     put_off: bool,
-    /// The layers put off, each with its state then: not asked again while it stays so. Read from the cache once.
+    /// The layers put off, each with its state then: not asked again while it stays so. Read from this machine's settings of the project once.
     put_off_as: Option<std::collections::BTreeMap<Arc<Name>, String>>,
     /// Asked for (the command), whatever the layers' states.
     asked: bool,
@@ -66,7 +66,8 @@ impl Fill {
     }
 }
 
-const PUT_OFF: &pe2_path::RelPath = pe2_path::RelPath::constant("fill-put-off.toml");
+/// Where this machine's settings of the project keep the fills put off.
+const PUT_OFF: &[&str] = &["editor", "fill", "put_off"];
 
 /// How a layer's state is remembered as put off.
 fn remembered(state: &State) -> String {
@@ -147,13 +148,7 @@ fn finish(ws: &mut Workspace) -> Option<String> {
 /// The step, where there is one to show; what a run did, once it is done.
 pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
     if ws.fill.put_off_as.is_none() {
-        let read = ws
-            .project
-            .io
-            .filesystem()
-            .read_to_string(&ws.cache_path(PUT_OFF))
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok());
+        let read = project::local::setting(ws.project.io.filesystem(), &ws.project.root, PUT_OFF);
         ws.fill.put_off_as = Some(read.unwrap_or_default());
     }
     let said = finish(ws);
@@ -232,9 +227,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
             let state = remembered(state);
             let put = ws.fill.put_off_as.get_or_insert_default();
             put.insert(layer.clone(), state);
-            if let Ok(text) = toml::to_string(put) {
-                let _ = ws.project.io.filesystem().write(&ws.cache_path(PUT_OFF), text.as_bytes());
-            }
+            let _ = project::local::set_setting(ws.project.io.filesystem(), &ws.project.root, PUT_OFF, put);
         }
     }
     said
@@ -341,7 +334,7 @@ fn look_in_ui(
         let changed = editing.1.trim() != now;
         let clicked = ui
             .add_enabled(changed, egui::Button::new("Look here"))
-            .on_hover_text("Kept for this computer alone (project.local.toml)")
+            .on_hover_text("Kept for this computer alone (.local/settings.toml)")
             .clicked();
         if changed && (typed || clicked) {
             asked = Some((at, editing.1.trim().to_string()));
