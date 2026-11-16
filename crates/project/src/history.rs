@@ -975,9 +975,17 @@ impl History {
         };
         for (made, change) in changes.iter().enumerate() {
             if let Err(e) = self.apply(change) {
-                // A file could not be written: what was is put back, and the log told not to make it again.
+                // A file could not be written: what was is put back, and the log told not to make it again. What
+                // cannot all be put back - the disk failing still - is left in the log, for the next opening of the
+                // project to make whole: never half a set, given up.
+                let mut put_back = true;
                 for done in changes[..made].iter().rev() {
-                    let _ = self.apply(&done.inverse());
+                    put_back &= self.apply(&done.inverse()).is_ok();
+                }
+                if !put_back {
+                    return Err(e.context(
+                        "and what it had written could not all be put back: it is made whole as the project is next opened",
+                    ));
                 }
                 if let (Some(storage), Some(began)) = (&self.storage, began) {
                     storage.gave_up(began);
@@ -1589,6 +1597,109 @@ mod tests {
 
     fn read(path: &HostPath) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    /// What a project's folder holds as the index sees it, each file by its bytes, each folder as none: what is
+    /// hidden (a name starting with `.`, its cache, what an atomic write left half written) is none of it.
+    fn snapshot(root: &HostPath) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+        fn walk(dir: &std::path::Path, within: &str, into: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let name = format!("{within}{}", entry.file_name().to_string_lossy());
+                if entry.file_type().unwrap().is_dir() {
+                    into.insert(format!("{name}/"), None);
+                    walk(&entry.path(), &format!("{name}/"), into);
+                } else {
+                    into.insert(name, Some(std::fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+        let mut held = std::collections::BTreeMap::new();
+        walk(root.as_path(), "", &mut held);
+        held
+    }
+
+    /// A history of the project, written through `io`.
+    fn history_through(root: &HostPath, io: std::sync::Arc<dyn pe2_io::Io>) -> History {
+        let project = Project::load_with(root, io).unwrap();
+        let lock = Lock::try_acquire(root, "a test", &pe2_io::System).unwrap();
+        History::open(&Cache::open(&project, &lock).unwrap()).unwrap().0
+    }
+
+    /// One edit of every kind a transaction makes: a file written over, one written new in a folder made for it, a
+    /// folder moved and one removed.
+    fn every_kind(history: &mut History, root: &HostPath) -> anyhow::Result<Vec<HostPath>> {
+        let mut tx = history.begin("every kind");
+        tx.write(&root.at("layer/a/one"), b"ONE")?;
+        tx.write(&root.at("layer/b/c/two"), b"two")?;
+        tx.rename(&root.at("layer/a"), &root.at("layer/moved"))?;
+        tx.remove(&root.at("layer/old"))?;
+        tx.commit()
+    }
+
+    #[test]
+    fn a_transaction_failing_at_any_change_is_put_back_and_one_cut_short_is_whole_or_none_once_opened_again() {
+        let fixture = |name: &str| {
+            let root = project(name);
+            std::fs::create_dir_all(root.at("layer/old")).unwrap();
+            std::fs::write(root.at("layer/old/gone"), "gone").unwrap();
+            root
+        };
+        let faulty = |root: &HostPath| {
+            let fs = pe2_io::Faulty::new(std::sync::Arc::new(pe2_io::SystemFilesystem));
+            let io = pe2_io::Composed { filesystem: std::sync::Arc::new(fs.clone()), ..pe2_io::Composed::system() };
+            (history_through(root, std::sync::Arc::new(io)), fs)
+        };
+        // How many changes it makes as it commits, and what it leaves - unfailed.
+        let root = fixture("faults-counted");
+        let before = snapshot(&root);
+        let (mut history, fs) = faulty(&root);
+        let counted = fs.changes();
+        every_kind(&mut history, &root).unwrap();
+        let (changes, after) = (fs.changes() - counted, snapshot(&root));
+        assert!(changes > 4 && before != after, "{changes} changes");
+        drop(history);
+        crate::cache::remove_all(&root);
+        for how in [pe2_io::Fault::Once, pe2_io::Fault::From] {
+            for nth in 1..=changes + 1 {
+                let root = fixture(&format!("faults-{how:?}-{nth}"));
+                let (mut history, fs) = faulty(&root);
+                // Staged before it commits, then failing as it commits.
+                let mut tx = history.begin("every kind");
+                tx.write(&root.at("layer/a/one"), b"ONE").unwrap();
+                tx.write(&root.at("layer/b/c/two"), b"two").unwrap();
+                tx.rename(&root.at("layer/a"), &root.at("layer/moved")).unwrap();
+                tx.remove(&root.at("layer/old")).unwrap();
+                fs.fail(nth, how);
+                let committed = tx.commit();
+                let left = snapshot(&root);
+                if how == pe2_io::Fault::Once {
+                    // An error midway: what was written is put back - or, past its last change, all is written.
+                    let expected = if committed.is_ok() { &after } else { &before };
+                    assert!(left == *expected, "{how:?} at change {nth}: {committed:?}, left {left:?}");
+                }
+                // Opened again, with nothing failing: what was said whole is made whole, what was not is none.
+                drop(history);
+                fs.heal();
+                let project = Project::load(&root).unwrap();
+                let lock = Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
+                let cache = Cache::open(&project, &lock)
+                    .unwrap_or_else(|e| panic!("{how:?} at change {nth}: opened again: {e:#}; left {left:?}"));
+                let (history, _) = super::History::open(&cache).unwrap();
+                drop(history);
+                let opened = snapshot(&root);
+                assert!(
+                    opened == before || opened == after,
+                    "{how:?} at change {nth}: half of it, once opened again: {opened:?}"
+                );
+                if how == pe2_io::Fault::Once {
+                    assert_eq!(opened, left, "{how:?} at change {nth}: a set given up is not made again");
+                }
+                crate::cache::remove_all(&root);
+            }
+        }
     }
 
     #[test]

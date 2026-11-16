@@ -93,7 +93,8 @@ pub fn make(fs: &dyn pe2_io::Filesystem, root: &HostPath) -> Result<HostPath> {
     Ok(dir)
 }
 
-/// Write a file whole: to a temporary name beside it, then renamed over it, so no reader ever sees half a file.
+/// Write a file whole: to a temporary name beside it, then renamed over it, so no reader ever sees half a file. One
+/// that fails leaves nothing beside it: what it wrote under the temporary name is removed.
 ///
 /// # Errors
 /// The temporary file cannot be written or renamed.
@@ -105,8 +106,12 @@ pub fn write_atomic(fs: &dyn pe2_io::Filesystem, path: &HostPath, bytes: &[u8]) 
     let aside = format!(".{name}.{}.{write}.tmp", std::process::id());
     let aside = pe2_path::Name::new(&aside)?;
     let temporary = path.parent().map(|folder| folder.join(aside)).with_context(|| path.display().to_string())?;
-    fs.write(&temporary, bytes).with_context(|| format!("{}", temporary.display()))?;
-    fs.rename(&temporary, path).with_context(|| format!("{}", path.display()))
+    let written = fs.write(&temporary, bytes).with_context(|| format!("{}", temporary.display()));
+    let renamed = written.and_then(|()| fs.rename(&temporary, path).with_context(|| format!("{}", path.display())));
+    if renamed.is_err() {
+        let _ = fs.remove_file(&temporary);
+    }
+    renamed
 }
 
 /// Remove a test's project, whatever a history still alive in it is writing behind this moment: tried again

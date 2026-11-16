@@ -11,7 +11,9 @@
   in `project::edit` gather their changes into it, reading the project as their own pending changes leave it. Nothing
   touches the disk until the transaction commits; then the whole set is logged, flushed once, and applied (see [The
   shared filesystem](../filesystem/shared.md)). A set that fails midway is rolled back; one interrupted by a crash
-  is completed from the log when the project is next opened.
+  is completed from the log when the project is next opened, and so is one whose roll-back fails too (the disk still
+  failing): a set is given up only once it was put back whole. Completing it makes each change again as it leaves the
+  files, whatever of it they have already - a move clearing what its own set, or one after it, put in its way.
 
 Undo and redo restore files through the same path, so no edit operation needs undo code of its own.
 

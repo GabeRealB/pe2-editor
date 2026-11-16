@@ -1,7 +1,7 @@
 //! The host's I/O, given rather than reached for. What code reads of the outside world - the time, randomness, the
 //! environment, files - and does in it - watching files, starting programs, talking to other processes and over the
 //! network - it does through an [`Io`] it is given, never with the system directly, so that any part of it can be
-//! another: the system's ([`system`]), one a test drives ([`Standing`], [`Skipping`], [`Seeded`], [`Fixed`], [`Telling`],
+//! another: the system's ([`system`]), one a test drives ([`Standing`], [`Skipping`], [`Seeded`], [`Fixed`], [`Faulty`], [`Telling`],
 //! [`Scripted`], [`InMemory`], [`Served`], [`Closed`]), or any other, mixed ([`Composed`]).
 //!
 //! Each part is a trait shaped like the WASI interface for it - [`Clock`] like `wasi:clocks`, [`Random`] like
@@ -16,6 +16,7 @@
 mod channels;
 mod clock;
 mod environment;
+mod faulty;
 mod filesystem;
 mod host;
 mod http;
@@ -28,6 +29,7 @@ pub use channels::{Channel, ChannelListener, ChannelName, Channels, InMemory, Sy
 
 pub use clock::{Clock, Receiver, Sender, Signal, Skipping, Standing, SystemClock, Waiter, channel, sleep};
 pub use environment::{Environment, Fixed, SystemEnvironment};
+pub use faulty::{Fault, Faulty};
 pub use filesystem::{
     Appending, Descriptor, DirEntry, Filesystem, Kind, LockKind, Mapped, Mapping, Open, Stat, SystemDescriptor,
     SystemFilesystem, copy_all, create_directory_all_at, is_empty_folder, read_file_at, read_whole, remove_all_at,

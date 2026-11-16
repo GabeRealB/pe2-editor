@@ -119,7 +119,10 @@ on Linux and on Windows. Three kinds of test matter most:
   with it.
 
 The concurrency-heavy parts have harnesses of their own: the shared filesystem's tests kill writers and readers at
-every step of a transaction, and run a second process against the same space.
+every step of a transaction, and run a second process against the same space. A history's transactions are held to
+what a failing disk leaves (`pe2_io::Faulty`): the transaction is run once to count its changes to the disk, then again
+failing at each of them in turn - once, which must be put back, and from there on, as a crash, after which the project
+opened again must have the set whole or not at all.
 
 A test decides correctness, never time. What waits, waits on its `Io`'s clock, which a test moves
 (`pe2_io::Standing`), and `Standing::settle` waits until what waits by it has taken in all it was told: the writes'

@@ -875,9 +875,14 @@ fn again(
         }
         Stored::Move { from, to } => {
             let (from, to) = (at(from)?, at(to)?);
-            // Moved already where nothing is left to move; else what is in its way - what a move replaces - goes.
+            // Moved already where nothing is left to move; else what is in its way - what a move replaces - goes: a file,
+            // or a folder. Nothing was there as the set was said (a move is made only where nothing is); what is there
+            // now this set put there as it was written the first time, or a set after it - which is written again after
+            // it, from the log.
             if fs.exists(&from) {
-                if fs.is_file(&to) {
+                if fs.is_folder(&to) {
+                    fs.remove_all(&to).with_context(|| to.display().to_string())?;
+                } else if fs.exists(&to) {
                     fs.remove_file(&to).with_context(|| to.display().to_string())?;
                 }
                 if let Some(folder) = to.parent() {
