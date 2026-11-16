@@ -84,7 +84,7 @@ fn shown_free(index: &Index, changeset: &Changeset, path: &TreePath, going: &[&T
 
 /// Whether a layer holds a file or a folder at a path: on disk, or as its store or records keep it.
 fn holds(io: &Arc<dyn pe2_io::Io>, path: &HostPath) -> bool {
-    io.filesystem().exists(path) || crate::content::exists(io, path) || crate::pack::is_dir(io, path)
+    io.filesystem().exists(path) || crate::content::exists(io, path) || crate::content::is_dir(io, path)
 }
 
 /// What an edit does to a layer's files and its list, through its step: on a layer stored as a tree, at once; on a
@@ -1520,7 +1520,7 @@ mod tests {
         crate::records::mark(&pe2_io::SystemFilesystem, &root.at("layers/top"), &crate::records::Settings::default())
             .unwrap();
         let mut o = open(&root);
-        // Text is kept in its record whatever its length: here longer than what a layer keeps as chunks.
+        // Text is kept in its record whatever its length: here longer than a mebibyte.
         let long = "a line of a long text\n".repeat(60_000);
         assert!(long.len() > crate::chunks::THRESHOLD);
         let paths = super::create_file(

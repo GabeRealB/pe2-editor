@@ -1,7 +1,8 @@
-//! Large files' content as chunks: a file a layer holds above `THRESHOLD` is stored as a manifest (`<name>.chunks`)
-//! naming its chunks in the project's store (`store/<aa>/<hash>`), where each chunk is kept once, by its
-//! BLAKE3 hash. Chunks are cut where the content says (`FastCDC`, about 64 KiB each), so an edit to a large file stores
-//! only the chunks around it, and what layers, releases and the history hold alike is held once.
+//! The project's store: content kept by hash - a file as a manifest naming its chunks (`store/<aa>/<hash>`), where each
+//! chunk is kept once, by its BLAKE3 hash. Chunks are cut where the content says (`FastCDC`, about 64 KiB each), so an
+//! edit to a large file stores only the chunks around it, and what layers, releases and the history hold alike is held
+//! once. The project's store is shipped with it (`store/`); what only this machine's records name is in its local one
+//! (`.local/store/`, `Store::local`).
 //!
 //! A manifest is text:
 //!
@@ -13,7 +14,7 @@
 //! ...
 //! ```
 //!
-//! It is the only copy of what it names: the store is not cache. What no manifest of any layer, nor the history, names
+//! It is the only copy of what it names: the store is not cache. What no record of any layer, nor the history, names
 //! any more is swept (`unreferenced`).
 //!
 //! The store keeps files three ways, by what they are:
@@ -53,7 +54,8 @@ use pe2_path::{Name, RelPath};
 use sfs::HostPath;
 use std::time::Duration;
 
-/// Files this long or longer are stored as chunks.
+/// What names a file kept in the store - a record, a changeset, a step's content - is shorter than this: a sweep reads
+/// nothing longer for the hashes it names.
 pub const THRESHOLD: usize = 1 << 20;
 
 /// What this process wrote into stores and has not had on disk yet - as many as are worth telling apart.
@@ -105,8 +107,6 @@ pub fn sync_written(fs: &dyn Filesystem, root: &HostPath) {
         pe2_io::sync_file(fs, &path);
     }
 }
-/// The name a manifest adds to its file's.
-pub const SUFFIX: &Name = Name::constant(".chunks");
 /// Where the store keeps whole files by their SHA-1 - a manifest of chunks each, whatever their size: the versions an
 /// override was made from (`changeset::Base`), what a layer holds of its own.
 const FILES: &Name = Name::constant("files");
@@ -563,30 +563,10 @@ impl Store {
     }
 }
 
-/// A file's manifest: its path with `.chunks` added.
-#[must_use]
-pub fn manifest_path(path: &HostPath) -> HostPath {
-    path.with_suffix(SUFFIX)
-}
-
-/// The file a manifest stands for: its path without `.chunks`; none for a path that is no manifest.
-#[must_use]
-pub fn logical(path: &HostPath) -> Option<HostPath> {
-    path.without_suffix(SUFFIX)
-}
-
 /// The chunks no manifest names: of the store, those absent from `named`.
 #[must_use]
 pub fn unreferenced(store: &Store, named: &BTreeSet<String>) -> BTreeSet<String> {
     store.hashes().difference(named).cloned().collect()
-}
-
-/// What a pass over a project's stored files did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Pass {
-    pub files: usize,
-    pub before: u64,
-    pub after: u64,
 }
 
 /// Every file of a folder, recursively, its hidden ones too.
@@ -599,47 +579,6 @@ fn files_under(fs: &dyn Filesystem, dir: &HostPath, out: &mut Vec<HostPath>) {
             _ => {}
         }
     }
-}
-
-/// Store a project's large files as chunks: each file the index lists - an asset's, or a plain file - in its layers in
-/// `layers/` (not its mounts), as long as `THRESHOLD` or longer and kept as itself until now, is put in the store and
-/// replaced by its manifest. What a layer holds that is not its content (a generated layer's record of its plan) stays
-/// as it is. The content is the same, so nothing that recorded it changes. Returns how many files moved, and the bytes
-/// they held and hold now.
-///
-/// # Errors
-/// A file cannot be read, or its chunks or manifest written.
-pub fn migrate(project: &crate::Project, index: &crate::index::Index) -> io::Result<Pass> {
-    let fs = project.io.filesystem();
-    let mut pass = Pass::default();
-    let layers: Vec<&HostPath> = project.layers.iter().filter(|l| !l.mounted).map(|l| &l.path).collect();
-    let in_layers = |path: &HostPath| layers.iter().any(|layer| path.starts_with(layer));
-    let mut found: BTreeSet<HostPath> = BTreeSet::new();
-    for entry in index.entries.values().filter(|e| e.kind == crate::index::Kind::File) {
-        found.insert(entry.disk.clone());
-    }
-    for asset in index.assets.values() {
-        found.extend(asset.on_disk().files.iter().filter(|f| f.made_by.is_none()).map(|f| f.path.clone()));
-    }
-    for path in found.into_iter().filter(|p| in_layers(p) && fs.is_file(p)) {
-        let len = fs.stat(&path)?.size;
-        if usize::try_from(len).unwrap_or(usize::MAX) < THRESHOLD {
-            continue;
-        }
-        let Some(store) = Store::of(&path, &project.io) else { continue };
-        let bytes = fs.read(&path)?;
-        let manifest = store.put(&bytes)?.render();
-        crate::local::write_atomic(fs, &manifest_path(&path), manifest.as_bytes()).map_err(io::Error::other)?;
-        fs.remove_file(&path)?;
-        pass.files += 1;
-        pass.before += len;
-        pass.after += manifest.len() as u64;
-    }
-    let store = Store::at(&project.root, project.io.clone());
-    let held: u64 =
-        store.hashes().iter().filter_map(|h| store.path(h).ok()).map(|path| fs.stat(&path).map_or(0, |m| m.size)).sum();
-    pass.after += held;
-    Ok(pass)
 }
 
 /// The chunks a manifest's text names; none where the text is no manifest.
@@ -701,18 +640,12 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     found.extend(project.layers.iter().map(|l| l.changeset.clone()));
     let mut kept = BTreeSet::new();
     for path in found {
-        let is_manifest = logical(&path).is_some();
+        // A record, a changeset, a step's content: what names a file kept whole, by its hash - none of them large.
         let small = fs.stat(&path).is_ok_and(|m| m.size < (THRESHOLD as u64));
-        if (is_manifest || small)
-            && let Ok(text) = fs.read(&path)
-        {
+        if small && let Ok(text) = fs.read(&path) {
             named.extend(named_by(&text));
             kept.extend(sha1s_in(&text));
         }
-    }
-    // A packed layer's listing names its chunks too.
-    for layer in project.layers.iter().filter(|l| fs.is_file(&l.path.join(&crate::pack::FILE))) {
-        named.extend(crate::pack::Pack::open(&layer.path, &project.io)?.chunks());
     }
     let store = Store::at(&project.root, project.io.clone());
     let now = project.io.clock().wall();

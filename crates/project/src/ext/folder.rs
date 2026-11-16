@@ -109,8 +109,8 @@ pub fn checked_alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Result<Abou
 /// Whether an extension's folder is only its manifest: no component beside it.
 #[must_use]
 pub fn alone(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> bool {
-    !crate::pack::is_file(io, &folder.join(&super::EXTENSION_COMPONENT))
-        && crate::pack::is_file(io, &folder.join(&MANIFEST))
+    !crate::content::is_file(io, &folder.join(&super::EXTENSION_COMPONENT))
+        && crate::content::is_file(io, &folder.join(&MANIFEST))
 }
 
 /// An extension's manifest (`text`) checked: its component's (`bytes`), in a folder named (`name`) for its id - in its

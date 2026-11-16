@@ -289,7 +289,7 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
             _ => None,
         })
         .filter(|folder| {
-            project::pack::is_file(&ws.project.io, &folder.join(&pe2_path::RelPath::constant("tests/tests.wasm")))
+            project::content::is_file(&ws.project.io, &folder.join(&pe2_path::RelPath::constant("tests/tests.wasm")))
         })
         .map(|folder| folder.display().to_string())
         .collect();

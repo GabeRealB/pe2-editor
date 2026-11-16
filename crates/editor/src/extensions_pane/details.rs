@@ -431,14 +431,14 @@ const LINKED: &str = "licenses/LINKED.txt";
 /// what its component is built with, each opened as it is.
 fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>, io: &std::sync::Arc<dyn pe2_io::Io>) {
     // An archive's are read once it is added and unpacked.
-    let Some(folder) = p.origin.folder().filter(|folder| project::pack::is_dir(io, folder)) else { return };
+    let Some(folder) = p.origin.folder().filter(|folder| project::content::is_dir(io, folder)) else { return };
     let described = &p.described;
     let pages = [("Guides", described.docs.as_deref()), ("Installation", described.install.as_deref())];
     let pages: Vec<(&str, &str)> = pages.into_iter().filter_map(|(label, page)| Some((label, page?))).collect();
     // What its component is built with, each license's text with it: written into its folder as it is laid out to
     // ship (`cargo xtask dist`). A built-in one's is the editor's own (Settings, Licenses).
     let linked =
-        Some(LINKED).filter(|file| project::pack::is_file(io, &folder.join(&pe2_path::RelPath::constant(file))));
+        Some(LINKED).filter(|file| project::content::is_file(io, &folder.join(&pe2_path::RelPath::constant(file))));
     if pages.is_empty() && described.bundled.is_empty() && linked.is_none() {
         return;
     }

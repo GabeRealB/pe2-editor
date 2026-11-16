@@ -1399,18 +1399,10 @@ impl Transaction<'_> {
     /// # Errors
     /// It cannot be written, or the history cannot keep what it was.
     pub fn write(&mut self, path: &HostPath, bytes: &[u8]) -> Result<()> {
-        // A large content in a layer is stored as chunks: what the step keeps is its manifest, the other form gone.
-        let manifest = crate::chunks::manifest_path(path);
-        if let Some(text) = crate::content::chunked(&self.history.io, path, bytes)? {
-            self.write_stored(&manifest, text.as_bytes())?;
-            self.drop_stored(path)
-        } else {
-            self.write_stored(path, bytes)?;
-            self.drop_stored(&manifest)
-        }
+        self.write_stored(path, bytes)
     }
 
-    /// Write a file as it is to be stored - a manifest as a manifest - not as the content it may stand for.
+    /// Write a file as it is, whole: a record as it is written.
     ///
     /// # Errors
     /// Its folder cannot be made, or it cannot be written.
@@ -1460,13 +1452,10 @@ impl Transaction<'_> {
             self.change(Change::Rename { from: path.clone(), to });
             return Ok(());
         }
-        // A file, in whichever form it is stored.
-        let manifest = crate::chunks::manifest_path(path);
-        if !self.is_file(path) && !self.is_file(&manifest) {
+        if !self.is_file(path) {
             bail!("{}: nothing to remove", path.display());
         }
-        self.drop_stored(path)?;
-        self.drop_stored(&manifest)
+        self.drop_stored(path)
     }
 
     /// Put a copy of a file or a folder at `to`, where there is nothing: copied whole into the history's trash, each
@@ -1496,13 +1485,6 @@ impl Transaction<'_> {
     /// # Errors
     /// The source does not exist, the target does, or the move fails.
     pub fn rename(&mut self, from: &HostPath, to: &HostPath) -> Result<()> {
-        // A file held as its manifest moves as it.
-        let (manifest, to_manifest) = (crate::chunks::manifest_path(from), crate::chunks::manifest_path(to));
-        if !self.exists(from) && self.is_file(&manifest) && !self.exists(to) && !self.exists(&to_manifest) {
-            self.make_parents(&to_manifest);
-            self.change(Change::Rename { from: manifest, to: to_manifest });
-            return Ok(());
-        }
         if !self.exists(from) || self.exists(to) {
             bail!("{} cannot move to {}", from.display(), to.display());
         }
@@ -1728,35 +1710,6 @@ mod tests {
         history.redo(&index, None, false).unwrap();
         assert!(!one.exists() && root.at("layer/d/c/two").exists());
         assert!(history.redo(&index, None, false).is_err());
-        crate::local::remove_all(&root);
-    }
-
-    #[test]
-    fn a_large_write_is_kept_as_its_manifest_and_undone_by_it() {
-        let root = project("chunked");
-        let (mut history, _) = history(&root);
-        let index = index(&root);
-        let file = root.at("layers/top/a.node/native.bin");
-        let manifest = crate::chunks::manifest_path(&file);
-        let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        let mut tx = history.begin("write");
-        tx.write(&file, b"small first").unwrap();
-        tx.commit().unwrap();
-        let mut tx = history.begin("write big");
-        tx.write(&file, &big).unwrap();
-        tx.commit().unwrap();
-        assert!(!file.exists() && manifest.is_file(), "a large content is stored as its manifest");
-        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
-        history.undo(&index, None, false).unwrap();
-        assert!(!manifest.exists() && read(&file).as_deref() == Some("small first"));
-        history.redo(&index, None, false).unwrap();
-        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
-        let mut tx = history.begin("remove");
-        tx.remove(&file).unwrap();
-        tx.commit().unwrap();
-        assert!(!crate::content::exists(&crate::testing::io(), &file));
-        history.undo(&index, None, false).unwrap();
-        assert_eq!(crate::content::read(&crate::testing::io(), &file).unwrap(), big);
         crate::local::remove_all(&root);
     }
 

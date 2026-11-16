@@ -38,13 +38,7 @@ struct Server {
     /// When the last lease ended.
     quiet_since: Mutex<Instant>,
     stopping: Arc<AtomicBool>,
-    /// The layers' files it was told changed, each as it was when what is read of it was read again: reported again
-    /// as it still is - by its watch, after whoever holds the project told of it - it is read already.
-    reread: Mutex<std::collections::HashMap<HostPath, Option<Stamp>>>,
 }
-
-/// What tells a file's version from another: its time and length; none where it is gone.
-type Stamp = (std::time::SystemTime, u64);
 
 #[derive(Default)]
 struct State {
@@ -104,17 +98,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         leases: AtomicUsize::new(0),
         quiet_since: Mutex::new(p.io.clock().now()),
         stopping: Arc::new(AtomicBool::new(false)),
-        reread: Mutex::default(),
     });
-    let watched = Arc::downgrade(&server);
-    let _watching = holder::watch::layers(&p, move |change| {
-        let Some(server) = watched.upgrade() else { return false };
-        match change {
-            holder::watch::Change::Paths(batch) => server.reread(&batch),
-            holder::watch::Change::Error(e) => eprintln!("changes in the layers may be missed: {e}"),
-        }
-        true
-    })?;
     let stopping = server.stopping.clone();
     ctrlc::set_handler(move || stopping.store(true, Ordering::Relaxed))?;
     let (talking, ids) = (Arc::downgrade(&server), AtomicU64::new(0));
@@ -217,27 +201,6 @@ impl Server {
     /// Wait this long, by the project's clock.
     fn pause(&self, duration: Duration) {
         pe2_io::sleep(self.project.io.clock(), duration);
-    }
-
-    /// Read again what these files of the layers are to what is read of the project, where they changed since it
-    /// last did: its packs' listings. What its records hold it reads by what is said to be served, not by them.
-    fn reread(&self, changed: &[HostPath]) {
-        let stamp = |path: &HostPath| {
-            let stat = self.project.io.filesystem().stat(path).ok()?;
-            Some((stat.modified?, stat.size))
-        };
-        let changed: Vec<HostPath> = {
-            let mut read = lock(&self.reread);
-            if read.len() > 10_000 {
-                read.clear();
-            }
-            let other = |path: &&HostPath| {
-                let now = stamp(path);
-                read.insert((*path).clone(), now) != Some(now)
-            };
-            changed.iter().filter(other).cloned().collect()
-        };
-        project::pack::reread_changed(&changed);
     }
 
     /// Take in what whoever holds the project said is served, in the shared filesystem - which is the tree it
@@ -700,10 +663,6 @@ fn connection(server: &Arc<Server>, id: u64, stream: Box<dyn pe2_io::Channel>) {
                 FromServer::Kept
             }
             Ok(ToServer::Shown) => server.show((id, &who)),
-            Ok(ToServer::Changed { paths }) => {
-                server.reread(&paths);
-                FromServer::Done
-            }
             Ok(ToServer::Status) => server.status(),
             Ok(ToServer::Stop) => {
                 server.stopping.store(true, Ordering::Relaxed);

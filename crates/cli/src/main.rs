@@ -377,37 +377,11 @@ struct EditAt {
 
 #[derive(Subcommand)]
 enum StoreCommand {
-    /// Store the project's large files as chunks: each file of its layers' assets, and each plain file, of 1 MiB or
-    /// more and held whole until now, put in the store and replaced by its manifest, its content the same
-    Migrate {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    /// Remove the chunks nothing names any more: no layer's manifest or listing, nor the history
+    /// Remove what the project's store keeps that nothing names any more: no layer's record, nor the history
     Gc {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
-    },
-    /// Pack a generated layer: its files kept in one listing (`.pack`), their chunks in the store, `project.toml`
-    /// saying so (`storage = "packed"`)
-    Pack {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The layer
-        #[arg(long, value_parser = name)]
-        layer: Arc<pe2_path::Name>,
-    },
-    /// Unpack a packed layer: its files written back as files
-    Unpack {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The layer
-        #[arg(long, value_parser = name)]
-        layer: Arc<pe2_path::Name>,
     },
 }
 
@@ -1860,36 +1834,14 @@ fn outputs(
 /// `pe2-cli project store`.
 #[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn store(command: &StoreCommand) -> Result<()> {
-    let (StoreCommand::Migrate { project }
-    | StoreCommand::Gc { project }
-    | StoreCommand::Pack { project, .. }
-    | StoreCommand::Unpack { project, .. }) = command;
+    let StoreCommand::Gc { project } = command;
     let p = project::Project::load(project)?;
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", &*p.io, |owner| {
+    let _lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     // Whole MiB with a tenth: what a person reads of a size.
     let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
     match command {
-        StoreCommand::Migrate { .. } => {
-            let local = project::local::Local::open(&p, &lock)?;
-            let index = project::index::Index::open(&p, &local)?;
-            let pass = project::chunks::migrate(&p, &index)?;
-            println!(
-                "{} files stored as chunks: {} MiB whole, {} MiB in the store and their manifests",
-                pass.files,
-                mib(pass.before),
-                mib(pass.after)
-            );
-        }
-        StoreCommand::Pack { layer, .. } => {
-            let count = project::pack::pack_layer(&p, layer)?;
-            println!("{layer}: {count} files packed");
-        }
-        StoreCommand::Unpack { layer, .. } => {
-            let count = project::pack::unpack_layer(&p, layer)?;
-            println!("{layer}: {count} files unpacked");
-        }
         StoreCommand::Gc { .. } => {
             let (gone, freed) = project::chunks::sweep(&p)?;
             println!("{gone} chunks no longer named removed: {} MiB freed", mib(freed));

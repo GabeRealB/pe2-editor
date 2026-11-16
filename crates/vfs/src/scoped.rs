@@ -420,15 +420,28 @@ mod tests {
     }
 
     #[test]
-    fn a_chunked_file_is_given_to_programs_in_its_scope() {
+    fn a_stored_file_is_given_to_programs_in_its_scope() {
+        use project::records::{Content, File, Kind, Op, Record};
         let root = sfs::testing::scratch("scope");
         let _ = std::fs::remove_dir_all(&root);
-        // A file of a project's layers, its content in that project's store.
+        // A file of a node of the project's own layer, kept in its store by hash.
         project::create(&root, &pe2_io::SystemFilesystem).expect("made");
-        project::Project::load(&root).expect("opened");
-        let file = root.at("layers/top/a.node/movie.str");
+        let p = project::Project::load(&root).expect("opened");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        project::content::write(&pe2_io::system(), &file, &bytes).expect("written");
+        let sha1 = project::chunks::Store::at(&root, pe2_io::system()).put_file(&bytes).expect("stored");
+        let held = File { content: Some(Content::Stored { sha1, size: bytes.len() as u64 }), base: None };
+        let name = pe2_path::Name::new("a").expect("a name").to_owned();
+        let files =
+            std::collections::BTreeMap::from([(pe2_path::RelPath::new("movie.str").expect("a name").to_owned(), held)]);
+        let record = Record { op: Op::Create, kind: Kind::Node, parent: None, name: Some(name), files };
+        let layer = p.layer(pe2_path::Name::constant("project")).expect("its own layer");
+        let uid = pe2_path::Uid::new("uid://1a2b3c4d5e6f7").expect("a uid");
+        let records = std::collections::BTreeMap::from([(uid, record)]);
+        let folder = layer.records.as_ref().expect("records");
+        project::records::replace(&p, folder, &project::records::Settings::default(), &records, "a node")
+            .expect("written");
+        project::records::Set::open(&p).expect("read");
+        let file = layer.path.join(&pe2_path::RelPath::new("a.node/movie.str").expect("a path"));
         let scopes = scopes();
         let given = project::content::for_program(&pe2_io::system(), &file).expect("given");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.

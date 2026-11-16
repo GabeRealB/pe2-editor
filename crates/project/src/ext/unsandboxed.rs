@@ -44,7 +44,8 @@ pub fn program(folder: Option<&HostPath>, fetched: &[HostPath], tool: &str, io: 
         .filter(|_| !std::env::consts::EXE_EXTENSION.is_empty())
         .map(|exe| within.parent().unwrap_or_default().join(exe));
     let named: Vec<Arc<RelPath>> = with_exe.into_iter().chain([within.to_owned()]).collect();
-    let found = named.iter().flat_map(|name| places(folder, fetched, name)).find(|path| crate::pack::is_file(io, path));
+    let found =
+        named.iter().flat_map(|name| places(folder, fetched, name)).find(|path| crate::content::is_file(io, path));
     found.map_or_else(|| Runnable::Named(tool.to_owned()), |p| Runnable::At(runnable(&p, io)))
 }
 
@@ -140,7 +141,7 @@ pub fn in_tree(
     let found = places(folder, fetched, within).into_iter();
     found
         .into_iter()
-        .find(|path| crate::pack::is_file(io, path) || crate::pack::is_dir(io, path))
+        .find(|path| crate::content::is_file(io, path) || crate::content::is_dir(io, path))
         .map(|path| runnable(&path, io))
 }
 
@@ -152,11 +153,11 @@ fn files_in(
     within: &RelPath,
     files: &mut Vec<(Arc<RelPath>, HostPath)>,
 ) -> Result<()> {
-    if !crate::pack::is_dir(io, folder) {
+    if !crate::content::is_dir(io, folder) {
         anyhow::bail!("{}: no such folder", folder.display());
     }
-    let mut entries = crate::pack::read_dir(io, folder);
-    entries.sort_by(|a, b| crate::pack::shown(&a.0).cmp(crate::pack::shown(&b.0)));
+    let mut entries = crate::content::read_dir(io, folder);
+    entries.sort_by(|a, b| crate::content::shown(&a.0).cmp(crate::content::shown(&b.0)));
     for (name, path, is_folder) in entries {
         let name = within.join(&name.with_context(|| format!("{}: what it holds", folder.display()))?);
         if is_folder {

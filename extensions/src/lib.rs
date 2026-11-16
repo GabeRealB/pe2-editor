@@ -576,7 +576,7 @@ pub fn user_settings() -> BTreeMap<String, Table> {
 /// The tests in an extension's folder.
 fn tests_of(folder: &HostPath, io: &Arc<dyn pe2_io::Io>) -> Option<Found> {
     let file = folder.join(&TESTS).join(&pe2_path::Name::constant("tests.wasm"));
-    project::pack::is_file(io, &file).then(|| Found {
+    project::content::is_file(io, &file).then(|| Found {
         origin: Origin::Component(file.clone()),
         stamp: file_stamp(&file, io),
         folder: file.parent(),
@@ -754,13 +754,18 @@ fn components_in(folder: &Path, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2
 
 /// The extension in a folder of its own (`<id>.extension`), holding its component and what it ships.
 fn component_at(entry: HostPath, origin: fn(HostPath) -> Origin, io: &Arc<dyn pe2_io::Io>) -> Option<Found> {
-    if !project::pack::is_dir(io, &entry) || folder::id_of(&entry).is_none() {
+    if !project::content::is_dir(io, &entry) || folder::id_of(&entry).is_none() {
         return None;
     }
     // Its component; or, where it is only its manifest (programs and what they are fetched from), that.
     let file = if folder::alone(&entry, io) { entry.join(&folder::MANIFEST) } else { entry.join(&EXTENSION_COMPONENT) };
     let stamp = own_stamp(&entry, io);
-    project::pack::is_file(io, &file).then(|| Found { origin: origin(entry.clone()), file, folder: Some(entry), stamp })
+    project::content::is_file(io, &file).then(|| Found {
+        origin: origin(entry.clone()),
+        file,
+        folder: Some(entry),
+        stamp,
+    })
 }
 
 /// The extensions in the user's folder, to be added to a project.

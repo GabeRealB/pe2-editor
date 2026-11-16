@@ -286,10 +286,8 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &pe2_io::
         if !untold && changed.is_empty() {
             continue;
         }
-        // What changed in the layers first: what it reads of the files listed is read again before they are served.
-        if !changed.is_empty() {
-            let _ = lock(&lease).tell(&ToServer::Changed { paths: std::mem::take(&mut changed) });
-        }
+        // What changed is in what it is told is served: it reads every file by that.
+        changed.clear();
         let answered = {
             let _span = tracing::info_span!("served: server told it was said").entered();
             lock(&lease).tell(&ToServer::Shown)

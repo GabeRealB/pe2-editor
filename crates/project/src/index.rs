@@ -888,14 +888,14 @@ impl Scan {
             if name.starts_with('.') || place.ignores(&rel) {
                 return;
             }
-            if crate::pack::is_dir(&place.io, &start) {
+            if crate::content::is_dir(&place.io, &start) {
                 if place.assets && name.ends_with(BUNDLE_SUFFIX) {
                     self.bundle(&place.io, &rel, &start);
                     return;
                 }
                 self.folders.insert(rel.clone());
             } else {
-                if crate::pack::is_file(&place.io, &start) {
+                if crate::content::is_file(&place.io, &start) {
                     self.files.insert(rel, start);
                 }
                 return;
@@ -990,7 +990,7 @@ impl Scan {
     ) {
         // On disk, or in a packed layer's listing.
         let mut listing = Vec::new();
-        for (name, path, is_dir) in crate::pack::read_dir(&place.io, dir) {
+        for (name, path, is_dir) in crate::content::read_dir(&place.io, dir) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
@@ -1008,9 +1008,7 @@ impl Scan {
             if place.ignores(&dir_rel.join(&name)) {
                 continue;
             }
-            // A large file is held as its manifest: listed as the file it stands for.
-            let (shown, path) = if is_dir { (name.clone(), path) } else { listed(&name, path) };
-            listing.push(Listed { shown, on_disk: name, held: (path, is_dir) });
+            listing.push(Listed { shown: name.clone(), on_disk: name, held: (path, is_dir) });
         }
         let (listing, alike) = apart(listing);
         for Refusal { text, why } in alike {
@@ -1123,8 +1121,9 @@ impl Scan {
         let mut above = rel.parent();
         while let Some(folder) = above.filter(|folder| !folder.is_root() && place.at != **folder) {
             let name = folder.name().unwrap_or_default();
-            let there =
-                !name.starts_with('.') && !place.ignores(folder) && crate::pack::is_dir(&place.io, &place.disk(folder));
+            let there = !name.starts_with('.')
+                && !place.ignores(folder)
+                && crate::content::is_dir(&place.io, &place.disk(folder));
             let was = self.folders.contains(folder);
             if there && !was {
                 self.folders.insert(folder.to_owned());
@@ -1228,7 +1227,7 @@ pub(crate) fn bundle_files(
             |text: &str| -> Box<str> { if prefix.is_root() { text.into() } else { format!("{prefix}/{text}").into() } };
         // On disk, or in a packed layer's listing.
         let mut listing = Vec::new();
-        for (name, path, is_dir) in crate::pack::read_dir(io, &folder) {
+        for (name, path, is_dir) in crate::content::read_dir(io, &folder) {
             let name = match name {
                 Ok(name) if name.as_str().starts_with('.') => continue,
                 Ok(name) => name,
@@ -1238,9 +1237,7 @@ pub(crate) fn bundle_files(
                     continue;
                 }
             };
-            // A large file is held as its manifest: listed as the file it stands for.
-            let (shown, path) = if is_dir { (name.clone(), path) } else { listed(&name, path) };
-            listing.push(Listed { shown, on_disk: name, held: (path, is_dir) });
+            listing.push(Listed { shown: name.clone(), on_disk: name, held: (path, is_dir) });
         }
         let (listing, alike) = apart(listing);
         refused.extend(alike.into_iter().map(|refusal| Refusal { text: within(&refusal.text), why: refusal.why }));
@@ -1305,15 +1302,6 @@ fn apart<T>(listing: Vec<Listed<T>>) -> (Vec<Listed<T>>, Vec<Refusal>) {
     refused.sort_by(|a, b| a.text.cmp(&b.text));
     let kept = listing.into_iter().zip(gone).filter(|(_, gone)| !gone).map(|(entry, _)| entry).collect();
     (kept, refused)
-}
-
-/// A file as the index lists it: a manifest (`<name>.chunks`) as the file it stands for, by that file's name and path.
-fn listed(name: &Name, path: HostPath) -> (Arc<Name>, HostPath) {
-    let stands_for = name.as_str().strip_suffix(crate::chunks::SUFFIX.as_str()).and_then(|name| Name::new(name).ok());
-    match (stands_for, crate::chunks::logical(&path)) {
-        (Some(name), Some(logical)) => (name.to_owned(), logical),
-        _ => (name.to_owned(), path),
-    }
 }
 
 /// The asset a bundle's path names: its last name without `.node`.
@@ -1638,7 +1626,7 @@ fn stack_made_of(project: &Project) -> String {
     project.layers.iter().fold(String::new(), |mut made_of, layer| {
         let _ = writeln!(
             made_of,
-            "{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{:?}",
+            "{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}",
             layer.name,
             layer.kind,
             layer.path.display(),
@@ -1647,8 +1635,7 @@ fn stack_made_of(project: &Project) -> String {
             layer.read_only,
             layer.changeset_writable,
             layer.mounted,
-            layer.fills,
-            layer.storage
+            layer.fills
         );
         made_of
     })
@@ -2500,17 +2487,7 @@ impl Index {
     /// A changeset cannot be read or written.
     pub fn refresh(&mut self, project: &Project, changed: &[HostPath]) -> Result<Refreshed> {
         let _span = tracing::info_span!("index refresh").entered();
-        // A packed layer's listing changed (written by another process, or this one): read again.
-        crate::pack::reread_changed(changed);
-        // A manifest changing is the file it stands for changing; a packed layer's listing, its whole layer.
-        let changed: Vec<HostPath> = changed
-            .iter()
-            .map(|p| match p.file_name() {
-                Some(name) if name == crate::pack::FILE => p.parent().unwrap_or_else(|| p.clone()),
-                _ => crate::chunks::logical(p).unwrap_or_else(|| p.clone()),
-            })
-            .collect();
-        let mut refreshed = self.refresh_files(project, &changed)?;
+        let mut refreshed = self.refresh_files(project, changed)?;
         self.say_stack(&mut refreshed);
         Ok(refreshed)
     }

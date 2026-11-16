@@ -23,7 +23,6 @@ pub mod local;
 pub mod lock;
 pub mod merge;
 pub mod model;
-pub mod pack;
 pub mod places;
 pub mod plan;
 pub mod profile;
@@ -287,9 +286,6 @@ struct LayerFile {
     kind: Option<String>,
     /// The layer whose nodes a generated layer gives their files.
     fills: Option<String>,
-    /// How its content is stored: `text`, its files as files (by default), or `packed`, one listing of them with their
-    /// chunks in the store (`pack`) - a generated layer's, for now.
-    storage: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -431,8 +427,6 @@ pub struct Layer {
     pub mounted: bool,
     /// The layer a generated layer gives its nodes' files.
     pub fills: Option<Arc<Name>>,
-    /// How its content is stored.
-    pub storage: Storage,
 }
 
 #[derive(Clone)]
@@ -626,38 +620,6 @@ pub fn create(directory: &Path, fs: &dyn pe2_io::Filesystem) -> Result<()> {
     fs.write(&ignore, text.as_bytes()).with_context(|| ignore.to_string())
 }
 
-/// How a layer's content is stored (`storage` in `project.toml`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Storage {
-    /// Its files as files: what a person and version control read.
-    #[default]
-    Text,
-    /// One listing of its files, their chunks in the store (`pack`).
-    Packed,
-}
-
-/// How a layer says it is stored, its pack opened where it is packed.
-fn storage_of(
-    root: &HostPath,
-    layer: &Name,
-    said: Option<&str>,
-    generated: bool,
-    path: &HostPath,
-    io: &Arc<dyn pe2_io::Io>,
-) -> Result<Storage> {
-    let file = root.join(&FILE);
-    let storage = match said {
-        None | Some("text") => Storage::Text,
-        Some("packed") if generated => Storage::Packed,
-        Some("packed") => bail!("{}: the layer {layer}: only a generated layer is packed, so far", file.display()),
-        Some(other) => bail!("{}: the layer {layer}: no storage {other} (text, packed)", file.display()),
-    };
-    if storage == Storage::Packed {
-        pack::Pack::open(path, io).with_context(|| format!("{}: its pack", path.display()))?;
-    }
-    Ok(storage)
-}
-
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`.local/settings.toml`).
 fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
     let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
@@ -710,7 +672,6 @@ impl Project {
                     changeset_writable: true,
                     mounted: true,
                     fills: None,
-                    storage: Storage::Text,
                     records: None,
                 })
             })
@@ -742,7 +703,6 @@ impl Project {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
             let read_only = l.read_only || generated;
-            let storage = storage_of(&root, &name, l.storage.as_deref(), generated, &path, &io)?;
             let fills = l.fills.as_deref().map(layer_name).transpose()?;
             layers.push(Layer {
                 name,
@@ -754,7 +714,6 @@ impl Project {
                 changeset_writable: !read_only,
                 mounted: false,
                 fills,
-                storage,
                 records,
             });
         }
@@ -894,15 +853,6 @@ pub(crate) mod testing {
     use sfs::HostPath;
     pub use sfs::testing::{At, scratch};
     use std::sync::Arc;
-
-    /// A test's own empty project, made afresh and opened: what finds the store of a file of its layers.
-    pub fn opened(name: &str) -> HostPath {
-        let root = scratch(name);
-        let _ = std::fs::remove_dir_all(&root);
-        crate::create(&root, &pe2_io::SystemFilesystem).expect("a test's project made");
-        crate::Project::load(&root).expect("a test's project opened");
-        root
-    }
 
     /// Make the layers a test wrote as trees of files records layers (`records::import_trees`).
     pub fn as_records(root: &HostPath) {

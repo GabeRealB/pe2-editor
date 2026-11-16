@@ -66,9 +66,10 @@ counting, as that is what it is.
   hands over once (`buffer`'s constructor). One `buffer` serves contents and media alike (`HostBuffer`, an
   `Arc<[u8]>` shared by every handle). A hash is a `Sha1` on both sides and in the project's records, the store and the
   model: text only where it is written out.
-- **A content is placed for a program** (`place-content`, `PlacedContent`): a stored blob where it is kept (a chunked
-  one served or assembled, `content::for_program`); one held in itself or in memory written to a file of its own,
-  removed when the handle is dropped - which the guard holding it does once the program is done (`exec::Written`).
+- **A content is placed for a program** (`place-content`, `PlacedContent`): a stored blob where it is kept (one kept
+  by hash in a store served or assembled, `content::for_program`); one held in itself or in memory written to a file of
+  its own, removed when the handle is dropped - which the guard holding it does once the program is done
+  (`exec::Written`).
 - **Names are types on both sides, text between.** The contract carries an asset's path, a reference, an output's
   address and a file's name (`RelPath`, within an asset or a value) as strings; the SDK and the host check each into
   its `pe2-path` type where it arrives. An operation's lent asset holds no files by name: its values' contents are

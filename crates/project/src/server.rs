@@ -150,9 +150,6 @@ pub enum ToServer {
     /// said, by whoever holds the project: read it there. The first is what it starts serving with; who says so
     /// feeds it from then on, until its connection ends.
     Shown,
-    /// These files changed in the layers - an edit made by whoever holds the project - for what is read of them to
-    /// follow at once.
-    Changed { paths: Vec<HostPath> },
     /// What it is doing.
     Status,
     /// Stop serving, now.
