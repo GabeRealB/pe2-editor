@@ -27,7 +27,8 @@ depends on.
 
 When you edit an asset from a layer below, the editor copies it into the active layer first: an **override**. You
 can also do this yourself: right-click the asset in the Assets pane and choose **Override in** *layer*. The override
-holds only the files you change; everything else still comes from below. A plain file - code, for instance - is
+holds only the files you change, and of each only what you change - so what your layer shares follows your edits,
+however large the file; everything else still comes from below. A plain file - code, for instance - is
 copied whole when you override it, so that you can edit it in the `assets` folder with your own tools.
 
 To give up your version, right-click the asset and choose **Take the version below**.

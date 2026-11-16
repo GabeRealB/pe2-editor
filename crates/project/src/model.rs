@@ -429,6 +429,13 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
                 out.0.extend_from_slice(sha1.bytes());
                 out.u64(*size);
             }
+            Some(Content::Delta { sha1, size, base, delta }) => {
+                out.u8(4);
+                out.0.extend_from_slice(sha1.bytes());
+                out.u64(*size);
+                out.0.extend_from_slice(base.bytes());
+                delta_out(&mut out, delta);
+            }
         }
         out.u8(u8::from(held.base.is_some()));
         if let Some(base) = &held.base {
@@ -444,6 +451,75 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
         out.text(name);
     }
     out.0
+}
+
+/// What a delta changes, as the model keeps it.
+fn delta_out(out: &mut Out, delta: &crate::records::Delta) {
+    use crate::merge::fields::Step;
+    use crate::records::Delta;
+    match delta {
+        Delta::Fields(sets) => {
+            out.u8(0);
+            out.u32(u32::try_from(sets.len()).unwrap_or(u32::MAX));
+            for (at, to) in sets {
+                out.u32(u32::try_from(at.len()).unwrap_or(u32::MAX));
+                for step in at {
+                    match step {
+                        Step::Key(key) => {
+                            out.u8(0);
+                            out.text(key);
+                        }
+                        Step::Id(id) => {
+                            out.u8(1);
+                            out.text(id);
+                        }
+                        Step::At(at) => {
+                            out.u8(2);
+                            out.u64(*at as u64);
+                        }
+                    }
+                }
+                out.maybe(to.as_deref());
+            }
+        }
+        Delta::Lines(text) => {
+            out.u8(1);
+            out.text(text);
+        }
+        Delta::Bytes(sha1) => {
+            out.u8(2);
+            out.0.extend_from_slice(sha1.bytes());
+        }
+    }
+}
+
+/// What a delta changes, read back (`delta_out`).
+fn delta_in(read: &mut In<'_>) -> Option<crate::records::Delta> {
+    use crate::merge::fields::Step;
+    use crate::records::Delta;
+    Some(match read.u8()? {
+        0 => {
+            let mut sets = Vec::new();
+            for _ in 0..read.u32()? {
+                let mut at = Vec::new();
+                for _ in 0..read.u32()? {
+                    at.push(match read.u8()? {
+                        0 => Step::Key(read.text()?),
+                        1 => Step::Id(read.text()?),
+                        2 => Step::At(usize::try_from(read.u64()?).ok()?),
+                        _ => return None,
+                    });
+                }
+                let mut to = None;
+                read.maybe(&mut to)?;
+                sets.push((at, to));
+            }
+            Delta::Fields(sets)
+        }
+        1 => Delta::Lines(read.text()?),
+        2 => Delta::Bytes(sha1_in(read)?),
+        _ => return None,
+    })
 }
 
 /// A layer's record read back, with its file's time and length and the name it says where its key could not.
@@ -475,6 +551,10 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
             1 => Some(Content::Text(read.text()?)),
             2 => Some(Content::Stored { sha1: sha1_in(&mut read)?, size: read.u64()? }),
             3 => Some(Content::Object { sha1: sha1_in(&mut read)?, size: read.u64()? }),
+            4 => {
+                let (sha1, size, base) = (sha1_in(&mut read)?, read.u64()?, sha1_in(&mut read)?);
+                Some(Content::Delta { sha1, size, base, delta: delta_in(&mut read)? })
+            }
             _ => return None,
         };
         let base = match read.u8()? {

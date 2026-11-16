@@ -710,8 +710,16 @@ fn read(io: &Arc<dyn pe2_io::Io>, file: &Pending) -> Option<Record> {
     let recorded = stamp(SystemTime::now());
     // A declaration is read whole, to be parsed; any other file is only hashed, a piece at a time.
     let (sha1, declaration) = if file.declaration {
-        let bytes = crate::content::read(io, &file.path).ok()?;
-        (crate::extract::sha1_of(&bytes), Some(declaration(&bytes)))
+        match crate::content::read(io, &file.path) {
+            Ok(bytes) => (crate::extract::sha1_of(&bytes), Some(declaration(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // There, and not to be read - an override made of a version no store has: said, as a text that is no
+            // declaration is.
+            Err(e) => {
+                let sha1 = crate::content::sha1(io, &file.path).ok()?;
+                (sha1, Some(Declaration { error: Some(e.to_string()), ..Declaration::default() }))
+            }
+        }
     } else {
         (crate::content::sha1(io, &file.path).ok()?, None)
     };

@@ -8,6 +8,7 @@ pub mod build;
 pub mod changeset;
 pub mod chunks;
 pub mod content;
+pub mod delta;
 pub mod discs;
 pub mod dump;
 pub mod edit;

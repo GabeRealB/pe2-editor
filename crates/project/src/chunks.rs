@@ -316,6 +316,14 @@ impl Store {
         }
     }
 
+    /// This machine's store of the project: this one, or - of the shipped one - the other.
+    #[must_use]
+    pub fn local_one(&self) -> Store {
+        let local =
+            self.dir.parent().and_then(|parent| parent.file_name().map(|name| name == crate::local::DIR.as_str()));
+        if local == Some(true) { self.clone() } else { self.other().unwrap_or_else(|| self.clone()) }
+    }
+
     /// Of this store and the other, the first that keeps a file whole by its SHA-1.
     #[must_use]
     pub fn holding_file(&self, sha1: &Sha1) -> Option<Store> {
@@ -715,8 +723,18 @@ impl Named {
             if local { &mut self.local } else { &mut self.shipped }.trees.insert(tree);
         }
         for file in record.files.values() {
-            if let Some(crate::records::Content::Stored { sha1, .. }) = &file.content {
-                if local { &mut self.local } else { &mut self.shipped }.files.insert(*sha1);
+            match &file.content {
+                Some(crate::records::Content::Stored { sha1, .. }) => {
+                    if local { &mut self.local } else { &mut self.shipped }.files.insert(*sha1);
+                }
+                // A delta: what it keeps of bytes, as its record's; the file it makes, made once, this machine's.
+                Some(crate::records::Content::Delta { sha1, delta, .. }) => {
+                    if let crate::records::Delta::Bytes(kept) = delta {
+                        if local { &mut self.local } else { &mut self.shipped }.files.insert(*kept);
+                    }
+                    self.local.files.insert(*sha1);
+                }
+                _ => {}
             }
             self.local.files.extend(file.base);
         }

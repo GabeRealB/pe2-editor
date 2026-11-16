@@ -92,10 +92,24 @@ Programs outside the editor ask `pe2-cli project paths` where a project keeps wh
 
 ## Overrides and merges
 
-An override holds only the files it writes, whole, and records the hash of the version below each was made from.
-When the version below changes, the index merges three ways, by what the file is - TOML by field, other text by line,
-bytes not at all. A conflict leaves the layer's side shown and the override stale until the user keeps or drops it.
-Merges are cached by what they were made from; diffs are never stored.
+An override holds only the files it writes, and of each only what it changes of its base - the version below it was
+made from, named by its SHA-1 and kept in this machine's store (`delta`, `records::Content::Delta`): the fields of a
+TOML file it sets, each by its path, set in the base's document as a merge sets them; the lines of a text it replaces;
+or a bytes delta (`pe2 delta 1`: runs of the base copied and bytes added, found by a rolling hash over 32-byte windows
+of the base) kept as a file in the store. Each is kept only where applying it to the base gives the file back exactly -
+fields only where the layout matches, lines always - and only where it is less than half the file; else the file is
+kept whole, its base still said. The record says the file it makes (`sha1`, `size`), so its length and hash are known
+without it; read, it is made once of its base and kept in this machine's store, read as any file kept whole. A base in
+no store - a project on a machine whose game files are not filled - is a problem saying so. Since a delta names its
+base by hash, reordering the layers changes no stored byte.
+
+When the version below changes, the index merges three ways on the files' contents - the base, the base with the delta
+applied, and the version below now - by what the file is: TOML by field, other text by line, bytes not at all. A
+conflict leaves the layer's side shown and the override stale until the user keeps it - what it changes then said
+again of the version below now - or drops it. Merges are cached by what they were made from.
+
+A text a record holds inline is at most 64 KiB, and one written and read back as it is (`records::INLINE`); any other
+is kept in the store.
 
 ## Sealed nodes and extensions
 

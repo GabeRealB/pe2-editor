@@ -2120,6 +2120,301 @@ mod tests {
         crate::local::remove_all(&root);
     }
 
+    /// Bytes of a seed, as noise: no text.
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.max(1);
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The text of the record a layer has of an entry, waiting writes and all.
+    fn record_text(root: &HostPath, layer: &str, uid: Uid) -> String {
+        let folder = root.at("layers").at(layer);
+        let read = crate::records::read_records(&pe2_io::SystemFilesystem, &folder, None).unwrap();
+        read[&uid].record.render()
+    }
+
+    /// A project whose base layer has a node of a declaration, a text and bytes.
+    fn deltas(name: &str) -> HostPath {
+        let root = project(name);
+        let write = |path: &str, bytes: &[u8]| {
+            let path = root.at(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let stack = "# the node\nsize = 2 # its size\n\n[[stack]]\nid = \"image\"\nop = \"t.image\"\nmode = \"a\"\n";
+        write("layers/base/d.node/node.toml", stack.as_bytes());
+        let text = (0..400).fold(String::new(), |mut text, n| {
+            let _ = std::fmt::Write::write_fmt(&mut text, format_args!("line {n}\n"));
+            text
+        });
+        write("layers/base/d.node/notes.txt", text.as_bytes());
+        write("layers/base/d.node/native.bin", &noise(64 << 10, 7));
+        root
+    }
+
+    #[test]
+    fn an_override_keeps_what_it_changes_of_its_base_and_reads_as_the_file() {
+        let root = deltas("deltas");
+        let mut o = open(&root);
+        let uid = o.uid("d.node");
+        let top = pe2_path::Name::constant("top");
+        let write = |o: &mut Open, file: &str, bytes: &[u8]| {
+            let paths = super::write_file(
+                &o.project,
+                &o.index,
+                top,
+                uid,
+                pe2_path::RelPath::new(file).unwrap(),
+                bytes,
+                format!("Write {file}"),
+                None,
+                &mut o.history,
+            )
+            .unwrap();
+            o.refresh(&paths);
+        };
+        let stack = "# the node\nsize = 3 # its size\n\n[[stack]]\nid = \"image\"\nop = \"t.image\"\nmode = \"b\"\n";
+        write(&mut o, "node.toml", stack.as_bytes());
+        let text: String =
+            (0..400).map(|n| if n == 200 { "changed\n".to_string() } else { format!("line {n}\n") }).collect();
+        write(&mut o, "notes.txt", text.as_bytes());
+        let mut bytes = noise(64 << 10, 7);
+        bytes[1000..1010].copy_from_slice(b"0123456789");
+        write(&mut o, "native.bin", &bytes);
+        // Each kept as what it changes: fields, lines, a bytes delta - never whole.
+        let record = record_text(&root, "top", uid);
+        assert!(record.contains("[[files.\"node.toml\".set]]") && record.contains("mode"), "{record}");
+        assert!(record.contains("lines = ") && !record.contains("line 100"), "{record}");
+        assert!(record.contains("delta = "), "{record}");
+        assert!(record.len() < 4000, "{} bytes of record for three small edits", record.len());
+        // Read as the files they make.
+        let asset = &o.index.assets[&tree("d")];
+        let read = |name: &str| {
+            let file = asset.files.iter().find(|f| f.name.as_str() == name).unwrap();
+            crate::content::read(&o.project.io, &file.path).unwrap()
+        };
+        assert_eq!(
+            (read("node.toml"), read("notes.txt"), read("native.bin")),
+            (stack.into(), text.into(), bytes.clone())
+        );
+        // A change of most of it is kept whole.
+        write(&mut o, "native.bin", &noise(64 << 10, 8));
+        let record = record_text(&root, "top", uid);
+        assert!(!record.contains("delta = "), "{record}");
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn an_override_made_over_a_base_that_changed_merges_and_kept_is_said_again_of_the_new_one() {
+        let root = deltas("deltas-stale");
+        let mut o = open(&root);
+        let uid = o.uid("d.node");
+        let (top, base) = (pe2_path::Name::constant("top"), pe2_path::Name::constant("base"));
+        let write = |o: &mut Open, layer: &pe2_path::Name, text: &str| {
+            let paths = super::write_file(
+                &o.project,
+                &o.index,
+                layer,
+                uid,
+                pe2_path::RelPath::new("node.toml").unwrap(),
+                text.as_bytes(),
+                "Write".into(),
+                None,
+                &mut o.history,
+            )
+            .unwrap();
+            o.refresh(&paths);
+        };
+        let node = |size: u32, mode: &str| {
+            format!(
+                "# the node\nsize = {size} # its size\n\n[[stack]]\nid = \"image\"\nop = \"t.image\"\nmode = \"{mode}\"\n"
+            )
+        };
+        write(&mut o, top, &node(3, "a"));
+        // Below, another field changes: the two merge.
+        write(&mut o, base, &node(2, "c"));
+        let asset = &o.index.assets[&tree("d")];
+        let file = asset.files.iter().find(|f| f.name.as_str() == "node.toml").unwrap();
+        assert_eq!(crate::content::read_to_string(&o.project.io, &file.path).unwrap(), node(3, "c"));
+        // Kept as it is now: what it changes is said again of the new version below.
+        let paths =
+            super::resolve(&o.project, &o.index, top, uid, super::Resolution::KeepMine, &mut o.history).unwrap();
+        o.refresh(&paths);
+        let record = record_text(&root, "top", uid);
+        let new_base = crate::extract::sha1_of(node(2, "c").as_bytes()).to_string();
+        assert!(record.contains(&new_base) && record.contains("[[files.\"node.toml\".set]]"), "{record}");
+        let asset = &o.index.assets[&tree("d")];
+        let file = asset.files.iter().find(|f| f.name.as_str() == "node.toml").unwrap();
+        assert_eq!(crate::content::read_to_string(&o.project.io, &file.path).unwrap(), node(3, "c"));
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn an_override_kept_as_a_delta_cut_short_at_any_change_reads_as_before_or_after() {
+        let (old, mut new) = (noise(64 << 10, 7), noise(64 << 10, 7));
+        new[2000..2010].copy_from_slice(b"0123456789");
+        // The edit, over a project whose I/O is given: what it touched, or why it failed.
+        let edit = |root: &HostPath, io: std::sync::Arc<dyn pe2_io::Io>| -> Result<(), String> {
+            let project = Project::load_with(root, io).map_err(|e| e.to_string())?;
+            let lock = Lock::try_acquire(root, "a test", &pe2_io::System).map_err(|e| e.to_string())?;
+            let local = Local::open(&project, &lock).map_err(|e| e.to_string())?;
+            let index = Index::open(&project, &local).map_err(|e| e.to_string())?;
+            let (mut history, _) = History::open(&local).map_err(|e| e.to_string())?;
+            let uid = index.entries[&tree("d.node")].uid;
+            let file = pe2_path::RelPath::new("native.bin").unwrap();
+            let top = pe2_path::Name::constant("top");
+            super::write_file(&project, &index, top, uid, file, &new, "Write".into(), None, &mut history)
+                .map(drop)
+                .map_err(|e| format!("{e:#}"))
+        };
+        // What the file reads as, opened again with nothing failing.
+        let read = |root: &HostPath| -> Vec<u8> {
+            let o = open(root);
+            let asset = &o.index.assets[&tree("d")];
+            let file = asset.files.iter().find(|f| f.name.as_str() == "native.bin").unwrap();
+            let bytes = crate::content::read(&o.project.io, &file.path).unwrap();
+            drop(o);
+            bytes
+        };
+        let faulty = || {
+            let fs = pe2_io::Faulty::new(std::sync::Arc::new(pe2_io::SystemFilesystem));
+            let io = pe2_io::Composed { filesystem: std::sync::Arc::new(fs.clone()), ..pe2_io::Composed::system() };
+            (std::sync::Arc::new(io) as std::sync::Arc<dyn pe2_io::Io>, fs)
+        };
+        let root = deltas("deltas-counted");
+        crate::testing::as_records(&root);
+        let (io, fs) = faulty();
+        let counted = fs.changes();
+        edit(&root, io).unwrap();
+        let changes = fs.changes() - counted;
+        assert_eq!(read(&root), new);
+        assert!(record_text(&root, "top", open_uid(&root)).contains("delta = "));
+        crate::local::remove_all(&root);
+        for how in [pe2_io::Fault::Once, pe2_io::Fault::From] {
+            for nth in 1..=changes + 1 {
+                let root = deltas(&format!("deltas-{how:?}-{nth}"));
+                crate::testing::as_records(&root);
+                let (io, fs) = faulty();
+                fs.fail(nth, how);
+                let edited = edit(&root, io);
+                fs.heal();
+                let bytes = read(&root);
+                assert!(
+                    bytes == old || bytes == new,
+                    "{how:?} at change {nth} ({edited:?}): neither the file nor the edit"
+                );
+                crate::local::remove_all(&root);
+            }
+        }
+    }
+
+    /// The uid of the test's node, as a project opened afresh has it.
+    fn open_uid(root: &HostPath) -> Uid {
+        let o = open(root);
+        let uid = o.uid("d.node");
+        drop(o);
+        uid
+    }
+
+    #[test]
+    fn an_override_whose_base_is_in_no_store_is_a_problem_saying_how_to_have_it() {
+        let root = deltas("deltas-missing");
+        let mut o = open(&root);
+        let uid = o.uid("d.node");
+        let stack = "# the node\nsize = 3 # its size\n\n[[stack]]\nid = \"image\"\nop = \"t.image\"\nmode = \"a\"\n";
+        let file = pe2_path::RelPath::new("node.toml").unwrap();
+        let top = pe2_path::Name::constant("top");
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            top,
+            uid,
+            file,
+            stack.as_bytes(),
+            "Write".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
+        drop(o);
+        // This machine's folder gone - the base its store keeps, the file made of it, what the model knew - as on
+        // another that has not them.
+        crate::local::remove_all(&root.at(".local"));
+        let o = open(&root);
+        let said = format!("{:?}", o.index.problems);
+        assert!(said.contains("fill the project from the discs"), "{said}");
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
+    #[test]
+    fn layers_reordered_change_no_stored_byte() {
+        let root = deltas("deltas-order");
+        std::fs::write(
+            root.at("project.toml"),
+            "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n\n[[layer]]\nname = \"other\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.at("layers/other")).unwrap();
+        let mut o = open(&root);
+        let uid = o.uid("d.node");
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            pe2_path::Name::constant("top"),
+            uid,
+            pe2_path::RelPath::new("notes.txt").unwrap(),
+            b"line 0\nnew\n",
+            "Write".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        // The layers' records as their readers read them - what waits to be written among them - and the store.
+        let stored = |root: &HostPath| -> Vec<(String, Vec<u8>)> {
+            let mut all = Vec::new();
+            for layer in ["base", "top", "other"] {
+                let folder = root.at("layers").at(layer);
+                for (uid, held) in crate::records::read_records(&pe2_io::SystemFilesystem, &folder, None).unwrap() {
+                    all.push((format!("{layer}/{uid:?}"), held.record.render().into_bytes()));
+                }
+            }
+            let mut todo = vec![root.at("store").to_path_buf()];
+            while let Some(dir) = todo.pop() {
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    if entry.file_type().unwrap().is_dir() {
+                        todo.push(entry.path());
+                    } else {
+                        all.push((entry.path().display().to_string(), std::fs::read(entry.path()).unwrap()));
+                    }
+                }
+            }
+            all.sort();
+            all
+        };
+        let before = stored(&root);
+        let order: Vec<std::sync::Arc<pe2_path::Name>> =
+            ["base", "other", "top"].into_iter().map(|n| pe2_path::Name::new(n).unwrap().to_owned()).collect();
+        let layers = o.index.layers();
+        crate::stack::reorder(&o.project, &layers, &order, &mut o.history).unwrap();
+        let after: Vec<(String, Vec<u8>)> = stored(&root);
+        assert_eq!(before, after, "the records and the store as they were");
+        drop(o);
+        crate::local::remove_all(&root);
+    }
+
     #[test]
     fn deletes_what_the_layer_makes() {
         let root = project("own");

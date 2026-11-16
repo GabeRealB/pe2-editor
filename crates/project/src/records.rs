@@ -69,13 +69,28 @@ pub enum Kind {
 }
 
 /// A file's content in a record: inline text, or a file kept whole in the store - or, a sealed node's, a whole object
-/// of its tree (`Record::tree`).
+/// of its tree (`Record::tree`) - or, an override's, what it changes of its base (`delta`): the file it makes is `sha1`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
     Text(String),
     Stored { sha1: pe2_ext::Sha1, size: u64 },
     Object { sha1: pe2_ext::Sha1, size: u64 },
+    Delta { sha1: pe2_ext::Sha1, size: u64, base: pe2_ext::Sha1, delta: Delta },
 }
+
+/// What an override's file changes of its base (`delta`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// Fields of a TOML file, each set to a value - written as TOML - or removed (none).
+    Fields(Vec<(Vec<crate::merge::fields::Step>, Option<String>)>),
+    /// Runs of lines of a text (`delta::lines_of`).
+    Lines(String),
+    /// Bytes (`delta::bytes_of`), kept in the store by this SHA-1.
+    Bytes(pe2_ext::Sha1),
+}
+
+/// The longest text a record holds inline: longer, it is kept in the store.
+pub const INLINE: usize = 64 << 10;
 
 /// A file of an entry, as a record holds it: its content, none where the layer removes it; and, for an override's,
 /// the SHA-1 of the version below it was made from (its base).
@@ -214,14 +229,17 @@ impl Kind {
 }
 
 impl Content {
-    /// A file's content as a record keeps it: text inline whatever its length, so a layer's history always reads as
-    /// text, anything else (bytes that are not UTF-8, or hold a NUL, as git tells binary files) kept in the store.
+    /// A file's content as a record keeps it: a text inline - so that a layer's history reads as text - where it is
+    /// UTF-8, holds no NUL (as git tells binary files), is at most `INLINE` long and is written and read back as it is;
+    /// anything else kept in the store.
     ///
     /// # Errors
     /// It cannot be kept.
     pub fn of(bytes: &[u8], store: &crate::chunks::Store) -> Result<Content> {
-        if !bytes.contains(&0)
+        if bytes.len() <= INLINE
+            && !bytes.contains(&0)
             && let Ok(text) = std::str::from_utf8(bytes)
+            && inline_as_it_is(text)
         {
             return Ok(Content::Text(text.to_string()));
         }
@@ -229,15 +247,73 @@ impl Content {
         Ok(Content::Stored { sha1, size: bytes.len() as u64 })
     }
 
-    /// Its bytes.
+    /// An override's file as a record keeps it: what it changes of its base (`delta`), where the base is in a store and
+    /// what it changes is less than half of it - the file whole (`of`) otherwise. A delta is kept only where it gives
+    /// the file back; one of bytes is kept in `store`, as the file would be.
     ///
     /// # Errors
-    /// A file kept in the store is not there.
+    /// It cannot be kept.
+    pub fn over(
+        bytes: &[u8],
+        base: Option<pe2_ext::Sha1>,
+        name: &str,
+        store: &crate::chunks::Store,
+    ) -> Result<Content> {
+        let whole = |store| Content::of(bytes, store);
+        let Some(base) = base else { return whole(store) };
+        let Ok(from) = store.get_file(&base) else { return whole(store) };
+        let (sha1, size) = (crate::extract::sha1_of(bytes), bytes.len() as u64);
+        let texts = (std::str::from_utf8(&from), std::str::from_utf8(bytes));
+        let delta = if let (Ok(from), Ok(to)) = texts
+            && !bytes.contains(&0)
+        {
+            let toml = std::path::Path::new(name).extension().is_some_and(|e| e == "toml");
+            let fields = toml.then(|| crate::delta::fields(from, to)).flatten();
+            let fields = fields.map(|sets| {
+                Delta::Fields(sets.into_iter().map(|set| (set.at, set.to.map(|value| value.to_string()))).collect())
+            });
+            let delta = fields.unwrap_or_else(|| Delta::Lines(crate::delta::lines_of(from, to)));
+            // As large as the file's half, or not written and read back as it is: the file whole.
+            let said = delta_len(&delta);
+            if said * 2 >= bytes.len() || matches!(&delta, Delta::Lines(text) if !inline_as_it_is(text)) {
+                return whole(store);
+            }
+            delta
+        } else {
+            let made = crate::delta::bytes_of(&from, bytes);
+            if made.len() * 2 >= bytes.len() {
+                return whole(store);
+            }
+            Delta::Bytes(store.put_file(&made)?)
+        };
+        let content = Content::Delta { sha1, size, base, delta };
+        // Held to giving the file back.
+        if content.bytes(store).ok().as_deref() != Some(bytes) {
+            return whole(store);
+        }
+        Ok(content)
+    }
+
+    /// Its bytes: a delta's made of its base, which either of the project's stores keeps.
+    ///
+    /// # Errors
+    /// A file kept in the store is not there - a delta's base among them - or a delta is none of its form.
     pub fn bytes(&self, store: &crate::chunks::Store) -> std::io::Result<Vec<u8>> {
         match self {
             Content::Text(text) => Ok(text.clone().into_bytes()),
             Content::Stored { sha1, .. } => store.get_file(sha1),
             Content::Object { sha1, .. } => store.get_object(sha1),
+            Content::Delta { base, delta, .. } => {
+                let from = store.get_file(base).map_err(|e| {
+                    let why = format!(
+                        "the version it was made from ({base}) is in no store of the project's - fill the project \
+                         from the discs, or take the version below: {e}"
+                    );
+                    // Not the file gone: it is there, and its base is not.
+                    std::io::Error::other(why)
+                })?;
+                apply(&from, delta, store).map_err(|e| std::io::Error::other(format!("{e:#}")))
+            }
         }
     }
 
@@ -246,7 +322,7 @@ impl Content {
     pub fn size(&self) -> u64 {
         match self {
             Content::Text(text) => text.len() as u64,
-            Content::Stored { size, .. } | Content::Object { size, .. } => *size,
+            Content::Stored { size, .. } | Content::Object { size, .. } | Content::Delta { size, .. } => *size,
         }
     }
 
@@ -255,7 +331,143 @@ impl Content {
     pub fn sha1(&self) -> pe2_ext::Sha1 {
         match self {
             Content::Text(text) => crate::extract::sha1_of(text.as_bytes()),
-            Content::Stored { sha1, .. } | Content::Object { sha1, .. } => *sha1,
+            Content::Stored { sha1, .. } | Content::Object { sha1, .. } | Content::Delta { sha1, .. } => *sha1,
+        }
+    }
+}
+
+/// Where the file a content is can be read whole, by its SHA-1, for one that is a delta (`Content::Delta`): made of
+/// its base once, and kept in this machine's store (`chunks::Store::local_one`) as any file kept whole - read by range
+/// as any is. Of another content, none.
+///
+/// # Errors
+/// Its base is in no store of the project's, or what it makes is not the file it says.
+pub fn made(content: &Content, store: &crate::chunks::Store) -> std::io::Result<Option<pe2_ext::Sha1>> {
+    let Content::Delta { sha1, .. } = content else { return Ok(None) };
+    if store.holding_file(sha1).is_none() {
+        let bytes = content.bytes(store)?;
+        if crate::extract::sha1_of(&bytes) != *sha1 {
+            return Err(std::io::Error::other(format!("what its delta makes is not the file {sha1}")));
+        }
+        store.local_one().put_file(&bytes)?;
+    }
+    Ok(Some(*sha1))
+}
+
+/// A delta applied to its base's bytes.
+///
+/// # Errors
+/// It is none of its form, a field's value is no TOML, or a bytes delta is in no store.
+fn apply(base: &[u8], delta: &Delta, store: &crate::chunks::Store) -> Result<Vec<u8>> {
+    match delta {
+        Delta::Fields(sets) => {
+            let base = std::str::from_utf8(base).context("a base that is no text")?;
+            let sets: Vec<crate::delta::Set> = sets
+                .iter()
+                .map(|(at, to)| -> Result<crate::delta::Set> {
+                    let to = to.as_deref().map(value_of).transpose()?;
+                    Ok(crate::delta::Set { at: at.clone(), to })
+                })
+                .collect::<Result<_>>()?;
+            Ok(crate::delta::apply_fields(base, &sets).context("a base that is no TOML")?.into_bytes())
+        }
+        Delta::Lines(text) => {
+            let base = std::str::from_utf8(base).context("a base that is no text")?;
+            Ok(crate::delta::apply_lines(base, text)?.into_bytes())
+        }
+        Delta::Bytes(sha1) => crate::delta::apply_bytes(base, &store.get_file(sha1)?),
+    }
+}
+
+/// A value, from the TOML it is written as.
+fn value_of(text: &str) -> Result<toml::Value> {
+    let mut table: toml::Table = toml::from_str(&format!("v = {text}")).with_context(|| format!("a value: {text}"))?;
+    table.remove("v").context("a value")
+}
+
+/// How long a delta is, as a record holds it (a bytes delta: its key alone).
+fn delta_len(delta: &Delta) -> usize {
+    match delta {
+        Delta::Fields(sets) => sets.iter().map(|(at, to)| at.len() * 8 + to.as_ref().map_or(0, String::len)).sum(),
+        Delta::Lines(text) => text.len(),
+        Delta::Bytes(_) => 40,
+    }
+}
+
+/// Whether a text is written in a record and read back as it is.
+fn inline_as_it_is(text: &str) -> bool {
+    let mut doc = toml_edit::DocumentMut::new();
+    doc["t"] = toml_edit::value(text);
+    toml::from_str::<toml::Table>(&doc.to_string())
+        .ok()
+        .and_then(|t| t.get("t").cloned())
+        .as_ref()
+        .and_then(toml::Value::as_str)
+        == Some(text)
+}
+
+/// What a file's table says it changes of its base: its fields set (`set`), its lines (`lines`) or a bytes delta
+/// (`delta`); none where it says none.
+///
+/// # Errors
+/// What it says is none of those forms.
+fn delta_in(file: &toml::Table) -> Result<Option<Delta>> {
+    use crate::merge::fields::Step;
+    if let Some(text) = file.get("lines") {
+        return Ok(Some(Delta::Lines(text.as_str().context("lines that are no text")?.to_string())));
+    }
+    if let Some(sha1) = file.get("delta") {
+        return Ok(Some(Delta::Bytes(pe2_ext::Sha1::from_hex(sha1.as_str().context("a delta that is no SHA-1")?)?)));
+    }
+    let Some(sets) = file.get("set") else { return Ok(None) };
+    let mut out = Vec::new();
+    for set in sets.as_array().context("fields set that are no list")? {
+        let at = set.get("at").and_then(toml::Value::as_array).context("a field set at no path")?;
+        let at = at
+            .iter()
+            .map(|step| match step {
+                toml::Value::String(key) => Ok(Step::Key(key.clone())),
+                toml::Value::Integer(at) => Ok(Step::At(usize::try_from(*at)?)),
+                toml::Value::Table(id) => {
+                    Ok(Step::Id(id.get("id").and_then(toml::Value::as_str).context("a step by no id")?.to_string()))
+                }
+                other => bail!("a step that is none: {other}"),
+            })
+            .collect::<Result<Vec<Step>>>()?;
+        out.push((at, set.get("to").map(ToString::to_string)));
+    }
+    Ok(Some(Delta::Fields(out)))
+}
+
+/// Write what a file changes of its base in its table (`delta_in`).
+fn render_delta(table: &mut toml_edit::Table, delta: &Delta) {
+    use crate::merge::fields::Step;
+    match delta {
+        Delta::Lines(text) => table["lines"] = toml_edit::value(text.as_str()),
+        Delta::Bytes(sha1) => table["delta"] = toml_edit::value(sha1.to_string()),
+        Delta::Fields(sets) => {
+            let mut array = toml_edit::ArrayOfTables::new();
+            for (at, to) in sets {
+                let mut set = toml_edit::Table::new();
+                let mut path = toml_edit::Array::new();
+                for step in at {
+                    match step {
+                        Step::Key(key) => path.push(key.as_str()),
+                        Step::At(at) => path.push(i64::try_from(*at).unwrap_or(i64::MAX)),
+                        Step::Id(id) => {
+                            let mut by = toml_edit::InlineTable::new();
+                            by.insert("id", id.as_str().into());
+                            path.push(by);
+                        }
+                    }
+                }
+                set["at"] = toml_edit::value(path);
+                if let Some(value) = to.as_deref().and_then(|text| text.parse::<toml_edit::Value>().ok()) {
+                    set["to"] = toml_edit::Item::Value(value);
+                }
+                array.push(set);
+            }
+            table["set"] = toml_edit::Item::ArrayOfTables(array);
         }
     }
 }
@@ -295,12 +507,23 @@ impl Record {
         for (name, file) in table.get("files").and_then(toml::Value::as_table).into_iter().flatten() {
             let file = file.as_table().with_context(|| format!("{name}: not a table"))?;
             let field = |key: &str| file.get(key).and_then(toml::Value::as_str).map(str::to_string);
+            let base = field("base").map(|base| pe2_ext::Sha1::from_hex(&base)).transpose();
+            let base = base.with_context(|| format!("{name}: its base"))?;
             let content = match (field("text"), field("sha1")) {
                 (Some(text), None) => Some(Content::Text(text)),
                 (None, Some(sha1)) => {
                     let size = file.get("size").and_then(toml::Value::as_integer).context("a stored file's size")?;
-                    let sha1 = pe2_ext::Sha1::from_hex(&sha1).with_context(|| format!("{name}: its sha1"))?;
-                    Some(Content::Stored { sha1, size: u64::try_from(size)? })
+                    let (sha1, size) = (
+                        pe2_ext::Sha1::from_hex(&sha1).with_context(|| format!("{name}: its sha1"))?,
+                        u64::try_from(size)?,
+                    );
+                    match delta_in(file).with_context(|| format!("{name}: what it changes"))? {
+                        Some(delta) => {
+                            let base = base.with_context(|| format!("{name}: what it changes, of no base"))?;
+                            Some(Content::Delta { sha1, size, base, delta })
+                        }
+                        None => Some(Content::Stored { sha1, size }),
+                    }
                 }
                 (None, None) if file.get("removed").and_then(toml::Value::as_bool) == Some(true) => None,
                 _ => bail!("{name}: neither text, a stored file nor removed"),
@@ -310,8 +533,7 @@ impl Record {
             if let Some((other, _)) = files.get_key_value(&*at) {
                 bail!("its files {other} and {name} are one name to a system that does not tell case or form apart");
             }
-            let base = field("base").map(|base| pe2_ext::Sha1::from_hex(&base)).transpose();
-            files.insert(at, File { content, base: base.with_context(|| format!("{name}: its base"))? });
+            files.insert(at, File { content, base });
         }
         let tree = string("tree").map(|text| pe2_ext::Sha1::from_hex(&text)).transpose().context("its tree")?;
         if tree.is_some() && kind != Kind::Node {
@@ -349,6 +571,11 @@ impl Record {
                     Some(Content::Stored { sha1, size } | Content::Object { sha1, size }) => {
                         table["sha1"] = toml_edit::value(sha1.to_string());
                         table["size"] = toml_edit::value(i64::try_from(*size).unwrap_or(i64::MAX));
+                    }
+                    Some(Content::Delta { sha1, size, delta, .. }) => {
+                        table["sha1"] = toml_edit::value(sha1.to_string());
+                        table["size"] = toml_edit::value(i64::try_from(*size).unwrap_or(i64::MAX));
+                        render_delta(&mut table, delta);
                     }
                     None => table["removed"] = toml_edit::value(true),
                 }
@@ -1212,6 +1439,11 @@ impl Set {
             }
             Content::Stored { sha1, .. } => Source::Stored { sha1, store: view.store.dir.clone() },
             Content::Object { sha1, size } => Source::Object { sha1, size, store: view.store.dir.clone() },
+            // Made whole once, and read so.
+            delta @ Content::Delta { .. } => {
+                let sha1 = made(&delta, &view.store).ok()??;
+                Source::Stored { sha1, store: view.store.holding_file(&sha1)?.dir }
+            }
         })
     }
 
@@ -1990,8 +2222,15 @@ fn override_files(
             None
         } else {
             match now.remove(file) {
-                Some(Some(bytes)) => Some(Content::of(&bytes, store)?),
-                _ => held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()),
+                // What it changes of the version below it was made from.
+                Some(Some(bytes)) => Some(Content::over(&bytes, base.was, file.as_str(), store)?),
+                _ => match held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()) {
+                    // Made from another version than now: what it changes said again of this one.
+                    Some(delta @ Content::Delta { base: from, .. }) if Some(from) != base.was => {
+                        Some(Content::over(&delta.bytes(store)?, base.was, file.as_str(), store)?)
+                    }
+                    content => content,
+                },
             }
         };
         files.insert(file.clone(), File { content, base: base.was });

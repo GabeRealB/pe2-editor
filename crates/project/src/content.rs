@@ -34,6 +34,13 @@ enum Form {
         store: Store,
         modified: std::time::SystemTime,
     },
+    /// What an override changes of its base (`records::Content::Delta`): its length and hash known, the file made whole -
+    /// once, kept in this machine's store - only when its bytes are read (`whole`).
+    Delta {
+        content: crate::records::Content,
+        store: Store,
+        modified: std::time::SystemTime,
+    },
     /// A file of a sealed node, a whole object of its tree (`records::Record::tree`): read where it is, never written.
     Object {
         path: HostPath,
@@ -210,6 +217,8 @@ fn form(io: &Io, path: &HostPath) -> io::Result<Form> {
             crate::records::Content::Object { sha1, size } => {
                 Form::Object { path: store.held_object(&sha1)?, sha1, size, modified }
             }
+            // What an override changes of its base: made whole when it is read.
+            content @ crate::records::Content::Delta { .. } => Form::Delta { content, store, modified },
         });
     }
     if fs.is_file(path) {
@@ -218,12 +227,30 @@ fn form(io: &Io, path: &HostPath) -> io::Result<Form> {
     Err(io::Error::new(io::ErrorKind::NotFound, path.display().to_string()))
 }
 
+/// Where a path's content is, to be read: a delta's file made whole - once, kept in this machine's store - and read as a
+/// file kept whole is.
+///
+/// # Errors
+/// It is nowhere, or a delta's base is in no store of the project's.
+fn whole(io: &Io, path: &HostPath) -> io::Result<Form> {
+    match form(io, path)? {
+        Form::Delta { content, store, modified } => {
+            let sha1 = crate::records::made(&content, &store)?.ok_or_else(|| io::Error::other("no delta"))?;
+            let (manifest, store) = stored_manifest(&store, &sha1)?;
+            Ok(Form::Stored { manifest, store, modified })
+        }
+        form => Ok(form),
+    }
+}
+
 /// A file's content, whole.
 ///
 /// # Errors
 /// It cannot be read.
 pub fn read(io: &Io, path: &HostPath) -> io::Result<Vec<u8>> {
-    match form(io, path)? {
+    match whole(io, path)? {
+        // Made whole before it is read (`whole`).
+        Form::Delta { .. } => Err(io::Error::other("a delta read before it was made whole")),
         Form::Plain(path) | Form::Object { path, .. } => io.filesystem().read(&path),
         Form::Inline { bytes, .. } => Ok(bytes),
         Form::Stored { manifest, store, .. } => {
@@ -245,7 +272,9 @@ pub fn read_to_string(io: &Io, path: &HostPath) -> io::Result<String> {
 /// # Errors
 /// It cannot be opened or read.
 pub fn read_range(io: &Io, path: &HostPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    match form(io, path)? {
+    match whole(io, path)? {
+        // Made whole before it is read (`whole`).
+        Form::Delta { .. } => Err(io::Error::other("a delta read before it was made whole")),
         Form::Plain(path) | Form::Object { path, .. } => {
             let file = io.filesystem().open(&path, Open::READ)?;
             let len = usize::try_from(file.stat()?.size.saturating_sub(offset)).unwrap_or(usize::MAX).min(len);
@@ -268,7 +297,9 @@ pub fn read_range(io: &Io, path: &HostPath, offset: u64, len: usize) -> io::Resu
 /// # Errors
 /// It cannot be opened or read.
 pub fn read_range_into(io: &Io, path: &HostPath, offset: u64, into: &mut [u8]) -> io::Result<usize> {
-    match form(io, path)? {
+    match whole(io, path)? {
+        // Made whole before it is read (`whole`).
+        Form::Delta { .. } => Err(io::Error::other("a delta read before it was made whole")),
         Form::Plain(path) | Form::Object { path, .. } => {
             read_all_at(&*io.filesystem().open(&path, Open::READ)?, offset, into)
         }
@@ -342,6 +373,7 @@ pub fn stat(io: &Io, path: &HostPath) -> io::Result<(u64, std::time::SystemTime)
             Ok((stat.size, stat.modified.ok_or_else(no_time)?))
         }
         Form::Stored { manifest, modified, .. } => Ok((manifest.size, modified)),
+        Form::Delta { content, modified, .. } => Ok((content.size(), modified)),
         Form::Inline { bytes, modified } => Ok((bytes.len() as u64, modified)),
         Form::Object { size, modified, .. } => Ok((size, modified)),
     }
@@ -356,6 +388,7 @@ pub fn sha1(io: &Io, path: &HostPath) -> io::Result<pe2_ext::Sha1> {
         Form::Plain(path) => crate::extract::sha1_file(io.filesystem(), &path).map_err(io::Error::other),
         Form::Inline { bytes, .. } => Ok(crate::extract::sha1_of(&bytes)),
         Form::Stored { manifest, .. } => Ok(manifest.sha1),
+        Form::Delta { content, .. } => Ok(content.sha1()),
         Form::Object { sha1, .. } => Ok(sha1),
     }
 }
@@ -562,7 +595,7 @@ fn laid_out(io: &Io, files: &BTreeMap<Arc<GivenPath>, Given>, under: &HostPath) 
             Given::Bytes(bytes) => fs.write(&to, bytes)?,
             // A whole file linked where it is, else its content written.
             Given::Disk(disk) => {
-                let whole = matches!(form(io, disk)?, Form::Plain(_) | Form::Object { .. });
+                let whole = matches!(whole(io, disk)?, Form::Plain(_) | Form::Object { .. });
                 if !(whole && fs.hard_link(disk, &to).is_ok()) {
                     fs.write(&to, &read(io, disk)?)?;
                 }
@@ -596,7 +629,9 @@ pub fn for_program(io: &Io, path: &HostPath) -> io::Result<HostPath> {
         };
         exposer.and_then(|serve| serve(io, path).ok())
     };
-    match form(io, path)? {
+    match whole(io, path)? {
+        // Made whole before it is read (`whole`).
+        Form::Delta { .. } => Err(io::Error::other("a delta read before it was made whole")),
         Form::Plain(path) => Ok(path),
         Form::Inline { .. } => materialize(io, path),
         Form::Stored { store, .. } => match exposed(&store.dir) {
@@ -631,7 +666,9 @@ fn not_in_a_project(path: &HostPath) -> io::Error {
 /// It cannot be read, or the outputs cannot be written.
 pub fn materialize(io: &Io, path: &HostPath) -> io::Result<HostPath> {
     let fs = io.filesystem();
-    match form(io, path)? {
+    match whole(io, path)? {
+        // Made whole before it is read (`whole`).
+        Form::Delta { .. } => Err(io::Error::other("a delta read before it was made whole")),
         // A whole object is a file already: never copied.
         Form::Plain(path) | Form::Object { path, .. } => Ok(path),
         Form::Inline { bytes, .. } => {
