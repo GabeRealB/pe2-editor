@@ -62,7 +62,9 @@ impl std::fmt::Display for LockError {
 
 impl std::error::Error for LockError {}
 
-fn paths(root: &HostPath) -> (HostPath, HostPath) {
+/// The project in `root`'s lock file, and the file beside it naming who holds it.
+#[must_use]
+pub fn paths(root: &HostPath) -> (HostPath, HostPath) {
     let dir = root.join(&DIR);
     (dir.join(&LOCK), dir.join(&OWNER))
 }

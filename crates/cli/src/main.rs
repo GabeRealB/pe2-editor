@@ -586,6 +586,20 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// What the project resolves to, as JSON: every entry by its path - what it is, its uid, the layers making it what
+    /// it is, its files by hash - and the problems; nothing of how the project is stored, so that two compare
+    Dump {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Where the project keeps what other programs reach of it, as JSON: the folder of this machine's state, the lock
+    /// and the file naming who holds it, where its host listens, and each layer's folder and plan
+    Paths {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// The project's chunk store, where its large files' content is kept
     Store {
         #[command(subcommand)]
@@ -1658,6 +1672,12 @@ fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Exte
 fn project_command(command: &ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
     match command {
         ProjectCommand::Problems { project } => return problems(project),
+        ProjectCommand::Dump { project } => return dump(project),
+        ProjectCommand::Paths { project } => {
+            let p = project::Project::load(project)?;
+            println!("{}", serde_json::to_string_pretty(&project::places::places(&p)?)?);
+            return Ok(());
+        }
         ProjectCommand::Serve { project, backend, address, forget, stop, set_aside, take_in } => {
             let strays = match (set_aside, take_in) {
                 (true, _) => server::Strays::SetAside,
@@ -1764,6 +1784,18 @@ fn problems(project: &Path) -> Result<()> {
     if listed("problems").is_empty() && listed("dangling_references").is_empty() {
         println!("no problems");
     }
+    Ok(())
+}
+
+/// `pe2-cli project dump`: what the project resolves to, read under its lock, as JSON.
+fn dump(project: &Path) -> Result<()> {
+    let p = project::Project::load(project)?;
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project dump", &*p.io, |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
+    let cache = project::cache::Cache::open(&p, &lock)?;
+    let index = project::index::Index::open(&p, &cache)?;
+    println!("{}", serde_json::to_string_pretty(&project::dump::dump(&index)?)?);
     Ok(())
 }
 
