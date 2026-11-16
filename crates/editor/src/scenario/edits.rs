@@ -38,13 +38,14 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
     let (label, _) = editor.workspace().apply_edit(&op, None).expect("made");
     assert!(label.contains("made"), "{label}");
     editor.until("the folder to be taken in", |e| e.workspace().index.entries.contains_key(&super::path("made")));
-    assert_eq!(records(&mut editor).len(), 1);
+    // Its record is said in the log first, and written behind it.
+    editor.until("its record to be written", |e| records(e).len() == 1);
     // The node below overridden: its record says what it was made from.
     let op = vfs::ops::Op::Override { path: tree("notes") };
     editor.workspace().apply_edit(&op, None).expect("overridden");
     editor
         .until("the override to be taken in", |e| e.workspace().index.assets[&super::path("notes")].layers.len() == 2);
-    assert_eq!(records(&mut editor).len(), 2);
+    editor.until("its record to be written", |e| records(e).len() == 2);
     // Both taken back, one step each: the layer holds nothing again.
     for _ in 0..2 {
         editor.workspace().apply_edit(&vfs::ops::Op::Undo, None).expect("undone");
@@ -53,7 +54,7 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
         !e.workspace().index.entries.contains_key(&super::path("made"))
             && e.workspace().index.assets[&super::path("notes")].layers.len() == 1
     });
-    assert!(records(&mut editor).is_empty(), "{:?}", records(&mut editor));
+    editor.until("their records to be removed", |e| records(e).is_empty());
 }
 
 #[test]

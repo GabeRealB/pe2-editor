@@ -52,7 +52,7 @@ fn number<T: std::str::FromStr>(entries: &[(String, String)], key: &str) -> Resu
 fn rate(text: &str) -> Option<f64> {
     let (top, bottom) = text.split_once('/')?;
     let (top, bottom): (f64, f64) = (top.parse().ok()?, bottom.parse().ok()?);
-    (bottom != 0.0).then(|| top / bottom)
+    (bottom != 0.0).then_some(top / bottom)
 }
 
 /// A file's sound, as it is read.

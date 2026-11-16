@@ -389,332 +389,441 @@ enum StoreCommand {
 enum ProjectCommand {
     /// Fill a project's generated layers by their plans (`layers/<layer>.plan.jsonl`), reading the discs where the
     /// plans say: only what changed or is gone is made, and what a plan no longer gives is removed
-    Extract {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// This generated layer alone
-        #[arg(long, value_parser = name)]
-        layer: Option<Arc<pe2_path::Name>>,
-        /// The releases to read: `available` - those whose discs are all found - `all`, failing by name on a disc not
-        /// found, or a list (`USA,EUR`)
-        #[arg(long, default_value = "available")]
-        releases: String,
-    },
+    Extract(ExtractArgs),
     /// Build a project's packages for a config
-    Build {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The config (the project's first by default)
-        #[arg(long, value_parser = name)]
-        config: Option<Arc<pe2_path::Name>>,
-        /// Clean first
-        #[arg(long)]
-        clean: bool,
-    },
+    Build(BuildArgs),
     /// Make an empty project: a `project.toml` naming a layer of its own
-    New {
-        /// The directory to make it in (made where missing)
-        directory: PathBuf,
-    },
+    New(NewArgs),
     /// The project's layers
-    Layer {
-        #[command(subcommand)]
-        command: LayerCommand,
-    },
+    Layer(LayerArgs),
     /// The trees mounted into the project
-    Mount {
-        #[command(subcommand)]
-        command: MountCommand,
-    },
+    Mount(MountArgs),
     /// The builds the project can be
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
+    Config(ConfigArgs),
     /// Links this machine wants to what the project's builds deploy (`.local/settings.toml`)
-    Link {
-        #[command(subcommand)]
-        command: LinkCommand,
-    },
+    Link(LinkArgs),
     /// Write a file at a path of the project (`packages/aya/node.toml`), from a file or standard input: a node's file, a
     /// plain one, or a `node.toml` that makes its folder a node
-    Write {
-        /// The path in the project, as the served folder shows it
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        /// The file whose content to write; standard input where none
-        #[arg(long)]
-        from: Option<PathBuf>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Write(WriteArgs),
     /// Make a folder
-    Mkdir {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Mkdir(MkdirArgs),
     /// Delete an entry (a node with what is inside it), or a file of a node
-    Rm {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Rm(RmArgs),
     /// Rename or move an entry, or a file within its node
-    Mv {
-        #[arg(value_parser = tree)]
-        from: Arc<project::TreePath>,
-        #[arg(value_parser = tree)]
-        to: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Mv(MvArgs),
     /// Make the layer's own version of an entry from below
-    Override {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Override(OverrideArgs),
     /// Drop the layer's operation on an entry - an override, a move, a delete - and what it holds of it
-    Drop {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Drop(DropArgs),
     /// Keep the layer's version of a stale override: its base becomes what is below now
-    KeepMine {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    KeepMine(KeepMineArgs),
     /// Give up the layer's version of an entry for the one below
-    TakeBase {
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    TakeBase(TakeBaseArgs),
     /// Take an entry a layer lists and no longer holds out of its list (a problem's layer and path)
-    Forget {
-        /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER", value_parser = name)]
-        of: Arc<pe2_path::Name>,
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Forget(ForgetArgs),
     /// List what a layer holds unlisted at and under a path of it (a problem's layer and path)
-    Adopt {
-        /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER", value_parser = name)]
-        of: Arc<pe2_path::Name>,
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Adopt(AdoptArgs),
     /// Remove what a layer holds unlisted at a path of it from its folder (a problem's layer and path)
-    RemoveUnlisted {
-        /// The layer holding it, as the problem names it
-        #[arg(value_name = "LAYER", value_parser = name)]
-        of: Arc<pe2_path::Name>,
-        #[arg(value_parser = tree)]
-        path: Arc<project::TreePath>,
-        #[command(flatten)]
-        at: EditAt,
-    },
+    RemoveUnlisted(RemoveUnlistedArgs),
     /// Take back the last step of whoever holds the project (an editor, or a host)
-    Undo {
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Undo(UndoArgs),
     /// Do again the last step taken back
-    Redo {
-        #[command(flatten)]
-        at: EditAt,
-    },
+    Redo(RedoArgs),
     /// The project's problems: what does not add up, each with the paths it is about
-    Problems {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Problems(ProblemsArgs),
     /// What the project resolves to, as JSON: every entry by its path - what it is, its uid, the layers making it what
     /// it is, its files by hash - and the problems; nothing of how the project is stored, so that two compare
-    Dump {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Dump(DumpArgs),
     /// Where the project keeps what other programs reach of it, as JSON: the folder of this machine's state, the lock
     /// and the file naming who holds it, where its host listens, and each layer's folder and plan
-    Paths {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Paths(PathsArgs),
     /// The project's chunk store, where its large files' content is kept
-    Store {
-        #[command(subcommand)]
-        command: StoreCommand,
-    },
+    Store(StoreArgs),
     /// Serve a project's merged layers as a filesystem: the tree the editor shows - every asset a `<path>.node/` folder
     /// holding its files - at the project's `assets` folder, until stopped (Ctrl-C), what programs write there a step
     /// of the highest writable layer. It holds the project while it serves
-    Serve {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// What serves it - a backend's name (`project backends` lists them), or `auto` for the best suited - in
-        /// place of what `.local/settings.toml` (`[filesystem] serve`) and then this machine's settings say
-        #[arg(long)]
-        backend: Option<String>,
-        /// WebDAV's address (`127.0.0.1:4918`; port 0 for any), in place of `[filesystem] address`
-        #[arg(long)]
-        address: Option<String>,
-        /// No longer have the project's folder registered with the system (a sync root, on Windows), and serve nothing
-        #[arg(long)]
-        forget: bool,
-        /// Stop what serves it, and the host holding it, whoever keeps them
-        #[arg(long)]
-        stop: bool,
-        /// Where its folder holds files that are not the project's, move them aside (`.local/set-aside`)
-        #[arg(long, conflicts_with = "take_in")]
-        set_aside: bool,
-        /// Where its folder holds files that are not the project's, write them into the project
-        #[arg(long)]
-        take_in: bool,
-    },
+    Serve(ServeArgs),
     /// What can serve a project as a filesystem here - each backend, what it can do, whether it is available and why
     /// not - and what serves its folder and the files programs are given, as the project and this machine say
-    Backends {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Backends(BackendsArgs),
     /// Hold a project while no editor does, answering what is asked of it, and keep its folder served (unless
     /// `--backend none`): what commands, agents and `serve` start, and keep
     #[command(hide = true)]
-    Host {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        #[arg(long)]
-        backend: Option<String>,
-        #[arg(long)]
-        address: Option<String>,
-        #[arg(long, value_enum, default_value = "refuse")]
-        strays: server::Strays,
-    },
+    Host(HostArgs),
     /// Serve a project as a filesystem, what whoever holds it lists of it, and nothing else: what a host and the
     /// editor start, and keep
     #[command(hide = true)]
-    Server {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        #[arg(long)]
-        backend: Option<String>,
-        #[arg(long)]
-        address: Option<String>,
-        #[arg(long, value_enum, default_value = "refuse")]
-        strays: server::Strays,
-    },
+    Server(ServerArgs),
     /// How a project's generated layers are, by their plans: none, empty, filled, or not as the plan says now - known
     /// without the discs and without reading what was made
-    Status {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// This generated layer alone
-        #[arg(long, value_parser = name)]
-        layer: Option<Arc<pe2_path::Name>>,
-    },
+    Status(StatusArgs),
     /// Check a project's generated layers against their plans, without the discs: every file there, made by what the
     /// plan says now, unchanged since it was written
-    Verify {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// This generated layer alone
-        #[arg(long, value_parser = name)]
-        layer: Option<Arc<pe2_path::Name>>,
-    },
+    Verify(VerifyArgs),
     /// Make an output of assets for a config, saying what each made: a file's name, size and SHA-1, a table as TOML
-    Output {
-        /// The assets, by path or uid
-        assets: Vec<pe2_path::Reference>,
-        /// Every asset of this type besides (`pe2.dialogue@dialogue`)
-        #[arg(long)]
-        r#type: Option<String>,
-        /// The output, by its address
-        #[arg(long, default_value = "native", value_parser = asked)]
-        output: Arc<pe2_path::Asked>,
-        /// The config built (the project's first by default)
-        #[arg(long, value_parser = name)]
-        config: Option<Arc<pe2_path::Name>>,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Output(OutputArgs),
     /// What a project's extensions offer whoever writes its nodes, as JSON: each template - its node type, the files it
     /// takes, its stack with `{file}` for the node's stored file - each operation a stack may name - its ports, output,
     /// version, the settings it derives and what undoes it - and each extension's version
-    Registry {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
+    Registry(RegistryArgs),
     /// Remove what a build deployed, and make it again next time
-    Clean {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The config (the project's first by default)
-        #[arg(long, value_parser = name)]
-        config: Option<Arc<pe2_path::Name>>,
-    },
+    Clean(CleanArgs),
     /// Say which places of a project you trust: what is in them runs unsandboxed. Kept with you, never in the project.
     /// With nothing to trust named, it says what is trusted
-    Trust {
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// All that is inside the project (not what is mounted from outside it)
-        #[arg(long)]
-        all: bool,
-        /// A layer or a mount, by name
-        #[arg(long, value_parser = name)]
-        layer: Vec<Arc<pe2_path::Name>>,
-        /// A folder
-        #[arg(long)]
-        path: Vec<PathBuf>,
-        /// Stop trusting those named, or all of the project's
-        #[arg(long)]
-        revoke: bool,
-    },
+    Trust(TrustArgs),
     /// The extensions a project holds
-    Extension {
-        #[command(subcommand)]
-        command: ExtensionCommand,
-    },
+    Extension(ExtensionArgs),
     /// Signal an event, and wait for what it sets off
-    Signal {
-        /// The event's name
-        event: String,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The config (the project's first by default)
-        #[arg(long, value_parser = name)]
-        config: Option<Arc<pe2_path::Name>>,
-    },
+    Signal(SignalArgs),
+}
+
+#[derive(clap::Args)]
+struct ExtractArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// This generated layer alone
+    #[arg(long, value_parser = name)]
+    layer: Option<Arc<pe2_path::Name>>,
+    /// The releases to read: `available` - those whose discs are all found - `all`, failing by name on a disc not
+    /// found, or a list (`USA,EUR`)
+    #[arg(long, default_value = "available")]
+    releases: String,
+}
+
+#[derive(clap::Args)]
+struct BuildArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// The config (the project's first by default)
+    #[arg(long, value_parser = name)]
+    config: Option<Arc<pe2_path::Name>>,
+    /// Clean first
+    #[arg(long)]
+    clean: bool,
+}
+
+#[derive(clap::Args)]
+struct NewArgs {
+    /// The directory to make it in (made where missing)
+    directory: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct LayerArgs {
+    #[command(subcommand)]
+    command: LayerCommand,
+}
+
+#[derive(clap::Args)]
+struct MountArgs {
+    #[command(subcommand)]
+    command: MountCommand,
+}
+
+#[derive(clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(clap::Args)]
+struct LinkArgs {
+    #[command(subcommand)]
+    command: LinkCommand,
+}
+
+#[derive(clap::Args)]
+struct WriteArgs {
+    /// The path in the project, as the served folder shows it
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    /// The file whose content to write; standard input where none
+    #[arg(long)]
+    from: Option<PathBuf>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct MkdirArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct RmArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct MvArgs {
+    #[arg(value_parser = tree)]
+    from: Arc<project::TreePath>,
+    #[arg(value_parser = tree)]
+    to: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct OverrideArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct DropArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct KeepMineArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct TakeBaseArgs {
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct ForgetArgs {
+    /// The layer holding it, as the problem names it
+    #[arg(value_name = "LAYER", value_parser = name)]
+    of: Arc<pe2_path::Name>,
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct AdoptArgs {
+    /// The layer holding it, as the problem names it
+    #[arg(value_name = "LAYER", value_parser = name)]
+    of: Arc<pe2_path::Name>,
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct RemoveUnlistedArgs {
+    /// The layer holding it, as the problem names it
+    #[arg(value_name = "LAYER", value_parser = name)]
+    of: Arc<pe2_path::Name>,
+    #[arg(value_parser = tree)]
+    path: Arc<project::TreePath>,
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct UndoArgs {
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct RedoArgs {
+    #[command(flatten)]
+    at: EditAt,
+}
+
+#[derive(clap::Args)]
+struct ProblemsArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct DumpArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct PathsArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct StoreArgs {
+    #[command(subcommand)]
+    command: StoreCommand,
+}
+
+#[derive(clap::Args)]
+#[expect(clippy::struct_excessive_bools, reason = "a command's flags, each said apart")]
+struct ServeArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// What serves it - a backend's name (`project backends` lists them), or `auto` for the best suited - in
+    /// place of what `.local/settings.toml` (`[filesystem] serve`) and then this machine's settings say
+    #[arg(long)]
+    backend: Option<String>,
+    /// WebDAV's address (`127.0.0.1:4918`; port 0 for any), in place of `[filesystem] address`
+    #[arg(long)]
+    address: Option<String>,
+    /// No longer have the project's folder registered with the system (a sync root, on Windows), and serve nothing
+    #[arg(long)]
+    forget: bool,
+    /// Stop what serves it, and the host holding it, whoever keeps them
+    #[arg(long)]
+    stop: bool,
+    /// Where its folder holds files that are not the project's, move them aside (`.local/set-aside`)
+    #[arg(long, conflicts_with = "take_in")]
+    set_aside: bool,
+    /// Where its folder holds files that are not the project's, write them into the project
+    #[arg(long)]
+    take_in: bool,
+}
+
+#[derive(clap::Args)]
+struct BackendsArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct HostArgs {
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    #[arg(long)]
+    backend: Option<String>,
+    #[arg(long)]
+    address: Option<String>,
+    #[arg(long, value_enum, default_value = "refuse")]
+    strays: server::Strays,
+}
+
+#[derive(clap::Args)]
+struct ServerArgs {
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    #[arg(long)]
+    backend: Option<String>,
+    #[arg(long)]
+    address: Option<String>,
+    #[arg(long, value_enum, default_value = "refuse")]
+    strays: server::Strays,
+}
+
+#[derive(clap::Args)]
+struct StatusArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// This generated layer alone
+    #[arg(long, value_parser = name)]
+    layer: Option<Arc<pe2_path::Name>>,
+}
+
+#[derive(clap::Args)]
+struct VerifyArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// This generated layer alone
+    #[arg(long, value_parser = name)]
+    layer: Option<Arc<pe2_path::Name>>,
+}
+
+#[derive(clap::Args)]
+struct OutputArgs {
+    /// The assets, by path or uid
+    assets: Vec<pe2_path::Reference>,
+    /// Every asset of this type besides (`pe2.dialogue@dialogue`)
+    #[arg(long)]
+    r#type: Option<String>,
+    /// The output, by its address
+    #[arg(long, default_value = "native", value_parser = asked)]
+    output: Arc<pe2_path::Asked>,
+    /// The config built (the project's first by default)
+    #[arg(long, value_parser = name)]
+    config: Option<Arc<pe2_path::Name>>,
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct RegistryArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct CleanArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// The config (the project's first by default)
+    #[arg(long, value_parser = name)]
+    config: Option<Arc<pe2_path::Name>>,
+}
+
+#[derive(clap::Args)]
+struct TrustArgs {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// All that is inside the project (not what is mounted from outside it)
+    #[arg(long)]
+    all: bool,
+    /// A layer or a mount, by name
+    #[arg(long, value_parser = name)]
+    layer: Vec<Arc<pe2_path::Name>>,
+    /// A folder
+    #[arg(long)]
+    path: Vec<PathBuf>,
+    /// Stop trusting those named, or all of the project's
+    #[arg(long)]
+    revoke: bool,
+}
+
+#[derive(clap::Args)]
+struct ExtensionArgs {
+    #[command(subcommand)]
+    command: ExtensionCommand,
+}
+
+#[derive(clap::Args)]
+struct SignalArgs {
+    /// The event's name
+    event: String,
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// The config (the project's first by default)
+    #[arg(long, value_parser = name)]
+    config: Option<Arc<pe2_path::Name>>,
 }
 
 #[derive(Subcommand)]
@@ -1502,18 +1611,20 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 /// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
 fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
     match command {
-        ProjectCommand::New { directory } => {
+        ProjectCommand::New(NewArgs { directory }) => {
             project::create(&directory, io.filesystem())?;
             println!("an empty project in {}", directory.display());
         }
-        ProjectCommand::Layer { command: LayerCommand::Add { name, bottom, generated: _, fills, project } } => {
+        ProjectCommand::Layer(LayerArgs {
+            command: LayerCommand::Add { name, bottom, generated: _, fills, project },
+        }) => {
             if let Some(fills) = fills {
                 edit_project(&project, |p, history| project::setup::add_generated(p, &name, &fills, history))?;
             } else {
                 edit_project(&project, |p, history| project::stack::add_at(p, &name, bottom, history))?;
             }
         }
-        ProjectCommand::Layer { command: LayerCommand::Import { name, from, project } } => {
+        ProjectCommand::Layer(LayerArgs { command: LayerCommand::Import { name, from, project } }) => {
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", &*p.io, |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
@@ -1522,24 +1633,24 @@ fn setup_command(command: ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
             let count = project::records::import(&p, &name, &from)?;
             println!("{name}: {count} records");
         }
-        ProjectCommand::Layer { command: LayerCommand::Export { name, to, project } } => {
+        ProjectCommand::Layer(LayerArgs { command: LayerCommand::Export { name, to, project } }) => {
             let p = project::Project::load(&project)?;
             let count = project::records::export(&p, &name, &to)?;
             println!("{name}: {count} entries written to {}", to.display());
         }
-        ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, unmanaged, project } } => {
+        ProjectCommand::Mount(MountArgs { command: MountCommand::Add { at, path, read_only, unmanaged, project } }) => {
             edit_project(&project, |p, history| {
                 project::setup::add_mount(p, &at, path.as_deref(), read_only, unmanaged, history)
             })?;
         }
-        ProjectCommand::Mount { command: MountCommand::Locate { at, path, project } } => {
+        ProjectCommand::Mount(MountArgs { command: MountCommand::Locate { at, path, project } }) => {
             project::setup::locate(&project::Project::load(&project)?, &at, &path)?;
         }
-        ProjectCommand::Link { command: LinkCommand::Add { at, deployed, project } } => {
+        ProjectCommand::Link(LinkArgs { command: LinkCommand::Add { at, deployed, project } }) => {
             project::setup::add_link(&project::Project::load(&project)?, &at, &deployed)?;
         }
-        ProjectCommand::Config { command } => config_command(command)?,
-        ProjectCommand::Status { project, layer } => {
+        ProjectCommand::Config(ConfigArgs { command }) => config_command(command)?,
+        ProjectCommand::Status(StatusArgs { project, layer }) => {
             let p = project::Project::load(&project)?;
             let extensions = project_extensions(&p);
             for l in generated_layers(&p, layer.as_deref())? {
@@ -1631,14 +1742,14 @@ fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Exte
 /// A project command serving it, editing it, or saying its problems.
 fn project_command(command: &ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> {
     match command {
-        ProjectCommand::Problems { project } => return problems(project),
-        ProjectCommand::Dump { project } => return dump(project),
-        ProjectCommand::Paths { project } => {
+        ProjectCommand::Problems(ProblemsArgs { project }) => return problems(project),
+        ProjectCommand::Dump(DumpArgs { project }) => return dump(project),
+        ProjectCommand::Paths(PathsArgs { project }) => {
             let p = project::Project::load(project)?;
             println!("{}", serde_json::to_string_pretty(&project::places::places(&p)?)?);
             return Ok(());
         }
-        ProjectCommand::Serve { project, backend, address, forget, stop, set_aside, take_in } => {
+        ProjectCommand::Serve(ServeArgs { project, backend, address, forget, stop, set_aside, take_in }) => {
             let strays = match (set_aside, take_in) {
                 (true, _) => server::Strays::SetAside,
                 (_, true) => server::Strays::TakeIn,
@@ -1650,11 +1761,11 @@ fn project_command(command: &ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> 
                 serve_project(project, backend.as_deref(), address.as_deref(), *stop, strays)
             };
         }
-        ProjectCommand::Backends { project } => return backends(project),
-        ProjectCommand::Host { project, backend, address, strays } => {
+        ProjectCommand::Backends(BackendsArgs { project }) => return backends(project),
+        ProjectCommand::Host(HostArgs { project, backend, address, strays }) => {
             return host::run(project, backend.as_deref(), address.as_deref(), *strays);
         }
-        ProjectCommand::Server { project, backend, address, strays } => {
+        ProjectCommand::Server(ServerArgs { project, backend, address, strays }) => {
             return server::run(project, backend.as_deref(), address.as_deref(), *strays);
         }
         _ => {}
@@ -1662,7 +1773,7 @@ fn project_command(command: &ProjectCommand, io: &dyn pe2_io::Io) -> Result<()> 
     let (op, at) = edit_of(command).context("no such command")??;
     let done = edit(&op, at);
     // What standard input was kept in is the edit's alone.
-    if let (ProjectCommand::Write { from: None, .. }, vfs::ops::Op::Write { from, .. }) = (command, &op)
+    if let (ProjectCommand::Write(WriteArgs { from: None, .. }), vfs::ops::Op::Write { from, .. }) = (command, &op)
         && let vfs::write::Written::File(from) = from
     {
         let _ = io.filesystem().remove_file(from);
@@ -1679,27 +1790,29 @@ fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> 
 fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> {
     use vfs::ops::Op;
     Ok(Some(match command {
-        ProjectCommand::Write { path: at_path, from, at } => {
+        ProjectCommand::Write(WriteArgs { path: at_path, from, at }) => {
             let from = match from {
                 Some(from) => from.clone(),
                 None => read_stdin_to_file()?,
             };
             (Op::Write { path: at_path.clone(), from: vfs::write::Written::file(&from)? }, at)
         }
-        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: p.clone() }, at),
-        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: p.clone() }, at),
-        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: from.clone(), to: to.clone() }, at),
-        ProjectCommand::Override { path: p, at } => (Op::Override { path: p.clone() }, at),
-        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: p.clone() }, at),
-        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: p.clone() }, at),
-        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: p.clone() }, at),
-        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: p.clone() }, at),
-        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: p.clone() }, at),
-        ProjectCommand::RemoveUnlisted { of, path: p, at } => {
+        ProjectCommand::Mkdir(MkdirArgs { path: p, at }) => (Op::Folder { path: p.clone() }, at),
+        ProjectCommand::Rm(RmArgs { path: p, at }) => (Op::Remove { path: p.clone() }, at),
+        ProjectCommand::Mv(MvArgs { from, to, at }) => (Op::Rename { from: from.clone(), to: to.clone() }, at),
+        ProjectCommand::Override(OverrideArgs { path: p, at }) => (Op::Override { path: p.clone() }, at),
+        ProjectCommand::Drop(DropArgs { path: p, at }) => (Op::Drop { path: p.clone() }, at),
+        ProjectCommand::KeepMine(KeepMineArgs { path: p, at }) => (Op::KeepMine { path: p.clone() }, at),
+        ProjectCommand::TakeBase(TakeBaseArgs { path: p, at }) => (Op::TakeBase { path: p.clone() }, at),
+        ProjectCommand::Forget(ForgetArgs { of, path: p, at }) => {
+            (Op::Forget { layer: of.clone(), path: p.clone() }, at)
+        }
+        ProjectCommand::Adopt(AdoptArgs { of, path: p, at }) => (Op::Adopt { layer: of.clone(), path: p.clone() }, at),
+        ProjectCommand::RemoveUnlisted(RemoveUnlistedArgs { of, path: p, at }) => {
             (Op::RemoveUnlisted { layer: of.clone(), path: p.clone() }, at)
         }
-        ProjectCommand::Undo { at } => (Op::Undo, at),
-        ProjectCommand::Redo { at } => (Op::Redo, at),
+        ProjectCommand::Undo(UndoArgs { at }) => (Op::Undo, at),
+        ProjectCommand::Redo(RedoArgs { at }) => (Op::Redo, at),
         _ => return Ok(None),
     }))
 }
@@ -2086,38 +2199,38 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Editor { command: EditorCommand::Wait { project, until, timeout } } => {
             wait_editor(&project, until, timeout)?;
         }
-        Tool::Project { command: ProjectCommand::Build { project, config, clean } } => {
+        Tool::Project { command: ProjectCommand::Build(BuildArgs { project, config, clean }) } => {
             let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
             signal(&project, config.as_deref(), events)?;
         }
         Tool::Project {
             command:
-                command @ (ProjectCommand::New { .. }
-                | ProjectCommand::Layer { .. }
-                | ProjectCommand::Mount { .. }
-                | ProjectCommand::Config { .. }
-                | ProjectCommand::Link { .. }
-                | ProjectCommand::Status { .. }),
+                command @ (ProjectCommand::New(NewArgs { .. })
+                | ProjectCommand::Layer(LayerArgs { .. })
+                | ProjectCommand::Mount(MountArgs { .. })
+                | ProjectCommand::Config(ConfigArgs { .. })
+                | ProjectCommand::Link(LinkArgs { .. })
+                | ProjectCommand::Status(StatusArgs { .. })),
         } => setup_command(command, &*io)?,
-        Tool::Project { command: ProjectCommand::Verify { project, layer } } => {
+        Tool::Project { command: ProjectCommand::Verify(VerifyArgs { project, layer }) } => {
             verify_layer(&project, layer.as_deref())?;
         }
-        Tool::Project { command: ProjectCommand::Registry { project } } => print_registry(&project)?,
-        Tool::Project { command: ProjectCommand::Output { assets, r#type, output, config, project } } => {
+        Tool::Project { command: ProjectCommand::Registry(RegistryArgs { project }) } => print_registry(&project)?,
+        Tool::Project { command: ProjectCommand::Output(OutputArgs { assets, r#type, output, config, project }) } => {
             outputs(&project, &assets, r#type.as_deref(), &output, config.as_deref())?;
         }
-        Tool::Project { command: ProjectCommand::Clean { project, config } } => {
+        Tool::Project { command: ProjectCommand::Clean(CleanArgs { project, config }) } => {
             signal(&project, config.as_deref(), &[Clean::NAME])?;
         }
-        Tool::Project { command: ProjectCommand::Trust { project, all, layer, path, revoke } } => {
+        Tool::Project { command: ProjectCommand::Trust(TrustArgs { project, all, layer, path, revoke }) } => {
             trust(&project, all, &layer, path, revoke)?;
         }
-        Tool::Project { command: ProjectCommand::Extension { command } } => extension(command)?,
-        Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
+        Tool::Project { command: ProjectCommand::Extension(ExtensionArgs { command }) } => extension(command)?,
+        Tool::Project { command: ProjectCommand::Signal(SignalArgs { event, project, config }) } => {
             signal(&project, config.as_deref(), &[event.as_str()])?;
         }
-        Tool::Project { command: ProjectCommand::Store { command } } => store(&command)?,
-        Tool::Project { command: ProjectCommand::Extract { project, layer, releases } } => {
+        Tool::Project { command: ProjectCommand::Store(StoreArgs { command }) } => store(&command)?,
+        Tool::Project { command: ProjectCommand::Extract(ExtractArgs { project, layer, releases }) } => {
             let releases = match releases.as_str() {
                 "available" => project::plan::Releases::Available,
                 "all" => project::plan::Releases::All,

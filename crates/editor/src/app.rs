@@ -489,7 +489,7 @@ impl Editor {
             .file_name()
             .map_or_else(|| opening.dir.display().to_string(), |n| n.to_string_lossy().into_owned());
         #[expect(clippy::cast_precision_loss, reason = "a fraction shown")]
-        let fraction = (total > 0).then(|| done as f32 / total as f32);
+        let fraction = (total > 0).then_some(done as f32 / total as f32);
         Some(panes::OpeningShown { name, stage, fraction })
     }
 

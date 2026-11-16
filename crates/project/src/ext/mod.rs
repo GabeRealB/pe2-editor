@@ -3148,7 +3148,7 @@ mod tests {
         let plain = load(vec![of("test.editing", &[], &["test.movies"], &[], editing).into()]);
         assert_eq!(plain.loaded.len(), 1, "{:?}", plain.problems);
         let added = load(vec![movies(), of("test.editing", &["test.movies"], &[], &[], editing).into()]);
-        assert!(added.types["test.movies@movie"].0.values.contains(&"test.editing@built".to_string()));
+        assert!(added.types["test.movies@movie"].0.values.iter().any(|value| value == "test.editing@built"));
         let undeclared = load(vec![movies(), of("test.editing", &[], &[], &[], editing).into()]);
         assert_eq!(undeclared.loaded.len(), 1);
     }
