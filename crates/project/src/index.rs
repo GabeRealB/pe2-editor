@@ -872,6 +872,11 @@ impl Scan {
         self.folders.retain(|p| !below(p));
         self.files.retain(|p, _| !below(p));
         self.refused.retain(|p, _| !shown_within(p, rel));
+        // A records layer's tree is as its records show it: taken whole, not walked.
+        if let Some(shown) = crate::records::Set::shown(&place.root) {
+            self.records(place, rel, &shown);
+            return;
+        }
         let start = if rel.is_root() { place.root.clone() } else { place.disk(rel) };
         let rel = if rel.is_root() { place.at.clone() } else { rel.to_owned() };
         if rel == place.at {
@@ -922,6 +927,56 @@ impl Scan {
             self.folders.extend(folders);
             self.files.extend(files);
             self.refused.extend(refused);
+        }
+    }
+
+    /// What a records layer shows at and under `rel` (all of it at its root), as a walk of its tree would find it: its
+    /// nodes as bundles of their files, its folders and plain files outside them - but for what a name starting with
+    /// `.` or one the layer ignores leaves out, at any level, and a node whose asset's name is none, refused whole.
+    fn records(&mut self, place: &Place, rel: &TreePath, shown: &crate::records::Shown) {
+        // A path within a node is rescanned as its node.
+        let node_of = |path: &TreePath| -> Option<Arc<TreePath>> {
+            let mut at = Some(path);
+            while let Some(here) = at.filter(|here| !here.is_root()) {
+                if let Some(node) = shown.nodes.get(here) {
+                    return Some(node.clone());
+                }
+                at = here.parent();
+            }
+            None
+        };
+        let node = node_of(rel);
+        let rel = node.as_deref().unwrap_or(rel);
+        let kept = |path: &TreePath| {
+            let mut at = Some(path);
+            while let Some(here) = at.filter(|here| !here.is_root()) {
+                if here.name().is_some_and(|name| name.starts_with('.')) || place.ignores(here) {
+                    return false;
+                }
+                at = here.parent();
+            }
+            true
+        };
+        let wanted = |path: &TreePath| path.starts_with(rel) && kept(path);
+        for node in shown.nodes.iter().filter(|node| wanted(node)) {
+            match asset_named(node) {
+                Ok(_) => drop(self.bundles.insert(node.clone(), BTreeMap::new())),
+                Err(why) => drop(self.refused.insert(node.to_string(), format!("its asset's name: {why}").into())),
+            }
+        }
+        for folder in shown.folders.iter().filter(|folder| wanted(folder) && node_of(folder).is_none()) {
+            self.folders.insert(folder.clone());
+        }
+        for file in shown.files.iter().filter(|file| wanted(file)) {
+            match node_of(file) {
+                Some(node) => {
+                    let Some(files) = self.bundles.get_mut(&node) else { continue };
+                    if let Some(within) = file.strip_prefix(&node) {
+                        files.insert(within.to_owned(), place.disk(file));
+                    }
+                }
+                None => drop(self.files.insert(file.clone(), place.disk(file))),
+            }
         }
     }
 

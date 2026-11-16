@@ -576,6 +576,8 @@ struct View {
     /// Each file by its path in the layer: its entry's uid and its name in the entry (the root for a plain file).
     files: BTreeMap<Arc<TreePath>, (Uid, Arc<RelPath>)>,
     folders: std::collections::BTreeSet<Arc<TreePath>>,
+    /// The nodes it shows, by their paths (`<name>.node`).
+    nodes: BTreeSet<Arc<TreePath>>,
     /// Where each of its records' entries is.
     placed: std::collections::HashMap<Uid, Arc<TreePath>>,
     /// Where the entries its records name are - those it makes and those it moves: what the layers above place
@@ -606,6 +608,7 @@ impl View {
             }
             Kind::Node => {
                 self.folders.insert(at.clone());
+                self.nodes.insert(at.clone());
                 for (name, file) in &record.files {
                     if file.content.is_some() {
                         self.files.insert(at.join_path(name), (uid, name.clone()));
@@ -629,6 +632,7 @@ impl View {
             records: Read::default(),
             files: BTreeMap::new(),
             folders: std::collections::BTreeSet::new(),
+            nodes: BTreeSet::new(),
             placed: std::collections::HashMap::new(),
             named: std::sync::Arc::default(),
             children: std::collections::HashMap::new(),
@@ -651,6 +655,13 @@ impl View {
         }
         self.children = children;
     }
+}
+
+/// What a records layer shows (`Set::shown`).
+pub struct Shown {
+    pub nodes: BTreeSet<Arc<TreePath>>,
+    pub folders: Vec<Arc<TreePath>>,
+    pub files: Vec<Arc<TreePath>>,
 }
 
 /// What is known of a project's records layers, for a set to open over (`Set::open_over`): each layer's records by
@@ -1182,6 +1193,20 @@ impl Set {
             differing.extend(gone.filter_map(|uid| path_of(&view.folder, *uid).ok()));
         }
         differing
+    }
+
+    /// What the records layer whose tree is addressed at `dir` shows, as a scan takes it whole rather than walking it:
+    /// its nodes, its folders (a node's among them, and those inside one) and its files (a node's among them), each by
+    /// its path in the layer. None where `dir` is no records layer's.
+    #[must_use]
+    pub fn shown(dir: &HostPath) -> Option<Shown> {
+        let (set, i) = Set::view_at(dir)?;
+        let view = &set.views[i];
+        Some(Shown {
+            nodes: view.nodes.clone(),
+            folders: view.folders.iter().cloned().collect(),
+            files: view.files.keys().cloned().collect(),
+        })
     }
 
     /// The records layer whose tree is addressed at `dir`.
@@ -1808,6 +1833,134 @@ mod tests {
         assert!(error.to_string().contains("one name"), "{error}");
         assert!(Record::parse(&text("caf\u{e9}.txt", "cafe\u{301}.txt")).is_err());
         assert_eq!(Record::parse(&text("a.txt", "b.txt")).unwrap().files.len(), 2);
+    }
+
+    /// A project of its own layer alone, and a tool's tree beside it to import: a node, one holding bytes no text is,
+    /// a folder with a node and a plain file in it, and an empty folder.
+    fn staged(name: &str) -> (sfs::HostPath, sfs::HostPath) {
+        let root = crate::testing::scratch(name);
+        let _ = std::fs::remove_dir_all(&root);
+        crate::create(&root, &pe2_io::SystemFilesystem).unwrap();
+        let tree = root.at("staging/tree");
+        for (path, bytes) in [
+            ("a.node/node.toml", &b"stack = [{ op = \"t.file\" }]\n"[..]),
+            ("b.node/node.toml", b"stack = [{ op = \"t.file\" }]\n"),
+            ("b.node/native.bin", b"\0\x01\x02"),
+            ("g/c.node/node.toml", b"x = 1\n"),
+            ("g/notes", b"notes"),
+        ] {
+            std::fs::create_dir_all(tree.at(path).parent().unwrap()).unwrap();
+            std::fs::write(tree.at(path), bytes).unwrap();
+        }
+        std::fs::create_dir_all(tree.at("empty")).unwrap();
+        // Each listed by a uid of its own - but the empty folder, given one as it is imported.
+        let listing = "[entries]\n\"uid://1a2b3c4d5e6f7\" = \"a.node\"\n\"uid://2b\" = \"b.node\"\n\"uid://3g\" = \"g\"\n\
+                       \"uid://4c\" = \"g/c.node\"\n\"uid://5n\" = \"g/notes\"\n";
+        std::fs::write(root.at("staging/tree.toml"), listing).unwrap();
+        (root, tree)
+    }
+
+    /// Every file under a folder, by its path within it, with its bytes - but what an atomic write left beside its file
+    /// as the disk failed (`.<name>.<process>.<n>.tmp`), until storage writes its temporary files out of the trees.
+    fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut pending = vec![(dir.to_path_buf(), String::new())];
+        while let Some((at, within)) = pending.pop() {
+            for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') && std::path::Path::new(&name).extension().is_some_and(|e| e == "tmp") {
+                    continue;
+                }
+                let path = if within.is_empty() { name } else { format!("{within}/{name}") };
+                if entry.file_type().unwrap().is_dir() {
+                    out.insert(format!("{path}/"), Vec::new());
+                    pending.push((entry.path(), path));
+                } else {
+                    out.insert(path, std::fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_import_exported_again_is_the_tree_it_was() {
+        let (root, tree) = staged("import-back");
+        let project = crate::Project::load(&root).unwrap();
+        let layer = crate::testing::name("project");
+        assert_eq!(super::import(&project, &layer, tree.as_path()).unwrap(), 6);
+        let out = root.at("staging/out");
+        assert_eq!(super::export(&project, &layer, out.as_path()).unwrap(), 6);
+        assert_eq!(files(out.as_path()), files(tree.as_path()));
+        // Each by the uid the listing gave it; what it listed not, by one drawn for it.
+        let listed =
+            crate::changeset::Changeset::load(&pe2_io::SystemFilesystem, &root.at("staging/out.toml")).unwrap();
+        assert_eq!(listed.entries.get(&uid("uid://1a2b3c4d5e6f7")).map(|p| p.as_str()), Some("a.node"));
+        assert_eq!(listed.entries.len(), 6);
+        // Imported again as it is: nothing differs, nothing is written.
+        let before = files(root.at("layers/project").as_path());
+        std::fs::rename(root.at("staging/out.toml"), root.at("staging/tree.toml")).unwrap();
+        super::import(&project, &layer, tree.as_path()).unwrap();
+        assert_eq!(files(root.at("layers/project").as_path()), before);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_import_only_makes() {
+        let (root, tree) = staged("import-makes");
+        std::fs::write(root.at("staging/tree.toml"), "[ops]\n\"uid://1a2b3c4d5e6f7\" = { delete = true }\n").unwrap();
+        let project = crate::Project::load(&root).unwrap();
+        let refused = super::import(&project, &crate::testing::name("project"), tree.as_path()).unwrap_err();
+        assert!(refused.to_string().contains("only makes"), "{refused:#}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_import_cut_short_at_any_change_is_whole_or_none_once_opened_again() {
+        let faulty = |root: &sfs::HostPath| {
+            let fs = pe2_io::Faulty::new(std::sync::Arc::new(pe2_io::SystemFilesystem));
+            let io = pe2_io::Composed { filesystem: std::sync::Arc::new(fs.clone()), ..pe2_io::Composed::system() };
+            (crate::Project::load_with(root.as_path(), std::sync::Arc::new(io)).unwrap(), fs)
+        };
+        let layer = crate::testing::name("project");
+        // How many changes it makes, and what it leaves - unfailed.
+        let staged = |name: &str| {
+            let (root, tree) = staged(name);
+            let listed = std::fs::read_to_string(root.at("staging/tree.toml")).unwrap();
+            std::fs::write(root.at("staging/tree.toml"), format!("{listed}\"uid://6e\" = \"empty\"\n")).unwrap();
+            (root, tree)
+        };
+        let (root, tree) = staged("import-counted");
+        let before = files(root.at("layers/project").as_path());
+        let (project, fs) = faulty(&root);
+        let counted = fs.changes();
+        super::import(&project, &layer, tree.as_path()).unwrap();
+        let (changes, after) = (fs.changes() - counted, files(root.at("layers/project").as_path()));
+        assert!(changes > 6 && before != after, "{changes} changes");
+        std::fs::remove_dir_all(&root).unwrap();
+        for how in [pe2_io::Fault::Once, pe2_io::Fault::From] {
+            for nth in 1..=changes + 1 {
+                let (root, tree) = staged(&format!("import-{how:?}-{nth}"));
+                let (project, fs) = faulty(&root);
+                fs.fail(nth, how);
+                let imported = super::import(&project, &layer, tree.as_path());
+                drop(project);
+                fs.heal();
+                // Opened again, with nothing failing: what was said whole is made whole, what was not is none.
+                let project = crate::Project::load(&root).unwrap();
+                let lock = crate::lock::Lock::try_acquire(&root, "a test", &pe2_io::System).unwrap();
+                crate::local::Local::open(&project, &lock)
+                    .unwrap_or_else(|e| panic!("{how:?} at change {nth}: opened again: {e:#}"));
+                let opened = files(root.at("layers/project").as_path());
+                assert!(
+                    opened == before || opened == after,
+                    "{how:?} at change {nth} ({imported:?}): half of it, once opened again: {:?}",
+                    opened.keys().collect::<Vec<_>>()
+                );
+                drop(lock);
+                crate::local::remove_all(&root);
+            }
+        }
     }
 
     #[test]

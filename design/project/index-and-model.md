@@ -11,6 +11,8 @@ reads the project reads the index; only whoever holds the project has one that c
 ### Opening
 
 Opening reads what each layer holds, applies the stack of layers, assembles assets on every core, and links them.
+What a records layer holds is what its records show, taken whole from them (`records::Set::shown`): its tree is on no
+disk, and is never walked; a mount's or a generated layer's tree is walked.
 That costs time proportional to the project, so the holder opens over the **model** (below): what the last holder
 knew is taken as known, nothing is read, and the files are checked against it on background threads. Whatever
 differs - something changed by git or by hand while nothing held the project - is taken in like any change.
