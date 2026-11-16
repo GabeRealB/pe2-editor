@@ -34,7 +34,8 @@ pub enum Change {
 /// # Errors
 /// The folders cannot be watched - the system's limit of watches reached.
 pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> anyhow::Result<Box<dyn Watching>> {
-    let roots: Vec<HostPath> = p.layers.iter().map(|l| l.path.clone()).collect();
+    // Where each layer is on disk: a records layer's records, another's tree.
+    let roots: Vec<HostPath> = p.layers.iter().map(|l| l.folder().clone()).collect();
     // Each layer's changeset sits beside its directory; `project.toml` in the project's own.
     let mut shallow: Vec<HostPath> = p.layers.iter().filter_map(|l| l.changeset.parent()).collect();
     shallow.push(p.root.clone());

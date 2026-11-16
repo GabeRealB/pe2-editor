@@ -1679,7 +1679,7 @@ impl Workspace {
     /// View > Refresh: what other programs changed taken in; where the watcher failed, every layer scanned again.
     pub fn refresh_now(&mut self) {
         if self.watch_error.is_some() {
-            let layers = self.project.layers.iter().map(|l| l.path.clone());
+            let layers = self.project.layers.iter().map(|l| l.folder().clone());
             self.pending().extend(layers);
         }
         self.take_in_pending();
@@ -1785,7 +1785,7 @@ impl Workspace {
     /// was showing is shown by them.
     fn take_up(&mut self, reloaded: crate::takein::Reloaded, all: bool) {
         let crate::takein::Reloaded { project, extensions, why } = reloaded;
-        let places = |project: &Project| project.layers.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        let places = |project: &Project| project.layers.iter().map(|l| l.folder().clone()).collect::<Vec<_>>();
         if places(&project) != places(&self.project) {
             self.watch = None;
         }

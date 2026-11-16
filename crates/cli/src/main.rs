@@ -1417,7 +1417,7 @@ fn trust(project: &Path, all: bool, layers: &[Arc<pe2_path::Name>], paths: Vec<P
             let known: Vec<&str> = p.layers.iter().map(|layer| layer.name.as_str()).collect();
             anyhow::bail!("the project has no layer {name}; it has {}", known.join(", "));
         };
-        named.push(layer.path.to_path_buf());
+        named.push(layer.folder().to_path_buf());
     }
     match (revoke, named.is_empty()) {
         (true, _) => places::distrust(&p.root, &named)?,

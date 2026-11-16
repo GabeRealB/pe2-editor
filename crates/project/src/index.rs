@@ -42,16 +42,17 @@ pub const SETTINGS_FILE: &Name = Name::constant("settings.toml");
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
 
-/// Whether a path is a records layer's record (`records`).
-fn in_records(path: &HostPath) -> bool {
-    path.ancestors().any(|a| a.file_name().is_some_and(|n| n == crate::records::DIR))
+/// Whether a path is in a records layer's folder: one of its records, its marker, or the record of an extension it
+/// holds.
+fn in_records(layers: &[LayerState], path: &HostPath) -> bool {
+    layers.iter().filter_map(|layer| layer.records.as_ref()).any(|folder| path.starts_with(folder))
 }
 
 /// Whether a path is a layer's record of an extension it holds: no entry, nothing of the index's.
-fn of_extensions(path: &HostPath) -> bool {
+fn of_extensions(layers: &[LayerState], path: &HostPath) -> bool {
     let Some(folder) = path.parent() else { return false };
     folder.file_name().is_some_and(|n| n == crate::records::EXTENSIONS)
-        && folder.parent().is_some_and(|records| records.file_name().is_some_and(|n| n == crate::records::DIR))
+        && folder.parent().is_some_and(|records| layers.iter().any(|layer| layer.records.as_ref() == Some(&records)))
 }
 
 /// A file an override merged over the one below, in the outputs (`.local/outputs/merged/<sha1>/<name>`), written where it is not
@@ -1350,6 +1351,8 @@ struct LayerState {
     name: Arc<Name>,
     kind: LayerKind,
     place: Place,
+    /// The folder of its records, where it is a records layer.
+    records: Option<HostPath>,
     changeset_path: HostPath,
     changeset: Changeset,
     /// Names its tree's own rules leave out (a mount's `.gitignore`s), beside its changeset's.
@@ -1378,7 +1381,7 @@ impl LayerState {
         taken: bool,
         io: &Arc<dyn pe2_io::Io>,
     ) -> Result<(LayerState, Option<Scan>)> {
-        let records = crate::records::is_records(io.filesystem(), &layer.path);
+        let records = layer.records.is_some();
         let changeset = LayerState::changeset_of(layer, io.filesystem())?;
         let tree_ignore = if layer.mounted { tree_ignores(io.filesystem(), &layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
@@ -1397,6 +1400,7 @@ impl LayerState {
             name: layer.name.clone(),
             kind: layer.kind,
             place,
+            records: layer.records.clone(),
             changeset_path: layer.changeset.clone(),
             writable: layer.changeset_writable && !changeset.read_only,
             changeset,
@@ -1418,7 +1422,7 @@ impl LayerState {
 
     /// A layer's changeset: as its file says, or, for a records layer, as its records say (`records::Set::changeset`).
     fn changeset_of(layer: &Layer, fs: &dyn pe2_io::Filesystem) -> Result<Changeset> {
-        if crate::records::is_records(fs, &layer.path) {
+        if layer.records.is_some() {
             return crate::records::Set::changeset(&layer.path)
                 .with_context(|| format!("{}: its records are not read", layer.name));
         }
@@ -1427,7 +1431,7 @@ impl LayerState {
 
     /// Its changeset read again, and the names it leaves out with it.
     fn reload_changeset(&mut self) -> Result<()> {
-        self.changeset = if crate::records::is_records(self.place.io.filesystem(), &self.place.root) {
+        self.changeset = if self.records.is_some() {
             crate::records::Set::changeset(&self.place.root).context("its records are not read")?
         } else {
             Changeset::load(self.place.io.filesystem(), &self.changeset_path)?
@@ -2606,9 +2610,7 @@ impl Index {
         let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             // A layer whose records are as they were says of itself what it said.
-            if !crate::records::is_records(self.io.filesystem(), &layer.place.root)
-                || differences.same.contains(&layer.place.root)
-            {
+            if layer.records.is_none() || differences.same.contains(&layer.place.root) {
                 continue;
             }
             let was = layer.changeset.clone();
@@ -2624,7 +2626,7 @@ impl Index {
         if placed && let Some(lowest) = lowest_changed {
             let paths: BTreeSet<&TreePath> = changed.iter().flat_map(|(_, paths)| paths).map(|path| &**path).collect();
             for (i, layer) in self.layers.iter().enumerate().skip(lowest + 1) {
-                if crate::records::is_records(self.io.filesystem(), &layer.place.root) {
+                if layer.records.is_some() {
                     wanted.extend(paths.iter().map(|path| (i, (*path).to_owned())));
                 }
             }
@@ -2638,12 +2640,12 @@ impl Index {
         let mut wanted: Vec<(usize, Arc<TreePath>)> = Vec::new();
         // The records layers whose changesets changed, with what each said before.
         let mut were: Vec<(usize, Changeset)> = Vec::new();
-        if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
+        if changed.iter().any(|p| in_records(&self.layers, p) && !of_extensions(&self.layers, p)) {
             changesets |= self.take_in_records(project, changed, &mut wanted, &mut were, &mut refreshed.model)?;
         }
         for path in changed {
             // `project.toml` is read again whole, records with their layers (above).
-            if *path == project.root.join(&FILE) || in_records(path) {
+            if *path == project.root.join(&FILE) || in_records(&self.layers, path) {
                 refreshed.project_file |= *path == project.root.join(&FILE);
                 continue;
             }
@@ -2782,7 +2784,7 @@ impl Index {
             || was.read_only != now.read_only
             || was.ignore != now.ignore
             || layer.kind == LayerKind::Generated
-            || !crate::records::is_records(self.io.filesystem(), &layer.place.root)
+            || layer.records.is_none()
             || self.filled_by(at).is_some()
             || !self.layers[at + 1..].iter().all(silent)
         {

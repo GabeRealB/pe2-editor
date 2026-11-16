@@ -1,9 +1,9 @@
-//! A layer stored as records: one per entry the layer creates or acts on, by uid, at `.records/<aa>/<uid>.toml` in the
-//! layer's folder - no tree of folders and files, which nobody edits by hand. A record says what the layer does to its entry
-//! (creates it, overrides, moves or deletes it), where it is (its parent's uid and its name, so a rename or a move of a
-//! folder holding thousands of entries is one record), and its files: text inline whatever its length, so a layer's history reads as
-//! text in version control, anything else by its SHA-1 in the store (`chunks::Store::put_file`). An override's file
-//! carries what it was made from (`was`), or is removed.
+//! A layer stored as records: one per entry the layer creates or acts on, by uid, at `<aa>/<uid>.toml` in the layer's
+//! folder (`layers/<name>/`) - no tree of folders and files, which nobody edits by hand. A record says what the layer does
+//! to its entry (creates it, overrides, moves or deletes it), where it is (its parent's uid and its name, so a rename or
+//! a move of a folder holding thousands of entries is one record), and its files: text inline whatever its length, so
+//! a layer's history reads as text in version control, anything else by its SHA-1 in the store
+//! (`chunks::Store::put_file`). An override's file carries what it was made from (its `base`), or is removed.
 //!
 //! ```toml
 //! format = 1
@@ -11,7 +11,7 @@
 //! kind = "node"
 //!
 //! [files."node.toml"]
-//! was = "3f2a…"
+//! base = "3f2a…"
 //! text = """
 //! type = "data"
 //! """
@@ -21,12 +21,12 @@
 //! size = 1835008
 //! ```
 //!
-//! A layer stored so says it in its folder (`.records/layer.toml`: its format, and what its changeset said of it - read
-//! only, the names it ignores), and every record its format: a program meeting a format it does not know refuses it,
-//! and writes nothing.
+//! A layer stored so says it in its folder (`layer.toml`: its format, and its settings - read only, the names it
+//! ignores), and every record its format: a program meeting a format it does not know refuses it, and writes nothing.
 //!
 //! What reads a layer sees it as it would a tree of files: each records layer's files at the paths a layer's tree would
-//! have them (`Set`), its entries placed through the layers below, read through `content` as a packed layer's are.
+//! have them, under a root of its own on no disk (`<its folder>/tree`, `TREE`), its entries placed through the layers
+//! below (`Set`), read through `content` as a packed layer's are.
 
 use anyhow::{Context, Result, bail};
 use pe2_path::{Name, RelPath, Uid};
@@ -36,10 +36,18 @@ use std::sync::Arc;
 use crate::TreePath;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The folder of a layer's records, in its folder: a name a scan of the layer leaves out.
-pub const DIR: &Name = Name::constant(".records");
 /// The file marking a layer's folder as records: their format, and the layer's settings.
 pub const MARKER: &Name = Name::constant("layer.toml");
+/// Where a records layer's tree is addressed - what reads its files reads them at `<its folder>/tree/<path>`: a folder
+/// of its own in the layer's, never made on disk, so that no folder of the tree meets one of its records' shards (two
+/// letters) or its marker.
+pub const TREE: &Name = Name::constant("tree");
+
+/// The folder of a records layer's records, of the root its tree is addressed at (`TREE`): none for another path.
+#[must_use]
+pub fn shipped_of(tree: &HostPath) -> Option<HostPath> {
+    (tree.file_name()? == TREE).then(|| tree.parent()).flatten()
+}
 /// The format of the records this program reads and writes.
 pub const FORMAT: i64 = 1;
 
@@ -68,11 +76,11 @@ pub enum Content {
 }
 
 /// A file of an entry, as a record holds it: its content, none where the layer removes it; and, for an override's,
-/// the SHA-1 of the version below it was made from.
+/// the SHA-1 of the version below it was made from (its base).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
     pub content: Option<Content>,
-    pub was: Option<pe2_ext::Sha1>,
+    pub base: Option<pe2_ext::Sha1>,
 }
 
 /// What a layer has of one entry.
@@ -87,8 +95,8 @@ pub struct Record {
     pub files: BTreeMap<Arc<RelPath>, File>,
 }
 
-/// Where a layer keeps the extensions it holds - a records layer, or one stored as a tree, whose scan leaves `.records`
-/// out: a record an id, `.records/extensions/<id>.toml`. They are no entries - an extension is not in the tree of what the project holds - and are sealed: kept whole, as one tree of
+/// Where a layer keeps the extensions it holds, in its folder: a record an id, `extensions/<id>.toml`. They are no
+/// entries - an extension is not in the tree of what the project holds - and are sealed: kept whole, as one tree of
 /// whole objects in the store (`chunks::Store::put_folder`), never merged, a higher layer's in place of a lower one's,
 /// and deleted to leave a lower one's off:
 ///
@@ -110,7 +118,7 @@ fn id_name(id: &str, suffix: &str) -> Result<Arc<Name>, pe2_path::PathError> {
 /// # Errors
 /// The id makes no file's name on every system: no layer holds it.
 pub fn extension_path(layer: &HostPath, id: &str) -> Result<HostPath, pe2_path::PathError> {
-    Ok(layer.join(&DIR).join(&EXTENSIONS).join(&id_name(id, ".toml")?))
+    Ok(layer.join(&EXTENSIONS).join(&id_name(id, ".toml")?))
 }
 
 /// The text of a layer's record of an extension: holding the tree named, or (none) leaving below's off.
@@ -132,7 +140,7 @@ pub fn extension_record(tree: Option<&pe2_ext::Sha1>) -> String {
 /// A record cannot be read, or is of a format this program does not know.
 pub fn extensions_of(fs: &dyn pe2_io::Filesystem, layer: &HostPath) -> Result<BTreeMap<String, Option<pe2_ext::Sha1>>> {
     let mut out = BTreeMap::new();
-    let folder = layer.join(&DIR).join(&EXTENSIONS);
+    let folder = layer.join(&EXTENSIONS);
     for file in fs.read_directory(&folder).unwrap_or_default() {
         let path = folder.entry(&file.name);
         let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".toml")) else {
@@ -201,8 +209,9 @@ pub fn held(io: &Arc<dyn pe2_io::Io>, folder: &HostPath) -> Option<std::sync::Ar
         return None;
     }
     let layer = parent.parent()?;
+    let folder = shipped_of(&layer)?;
     // Its id is a folder's name: the name of its record too.
-    let record = extension_path(&layer, id).ok()?;
+    let record = extension_path(&folder, id).ok()?;
     let stat = io.filesystem().stat(&record).ok()?;
     let stamp = (stat.modified?, stat.size);
     if let Some(found) =
@@ -212,7 +221,7 @@ pub fn held(io: &Arc<dyn pe2_io::Io>, folder: &HostPath) -> Option<std::sync::Ar
         return found.2.clone();
     }
     let read = || -> Option<std::sync::Arc<HeldExtension>> {
-        let tree = extensions_of(io.filesystem(), &layer).ok()?.remove(id)??;
+        let tree = extensions_of(io.filesystem(), &folder).ok()?.remove(id)??;
         let store = crate::chunks::Store::of(&layer, io)?;
         let files = std::sync::Arc::new(store.get_tree(&tree).ok()?);
         Some(std::sync::Arc::new(HeldExtension {
@@ -297,7 +306,7 @@ pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usi
         }
         let (tree, _) = store.put_folder(&folder)?;
         let at = extension_path(layer, &id)?;
-        fs.create_folder_all(&layer.join(&DIR).join(&EXTENSIONS))?;
+        fs.create_folder_all(&layer.join(&EXTENSIONS))?;
         crate::local::write_atomic(fs, &at, extension_record(Some(&tree)).as_bytes())?;
         project.io.filesystem().remove_all(&folder)?;
         count += 1;
@@ -319,18 +328,18 @@ pub(crate) fn is_shard(name: &std::ffi::OsStr) -> bool {
 /// # Errors
 /// The uid's digits make no file's name on every system (`con`, as Windows reserves it).
 pub fn path_of(layer: &HostPath, uid: Uid) -> Result<HostPath, pe2_path::PathError> {
-    Ok(layer.join(&DIR).join(&RelPath::sharded(&uid.digits(), ".toml")?))
+    Ok(layer.join(&RelPath::sharded(&uid.digits(), ".toml")?))
 }
 
-/// The uid a record's file is of: none for a file that is no record.
+/// The uid a record's file in a folder of records is of: none for a file that is no record of the folder's.
 #[must_use]
-pub fn uid_of(path: &HostPath) -> Option<Uid> {
+pub fn uid_of(folder: &HostPath, path: &HostPath) -> Option<Uid> {
     let key = path.file_name()?.to_str()?.strip_suffix(".toml")?;
     let shard = path.parent()?;
     // Entries' records are sharded by the first two characters of their uid's digits (the digits, where there are
-    // fewer); the extensions' are elsewhere.
+    // fewer); the extensions' and the marker are elsewhere.
     let in_records = shard.file_name().is_some_and(|n| n.to_str() == Some(key.get(..2).unwrap_or(key)))
-        && shard.parent()?.file_name().is_some_and(|n| n == DIR);
+        && shard.parent().is_some_and(|records| records == *folder);
     if !in_records || key.is_empty() {
         return None;
     }
@@ -340,7 +349,7 @@ pub fn uid_of(path: &HostPath) -> Option<Uid> {
 /// Whether a layer's folder is stored as records.
 #[must_use]
 pub fn is_records(fs: &dyn pe2_io::Filesystem, layer: &HostPath) -> bool {
-    fs.is_file(&layer.join(&DIR).join(&MARKER))
+    fs.is_file(&layer.join(&MARKER))
 }
 
 /// What a records layer says of itself, as a changeset says it of a layer stored as a tree.
@@ -355,8 +364,8 @@ pub struct Settings {
 /// # Errors
 /// The marker cannot be written.
 pub fn mark(fs: &dyn pe2_io::Filesystem, layer: &HostPath, settings: &Settings) -> Result<()> {
-    fs.create_folder_all(&layer.join(&DIR))?;
-    let at = layer.join(&DIR).join(&MARKER);
+    fs.create_folder_all(layer)?;
+    let at = layer.join(&MARKER);
     crate::local::write_atomic(fs, &at, marker(settings).as_bytes())
 }
 
@@ -378,7 +387,7 @@ fn marker(settings: &Settings) -> String {
 /// # Errors
 /// Another format, or no marker one can read.
 pub fn settings(fs: &dyn pe2_io::Filesystem, layer: &HostPath) -> Result<Settings> {
-    let at = layer.join(&DIR).join(&MARKER);
+    let at = layer.join(&MARKER);
     let text = fs.read_to_string(&at).with_context(|| at.display().to_string())?;
     let table: toml::Table = toml::from_str(&text).with_context(|| at.display().to_string())?;
     match table.get("format").and_then(toml::Value::as_integer) {
@@ -512,8 +521,8 @@ impl Record {
             if let Some((other, _)) = files.get_key_value(&*at) {
                 bail!("its files {other} and {name} are one name to a system that does not tell case or form apart");
             }
-            let was = field("was").map(|was| pe2_ext::Sha1::from_hex(&was)).transpose();
-            files.insert(at, File { content, was: was.with_context(|| format!("{name}: what it was"))? });
+            let base = field("base").map(|base| pe2_ext::Sha1::from_hex(&base)).transpose();
+            files.insert(at, File { content, base: base.with_context(|| format!("{name}: its base"))? });
         }
         Ok(Record { op, kind, parent, name, files })
     }
@@ -536,8 +545,8 @@ impl Record {
             files.set_implicit(true);
             for (name, file) in &self.files {
                 let mut table = toml_edit::Table::new();
-                if let Some(was) = &file.was {
-                    table["was"] = toml_edit::value(was.to_string());
+                if let Some(base) = &file.base {
+                    table["base"] = toml_edit::value(base.to_string());
                 }
                 match &file.content {
                     Some(Content::Text(text)) => table["text"] = toml_edit::value(text.as_str()),
@@ -558,7 +567,10 @@ impl Record {
 /// A records layer as what reads it sees it: its records by uid, each with its file's time, and the tree of files they
 /// make at the paths a layer's tree would have them.
 struct View {
+    /// Where its tree is addressed (`TREE`).
     dir: HostPath,
+    /// Where its records are.
+    folder: HostPath,
     settings: Settings,
     records: Read,
     /// Each file by its path in the layer: its entry's uid and its name in the entry (the root for a plain file).
@@ -608,10 +620,11 @@ impl View {
         }
     }
 
-    /// What a records layer in `dir` is seen as before its records are read.
-    fn new(dir: HostPath) -> View {
+    /// What a records layer whose tree is at `dir` and records in `folder` is seen as before its records are read.
+    fn new(dir: HostPath, folder: HostPath) -> View {
         View {
             dir,
+            folder,
             settings: Settings::default(),
             records: Read::default(),
             files: BTreeMap::new(),
@@ -801,16 +814,15 @@ fn read_changed(
     before: &Read,
     changed: &[HostPath],
 ) -> Option<Result<Read>> {
-    let within = dir.join(&DIR);
-    let ours: Vec<&HostPath> = changed.iter().filter(|path| path.starts_with(&within)).collect();
+    let ours: Vec<&HostPath> = changed.iter().filter(|path| path.starts_with(dir)).collect();
     let records: Option<Vec<(Uid, &HostPath)>> = ours
         .iter()
         .map(|path| {
             // A record is `<shard>/<uid>.toml`, its shard a folder of the records' own named by two letters -
             // what is beside the shards (the extensions the layer holds, its settings) is no record of an entry.
             let shard = path.parent().filter(|shard| shard.file_name().is_some_and(is_shard));
-            let in_shard = shard.and_then(|shard| shard.parent()).is_some_and(|records| records == within);
-            Some((uid_of(path).filter(|_| in_shard)?, *path))
+            let in_shard = shard.and_then(|shard| shard.parent()).is_some_and(|records| records == *dir);
+            Some((uid_of(dir, path).filter(|_| in_shard)?, *path))
         })
         .collect();
     let records = records?;
@@ -876,10 +888,10 @@ fn no_time(path: &HostPath) -> std::io::Error {
 fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Read>) -> Result<Read> {
     // What waits is asked first: a record not waiting by now is in its file already, as it was last said - where
     // one read from its file first, and found waiting no more after, would be missed in both.
-    let waiting = crate::storage::waiting_under(&dir.join(&DIR));
-    let records_dir = dir.join(&DIR);
+    let waiting = crate::storage::waiting_under(dir);
+    let records_dir = dir;
     let shards: Vec<HostPath> = fs
-        .read_directory(&records_dir)
+        .read_directory(records_dir)
         .unwrap_or_default()
         .iter()
         .filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name))
@@ -889,7 +901,7 @@ fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Rea
         let mut out = Vec::new();
         for file in fs.read_directory(shard)? {
             let path = shard.entry(&file.name);
-            let Some(uid) = uid_of(&path) else { continue };
+            let Some(uid) = uid_of(dir, &path) else { continue };
             let stat = fs.stat_link(&path)?;
             let (modified, len) = (stat.modified.ok_or_else(|| no_time(&path))?, stat.size);
             if let Some(held) = before.and_then(|b| b.get(&uid)).filter(|h| h.modified == modified && h.len == len) {
@@ -919,7 +931,7 @@ fn read_records(fs: &dyn pe2_io::Filesystem, dir: &HostPath, before: Option<&Rea
         out.extend(part?);
     }
     for (path, at, bytes) in waiting {
-        let Some(uid) = uid_of(&path) else { continue };
+        let Some(uid) = uid_of(dir, &path) else { continue };
         match bytes {
             Some(bytes) => {
                 let text = String::from_utf8(bytes).with_context(|| path.display().to_string())?;
@@ -979,23 +991,22 @@ impl Set {
         let mut below_changed = changed.is_none();
         let touched = |within: &HostPath| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
         for layer in &project.layers {
-            if !is_records(fs, &layer.path) {
+            let Some(folder) = &layer.records else {
                 below_changed |= changed.is_some_and(|paths| paths.contains(&layer.changeset));
                 places.layers.push(tree_places(fs, &layer.changeset));
                 continue;
-            }
+            };
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
-            if let Some(before) = before.filter(|_| !below_changed && !touched(&layer.path.join(&DIR))) {
+            if let Some(before) = before.filter(|_| !below_changed && !touched(folder)) {
                 // As it was read: what it places is there for the layers above, as it was.
                 places.layers.push(before.named.clone());
                 views.push(before.clone());
                 continue;
             }
             below_changed = true;
-            let settings = settings(fs, &layer.path)?;
+            let settings = settings(fs, folder)?;
             // The records that changed read again, where the paths say which; else all of them looked at.
-            let after =
-                before.zip(changed).and_then(|(view, paths)| read_changed(fs, &layer.path, &view.records, paths));
+            let after = before.zip(changed).and_then(|(view, paths)| read_changed(fs, folder, &view.records, paths));
             // What is known of the layer, as records read: what was read here before, where nothing else is.
             let known: Option<Read> = known.remove(&layer.path).map(|known| {
                 let held =
@@ -1006,10 +1017,10 @@ impl Set {
                 (Some(records), _) => records?,
                 // As known, each: no file is looked at.
                 (None, Some(known)) if taken => known,
-                (None, Some(known)) => read_records(fs, &layer.path, Some(&known))?,
-                (None, None) => read_records(fs, &layer.path, before.map(|v| &v.records))?,
+                (None, Some(known)) => read_records(fs, folder, Some(&known))?,
+                (None, None) => read_records(fs, folder, before.map(|v| &v.records))?,
             };
-            let mut view = View { settings, ..View::new(layer.path.clone()) };
+            let mut view = View { settings, ..View::new(layer.path.clone(), folder.clone()) };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<Uid, Arc<TreePath>> = std::collections::HashMap::new();
@@ -1146,14 +1157,14 @@ impl Set {
         let mut differing = Vec::new();
         for view in &self.views {
             let mut found = BTreeSet::new();
-            let records_dir = view.dir.join(&DIR);
+            let records_dir = &view.folder;
             let fs = self.store.io.filesystem();
-            let shards = fs.read_directory(&records_dir).unwrap_or_default();
+            let shards = fs.read_directory(records_dir).unwrap_or_default();
             for shard in shards.iter().filter(|shard| shard.kind == pe2_io::Kind::Folder && is_shard(&shard.name)) {
                 let shard = records_dir.entry(&shard.name);
                 for file in fs.read_directory(&shard).unwrap_or_default() {
                     let path = shard.entry(&file.name);
-                    let Some(uid) = uid_of(&path) else { continue };
+                    let Some(uid) = uid_of(records_dir, &path) else { continue };
                     let stamp = fs.stat_link(&path).ok().and_then(|stat| Some((stat.modified?, stat.size)));
                     let same = view
                         .records
@@ -1168,9 +1179,15 @@ impl Set {
             }
             // A record read is of a uid whose file can be named: written so, read back so.
             let gone = view.records.keys().filter(|uid| !found.contains(*uid));
-            differing.extend(gone.filter_map(|uid| path_of(&view.dir, *uid).ok()));
+            differing.extend(gone.filter_map(|uid| path_of(&view.folder, *uid).ok()));
         }
         differing
+    }
+
+    /// The records layer whose tree is addressed at `dir`.
+    fn view_at(dir: &HostPath) -> Option<(std::sync::Arc<Set>, usize)> {
+        let sets = SETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sets.iter().find_map(|set| Some((set.clone(), set.views.iter().position(|view| view.dir == *dir)?)))
     }
 
     /// The records layer a path is in, and the path within it.
@@ -1209,7 +1226,9 @@ impl Set {
         let (uid, name) = view.files.get(&rel)?;
         let held = view.records.get(uid)?;
         Some(match held.record.files.get(name)?.content.as_ref()? {
-            Content::Text(_) => Source::RecordText { record: path_of(&view.dir, *uid).ok()?, name: name.to_string() },
+            Content::Text(_) => {
+                Source::RecordText { record: path_of(&view.folder, *uid).ok()?, name: name.to_string() }
+            }
             Content::Stored { sha1, .. } => Source::Stored { sha1: *sha1, store: set.store.dir.clone() },
         })
     }
@@ -1236,7 +1255,7 @@ impl Set {
     /// A records layer's records, by uid: none where the folder is no records layer read.
     #[must_use]
     pub fn records_of(dir: &HostPath) -> Option<BTreeMap<Uid, Record>> {
-        let (set, i, _) = Set::view_of(&dir.join(&DIR))?;
+        let (set, i) = Set::view_at(dir)?;
         Some(set.views[i].records.iter().map(|(uid, held)| (*uid, (*held.record).clone())).collect())
     }
 
@@ -1258,7 +1277,7 @@ impl Set {
     /// and path; what it does to entries from below; whether it is read only, what it ignores.
     #[must_use]
     pub fn changeset(dir: &HostPath) -> Option<crate::changeset::Changeset> {
-        let (set, i, _) = Set::view_of(&dir.join(&DIR))?;
+        let (set, i) = Set::view_at(dir)?;
         let view = &set.views[i];
         let mut changeset = crate::changeset::Changeset {
             read_only: view.settings.read_only,
@@ -1279,7 +1298,7 @@ impl Set {
                         .files
                         .iter()
                         .map(|(name, f)| {
-                            let base = crate::changeset::Base { was: f.was, removed: f.content.is_none() };
+                            let base = crate::changeset::Base { was: f.base, removed: f.content.is_none() };
                             (name.clone(), base)
                         })
                         .collect();
@@ -1331,18 +1350,19 @@ pub fn import(project: &crate::Project, name: &Name, from: &std::path::Path) -> 
     let said = Settings { read_only: listing.read_only, ignore: listing.ignore.clone() };
     // What changes, and only that: each record that differs from what the layer has, those it no longer has gone, its
     // settings where they differ.
-    let old = read_records(fs, &layer.path, None)?;
+    let folder = layer.records.as_ref().with_context(|| format!("{name} is no records layer"))?;
+    let old = read_records(fs, folder, None)?;
     let mut writes: Vec<(HostPath, Option<String>)> = Vec::new();
     for (uid, record) in &records {
         if old.get(uid).is_none_or(|held| *held.record != *record) {
-            writes.push((path_of(&layer.path, *uid)?, Some(record.render())));
+            writes.push((path_of(folder, *uid)?, Some(record.render())));
         }
     }
     for uid in old.keys().filter(|uid| !records.contains_key(*uid)) {
-        writes.push((path_of(&layer.path, *uid)?, None));
+        writes.push((path_of(folder, *uid)?, None));
     }
-    if settings(fs, &layer.path).ok().as_ref() != Some(&said) {
-        writes.push((layer.path.join(&DIR).join(&MARKER), Some(marker(&said))));
+    if settings(fs, folder).ok().as_ref() != Some(&said) {
+        writes.push((folder.join(&MARKER), Some(marker(&said))));
     }
     write_set(project, &format!("Import the layer {name}"), &writes)?;
     Ok(records.len())
@@ -1504,7 +1524,7 @@ impl Staging<'_> {
                     let content =
                         Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
                     let files =
-                        BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content), was: None })]);
+                        BTreeMap::from([(RelPath::root().to_owned(), File { content: Some(content), base: None })]);
                     Record { op: Op::Create, kind: Kind::File, parent, name: Some(name.to_owned()), files }
                 }
             };
@@ -1525,7 +1545,7 @@ impl Staging<'_> {
             } else {
                 let content =
                     Content::of(&self.fs.read(&disk).with_context(|| disk.display().to_string())?, self.store)?;
-                out.insert(at, File { content: Some(content), was: None });
+                out.insert(at, File { content: Some(content), base: None });
             }
         }
         Ok(())
@@ -1669,7 +1689,7 @@ pub fn records_for(
         let mut files = before.map_or_else(BTreeMap::new, |r| r.files.clone());
         for (name, bytes) in written_at(path, kind) {
             match bytes {
-                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), was: None }),
+                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), base: None }),
                 None => files.remove(&name),
             };
         }
@@ -1724,7 +1744,7 @@ fn override_files(
                 _ => held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()),
             }
         };
-        files.insert(file.clone(), File { content, was: base.was });
+        files.insert(file.clone(), File { content, base: base.was });
     }
     Ok(files)
 }
@@ -1756,13 +1776,13 @@ mod tests {
             ("native.texels", Some(Content::Stored { sha1: crate::extract::sha1_of(b"texels"), size: 1_835_008 })),
             ("old.bin", None),
         ] {
-            record.files.insert(rel(name), File { content, was: Some(crate::extract::sha1_of(b"was")) });
+            record.files.insert(rel(name), File { content, base: Some(crate::extract::sha1_of(b"base")) });
         }
         let written = record.render();
         assert!(written.starts_with("format = 1\nop = \"override\"\n"), "{written}");
-        let was = crate::extract::sha1_of(b"was");
+        let base = crate::extract::sha1_of(b"base");
         assert!(
-            written.contains(&format!("[files.\"node.toml\"]\nwas = \"{was}\"\ntext = \"\"\"\ntype = \"data\"\n")),
+            written.contains(&format!("[files.\"node.toml\"]\nbase = \"{base}\"\ntext = \"\"\"\ntype = \"data\"\n")),
             "{written}"
         );
         assert_eq!(Record::parse(&written).unwrap(), record);
@@ -1794,9 +1814,10 @@ mod tests {
     fn a_record_is_placed_by_its_uid() {
         let layer = &crate::testing::scratch("record-place").at("layers/top");
         let at = super::path_of(layer, uid("uid://1hwweozpa40d9")).unwrap();
-        assert_eq!(at, layer.at(".records/1h/1hwweozpa40d9.toml"));
-        assert_eq!(super::uid_of(&at), Some(uid("uid://1hwweozpa40d9")));
-        assert_eq!(super::uid_of(&layer.at(".records").join(&super::MARKER)), None);
-        assert_eq!(super::uid_of(&layer.at("1h/1hwweozpa40d9.toml")), None);
+        assert_eq!(at, layer.at("1h/1hwweozpa40d9.toml"));
+        assert_eq!(super::uid_of(layer, &at), Some(uid("uid://1hwweozpa40d9")));
+        assert_eq!(super::uid_of(layer, &layer.join(&super::MARKER)), None);
+        assert_eq!(super::uid_of(layer, &layer.at("extensions/1hwweozpa40d9.toml")), None);
+        assert_eq!(super::uid_of(&layer.at("1h"), &at), None, "of another folder");
     }
 }

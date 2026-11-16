@@ -414,8 +414,11 @@ pub struct Layer {
     /// Its name, which names its folder in `layers/` and its changeset.
     pub name: Arc<Name>,
     pub kind: LayerKind,
-    /// Its content's directory: in `layers/`, or a mounted tree.
+    /// Where its content is addressed: a records layer's tree, on no disk (`records::TREE`); a generated layer's
+    /// folder in `layers/`; a mounted tree.
     pub path: HostPath,
+    /// The folder of its records (`layers/<name>/`), where it is a records layer.
+    pub records: Option<HostPath>,
     /// Where its content appears in the resolved project: the root for a layer at the top, the mount point for a mount.
     pub at: Arc<TreePath>,
     /// Its changeset, in `layers/`: `<path>.toml` beside a layer's directory, `layers/<name>.toml` for a mount.
@@ -445,6 +448,12 @@ impl Layer {
     #[must_use]
     pub fn plan(&self) -> HostPath {
         self.path.with_suffix(PLAN_SUFFIX)
+    }
+
+    /// Where it is on disk: a records layer's folder of records, another's tree.
+    #[must_use]
+    pub fn folder(&self) -> &HostPath {
+        self.records.as_ref().unwrap_or(&self.path)
     }
 
     /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree; joined part
@@ -702,16 +711,17 @@ impl Project {
                     mounted: true,
                     fills: None,
                     storage: Storage::Text,
+                    records: None,
                 })
             })
             .collect::<Result<_>>()?;
         for l in file.layer {
             let name = layer_name(&l.name)?;
-            let path = match l.path.as_deref() {
+            let folder = match l.path.as_deref() {
                 Some(path) => resolve_path(&root, path)?,
                 None => root.join(&LAYERS).join(&name),
             };
-            let changeset = path.with_suffix(CHANGESET_SUFFIX);
+            let changeset = folder.with_suffix(CHANGESET_SUFFIX);
             if layers.iter().any(|m| m.name == name) || unmanaged.iter().any(|m| m.at.parts().eq([&*name])) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
             }
@@ -722,9 +732,10 @@ impl Project {
             };
             let generated = kind == LayerKind::Generated;
             // A layer is its records; only what a plan fills is a tree of files, until plans write records too.
-            if !generated && !records::is_records(io.filesystem(), &path) {
-                bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, path.display());
+            if !generated && !records::is_records(io.filesystem(), &folder) {
+                bail!("{}: the layer {}: its folder holds no records ({})", root.join(&FILE), l.name, folder.display());
             }
+            let (path, records) = if generated { (folder, None) } else { (folder.join(records::TREE), Some(folder)) };
             if generated != l.fills.is_some() {
                 bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
@@ -742,6 +753,7 @@ impl Project {
                 mounted: false,
                 fills,
                 storage,
+                records,
             });
         }
         check_fills(&root, &layers)?;
@@ -796,14 +808,8 @@ impl Project {
     pub fn held_extensions(&self) -> Vec<HostPath> {
         let mut held: std::collections::BTreeMap<String, Option<HostPath>> = std::collections::BTreeMap::new();
         for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            if self.io.filesystem().is_folder(&layer.path.join(&ext::folder::HELD)) {
-                eprintln!(
-                    "{} holds extensions as folders, as layers held them before records: \
-                     `pe2-cli project store convert --layer {}` holds them as records",
-                    layer.name, layer.name
-                );
-            }
-            let records = match records::extensions_of(self.io.filesystem(), &layer.path) {
+            let Some(folder) = &layer.records else { continue };
+            let records = match records::extensions_of(self.io.filesystem(), folder) {
                 Ok(records) => records,
                 Err(e) => {
                     eprintln!("the extensions {} holds: {e:#}", layer.name);
@@ -927,9 +933,10 @@ pub(crate) mod testing {
     /// The files of a records layer's records, listed from its folder, not read: what is read of the records is the
     /// index's to read again.
     pub fn records_in(root: &HostPath, layer: &str) -> Vec<HostPath> {
-        let records = root.join(&crate::LAYERS).join(&name(layer)).join(&crate::records::DIR);
+        let records = root.join(&crate::LAYERS).join(&name(layer));
         let mut written = Vec::new();
-        for shard in std::fs::read_dir(&records).unwrap().flatten().filter(|e| e.path().is_dir()) {
+        let shards = std::fs::read_dir(&records).unwrap().flatten();
+        for shard in shards.filter(|e| e.path().is_dir() && crate::records::is_shard(&e.file_name())) {
             for file in std::fs::read_dir(shard.path()).unwrap().flatten() {
                 written.push(HostPath::new(&file.path()).unwrap());
             }
@@ -949,12 +956,12 @@ pub(crate) mod testing {
         let (new, gone) =
             crate::records::records_for(&project, &index, layer, changeset, &old, &written).expect("records made");
         for (uid, record) in new {
-            let at = crate::records::path_of(&layer.path, uid).unwrap();
+            let at = crate::records::path_of(layer.records.as_ref().unwrap(), uid).unwrap();
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             std::fs::write(&at, record.render()).unwrap();
         }
         for uid in gone {
-            std::fs::remove_file(crate::records::path_of(&layer.path, uid).unwrap()).unwrap();
+            std::fs::remove_file(crate::records::path_of(layer.records.as_ref().unwrap(), uid).unwrap()).unwrap();
         }
     }
 

@@ -15,7 +15,7 @@ below is copied or changed.
 
 | Kind | Storage | Why |
 |---|---|---|
-| A project's layers | **Records**: one file per entry it touches, by uid, in `layers/<layer>/.records/` | Nobody edits them by hand: what they hold - assets, and plain files such as code - is edited through the served folder with any tool; renaming a folder of thousands of entries is one record; text stays text in version control. |
+| A project's layers | **Records**: one file per entry it touches, by uid, in the layer's folder (`layers/<layer>/<aa>/<uid>.toml`, beside its `layer.toml`), its tree addressed under `layers/<layer>/tree` on no disk | Nobody edits them by hand: what they hold - assets, and plain files such as code - is edited through the served folder with any tool; renaming a folder of thousands of entries is one record; text stays text in version control. |
 | Mounts | Plain trees of files, outside the project | Worked on with their own tools, where they are. |
 | Generated layers | A tree of files, or **packed**: one journaled listing, contents in the store | Written only by their plan; nothing to scan. |
 

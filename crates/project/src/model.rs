@@ -425,9 +425,9 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
                 out.u64(*size);
             }
         }
-        out.u8(u8::from(held.was.is_some()));
-        if let Some(was) = &held.was {
-            out.0.extend_from_slice(was.bytes());
+        out.u8(u8::from(held.base.is_some()));
+        if let Some(base) = &held.base {
+            out.0.extend_from_slice(base.bytes());
         }
     }
     if long {
@@ -466,11 +466,11 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
             2 => Some(Content::Stored { sha1: sha1_in(&mut read)?, size: read.u64()? }),
             _ => return None,
         };
-        let was = match read.u8()? {
+        let base = match read.u8()? {
             0 => None,
             _ => Some(sha1_in(&mut read)?),
         };
-        files.insert(file, File { content, was });
+        files.insert(file, File { content, base });
     }
     let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
     let record = Record { op, kind, parent, name, files };
@@ -1109,19 +1109,19 @@ mod tests {
                     rel("node.toml"),
                     File {
                         content: Some(Content::Text(text)),
-                        was: (op == Op::Override).then(|| crate::extract::sha1_of(b"was")),
+                        base: (op == Op::Override).then(|| crate::extract::sha1_of(b"was")),
                     },
                 );
                 files.insert(
                     rel("native.bin"),
                     File {
                         content: Some(Content::Stored { sha1: crate::extract::sha1_of(b"native"), size: n * 1000 }),
-                        was: None,
+                        base: None,
                     },
                 );
-                files.insert(rel("gone.bin"), File { content: None, was: Some(crate::extract::sha1_of(b"gone")) });
+                files.insert(rel("gone.bin"), File { content: None, base: Some(crate::extract::sha1_of(b"gone")) });
             } else if op == Op::Create {
-                files.insert(rel(""), File { content: Some(Content::Text(String::new())), was: None });
+                files.insert(rel(""), File { content: Some(Content::Text(String::new())), base: None });
             }
             let placed = matches!(op, Op::Create | Op::Move);
             let record = Record {

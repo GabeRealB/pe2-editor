@@ -977,11 +977,11 @@ mod tests {
         assert_eq!(about.id, "pe2.events");
         let project = project::Project::load(&root).unwrap();
         // Held by a record of the layer's: its files read where its folder was, from its tree, on no disk.
-        let record = root.at("layers/mine/.records/extensions/pe2.events.toml");
+        let record = root.at("layers/mine/extensions/pe2.events.toml");
         let [held] = project.held_extensions().try_into().unwrap();
-        assert_eq!(held, root.at("layers/mine/extensions/pe2.events.extension"));
+        assert_eq!(held, root.at("layers/mine/tree/extensions/pe2.events.extension"));
         assert!(record.is_file() && !held.exists() && !root.at(".local/outputs/extensions").exists());
-        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at("layers/mine"));
+        assert_eq!(project::records::held(&pe2_io::system(), &held).unwrap().layer, root.at("layers/mine/tree"));
         assert_eq!(project.requires, [project::Requirement { id: "pe2.events".into(), version: Some("^0.1".into()) }]);
         // Trusted as the folder it came from was: the hash read from its tree is the folder's.
         let trust = |folder: &HostPath| {
@@ -1033,7 +1033,7 @@ mod tests {
         assert!(!record.exists(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
         add_extension(&project, &source, Some(pe2_path::Name::constant("game")), &mut history, "add".into()).unwrap();
-        let in_game = root.at("layers/game/.records/extensions/pe2.events.toml");
+        let in_game = root.at("layers/game/extensions/pe2.events.toml");
         assert!(in_game.is_file());
         let project = project::Project::load(&root).unwrap();
         std::fs::write(source.at(&shipped_tool()), "#!/bin/sh\necho newer\n").unwrap();

@@ -433,7 +433,7 @@ fn project(view: &View) -> Value {
         .iter()
         .zip(&view.project.layers)
         .map(|(info, layer)| {
-            let path = layer.path.strip_prefix(root).unwrap_or(&layer.path);
+            let path = layer.folder().strip_prefix(root).unwrap_or(layer.folder());
             let holds = match info.kind {
                 project::LayerKind::Assets => "assets",
                 project::LayerKind::Files => "files",

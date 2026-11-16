@@ -1860,7 +1860,7 @@ mod tests {
     /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
     /// layer's is: only a record and the folder of its first two letters are written behind.
     fn record(root: &HostPath, uid: &str) -> HostPath {
-        let records = root.at("layers/top/.records");
+        let records = root.at("layers/top");
         std::fs::create_dir_all(&records).unwrap();
         records.at(&uid[..2]).at(&format!("{uid}.toml"))
     }
@@ -1935,7 +1935,7 @@ mod tests {
         history.hold_back(false);
         history.settle();
         assert_eq!(read(&a).as_deref(), Some("theirs"), "not written over");
-        assert_eq!(read(&root.at(".local/conflicts/layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
+        assert_eq!(read(&root.at(".local/conflicts/layers/top/aa/aa1.toml")).as_deref(), Some("ours"));
         assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
         drop(history);
         crate::local::remove_all(&root);

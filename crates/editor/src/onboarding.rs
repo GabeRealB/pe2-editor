@@ -53,9 +53,9 @@ pub enum Answer {
 pub fn place_of(ws: &Workspace, file: &HostPath) -> (HostPath, String) {
     // One the project holds is read where its folder was in its layer, on no disk.
     let real = file;
-    let holding = ws.project.layers.iter().find(|layer| real.starts_with(&layer.path));
+    let holding = ws.project.layers.iter().find(|layer| real.starts_with(layer.folder()));
     if let Some(layer) = holding {
-        return (layer.path.clone(), format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));
+        return (layer.folder().clone(), format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));
     }
     let folder = real.parent().unwrap_or_else(|| real.clone());
     let label = folder.to_string();

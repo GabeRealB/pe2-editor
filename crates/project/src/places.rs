@@ -54,15 +54,14 @@ pub fn places(project: &crate::Project) -> std::io::Result<Places> {
         ChannelName::File(path) => Channel::Unix(text(&path)),
         ChannelName::Named(name) => Channel::Pipe(name),
     };
-    let fs = project.io.filesystem();
     let layers = project
         .layers
         .iter()
         .map(|layer| LayerPlaces {
             name: layer.name.to_string(),
-            path: text(&layer.path),
+            path: text(layer.folder()),
             plan: (layer.kind == crate::LayerKind::Generated).then(|| text(&layer.plan())),
-            records: crate::records::is_records(fs, &layer.path),
+            records: layer.records.is_some(),
         })
         .collect();
     Ok(Places {

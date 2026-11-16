@@ -2385,7 +2385,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<crate::workspa
         for layer in &p.layers {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(layer.name.as_str()).strong());
-                theme::short(ui, RichText::new(layer.path.display().to_string()).color(theme::weak()));
+                theme::short(ui, RichText::new(layer.folder().display().to_string()).color(theme::weak()));
             });
         }
     });
@@ -2838,7 +2838,7 @@ fn project_settings_ui(
                 grid(
                     ui,
                     "layers",
-                    p.layers.iter().map(|l| (l.name.to_string(), l.path.display().to_string())).collect(),
+                    p.layers.iter().map(|l| (l.name.to_string(), l.folder().display().to_string())).collect(),
                 );
                 ui.label(RichText::new("The project's own directory is the top layer.").small().color(theme::weak()));
             });

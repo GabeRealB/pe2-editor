@@ -106,7 +106,7 @@ impl<'a, 'h> Out<'a, 'h> {
         index: &'a Index,
         layer: &'a Layer,
     ) -> Self {
-        let records = crate::records::is_records(project.io.filesystem(), &layer.path).then(BTreeMap::new);
+        let records = layer.records.is_some().then(BTreeMap::new);
         Out { tx, project, index, layer, records }
     }
 
@@ -203,14 +203,13 @@ impl<'a, 'h> Out<'a, 'h> {
             .in_scope(|| crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written))?;
         // As it is, whatever its length: a record is read as a record, never kept as chunks as a layer's long
         // files are - which one holding a long text was, and was then not found again.
+        let folder = self.layer.records.as_ref().context("a records layer's records written")?;
         for (uid, record) in &new {
-            let at = crate::records::path_of(&self.layer.path, *uid).with_context(|| format!("{uid}: its record"))?;
+            let at = crate::records::path_of(folder, *uid).with_context(|| format!("{uid}: its record"))?;
             self.tx.write_stored(&at, record.render().as_bytes())?;
         }
         for uid in &gone {
-            self.tx.remove(
-                &crate::records::path_of(&self.layer.path, *uid).with_context(|| format!("{uid}: its record"))?,
-            )?;
+            self.tx.remove(&crate::records::path_of(folder, *uid).with_context(|| format!("{uid}: its record"))?)?;
         }
         // What is written is in the records now.
         self.records = Some(BTreeMap::new());
@@ -1556,7 +1555,8 @@ mod tests {
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
-            assert_eq!(held, [".records"], "a records layer holds no tree");
+            let record = |name: &String| name == "layer.toml" || crate::records::is_shard(std::ffi::OsStr::new(name));
+            assert!(held.iter().all(record), "a records layer holds no tree: {held:?}");
         };
         // A node made: its declaration and a file, read as any layer's.
         let declaration = "stack = [{ op = \"t.file\" }]\n";
@@ -1618,12 +1618,12 @@ mod tests {
         only_records(&root);
         // Renamed: one record changes, what is inside follows.
         let folder = o.uid("h");
-        let records_before = crate::records::Set::records_of(&root.at("layers/top")).unwrap();
+        let records_before = crate::records::Set::records_of(&root.at("layers/top/tree")).unwrap();
         let paths =
             rename(&o.project, &o.index, pe2_path::Name::constant("top"), folder, &tree("k"), &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(o.index.assets.contains_key(&tree("k/made")) && !o.index.assets.contains_key(&tree("h/made")));
-        let records_after = crate::records::Set::records_of(&root.at("layers/top")).unwrap();
+        let records_after = crate::records::Set::records_of(&root.at("layers/top/tree")).unwrap();
         let changed = records_after.iter().filter(|(uid, r)| records_before.get(*uid) != Some(*r)).count();
         assert_eq!(changed, 1, "a rename is one record");
         // Deleted, its own and one below.
@@ -1640,7 +1640,7 @@ mod tests {
             let paths = step.paths();
             o.refresh(&paths);
         }
-        assert!(crate::records::Set::records_of(&root.at("layers/top")).unwrap().is_empty());
+        assert!(crate::records::Set::records_of(&root.at("layers/top/tree")).unwrap().is_empty());
         assert_eq!(
             o.index.assets[&tree("g/a")].layers.iter().map(|layer| layer.as_str()).collect::<Vec<_>>(),
             ["base"]

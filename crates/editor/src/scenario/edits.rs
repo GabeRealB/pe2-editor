@@ -7,7 +7,7 @@ use sfs::HostPath;
 
 /// What a records layer holds: its records' files, by name.
 fn records(scenario: &mut Scenario) -> Vec<String> {
-    let at = scenario.workspace().project.root.at("layers/top/.records");
+    let at = scenario.workspace().project.root.at("layers/top");
     let mut found: Vec<String> = walk(&at).into_iter().filter(|name| name != "layer.toml").collect();
     found.sort();
     found

@@ -685,7 +685,7 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     let mut named = BTreeSet::new();
     let mut found = Vec::new();
     for layer in project.layers.iter().filter(|l| !l.mounted) {
-        files_under(fs, &layer.path, &mut found);
+        files_under(fs, layer.folder(), &mut found);
     }
     for part in [crate::local::HISTORY, crate::local::CONFLICTS] {
         files_under(fs, &crate::local::part(&project.root, part), &mut found);

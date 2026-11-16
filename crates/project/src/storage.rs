@@ -606,7 +606,8 @@ impl Storage {
     }
 
     /// Whether a set of these files can be written behind: there is where to keep what waits, and each is a record
-    /// of a records layer - or the folder one is in - under a path short enough to keep it by.
+    /// of a records layer - a file in a shard of a layer's folder in `layers/`, or a shard - under a path short enough
+    /// to keep it by.
     #[must_use]
     pub fn defers(&self, files: &[Behind]) -> bool {
         let record = |file: &Behind| {
@@ -615,7 +616,8 @@ impl Storage {
                 .filter(|shard| shard.file_name().is_some_and(crate::records::is_shard))
                 .and_then(|shard| shard.parent());
             let named = name_in(&self.root, &file.path).is_ok_and(|name| name.len() <= WAITING_PATH);
-            named && records.is_some_and(|records| records.file_name().is_some_and(|name| name == crate::records::DIR))
+            let layers = self.root.join(&crate::LAYERS);
+            named && records.is_some_and(|records| records.parent().is_some_and(|parent| parent == layers))
         };
         // The space is asked for last: what holds a project and never changes a record attaches none.
         !files.is_empty() && files.iter().all(record) && self.shared.space().is_some()

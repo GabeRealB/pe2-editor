@@ -281,7 +281,8 @@ name = "played"
     #[must_use]
     pub fn tapped() -> Fixture {
         let rig = Fixture::rig();
-        let file = rig.node_file("rig/skeleton");
+        // As it is written, before its layer is made records.
+        let file = rig.root().at(&format!("layers/{LAYER}/rig/skeleton.node/node.toml"));
         let text = std::fs::read_to_string(&file).expect("its declaration");
         std::fs::write(file, format!("{text}\n[[stack]]\nop = \"preview\"\nname = \"again\"\n"))
             .expect("its declaration");
@@ -301,7 +302,8 @@ name = "played"
     /// Where a node's declaration is.
     #[must_use]
     pub fn node_file(&self, path: &str) -> HostPath {
-        self.root().at(&format!("layers/{LAYER}/{path}.node/node.toml"))
+        // Read through the records, where the layer's tree is addressed (`records::TREE`).
+        self.root().at(&format!("layers/{LAYER}/tree/{path}.node/node.toml"))
     }
 }
 

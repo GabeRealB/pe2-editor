@@ -53,9 +53,14 @@ enum Says {
     LeavesOff,
 }
 
+/// The folder of a layer's records, where the extensions it holds are said.
+fn records_of(layer: &crate::Layer) -> Result<&HostPath> {
+    layer.records.as_ref().with_context(|| format!("{} holds no records, nor extensions", layer.name))
+}
+
 /// What a layer's records say of an extension; nothing where they say nothing of it.
 fn held_in(layer: &crate::Layer, id: &str, fs: &dyn pe2_io::Filesystem) -> Option<Says> {
-    let said = crate::records::extensions_of(fs, &layer.path).ok()?.remove(id)?;
+    let said = crate::records::extensions_of(fs, layer.records.as_ref()?).ok()?.remove(id)?;
     Some(said.map_or(Says::LeavesOff, Says::Holds))
 }
 
@@ -113,7 +118,7 @@ pub fn add_extension(
     }
     let mut tx = history.begin(label);
     if !held_already {
-        let record = crate::records::extension_path(&layer.path, &about.id)?;
+        let record = crate::records::extension_path(records_of(layer)?, &about.id)?;
         tx.write(&record, crate::records::extension_record(Some(&tree)).as_bytes())?;
     }
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
@@ -150,10 +155,10 @@ pub fn remove_extension(project: &Project, id: &str, history: &mut History, labe
     }
     let mut tx = history.begin(label);
     for layer in saying.iter().filter(|layer| !layer.read_only) {
-        tx.remove(&crate::records::extension_path(&layer.path, id)?)?;
+        tx.remove(&crate::records::extension_path(records_of(layer)?, id)?)?;
     }
     if let Some(layer) = off_in {
-        let record = crate::records::extension_path(&layer.path, id)?;
+        let record = crate::records::extension_path(records_of(layer)?, id)?;
         tx.write(&record, crate::records::extension_record(None).as_bytes())?;
     }
     if required {

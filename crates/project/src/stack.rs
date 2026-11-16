@@ -145,7 +145,7 @@ pub fn add_at(project: &Project, name: &Name, bottom: bool, history: &mut Histor
     let folder = project.root.join(&LAYERS).join(name);
     tx.make_dir(&folder)?;
     // A layer is its records (`records`).
-    let marker = folder.join(&crate::records::DIR).join(&crate::records::MARKER);
+    let marker = folder.join(&crate::records::MARKER);
     tx.write(&marker, format!("format = {}\n", crate::records::FORMAT).as_bytes())?;
     tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)
