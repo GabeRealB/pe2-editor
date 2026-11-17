@@ -1486,10 +1486,29 @@ fn list_extensions(p: &project::Project) {
             Status::Disabled => "left off".to_string(),
             Status::Refused(why) => format!("not loaded: {why}"),
             Status::NotEnabled { .. } => "not trusted".to_string(),
-            Status::Available => format!("to be added: `pe2-cli project extension add {}`", present.id),
+            // Kept beside the editor: to be added, or - one of its id held - what the project's is updated from.
+            Status::Available => match extensions
+                .present
+                .iter()
+                .find(|held| held.id == present.id && matches!(held.origin, project::ext::Origin::Project(_)))
+            {
+                Some(held) if held.version == present.version => {
+                    format!(
+                        "kept, the same version as the project's: `pe2-cli project extension update {}` copies it again",
+                        present.id
+                    )
+                }
+                Some(held) => format!(
+                    "kept, the project's being {}: `pe2-cli project extension update {}` copies this one",
+                    held.version, present.id
+                ),
+                None => format!("to be added: `pe2-cli project extension add {}`", present.id),
+            },
             Status::Replaced(by) => format!("replaced by {by}"),
         };
-        let required = p.requires.iter().any(|required| required.id == present.id);
+        // What the project requires is the one it holds, not a copy kept beside it.
+        let required =
+            p.requires.iter().any(|required| required.id == present.id) && !matches!(present.status, Status::Available);
         println!(
             "{} {}  {}{status}  ({})",
             present.id,

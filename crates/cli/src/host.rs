@@ -306,14 +306,20 @@ impl Host {
         answered.unwrap_or(mcp::Reply::Declined)
     }
 
-    /// Have what answering takes: the extensions loaded and the imports attached to the index, made where they are not
-    /// (the first time, and after what changed the project).
+    /// Have what answering takes: the index held to the files, and the extensions loaded and the imports attached to
+    /// it, made where they are not (the first time, and after what changed the project).
     ///
     /// # Errors
     /// It does not hold the project (declined), or the project cannot be read.
     fn ready(&self, state: &mut State) -> std::result::Result<(), mcp::Reply> {
         let State { held, reading, .. } = state;
         let Some(held) = held.as_mut() else { return Err(mcp::Reply::Declined) };
+        // The files held to what the index took of them as it was opened - a project taken back after another process
+        // changed it, as an extraction filling it does - and what differs taken in, before anything is answered or run
+        // from it, as before an edit.
+        if held.core.verified().is_some() {
+            *reading = None;
+        }
         if reading.is_none() {
             let made = (|| {
                 let local = Local::open(&self.project, &held.lock)?;

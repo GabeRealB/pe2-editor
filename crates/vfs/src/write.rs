@@ -313,6 +313,14 @@ pub fn apply(
     history: &mut History,
 ) -> Result<Vec<HostPath>> {
     let label = change.label();
+    // What the served folder cannot name, no edit names either: a step of a path ending as storage marks a node.
+    let paths: &[&Arc<TreePath>] = match change {
+        Change::Write { path, .. } | Change::Remove { path } | Change::Folder { path } => &[path],
+        Change::Rename { from, to } => &[from, to],
+    };
+    if let Some(path) = paths.iter().find(|path| refused(path.rel())) {
+        bail!("{path}: no name in the project ends in `{BUNDLE_SUFFIX}`, which is how storage marks a node");
+    }
     match change {
         Change::Write { path, staged } => {
             keep_open(staged, project.io.filesystem());

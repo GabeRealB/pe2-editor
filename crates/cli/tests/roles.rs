@@ -460,3 +460,45 @@ fn what_is_written_while_a_tool_has_the_project_is_taken_in_once_it_is_done() {
     let (undone, said) = tried.ask(&["undo"]);
     assert!(undone && said.contains("meanwhile.txt"), "{said}");
 }
+
+#[test]
+fn an_edit_naming_a_step_as_storage_marks_a_node_is_refused_as_the_served_folder_refuses_it() {
+    let tried = Tried::new("node-names");
+    let file = tried.root.at("node.toml");
+    std::fs::write(&file, "a = 1\n").unwrap();
+    let from = file.to_str().unwrap();
+    let (wrote, said) = tried.ask(&["write", "x/node.toml", "--from", from]);
+    assert!(wrote, "{said}");
+    // Through the node's folder as storage names it, or a name made so: refused, nothing made.
+    for refused in [&["write", "x.node/file.txt", "--from", from][..], &["mkdir", "y.node"], &["mv", "x", "z.node"]] {
+        let (done, said) = tried.ask(refused);
+        assert!(!done && said.contains("`.node`"), "{refused:?}: {said}");
+    }
+    let (dumped, said) = tried.ask(&["dump"]);
+    assert!(dumped, "{said}");
+    assert!(!said.contains("file.txt") && !said.contains("y.node") && !said.contains("z.node"), "{said}");
+}
+
+#[test]
+fn what_a_tool_changed_while_it_had_the_project_is_what_the_host_answers_from_once_it_has_it_back() {
+    let tried = Tried::new("taken-back");
+    let file = tried.root.at("node.toml");
+    std::fs::write(&file, "a = 1\n").unwrap();
+    let (wrote, said) = tried.ask(&["write", "x/node.toml", "--from", file.to_str().unwrap()]);
+    assert!(wrote, "{said}");
+    let (asked, said) = tried.ask(&["problems"]);
+    assert!(asked && said.contains("no problems"), "{said}");
+    let host = tried.host().expect("a host holds it");
+    // A tool takes the project from the host and changes it, as an extraction does: the layer made again, its node
+    // now referring to what is not there.
+    let tree = tried.root.at("tree");
+    let (exported, said) = tried.ask(&["layer", "export", "project", "--to", tree.to_str().unwrap()]);
+    assert!(exported, "{said}");
+    std::fs::write(tree.at("x.node/node.toml"), "other = \"uid://abcdefghijkl\"\n").unwrap();
+    let (imported, said) = tried.ask(&["layer", "import", "project", "--from", tree.to_str().unwrap()]);
+    assert!(imported, "{said}");
+    // The host has it back, and what is asked of it first is answered from the project as the tool left it.
+    assert_eq!(tried.host(), Some(host), "the same host");
+    let (asked, said) = tried.ask(&["problems"]);
+    assert!(asked && said.contains("abcdefghijkl"), "{said}");
+}

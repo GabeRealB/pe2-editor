@@ -60,7 +60,8 @@ which to keep: **Keep mine** or **Take the disk's**.
 These changes take effect at once, without saving. Like every change, they can be undone.
 
 A name is one every system can hold: not `CON` or `aux` (with or without an extension), no `\ : * ? " < > |`, no
-ending in a dot or a space, no characters that turn how the text around them reads. Nor can it be one already beside
+ending in a dot or a space, no characters that turn how the text around them reads, and not ending in `.node`,
+which the project keeps for its own use. Nor can it be one already beside
 it but for its case or how its accents are written (`Notes` beside `notes`), which Windows and macOS do not tell apart.
 A name that cannot be is refused, and the window says why. Renaming an asset to another case of its name
 (`notes` to `Notes`) changes how it is written.
