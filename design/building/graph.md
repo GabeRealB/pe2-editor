@@ -48,8 +48,10 @@ Every step records what it read: its node's files, other assets' outputs, plain 
 configuration. Its result is kept under a key made from the plan and those reads, in the cache or with the build.
 Finding a result kept means holding its trace to what it read now - recursively, since each output read is itself
 kept by its reads - so an unchanged result is never remade, and a change remakes exactly what read it. A trace names a
-node, its own and each it read of, by its uid as the number it is, or its path where it has none (`exec::NodeId`,
-`OutputRead`), never by text.
+node, its own and each it read of, by its uid as the number it is, a version below an asset as that version (the
+asset's uid and how many below: `index::Version`, which a reference writes `below:<uid>`), or its path where it has none
+(`exec::NodeId`, `OutputRead`), never by text. The index keeps the versions by the same value, and a reference naming
+one is read as uids are, however its uid is written.
 
 What makes that cheap: file hashes are remembered by time and length, and a run remembers what it already found of
 other outputs.

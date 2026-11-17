@@ -2618,7 +2618,7 @@ impl graph::exec::World for Graph<'_> {
 
     fn node(&self, reference: &toml::Value) -> Option<(&dyn graph::exec::Node, graph::Plan)> {
         let asset: &index::Asset = if let Some(version) = reference.as_str().filter(|r| r.starts_with(index::BELOW)) {
-            self.index.version(version)?
+            self.index.version(index::Version::of(version)?)?
         } else if let Some(path) = reference.as_str().filter(|r| !r.starts_with("uid://")) {
             self.index.asset_at(path)?
         } else {

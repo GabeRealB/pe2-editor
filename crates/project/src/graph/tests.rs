@@ -1700,7 +1700,10 @@ fn a_trace_names_a_node_by_its_uid_as_a_number_or_by_its_path() {
     let asked = std::sync::Arc::from(pe2_path::Asked::new("cells/body").unwrap());
     let mut reads = Reads::default();
     reads.outputs.insert(OutputRead { node: uid, asked: std::sync::Arc::clone(&asked) }, "1".into());
-    reads.outputs.insert(OutputRead { node: path, asked }, "2".into());
+    reads.outputs.insert(OutputRead { node: path, asked: std::sync::Arc::clone(&asked) }, "2".into());
+    let version = NodeId::Version { uid: crate::testing::uid("uid://a"), depth: 2 };
+    assert_eq!(version.to_string(), "below:below:uid://000000000000a");
+    reads.outputs.insert(OutputRead { node: version, asked }, "3".into());
     let mut bytes = Vec::new();
     ciborium::into_writer(&reads, &mut bytes).unwrap();
     let read: Reads = ciborium::from_reader(bytes.as_slice()).unwrap();

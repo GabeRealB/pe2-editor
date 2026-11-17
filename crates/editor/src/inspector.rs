@@ -2005,7 +2005,7 @@ fn add_items(
         for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE) {
             add(ui, file.name.as_str(), "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
         }
-        let version = asset.uid.as_ref().and_then(|uid| index.version(&format!("{}{uid}", project::index::BELOW)));
+        let version = asset.uid.and_then(|uid| index.version(project::index::Version { uid, depth: 1 }));
         if let Some(version) = version {
             // Its type declared, as a stack's shape cannot reach the version below.
             let (plan, _) = extensions.plan(version);

@@ -807,7 +807,14 @@ impl Default for Ops {
         ops.add(OpDef::new(BELOW, "The version below", "1").output_of(declared).makes(Type::Any, move |call| {
             let address =
                 pe2_path::Asked::new(call.settings().get("output").and_then(Toml::as_str).unwrap_or("native"))?;
-            let reference = format!("{}{}", crate::index::BELOW, exec::id(call.recorder().node()));
+            // The version below the node: below the asset in effect, or below the version it is.
+            let node = call.recorder().node();
+            let below = match (node.version(), node.uid()) {
+                (Some(version), _) => version.below(),
+                (None, Some(uid)) => crate::index::Version { uid, depth: 1 },
+                (None, None) => anyhow::bail!("{}: it has no uid, so nothing is below it", node.path()),
+            };
+            let reference = below.to_string();
             let value = (*call.output_of(&Toml::String(reference), address)?).clone();
             if let Some(ty) = declared(call.settings()) {
                 anyhow::ensure!(

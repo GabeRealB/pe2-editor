@@ -66,6 +66,10 @@ pub trait Node: Sync {
         let path = self.content_path(sha1).with_context(|| format!("{}: no content {sha1}", self.path()))?;
         crate::content::read(io, &path).with_context(|| path.display().to_string())
     }
+    /// Where it is a version below an asset, which (`index::Version`).
+    fn version(&self) -> Option<crate::index::Version> {
+        None
+    }
 }
 
 /// An asset of the index is a node: its stored files those of its bundle, not what imports made; its declaration and
@@ -77,6 +81,10 @@ impl Node for crate::index::Asset {
 
     fn uid(&self) -> Option<pe2_path::Uid> {
         self.uid
+    }
+
+    fn version(&self) -> Option<crate::index::Version> {
+        self.below
     }
 
     fn declaration(&self) -> &str {
@@ -146,6 +154,12 @@ impl<'de> Deserialize<'de> for FileRead {
 pub enum NodeId {
     /// Its uid, kept as the number it is.
     Uid(#[serde(with = "pe2_path::uid_number")] pe2_path::Uid),
+    /// A version below an asset: the asset's uid, and how many below.
+    Version {
+        #[serde(with = "pe2_path::uid_number")]
+        uid: pe2_path::Uid,
+        depth: u32,
+    },
     Path(Arc<crate::TreePath>),
 }
 
@@ -161,6 +175,7 @@ impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeId::Uid(uid) => uid.fmt(f),
+            NodeId::Version { uid, depth } => crate::index::Version { uid: *uid, depth: *depth }.fmt(f),
             NodeId::Path(path) => path.fmt(f),
         }
     }
@@ -2411,8 +2426,12 @@ impl Node for Nowhere {
     }
 }
 
-/// A node as traces name it: by uid, else by path.
+/// A node as traces name it: by uid; a version below an asset as that version; else by path.
 #[must_use]
 pub fn id(node: &dyn Node) -> NodeId {
-    node.uid().map_or_else(|| NodeId::Path(node.path().to_owned()), NodeId::Uid)
+    match (node.uid(), node.version()) {
+        (Some(uid), _) => NodeId::Uid(uid),
+        (None, Some(version)) => NodeId::Version { uid: version.uid, depth: version.depth },
+        (None, None) => NodeId::Path(node.path().to_owned()),
+    }
 }

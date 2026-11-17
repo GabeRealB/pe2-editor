@@ -42,6 +42,42 @@ pub const SETTINGS_FILE: &Name = Name::constant("settings.toml");
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
 
+/// A version of an asset below the one in effect, by the asset's uid and how many below it is: what a reference
+/// `below:<uid>` names, `below:below:<uid>` the one below that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Version {
+    pub uid: Uid,
+    /// How many below the asset in effect: 1 for the version just below it.
+    pub depth: u32,
+}
+
+impl Version {
+    /// The version a reference's text names, read as uids are: `below:` once each level, then the uid, however written.
+    #[must_use]
+    pub fn of(text: &str) -> Option<Version> {
+        let (mut rest, mut depth) = (text, 0);
+        while let Some(below) = rest.strip_prefix(BELOW) {
+            (rest, depth) = (below, depth + 1);
+        }
+        (depth > 0).then_some(Version { uid: Uid::new(rest).ok()?, depth })
+    }
+
+    /// The version below this one.
+    #[must_use]
+    pub fn below(self) -> Version {
+        Version { depth: self.depth + 1, ..self }
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..self.depth {
+            f.write_str(BELOW)?;
+        }
+        self.uid.fmt(f)
+    }
+}
+
 /// Whether a path is in a records layer's folder: one of its records, or its marker.
 fn in_records(layers: &[LayerState], path: &HostPath) -> bool {
     layers.iter().any(|layer| {
@@ -94,9 +130,8 @@ pub struct BundleFile {
 pub struct Asset {
     pub path: Arc<TreePath>,
     pub uid: Option<Uid>,
-    /// The name the graph knows it by (`graph::exec::Node::uid`): its uid's text; for a version below an asset,
-    /// `below:<uid>`, as many times over as it is below - it is no uid of its own.
-    pub named: Option<Arc<str>>,
+    /// Where it is a version below an asset (`version`), which: it is then no uid of its own.
+    pub below: Option<Version>,
     /// What of its stack says what it makes (`graph::shape`): nodes alike share one.
     pub shape: Arc<str>,
     /// Its `variants`' names, in order.
@@ -1789,7 +1824,7 @@ pub struct Index {
     /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
     /// nodes of their own, read through the graph's `below` operation - made when first asked for (`version`),
     /// of the stack as it is then, and let go of whenever an asset is assembled again.
-    versions: Arc<OnceLock<HashMap<String, Arc<Asset>>>>,
+    versions: Arc<OnceLock<HashMap<Version, Arc<Asset>>>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
     pub entries: Shared<BTreeMap<Arc<TreePath>, Entry>>,
@@ -4251,7 +4286,7 @@ impl Index {
             io: self.io.clone(),
             path: asset_of(path),
             uid: Some(node.uid),
-            named: Some(node.uid.to_string().into()),
+            below: None,
             shape: Arc::from(""),
             variants: vec![],
             files: vec![],
@@ -4294,22 +4329,21 @@ impl Index {
         asset
     }
 
-    /// The versions every overridden asset has below it: `below:<uid>`, `below:below:<uid>`, ..., each below the
-    /// last, from the layer holding the asset.
-    fn versions_made(&self) -> HashMap<String, Arc<Asset>> {
+    /// The versions every overridden asset has below it, each below the last, from the layer holding the asset.
+    fn versions_made(&self) -> HashMap<Version, Arc<Asset>> {
         let mut versions = HashMap::new();
         let overridden =
             self.resolved.iter().filter(|(_, node)| node.kind == Kind::Asset && !node.overrides.is_empty());
         for (path, node) in overridden {
             let (at, uid) = (asset_of(path), node.uid);
             let mut layer = self.layers[node.content.0].name.clone();
-            let mut name = format!("{BELOW}{uid}");
+            let mut version = Version { uid, depth: 1 };
             while let Some(below) = self.below(&layer, uid) {
                 let mut asset = Asset {
                     io: self.io.clone(),
                     path: at.clone(),
                     uid: None,
-                    named: Some(name.as_str().into()),
+                    below: Some(version),
                     shape: Arc::from(""),
                     variants: vec![],
                     files: vec![],
@@ -4347,18 +4381,18 @@ impl Index {
                         made_by: None,
                     });
                 }
-                versions.insert(name.clone(), Arc::new(asset));
-                name.insert_str(0, BELOW);
+                versions.insert(version, Arc::new(asset));
+                version = version.below();
                 layer = below.layer;
             }
         }
         versions
     }
 
-    /// A version an asset overrides, by its name: `below:<uid>`.
+    /// A version an asset overrides.
     #[must_use]
-    pub fn version(&self, name: &str) -> Option<&Asset> {
-        self.versions.get_or_init(|| self.versions_made()).get(name).map(Arc::as_ref)
+    pub fn version(&self, version: Version) -> Option<&Asset> {
+        self.versions.get_or_init(|| self.versions_made()).get(&version).map(Arc::as_ref)
     }
 
     /// Resolve the uids and the references, and add what is wrong with the assets' declarations.
@@ -4484,7 +4518,7 @@ impl Index {
     reason = "a test's fixtures: the machine's time, places, files and environment, which nothing tested reads"
 )]
 mod tests {
-    use super::{Index, Problem};
+    use super::{Index, Problem, Version};
     use crate::Project;
     use crate::changeset::{Base, Changeset, Op};
     use crate::local::Local;
@@ -4494,7 +4528,12 @@ mod tests {
 
     /// The top layer's override of an entry, changing these files of it: each made from the version below now, kept.
     fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
-        let below = index.below(pe2_path::Name::constant("top"), crate::testing::uid(uid)).expect("below top");
+        overriding_in(index, "top", uid, files)
+    }
+
+    /// An override of an entry in a layer, of these files of the version below it.
+    fn overriding_in(index: &Index, layer: &str, uid: &str, files: &[&str]) -> Op {
+        let below = index.below(&crate::testing::name(layer), crate::testing::uid(uid)).expect("a version below");
         let store = crate::chunks::Store::at(
             &index.merged.parent().and_then(|local| local.parent()).expect("a project"),
             crate::testing::io(),
@@ -4593,6 +4632,38 @@ mod tests {
     }
 
     #[test]
+    fn a_stack_reads_the_version_below_and_that_version_the_one_below_it() {
+        let root = crate::testing::scratch("index-versions");
+        let _ = std::fs::remove_dir_all(&root);
+        let layers = "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"mid\"\n\n[[layer]]\nname = \"top\"\n";
+        write(&root, "project.toml", layers);
+        let made = "uid = \"uid://k\"\nstack = [{ op = \"constant\", value = { n = 1 } }]\n";
+        write(&root, "layers/base/k.node/node.toml", made);
+        for layer in ["mid", "top"] {
+            std::fs::create_dir_all(root.at("layers").at(layer)).unwrap();
+        }
+        // Each layer above keeps nothing of its own: what it makes is what the version below makes.
+        let below = [("k.node/node.toml", "stack = [{ op = \"below\", type = \"table\", output = \"result\" }]\n")];
+        for layer in ["mid", "top"] {
+            let (_, index) = open(&root);
+            let mut over = Changeset::default();
+            over.ops.insert(uid("uid://k"), overriding_in(&index, layer, "uid://k", &["node.toml"]));
+            crate::testing::apply(&root, layer, &over, &below);
+        }
+        let (_, index) = open(&root);
+        let k = Version { uid: uid("uid://k"), depth: 1 };
+        assert!(index.version(k).is_some() && index.version(k.below()).is_some());
+        let extensions = crate::ext::Extensions::load(Vec::new(), false);
+        let engine = crate::graph::exec::Engine::new(extensions.operations(), None);
+        let result = pe2_path::Asked::constant("result");
+        let given = extensions.output(&engine, &index, &index.assets[&tree("k")], result, true).unwrap();
+        let made = given.value.unwrap();
+        let crate::graph::Value::Table(table) = &*made else { panic!("{made:?}") };
+        assert_eq!(table.get("n").and_then(toml::Value::as_integer), Some(1), "through both versions below");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn applies_overrides_moves_and_deletes() {
         let root = project("ops");
         let (_, index) = open(&root);
@@ -4618,13 +4689,18 @@ mod tests {
         assert_eq!(index.assets[&tree("c")].uid, Some(uid_of("b.node")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // What it overrides is there, a node of its own.
-        let below = index.version(&format!("below:{}", uid("uid://a"))).unwrap();
+        let below = index.version(Version { uid: uid("uid://a"), depth: 1 }).unwrap();
         assert_eq!(
-            (below.named.as_deref(), below.uid, below.layers.as_slice()),
-            (Some(format!("below:{}", uid("uid://a")).as_str()), None, [crate::testing::name("base")].as_slice())
+            (below.below, below.uid, below.layers.as_slice()),
+            (Some(Version { uid: uid("uid://a"), depth: 1 }), None, [crate::testing::name("base")].as_slice())
         );
         assert!(below.files.iter().all(|f| *f.layer == "base"));
-        assert!(index.version(&format!("below:below:{}", uid("uid://a"))).is_none());
+        assert!(index.version(Version { uid: uid("uid://a"), depth: 2 }).is_none());
+        // Named however its uid is written.
+        assert_eq!(Version::of("below:uid://A"), Some(Version { uid: uid("uid://a"), depth: 1 }));
+        assert_eq!(Version::of("below:below:uid://00a").map(|v| v.depth), Some(2));
+        assert_eq!(Version::of(&Version { uid: uid("uid://a"), depth: 2 }.to_string()).map(|v| v.depth), Some(2));
+        assert_eq!(Version::of("uid://a"), None);
         // The base changes under the override: stale.
         crate::testing::write_in(&root, "base", "g/a.node/native.texels", Some("retouched"));
         let (_, index) = open(&root);
