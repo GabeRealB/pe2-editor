@@ -46,8 +46,7 @@ pub struct Trace {
     pub value: String,
     #[serde(default)]
     pub reads: Reads,
-    #[serde(default)]
-    pub node: String,
+    pub node: crate::graph::exec::NodeId,
     #[serde(default)]
     pub output: String,
     #[serde(default)]
@@ -519,7 +518,7 @@ impl Store {
     /// keeps outputs: what was written since a little before it began is left (a value's blobs are written before it,
     /// it before its trace).
     #[must_use = "what was swept is the sweep's report"]
-    pub fn sweep(&self, live: &HashSet<String>, used: &HashSet<&String>) -> (usize, usize, usize) {
+    pub fn sweep(&self, live: &HashSet<crate::graph::exec::NodeId>, used: &HashSet<&String>) -> (usize, usize, usize) {
         self.sweep_older(live, used, self.io.clock().wall() - std::time::Duration::from_secs(2))
     }
 
@@ -527,7 +526,7 @@ impl Store {
     #[must_use = "what was swept is the sweep's report"]
     pub fn sweep_older(
         &self,
-        live: &HashSet<String>,
+        live: &HashSet<crate::graph::exec::NodeId>,
         used: &HashSet<&String>,
         began: std::time::SystemTime,
     ) -> (usize, usize, usize) {
@@ -547,7 +546,7 @@ impl Store {
         let entries = |sub: &Name| listed(self.dir.join(sub));
         let mut swept = (0, 0, 0);
         // Each live output's newest trace of each build, by when it was written.
-        let mut newest: HashMap<(String, String), Builds> = HashMap::new();
+        let mut newest: HashMap<(crate::graph::exec::NodeId, String), Builds> = HashMap::new();
         let mut gone = Vec::new();
         for entry in entries(TRACES) {
             let (Some(key), Some(trace)) = (stem(&entry), stem(&entry).and_then(|k| self.trace(&k))) else {

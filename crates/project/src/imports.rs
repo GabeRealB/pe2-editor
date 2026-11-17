@@ -51,7 +51,7 @@ pub struct Imports {
     /// a refresh finds them here rather than on disk while that holds.
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The nodes each asset's last import read outputs of (as traces name them), by its path.
-    read_from: Mutex<HashMap<Arc<TreePath>, BTreeSet<String>>>,
+    read_from: Mutex<HashMap<Arc<TreePath>, BTreeSet<graph::exec::NodeId>>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from: kept
     /// in the outputs (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
     addresses: Mutex<HashMap<String, Listed>>,
@@ -159,9 +159,9 @@ impl Known {
     }
 }
 
-/// The nodes an import read outputs of, by what it names them (`uid://...` or a path, without the output).
-fn nodes_read(reads: &Reads) -> BTreeSet<String> {
-    reads.outputs.keys().map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string()).collect()
+/// The nodes an import read outputs of.
+fn nodes_read(reads: &Reads) -> BTreeSet<graph::exec::NodeId> {
+    reads.outputs.keys().map(|read| read.node.clone()).collect()
 }
 
 impl Imports {
@@ -311,7 +311,7 @@ impl Imports {
         let mut found: Vec<(Arc<TreePath>, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
         let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
-        let mut read_from: Vec<(Arc<TreePath>, BTreeSet<String>)> = Vec::new();
+        let mut read_from: Vec<(Arc<TreePath>, BTreeSet<graph::exec::NodeId>)> = Vec::new();
         if self.stopping() {
             return attached;
         }
@@ -686,7 +686,7 @@ pub const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_mins(30);
 /// process finds it is not due - and after, what the sweep removed being no news of its own.
 #[must_use = "what was swept is the sweep's report"]
 #[expect(clippy::implicit_hasher, reason = "the store sweeps by a set of the standard hasher's")]
-pub fn sweep_store(store: &Store, live: &HashSet<String>) -> (usize, usize, usize) {
+pub fn sweep_store(store: &Store, live: &HashSet<graph::exec::NodeId>) -> (usize, usize, usize) {
     let _span = tracing::info_span!("store sweep").entered();
     store.mark_swept();
     let swept = store.sweep(live, &HashSet::new());
@@ -704,7 +704,7 @@ pub fn sweep_if_due(store: &Store, index: &Index) -> Option<(usize, usize, usize
 
 /// The project's nodes, as traces name them: what the store keeps for others goes in a sweep.
 #[must_use]
-pub fn live_nodes(index: &Index) -> HashSet<String> {
+pub fn live_nodes(index: &Index) -> HashSet<graph::exec::NodeId> {
     index.assets.values().map(|a| graph::exec::id(&**a)).collect()
 }
 

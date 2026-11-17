@@ -140,6 +140,53 @@ impl<'de> Deserialize<'de> for FileRead {
     }
 }
 
+/// A node as the work graph's traces and what it read name it: by its uid, else by its path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NodeId {
+    /// Its uid, kept as the number it is.
+    Uid(#[serde(with = "pe2_path::uid_number")] pe2_path::Uid),
+    Path(Arc<crate::TreePath>),
+}
+
+impl NodeId {
+    /// How a reference names it.
+    #[must_use]
+    pub fn reference(&self) -> toml::Value {
+        toml::Value::String(self.to_string())
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeId::Uid(uid) => uid.fmt(f),
+            NodeId::Path(path) => path.fmt(f),
+        }
+    }
+}
+
+/// Another node's output as what read it names it: its node, and what of it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OutputRead {
+    pub node: NodeId,
+    pub asked: Arc<pe2_path::Asked>,
+}
+
+impl std::fmt::Display for OutputRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.node, self.asked)
+    }
+}
+
+/// What a run found it had looked at before (`Engine::found`): a project's file or folder, or the nodes of a type, by how
+/// a trace names them; or another node's output.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Looked {
+    Entry(String),
+    Output(OutputRead),
+}
+
 /// What operations read of their node: its stored files by their hashes (empty where it had none of the name), its
 /// declaration's hash where they read its settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +195,9 @@ pub struct Reads {
     pub files: BTreeMap<String, FileRead>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<String>,
-    /// Other nodes' outputs read, each by `<node>#<address>` (its node as traces name it), with its hash.
+    /// Other nodes' outputs read, each by its node and address, with its hash.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub outputs: BTreeMap<String, String>,
+    pub outputs: BTreeMap<OutputRead, String>,
     /// The project's plain files read, each by its path, with its hash; a folder listed, by its path and a `/`, with its list's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entries: BTreeMap<String, String>,
@@ -300,7 +347,7 @@ pub struct Reach<'a> {
 
 thread_local! {
     /// The outputs being made of other nodes on this thread, outermost first: one asked again is a cycle.
-    static MAKING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MAKING: std::cell::RefCell<Vec<OutputRead>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl<'a> Reach<'a> {
@@ -308,18 +355,22 @@ impl<'a> Reach<'a> {
     ///
     /// # Errors
     /// No node is so named.
-    pub fn key(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<String> {
+    pub fn key(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<OutputRead> {
         let (node, _) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
-        Ok(format!("{}#{asked}", id(node)))
+        Ok(OutputRead { node: id(node), asked: Arc::from(asked) })
     }
 
     /// Another node's output, by its reference and its address: made, or found kept, in the world; with its hash.
     ///
     /// # Errors
     /// No node is so named, it has no such output, it reads, through others, itself, or it cannot be made.
-    pub fn output(&self, reference: &toml::Value, asked: &pe2_path::Asked) -> Result<(String, Given, &'a dyn Node)> {
+    pub fn output(
+        &self,
+        reference: &toml::Value,
+        asked: &pe2_path::Asked,
+    ) -> Result<(OutputRead, Given, &'a dyn Node)> {
         let (node, plan) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
-        let read = format!("{}#{asked}", id(node));
+        let read = OutputRead { node: id(node), asked: Arc::from(asked) };
         let cycle = MAKING.with(|m| m.borrow().contains(&read));
         anyhow::ensure!(!cycle, "{read} reads, through others, itself");
         MAKING.with(|m| m.borrow_mut().push(read.clone()));
@@ -332,12 +383,13 @@ impl<'a> Reach<'a> {
     fn entry_hash(&self, read: &str) -> Option<String> {
         if let Some(node_type) = read.strip_prefix(TYPE_READ) {
             // Every node of the project looked at: once a run, while nothing is made in it.
-            if let Some(hash) = self.engine.found(read) {
+            let looked = Looked::Entry(read.to_string());
+            if let Some(hash) = self.engine.found(&looked) {
                 return Some(hash);
             }
             let made = self.engine.made();
             let hash = type_hash(&self.world.assets_of(node_type));
-            self.engine.find(read.to_string(), made, &hash);
+            self.engine.find(looked, made, &hash);
             return Some(hash);
         }
         // A trace keeps what it read as text: one that is no path any more names nothing, so the trace does not hold.
@@ -355,24 +407,24 @@ impl<'a> Reach<'a> {
         }
     }
 
-    /// The hash another node's output has now, by how a trace names it (`<node>#<address>`): its trace's, where that
-    /// still holds - its value neither read nor made, though it is not kept (`Engine::traced`) - else made now.
-    fn hash(&self, read: &str) -> Option<String> {
+    /// The hash another node's output has now, by how a trace names it: its trace's, where that still holds - its value
+    /// neither read nor made, though it is not kept (`Engine::traced`) - else made now.
+    fn hash(&self, read: &OutputRead) -> Option<String> {
         // Held to what it read once a run, while nothing is made in it, whoever reads it.
-        if let Some(hash) = self.engine.found(read) {
+        let looked = Looked::Output(read.clone());
+        if let Some(hash) = self.engine.found(&looked) {
             return Some(hash);
         }
         let made = self.engine.made();
-        let (node, asked) = read.rsplit_once('#')?;
-        let asked = pe2_path::Asked::new(asked).ok()?;
-        let (found, plan) = self.world.node(&toml::Value::String(node.to_string()))?;
+        let asked = &*read.asked;
+        let (found, plan) = self.world.node(&read.node.reference())?;
         let (output, parameter) = plan.output(asked.address().as_str())?;
         let asking = Asking { member: parameter.as_deref(), query: asked.query() };
         if let Some(trace) = self.engine.traced(Some(*self), &plan, found, output, asking) {
-            self.engine.find(read.to_string(), made, &trace.value);
+            self.engine.find(looked, made, &trace.value);
             return Some(trace.value);
         }
-        let read = format!("{}#{asked}", id(found));
+        let read = OutputRead { node: id(found), asked: read.asked.clone() };
         if MAKING.with(|m| m.borrow().contains(&read)) {
             return None;
         }
@@ -484,13 +536,13 @@ impl Drop for Call<'_> {
 /// What an operation said it reads, made before it ran, by `<node>#<address>`.
 #[derive(Default)]
 pub struct Needs {
-    made: Mutex<HashMap<String, std::result::Result<Got, String>>>,
+    made: Mutex<HashMap<OutputRead, std::result::Result<Got, String>>>,
 }
 
 /// An output of another node, read.
 #[derive(Clone)]
 struct Got {
-    read: String,
+    read: OutputRead,
     value: Arc<Value>,
     hash: String,
 }
@@ -524,7 +576,7 @@ fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, asked: &pe2
 }
 
 /// This work on another thread, what this one was making going with it: a node reading itself is found across threads too.
-fn making_as(chain: &[String], work: impl FnOnce() -> Result<Got>) -> Result<Got> {
+fn making_as(chain: &[OutputRead], work: impl FnOnce() -> Result<Got>) -> Result<Got> {
     let own = MAKING.with(|making| std::mem::replace(&mut *making.borrow_mut(), chain.to_vec()));
     let done = work();
     MAKING.with(|making| *making.borrow_mut() = own);
@@ -1149,7 +1201,7 @@ pub fn evaluate(
 }
 
 /// `making_as`, for a value made.
-fn making_made(chain: &[String], work: impl FnOnce() -> Made) -> Made {
+fn making_made(chain: &[OutputRead], work: impl FnOnce() -> Made) -> Made {
     let own = MAKING.with(|making| std::mem::replace(&mut *making.borrow_mut(), chain.to_vec()));
     let done = work();
     MAKING.with(|making| *making.borrow_mut() = own);
@@ -1665,7 +1717,7 @@ impl Evaluation<'_> {
     /// What an operation said it reads, or a step requested, made - at once, where nothing connects them - for it to read.
     fn make_needs(&self, wanted: &[pe2_ext::Need], needs: &Needs) {
         let Some(reach) = self.reach else { return };
-        let mut keyed: Vec<(String, toml::Value, Arc<pe2_path::Asked>)> = Vec::new();
+        let mut keyed: Vec<(OutputRead, toml::Value, Arc<pe2_path::Asked>)> = Vec::new();
         for need in wanted {
             let reference = toml::Value::String(need.node.to_string());
             // What names no node is refused where it is read: `output_of` finds no key for it.
@@ -1950,7 +2002,7 @@ struct Checked {
     /// How many outputs the run made.
     made: std::sync::atomic::AtomicU64,
     /// What was found, and after how many outputs made.
-    found: Mutex<(u64, HashMap<String, String>)>,
+    found: Mutex<(u64, HashMap<Looked, String>)>,
 }
 
 /// An output as the engine gives it: its value, where it was made or read now, its hash, and what it read - by which
@@ -1985,7 +2037,7 @@ impl Engine {
     }
 
     /// What this run found of something before, where nothing was made in it since.
-    fn found(&self, what: &str) -> Option<String> {
+    fn found(&self, what: &Looked) -> Option<String> {
         let checked = self.checked.as_ref()?;
         let made = checked.made.load(std::sync::atomic::Ordering::Acquire);
         let mut found = checked.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1997,7 +2049,7 @@ impl Engine {
 
     /// Remember what this run found of something, looked at after `made` outputs were made: only where no other
     /// was made meanwhile.
-    fn find(&self, what: String, made: u64, hash: &str) {
+    fn find(&self, what: Looked, made: u64, hash: &str) {
         let Some(checked) = &self.checked else { return };
         let mut found = checked.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if checked.made.load(std::sync::atomic::Ordering::Acquire) != made {
@@ -2361,6 +2413,6 @@ impl Node for Nowhere {
 
 /// A node as traces name it: by uid, else by path.
 #[must_use]
-pub fn id(node: &dyn Node) -> String {
-    node.uid().map_or_else(|| node.path().to_string(), |uid| uid.to_string())
+pub fn id(node: &dyn Node) -> NodeId {
+    node.uid().map_or_else(|| NodeId::Path(node.path().to_owned()), NodeId::Uid)
 }

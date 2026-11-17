@@ -47,7 +47,9 @@ Choice is part of the graph rather than of the code around it:
 Every step records what it read: its node's files, other assets' outputs, plain files of the project, the
 configuration. Its result is kept under a key made from the plan and those reads, in the cache or with the build.
 Finding a result kept means holding its trace to what it read now - recursively, since each output read is itself
-kept by its reads - so an unchanged result is never remade, and a change remakes exactly what read it.
+kept by its reads - so an unchanged result is never remade, and a change remakes exactly what read it. A trace names a
+node, its own and each it read of, by its uid as the number it is, or its path where it has none (`exec::NodeId`,
+`OutputRead`), never by text.
 
 What makes that cheap: file hashes are remembered by time and length, and a run remembers what it already found of
 other outputs.

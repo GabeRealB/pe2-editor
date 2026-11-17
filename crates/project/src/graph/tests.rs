@@ -590,7 +590,8 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     // An output's trace is under one key: its older value goes with the sweep (the count of three), and what was
     // written out for the count's port asking for a file (`ABCD`), which no value names; a node no longer live, all of
     // it - its two traces, their values, the native form's blob.
-    let live: HashSet<String> = ["test/bundle".to_string()].into();
+    let live: HashSet<super::exec::NodeId> =
+        [super::exec::NodeId::Path(crate::TreePath::new("test/bundle").unwrap().to_owned())].into();
     assert_eq!(engine.store().unwrap().sweep_older(&live, &HashSet::new(), later()), (0, 1, 1));
     assert_eq!(engine.store().unwrap().sweep_older(&HashSet::new(), &HashSet::new(), later()), (2, 2, 1));
     let _ = std::fs::remove_dir_all(&dir);
@@ -611,7 +612,8 @@ fn an_outputs_newest_trace_of_each_of_the_last_two_builds_is_kept() {
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let node = Bundle::new(stack, &[("a.txt", "abc")]);
-    let live: HashSet<String> = ["test/bundle".to_string()].into();
+    let live: HashSet<super::exec::NodeId> =
+        [super::exec::NodeId::Path(crate::TreePath::new("test/bundle").unwrap().to_owned())].into();
     let made = |engine: &Engine| {
         let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
         let kept = engine.output(&plan, &node, pe2_path::Asked::constant("native"), false).unwrap().kept;
@@ -1323,7 +1325,7 @@ fn select_reads_only_the_node_it_chooses_and_nothing_where_it_names_none() {
         let (made, reads) =
             evaluate(&plan, &engine.ops, &node, &[(strings, Asking::none())], &Vec::new(), (None, Some(reach)));
         let Value::Table(table) = &*made.into_iter().next().unwrap().unwrap() else { panic!("no table") };
-        (table["strings"].to_string(), reads.outputs.keys().cloned().collect::<Vec<_>>())
+        (table["strings"].to_string(), reads.outputs.keys().map(ToString::to_string).collect::<Vec<_>>())
     };
     let (made, read) = made_for("fr");
     assert_eq!(made, r#"{ a = "un", b = "two" }"#, "French over the source, key by key");
@@ -1680,4 +1682,27 @@ fn an_output_is_asked_for_by_the_keys_its_operation_takes() {
         &[],
     );
     assert_eq!(problems.len(), 1, "{problems:?}");
+}
+
+#[test]
+fn a_trace_names_a_node_by_its_uid_as_a_number_or_by_its_path() {
+    use super::exec::{NodeId, OutputRead, Reads};
+    let uid = NodeId::Uid(crate::testing::uid("uid://a"));
+    let path = NodeId::Path(crate::TreePath::new("x/y").unwrap().to_owned());
+    let encoded = |value: &ciborium::Value| {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(value, &mut bytes).unwrap();
+        bytes
+    };
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&uid, &mut bytes).unwrap();
+    assert_eq!(bytes, encoded(&ciborium::Value::Integer(10.into())), "the number, nothing of its text");
+    let asked = std::sync::Arc::from(pe2_path::Asked::new("cells/body").unwrap());
+    let mut reads = Reads::default();
+    reads.outputs.insert(OutputRead { node: uid, asked: std::sync::Arc::clone(&asked) }, "1".into());
+    reads.outputs.insert(OutputRead { node: path, asked }, "2".into());
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&reads, &mut bytes).unwrap();
+    let read: Reads = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(read, reads);
 }
