@@ -34,7 +34,9 @@ after the edit has been answered (see [The editor](../processes/editor.md)).
 ### Names
 
 Paths of the project are `TreePath`s (`pe2_path::VfsPath<Tree>`), files within an asset `RelPath`s, uids `Uid`s:
-checked where they come in - a changeset or record read, an edit asked, a file a walk finds - and never text after.
+checked where they come in - a changeset or record read, an edit asked, a file a walk finds - and never text after. The
+model keeps a uid as its number (a record's key is its layer's name and the uid's eight bytes, most significant first),
+and a reference written with a uid that is none as the text written beside a 0.
 What a layer holds by a name no path takes is a problem of the project's (`Problem::Refused`), it and what is
 inside it left out; nothing is renamed or passed over unsaid.
 

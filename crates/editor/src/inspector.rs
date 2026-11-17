@@ -1764,7 +1764,7 @@ fn selected_ui(
         values.into_iter().filter(|(key, _)| key != "from" && key != project::graph::layers::POS).collect();
     let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
     let ops = ws.extensions.operations();
-    let defined = || ops.definitions.get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    let defined = || ops.defined(name).map_or_else(|| name.to_string(), |d| d.label.clone());
     let label = ops.get(name).map_or_else(defined, |d| d.label.clone());
     let sheet =
         Sheet { index: &ws.index, extensions: &ws.extensions, fields, within: steps_of_layer(at, op), derived: None };
@@ -2034,7 +2034,7 @@ fn problem_place(at: &str) -> String {
 fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: &toml::Value) {
     ui.label(RichText::new("Operation").color(theme::weak()));
     ui.horizontal_wrapped(|ui| {
-        let defined = ops.definitions.get(op).map(|d| d.label.as_str());
+        let defined = ops.defined(op).map(|d| d.label.as_str());
         ui.label(ops.get(op).map_or(defined.unwrap_or(op), |def| def.label.as_str()));
         ui.label(RichText::new(op).small().color(theme::weak()));
     });
@@ -2309,9 +2309,9 @@ mod tests {
         assert_eq!(super::reference_in(b).and_then(toml::Value::as_str), Some("uid://old"));
         let (uid, path) = (pe2_path::Uid::new("uid://new").unwrap(), project::TreePath::new("g/new").unwrap());
         let retarget = |value| super::retarget_to(value, uid, path);
-        assert_eq!(retarget(a).unwrap().as_str(), Some("uid://new/palettes/x"));
+        assert_eq!(retarget(a).unwrap().as_str(), Some("uid://0000000000new/palettes/x"));
         let moved = retarget(b).unwrap();
-        assert_eq!(moved["slot"].as_str(), Some("uid://new"));
+        assert_eq!(moved["slot"].as_str(), Some("uid://0000000000new"));
         assert_eq!(moved["at"], b["at"]);
     }
 

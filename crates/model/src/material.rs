@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(again["uid"].as_str(), Some("uid://x"));
         let extracted = Value::String("uid://x/cells/left".to_string());
         let read = reading(&extracted, "left", Some("two")).unwrap();
-        assert_eq!(read.as_str(), Some("uid://x/cells/left?palette=two"));
+        assert_eq!(read.as_str(), Some("uid://000000000000x/cells/left?palette=two"));
         assert_eq!((cell_of(&read).unwrap(), palette_of(&read).unwrap()), (Some("left"), Some("two")));
         assert!(cell_of(&Value::String("uid://x/cells/left@two".to_string())).is_err());
     }

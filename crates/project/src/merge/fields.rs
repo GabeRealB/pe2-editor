@@ -68,10 +68,29 @@ fn diff_into(at: &mut Vec<Step>, base: &toml::Table, new: &toml::Table, out: &mu
                     at.pop();
                 }
             }
-            (b, n) if b != n => out.push(Change { path: at.clone(), value: n.cloned(), was: b.cloned() }),
+            (b, n) if !same(b, n) => out.push(Change { path: at.clone(), value: n.cloned(), was: b.cloned() }),
             _ => {}
         }
         at.pop();
+    }
+}
+
+/// Whether two values say the same: a text that reads as a reference (`uid://...`) by what it reads as, however its uid
+/// is written; arrays and tables by their elements; anything else as it is.
+#[must_use]
+pub fn same(a: Option<&toml::Value>, b: Option<&toml::Value>) -> bool {
+    use toml::Value;
+    match (a, b) {
+        (Some(Value::String(a)), Some(Value::String(b))) if a != b => {
+            matches!((pe2_path::ResourcePath::new(a), pe2_path::ResourcePath::new(b)), (Ok(a), Ok(b)) if a == b)
+        }
+        (Some(Value::Array(a)), Some(Value::Array(b))) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(Some(a), Some(b)))
+        }
+        (Some(Value::Table(a)), Some(Value::Table(b))) => {
+            a.len() == b.len() && a.iter().all(|(key, a)| same(Some(a), b.get(key)))
+        }
+        (a, b) => a == b,
     }
 }
 
@@ -243,10 +262,10 @@ pub fn merge(base: &str, theirs: &str, mine: &str) -> Option<(String, Vec<Confli
     let mut conflicts = Vec::new();
     for change in diff(&base, &mine) {
         let now = get(&below, &change.path);
-        if now == change.value.as_ref() {
+        if same(now, change.value.as_ref()) {
             continue;
         }
-        if now != change.was.as_ref() {
+        if !same(now, change.was.as_ref()) {
             conflicts.push(Conflict {
                 at: Some(shown(&change.path)),
                 mine: change.value.as_ref().map(ToString::to_string),
@@ -275,6 +294,25 @@ mod tests {
         let (merged, conflicts) = merge(base, theirs, mine).unwrap();
         assert_eq!(merged, "# a node\nsize = 3 # its size\nname = \"b\"\n");
         assert_eq!(conflicts, vec![]);
+    }
+
+    #[test]
+    fn a_reference_written_otherwise_is_no_change() {
+        let base = "model = \"uid://000000000000a/cells/x\"\nsize = 2\n";
+        // Mine writes the same reference otherwise; theirs changes another field: no conflict, theirs reaches through.
+        let mine = "model = \"uid://A/cells/x\"\nsize = 2\n";
+        let theirs = "model = \"uid://000000000000a/cells/x\"\nsize = 3\n";
+        let (merged, conflicts) = merge(base, theirs, mine).unwrap();
+        assert_eq!(conflicts, vec![]);
+        assert!(merged.contains("size = 3"), "{merged}");
+        // Where both name it, written each their way: one, no conflict.
+        let theirs = "model = \"uid://0a/cells/x\"\nsize = 2\n";
+        let mine = "model = \"uid://a/cells/x\"\nsize = 2\n";
+        assert_eq!(merge(base, theirs, mine).unwrap().1, vec![]);
+        // What follows the uid is no uid: written otherwise, it is another output.
+        let mine = "model = \"uid://a/cells/X\"\nsize = 2\n";
+        let theirs = "model = \"uid://a/cells/y\"\nsize = 2\n";
+        assert_eq!(merge(base, theirs, mine).unwrap().1.len(), 1);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use pe2_ext::data::BuildConfig;
 use pe2_path::{Name, RelPath};
 use sfs::HostPath;
 
-use crate::events::{Action, Effects, Expr, Outcome, Report, Trigger, order, schedule};
+use crate::events::{Action, Effects, Event, Expr, Outcome, Report, Trigger, order, schedule};
 use crate::ext::Extensions;
 use crate::graph::exec::Engine;
 use crate::graph::{Content, File, Output, Plan, Value};
@@ -28,11 +28,11 @@ pub struct Wiring {
 impl Wiring {
     /// How much is wired to each event.
     #[must_use]
-    pub fn counts(&self) -> BTreeMap<String, usize> {
+    pub fn counts(&self) -> BTreeMap<Event, usize> {
         let mut counts = BTreeMap::new();
         for trigger in &self.triggers {
             for event in trigger.when.named() {
-                *counts.entry(event.to_string()).or_default() += 1;
+                *counts.entry(event.clone()).or_default() += 1;
             }
         }
         counts
@@ -46,8 +46,12 @@ fn any_of(plan: &Plan, steps: &[usize]) -> Expr {
     }
 }
 
-fn signals_of(output: &Output) -> Vec<String> {
-    [&output.events.ran, &output.events.changed, &output.events.failed].into_iter().flatten().cloned().collect()
+fn signals_of(output: &Output) -> Vec<Event> {
+    [&output.events.ran, &output.events.changed, &output.events.failed]
+        .into_iter()
+        .flatten()
+        .map(|e| Event::new(e))
+        .collect()
 }
 
 /// A project's triggers, from the plans of all a config holds.
@@ -72,13 +76,16 @@ pub fn wiring(index: &Index, extensions: &Extensions, config: &Config) -> Wiring
             }
         }
         for rule in &plan.rules {
-            let action = Action::Signal(rule.event.clone());
-            triggers.push(Trigger { when: any_of(&plan, &rule.when), action, signals: vec![rule.event.clone()] });
+            let event = Event::new(&rule.event);
+            let action = Action::Signal(event.clone());
+            triggers.push(Trigger { when: any_of(&plan, &rule.when), action, signals: vec![event] });
         }
     }
     for hook in &extensions.hooks {
-        let action = Action::Hook { op: hook.op.clone(), event: hook.event.clone(), signals: hook.signals.clone() };
-        triggers.push(Trigger { when: Expr::Event(hook.event.clone()), action, signals: hook.signals.clone() });
+        let (event, signals) =
+            (Event::new(&hook.event), hook.signals.iter().map(|s| Event::new(s)).collect::<Vec<_>>());
+        let action = Action::Hook { op: hook.op.clone(), event: event.clone(), signals: signals.clone() };
+        triggers.push(Trigger { when: Expr::Event(event), action, signals });
     }
     let named: Vec<String> = triggers.iter().map(|t: &Trigger| named(&t.action)).collect();
     let (triggers, refused) = order(triggers);
@@ -89,7 +96,7 @@ pub fn wiring(index: &Index, extensions: &Extensions, config: &Config) -> Wiring
 fn named(action: &Action) -> String {
     match action {
         Action::Pull { asset, .. } | Action::Push { asset, .. } => asset.clone(),
-        Action::Signal(event) => event.clone(),
+        Action::Signal(event) => event.to_string(),
         Action::Hook { op, .. } => op.clone(),
     }
 }
@@ -226,15 +233,15 @@ impl Site<'_> {
             Ok((kept, hash)) => {
                 outcome.made = !kept;
                 if !kept {
-                    outcome.signaled.extend(events.ran.clone());
+                    outcome.signaled.extend(events.ran.as_deref().map(Event::new));
                     if before.as_deref() != Some(hash.as_str()) {
-                        outcome.signaled.extend(events.changed.clone());
+                        outcome.signaled.extend(events.changed.as_deref().map(Event::new));
                     }
                 }
             }
             Err(why) => {
                 outcome.failed = Some(format!("{why:#}"));
-                outcome.signaled.extend(events.failed.clone());
+                outcome.signaled.extend(events.failed.as_deref().map(Event::new));
             }
         }
         outcome
@@ -271,7 +278,7 @@ impl Effects for Site<'_> {
             Action::Push { asset, output } => self.push(asset, output),
             Action::Signal(event) => Outcome { signaled: vec![event.clone()], ..Outcome::default() },
             Action::Hook { op, event, signals } => {
-                match self.extensions.run_hook(&self.engine, self.index, op, event) {
+                match self.extensions.run_hook(&self.engine, self.index, op, &event.to_string()) {
                     Ok(()) => Outcome { signaled: signals.clone(), ..Outcome::default() },
                     Err(why) => Outcome { failed: Some(format!("{why:#}")), ..Outcome::default() },
                 }
@@ -295,7 +302,7 @@ pub fn epoch(
     extensions: &Extensions,
     wiring: &Wiring,
     config: &Config,
-    roots: &[String],
+    roots: &[Event],
     cancel: &AtomicBool,
 ) -> Report {
     extensions.set_config(Some(build_config(project, config)), &config.disabled);

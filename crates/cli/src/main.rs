@@ -1159,7 +1159,7 @@ fn signal(project: &Path, config: Option<&pe2_path::Name>, events: &[&str]) -> a
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let mut failed = false;
     for event in events {
-        let roots = [(*event).to_string()];
+        let roots = [project::events::Event::new(event)];
         let report = project::build::epoch(&p, &index, &extensions, &wiring, &chosen, &roots, &cancel);
         for (asset, output) in &report.made {
             println!("{asset}: {output}");

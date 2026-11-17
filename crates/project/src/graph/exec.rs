@@ -1398,7 +1398,7 @@ impl Evaluation<'_> {
         let Some(uid) = step.settings.get("body").and_then(toml::Value::as_str) else {
             return fail("it runs no `body`".into());
         };
-        let Some(definition) = self.ops.definitions.get(uid) else {
+        let Some(definition) = self.ops.defined(uid) else {
             return fail(format!("`{uid}`: the project defines no such operation"));
         };
         let settings: Table =

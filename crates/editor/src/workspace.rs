@@ -776,7 +776,7 @@ fn stand_by(root: &HostPath, io: Arc<dyn pe2_io::Io>) {
 }
 
 /// An event asked for: the events, the config, and who waits for what became of it.
-type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
+type Signaled = (Vec<project::events::Event>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
 /// What is made of a project's `project.toml` and its files, and made again when either changes.
 pub struct Loaded {
     pub project: Project,
@@ -1003,7 +1003,7 @@ impl Workspace {
             attaching,
             outputs,
             requests_seen: 0,
-            held_events: vec![(vec![ProjectOpened::NAME.to_string()], None, None)],
+            held_events: vec![(vec![project::events::Event::new(ProjectOpened::NAME)], None, None)],
             views: HashMap::new(),
             contents: HashMap::new(),
             part_sheets: HashMap::new(),
@@ -1230,7 +1230,12 @@ impl Workspace {
 
     /// Signal an event: an epoch begins, on the project as last taken in, for the config in use.
     pub fn signal(&mut self, event: &str) {
-        self.signal_all(vec![event.to_string()], None, None);
+        self.signal_event(project::events::Event::new(event));
+    }
+
+    /// Signal an event, as it is named: an epoch begins, on the project as last taken in, for the config in use.
+    pub fn signal_event(&mut self, event: project::events::Event) {
+        self.signal_all(vec![event], None, None);
     }
 
     /// Define an event of the project: an asset of the active layer.
@@ -1441,11 +1446,11 @@ impl Workspace {
         let roots = self.runner().running();
         let said: Vec<String> = roots
             .iter()
-            .map(|root| match root.as_str() {
-                name if name == Build::NAME => "building".to_string(),
-                name if name == Clean::NAME => "cleaning".to_string(),
-                name if name == FilesChanged::NAME => "following the files changed".to_string(),
-                name if name == ProjectOpened::NAME => "following the project opened".to_string(),
+            .map(|root| match root {
+                name if name.is(Build::NAME) => "building".to_string(),
+                name if name.is(Clean::NAME) => "cleaning".to_string(),
+                name if name.is(FilesChanged::NAME) => "following the files changed".to_string(),
+                name if name.is(ProjectOpened::NAME) => "following the project opened".to_string(),
                 other => format!("running {other}"),
             })
             .collect();
@@ -1454,7 +1459,7 @@ impl Workspace {
 
     fn signal_all(
         &mut self,
-        roots: Vec<String>,
+        roots: Vec<project::events::Event>,
         config: Option<project::Config>,
         reply: Option<mpsc::Sender<mcp::Reply>>,
     ) {
@@ -1481,7 +1486,8 @@ impl Workspace {
             if let mcp::Request::Signal { events, config } = &request {
                 let config =
                     config.as_ref().and_then(|name| self.project.configs.iter().find(|c| *c.name == **name)).cloned();
-                self.signal_all(events.clone(), config, Some(reply));
+                let events = events.iter().map(|event| project::events::Event::new(event)).collect();
+                self.signal_all(events, config, Some(reply));
                 continue;
             }
             if request.uses_window() {

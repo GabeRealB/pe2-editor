@@ -6,66 +6,117 @@ use std::sync::Arc;
 use crate::error::{PathError, Why};
 use crate::vfs::{Tree, VfsPath};
 
-/// An asset's uid: 63 bits, written `uid://` and their digits in base 36 (0-9a-z), most significant first - Godot's
-/// scheme, with the full alphabet. It is drawn once, when an asset is first declared, and kept from then on.
+/// An asset's uid: 64 bits, never 0 (none is no uid: `Option<Uid>` is as large as a uid). It is drawn once, when an
+/// asset is first declared, and kept from then on, and compared as the number it is - never as text.
+///
+/// Written `uid://` and its 64 bits in Crockford's base 32, most significant digit first: 13 lowercase characters of
+/// `0123456789abcdefghjkmnpqrstvwxyz`, padded with zeros (`uid://000000000000a`) - so that one uid is always written
+/// alike, the order of the texts is that of the numbers, and no uid is a name some system keeps for itself. Read, it may
+/// be written otherwise, as Crockford's decoding takes it: in either case, without the zeros before it, and with `i`
+/// or `l` for `1` and `o` for `0` - `uid://A` is `uid://000000000000a`. What is no digit (`u` among them), more than 13
+/// characters, more than 64 bits, and 0, are no uid.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Uid(i64);
+pub struct Uid(std::num::NonZeroU64);
 
 /// What a uid's text begins with.
 pub(crate) const UID_PREFIX: &str = "uid://";
-const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+/// How many characters a uid is written in: 64 bits in fives.
+pub const UID_DIGITS: usize = 13;
+/// Crockford's base 32, written in lowercase: the characters a uid is written in.
+pub const UID_ALPHABET: &str = "0123456789abcdefghjkmnpqrstvwxyz";
+const DIGITS: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// The value of a character of a uid's digits, as Crockford's decoding reads it.
+const fn digit(c: u8) -> Option<u64> {
+    Some(match c.to_ascii_lowercase() {
+        c @ b'0'..=b'9' => (c - b'0') as u64,
+        b'o' => 0,
+        b'i' | b'l' => 1,
+        c @ b'a'..=b'h' => (c - b'a') as u64 + 10,
+        b'j' => 18,
+        b'k' => 19,
+        b'm' => 20,
+        b'n' => 21,
+        c @ b'p'..=b't' => (c - b'p') as u64 + 22,
+        c @ b'v'..=b'z' => (c - b'v') as u64 + 27,
+        _ => return None,
+    })
+}
 
 impl Uid {
-    /// The uid of an id, if it is one: not negative.
+    /// The uid a number is: none for 0.
     #[must_use]
-    pub fn from_id(id: i64) -> Option<Uid> {
-        (id >= 0).then_some(Uid(id))
+    pub const fn from_u64(n: u64) -> Option<Uid> {
+        match std::num::NonZeroU64::new(n) {
+            Some(n) => Some(Uid(n)),
+            None => None,
+        }
     }
 
-    /// Its id.
+    /// The number it is.
     #[must_use]
-    pub fn id(self) -> i64 {
-        self.0
+    pub const fn get(self) -> u64 {
+        self.0.get()
     }
 
     /// `text` as a uid.
     ///
     /// # Errors
-    /// It is not `uid://` and at most 13 digits of base 36 within 63 bits.
+    /// It is not `uid://` and the digits of one (see `Uid`).
     pub fn new(text: &str) -> Result<Uid, PathError> {
-        Uid::parse(text).ok_or_else(|| PathError::new(text, Why::NoUid))
+        text.strip_prefix(UID_PREFIX).and_then(Uid::of_digits).ok_or_else(|| PathError::new(text, Why::NoUid))
     }
 
-    fn parse(text: &str) -> Option<Uid> {
-        let digits = text.strip_prefix(UID_PREFIX)?;
-        if digits.is_empty() || digits.len() > 13 {
+    /// Its digits alone, without `uid://`, read as `new` reads them.
+    #[must_use]
+    pub fn of_digits(digits: &str) -> Option<Uid> {
+        if digits.is_empty() || digits.len() > UID_DIGITS {
             return None;
         }
         let mut n: u64 = 0;
         for c in digits.bytes() {
-            let d = DIGITS.iter().position(|&x| x == c)?;
-            n = n.checked_mul(36)?.checked_add(d as u64)?;
+            n = n.checked_mul(32)?.checked_add(digit(c)?)?;
         }
-        i64::try_from(n).ok().map(Uid)
+        Uid::from_u64(n)
+    }
+
+    /// Its digits alone, without `uid://`, as they are written: what names it where it is stored by its uid (a record's
+    /// file).
+    #[must_use]
+    pub fn digits(self) -> UidDigits {
+        let mut n = self.get();
+        let mut digits = [0u8; UID_DIGITS];
+        for at in (0..UID_DIGITS).rev() {
+            digits[at] = DIGITS[(n % 32) as usize];
+            n /= 32;
+        }
+        UidDigits(digits)
     }
 }
 
-impl Uid {
-    /// Its digits alone, without `uid://`: what names it where it is stored by its uid (a record's file).
+/// A uid's digits as they are written: 13 characters of Crockford's base 32, held without being allocated.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct UidDigits([u8; UID_DIGITS]);
+
+impl UidDigits {
+    /// Its text.
     #[must_use]
-    pub fn digits(self) -> String {
-        let mut n = self.0.unsigned_abs();
-        let mut digits = [0u8; 13];
-        let mut at = digits.len();
-        loop {
-            at -= 1;
-            digits[at] = DIGITS[(n % 36) as usize];
-            n /= 36;
-            if n == 0 {
-                break;
-            }
-        }
-        digits[at..].iter().map(|&d| char::from(d)).collect()
+    pub fn as_str(&self) -> &str {
+        // Characters of `DIGITS`: ASCII, so UTF-8.
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for UidDigits {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for UidDigits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -491,7 +542,7 @@ impl ResourcePath {
             None if digits.contains('?') => return Err(PathError::new(text, Why::NoOutput)),
             None => (digits, None),
         };
-        let uid = Uid::parse(&format!("{UID_PREFIX}{uid}")).ok_or_else(|| PathError::new(text, Why::NoUid))?;
+        let uid = Uid::of_digits(uid).ok_or_else(|| PathError::new(text, Why::NoUid))?;
         Ok(ResourcePath { uid, asked, fragment })
     }
 }
@@ -524,6 +575,52 @@ impl std::str::FromStr for ResourcePath {
 }
 
 crate::serde_as_text!(Uid);
+
+/// A uid's serde as the number it is, for what only programs read (`#[serde(with = "pe2_path::uid_number")]`): 0 is no
+/// uid, and is refused.
+pub mod uid_number {
+    use super::Uid;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    /// # Errors
+    /// The serializer's.
+    pub fn serialize<S: Serializer>(uid: &Uid, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(uid.get())
+    }
+
+    /// # Errors
+    /// What is read is no number, or 0.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Uid, D::Error> {
+        Uid::from_u64(u64::deserialize(deserializer)?).ok_or_else(|| serde::de::Error::custom("0 is no uid"))
+    }
+
+    /// A map by uids, its keys as their numbers (`#[serde(with = "pe2_path::uid_number::keys")]`).
+    pub mod keys {
+        use super::{BTreeMap, Deserialize, Deserializer, Serialize, Serializer, Uid};
+
+        /// # Errors
+        /// The serializer's.
+        pub fn serialize<V: Serialize, S: Serializer>(
+            map: &BTreeMap<Uid, V>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(map.iter().map(|(uid, value)| (uid.get(), value)))
+        }
+
+        /// # Errors
+        /// A key is no number, or 0; a value is none.
+        pub fn deserialize<'de, V: Deserialize<'de>, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<BTreeMap<Uid, V>, D::Error> {
+            let read = BTreeMap::<u64, V>::deserialize(deserializer)?;
+            read.into_iter()
+                .map(|(n, value)| Uid::from_u64(n).map(|uid| (uid, value)))
+                .collect::<Option<_>>()
+                .ok_or_else(|| serde::de::Error::custom("0 is no uid"))
+        }
+    }
+}
 crate::serde_as_text!(ResourcePath);
 
 /// A node, as what reads it names it: by its uid, or by its path in the project's tree. Written as either
@@ -617,15 +714,29 @@ mod tests {
     use crate::Why;
 
     #[test]
-    fn a_uid_is_its_text_both_ways() {
-        for text in ["uid://vdx31ffeypvs", "uid://0", "uid://1y2p0ij32e8e7"] {
-            assert_eq!(Uid::new(text).unwrap().to_string(), text);
+    fn a_uid_is_written_one_way_and_read_as_crockford_reads_it() {
+        assert_eq!(Uid::new("uid://000000000000a").unwrap().get(), 10);
+        assert_eq!(Uid::new("uid://zzzzzzzzzzzzz").ok(), None, "past 64 bits");
+        assert_eq!(Uid::new("uid://fzzzzzzzzzzzz").unwrap().get(), u64::MAX);
+        assert_eq!(Uid::from_u64(u64::MAX).unwrap().to_string(), "uid://fzzzzzzzzzzzz");
+        // One uid, however it is written.
+        let one = Uid::new("uid://0000000001jk1").unwrap();
+        for text in ["uid://1jk1", "uid://1JK1", "uid://IJKL", "uid://ljki", "uid://000000001jK1"] {
+            assert_eq!(Uid::new(text).unwrap(), one, "{text}");
         }
-        assert_eq!(Uid::new("uid://1y2p0ij32e8e7").unwrap().id(), i64::MAX);
-        for bad in ["uid://1y2p0ij32e8e8", "uid://ABC", "uid://", "vdx31ffeypvs", "uid://a-b"] {
+        assert_eq!(one.to_string(), "uid://0000000001jk1");
+        assert_eq!(Uid::new("uid://o1").unwrap(), Uid::new("uid://01").unwrap());
+        for bad in
+            ["uid://0", "uid://0000000000000", "uid://u", "uid://", "uid://00000000000001", "a", "UID://a", "uid://a-b"]
+        {
             assert_eq!(Uid::new(bad).unwrap_err().why, Why::NoUid, "{bad}");
         }
-        assert_eq!(Uid::from_id(-1), None);
+        assert_eq!(Uid::from_u64(0), None);
+        // What none is costs nothing.
+        assert_eq!(std::mem::size_of::<Option<Uid>>(), 8);
+        // Written as the numbers order.
+        let (a, b) = (Uid::from_u64(31).unwrap(), Uid::from_u64(32).unwrap());
+        assert!(a < b && a.to_string() < b.to_string());
     }
 
     #[test]
@@ -641,8 +752,8 @@ mod tests {
             (query.get("palette"), query.get("look"), query.get("none")),
             (Some("default"), Some("night-2"), None)
         );
-        assert_eq!(asked.to_string(), "uid://abc/cells/body?palette=default&look=night-2");
-        assert_eq!(ResourcePath::at(asset.uid, Asked::constant("objects")).to_string(), "uid://abc/objects");
+        assert_eq!(asked.to_string(), "uid://0000000000abc/cells/body?palette=default&look=night-2");
+        assert_eq!(ResourcePath::at(asset.uid, Asked::constant("objects")).to_string(), "uid://0000000000abc/objects");
         assert_eq!(
             Asked::with(Address::constant("cells/body"), Query::new("palette=a").unwrap()).query().get("palette"),
             Some("a")
@@ -669,14 +780,14 @@ mod tests {
         ] {
             assert_eq!(ResourcePath::new(bad).unwrap_err().why, why, "{bad}");
         }
-        let part = ResourcePath::new("uid://abc/tokens?symbol=gBody#cells/prompt/v").unwrap();
+        let part = ResourcePath::new("uid://0000000000abc/tokens?symbol=gBody#cells/prompt/v").unwrap();
         assert_eq!(part.fragment.as_deref().map(Address::as_str), Some("cells/prompt/v"));
         assert_eq!(part.query().get("symbol"), Some("gBody"));
-        assert_eq!(part.to_string(), "uid://abc/tokens?symbol=gBody#cells/prompt/v");
+        assert_eq!(part.to_string(), "uid://0000000000abc/tokens?symbol=gBody#cells/prompt/v");
         let of_asset = ResourcePath::new("uid://abc#joints/3").unwrap();
         assert_eq!((of_asset.asked, of_asset.fragment.as_deref().map(Address::as_str)), (None, Some("joints/3")));
         let read: ResourcePath = serde_json::from_str("\"uid://abc/objects?palette=default\"").unwrap();
-        assert_eq!(serde_json::to_string(&read).unwrap(), "\"uid://abc/objects?palette=default\"");
+        assert_eq!(serde_json::to_string(&read).unwrap(), "\"uid://0000000000abc/objects?palette=default\"");
     }
 
     #[test]
@@ -687,7 +798,7 @@ mod tests {
         assert_eq!(by_path.path().map(crate::VfsPath::as_str), Some("packages/aya/mist"));
         assert_eq!(
             (by_uid.to_string(), by_path.to_string()),
-            ("uid://abc".to_string(), "packages/aya/mist".to_string())
+            ("uid://0000000000abc".to_string(), "packages/aya/mist".to_string())
         );
         assert_eq!(Reference::new("uid://abc/objects").unwrap_err().why, Why::NoUid);
         assert!(Reference::new("a/../b").is_err());

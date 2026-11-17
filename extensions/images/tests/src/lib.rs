@@ -55,8 +55,8 @@ fn register(r: &mut Registry) -> Result<()> {
         if let Some(why) = editor.made(&format!("chain/{}", LONGEST - 1), "native")? {
             bail!("{why}");
         }
-        let declaration = "uid = \"uid://unsaid\"\n\n[[stack]]\nop = \"pe2.images.tests@unsaid\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
-        editor.declare("unsaid", "uid://unsaid", declaration)?;
+        let declaration = "uid = \"uid://notsaid\"\n\n[[stack]]\nop = \"pe2.images.tests@unsaid\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
+        editor.declare("unsaid", "uid://notsaid", declaration)?;
         let why = editor.made("unsaid", "native")?.unwrap_or_default();
         if !why.contains("it did not say it reads this") {
             bail!("reading what it did not say came to: {why:?}");

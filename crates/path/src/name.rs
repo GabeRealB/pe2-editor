@@ -299,6 +299,21 @@ impl RelPath {
         Ok(RelPath::shared(&format!("{shard}/{file}")))
     }
 
+    /// Where a store keeps what it keeps by a uid: in a folder of the last two characters of its digits as they are
+    /// written - the 10 bits a random uid spreads evenly, where its first are only ever `0` or `1` - as
+    /// `xy/000000000abxy`, with `suffix` after the uid's name (`.toml`).
+    ///
+    /// # Errors
+    /// The digits with the suffix are no portable name.
+    pub fn by_uid(uid: crate::Uid, suffix: &str) -> Result<Arc<RelPath>, PathError> {
+        let digits = uid.digits();
+        let file = format!("{digits}{suffix}");
+        if let Some(why) = refused(&file) {
+            return Err(PathError::new(&file, why));
+        }
+        Ok(RelPath::shared(&format!("{}/{file}", &digits[crate::UID_DIGITS - 2..])))
+    }
+
     /// Whether it names nothing but what it is taken within.
     #[must_use]
     pub const fn is_root(&self) -> bool {
@@ -808,5 +823,7 @@ mod tests {
         assert!(serde_json::from_str::<Box<Name>>("\"a/b\"").is_err());
         assert_eq!(RelPath::sharded("abcdef", ".cbor").unwrap().as_str(), "ab/abcdef.cbor");
         assert!(RelPath::sharded("../x", "").is_err());
+        let uid = crate::Uid::from_u64(32 * 32 + 33).unwrap();
+        assert_eq!(RelPath::by_uid(uid, ".toml").unwrap().as_str(), "11/0000000000111.toml");
     }
 }

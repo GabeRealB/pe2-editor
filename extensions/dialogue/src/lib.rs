@@ -226,7 +226,9 @@ fn recognition(args: &Table) -> Recognition {
     // The flags registries name, by ID: `flags`, each registry's uid with its flags' IDs by name.
     let mut flags: BTreeMap<u16, (String, String)> = BTreeMap::new();
     for registry in args.get("flags").and_then(Value::as_array).into_iter().flatten() {
-        let uid = registry.get("registry").and_then(Value::as_str).unwrap_or_default().to_string();
+        // Written as a uid is written, however the plan wrote it.
+        let written = registry.get("registry").and_then(Value::as_str).unwrap_or_default();
+        let uid = pe2_ext::Uid::new(written).map_or_else(|_| written.to_string(), |uid| uid.to_string());
         for (name, id) in registry.get("ids").and_then(Value::as_table).into_iter().flatten() {
             if let Some(id) = id.as_integer().and_then(|i| u16::try_from(i).ok()) {
                 flags.insert(id, (uid.clone(), name.clone()));

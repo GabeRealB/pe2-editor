@@ -411,7 +411,8 @@ pub struct Extensions {
     /// The assets that defined an operation or a template when the project's definitions were last taken, by
     /// path: one of them changing, or going, has them taken again.
     defined_at: RwLock<std::collections::BTreeSet<Arc<crate::TreePath>>>,
-    project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
+    /// The templates the project defines, by their nodes' uids.
+    project_templates: RwLock<Arc<std::collections::BTreeMap<pe2_path::Uid, pe2_ext::TemplateDef>>>,
     /// The project's generators (`graph::DEFINED_GENERATOR`), taken with its definitions.
     generators: RwLock<Vec<Arc<index::Asset>>>,
     /// The operations they made, for a configuration (said as text): made again where either changes.
@@ -1158,7 +1159,8 @@ impl Extensions {
     #[must_use]
     pub fn template(&self, name: &str) -> Option<pe2_ext::TemplateDef> {
         self.templates.get(name).cloned().or_else(|| {
-            self.project_templates.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
+            let uid = pe2_path::Uid::new(name).ok()?;
+            self.project_templates.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&uid).cloned()
         })
     }
 
@@ -1217,7 +1219,7 @@ impl Extensions {
                 "outputs": d.outputs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
                 "defined": true,
             });
-            operations.insert(uid.clone(), made);
+            operations.insert(uid.to_string(), made);
         }
         let extensions: Map<String, Value> =
             self.loaded.iter().map(|l| (l.id.clone(), Value::String(self.version_of(&l.id)))).collect();
@@ -1247,7 +1249,7 @@ impl Extensions {
         let missing = layers.iter().chain(inner).filter_map(name_of).find(|name| {
             ![graph::GRAPH, graph::OUTPUT, graph::PREVIEW].contains(&name.as_str())
                 && ops.get(name).is_none()
-                && !ops.definitions.contains_key(name)
+                && ops.defined(name).is_none()
         });
         missing.map_or(Ok(stack), |name| Err(format!("It takes {name}, which no extension provides, nor the project")))
     }
@@ -1328,7 +1330,7 @@ impl Extensions {
         let defined = definitions
             .values()
             .filter(|d| matches!(d.inputs.as_slice(), [port] if port.ty.unify(above, &mut Vec::new())));
-        layers.extend(defined.map(|d| (d.uid.clone(), d.label.clone())));
+        layers.extend(defined.map(|d| (d.uid.to_string(), d.label.clone())));
         layers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         layers
     }
@@ -1340,7 +1342,7 @@ impl Extensions {
         let operations = self.operations();
         let shown = operations.iter().filter(|(name, _)| name.as_str() != graph::GRAPH && !by_service(name));
         let mut listed: Vec<(String, String)> = shown.map(|(name, def)| (name.clone(), def.label.clone())).collect();
-        listed.extend(operations.definitions.values().map(|d| (d.uid.clone(), d.label.clone())));
+        listed.extend(operations.definitions.values().map(|d| (d.uid.to_string(), d.label.clone())));
         listed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         listed
     }
@@ -2081,9 +2083,9 @@ impl Extensions {
     ) -> graph::Definitions {
         let mut made = graph::Definitions::new();
         for asset in generators {
-            // The graph names an operation by its uid's text.
-            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
-            let uid = uid.as_str();
+            let Some(uid) = asset.uid else { continue };
+            // What its operations name one another by: its uid as it is written.
+            let written = uid.to_string();
             let (plan, problems) = graph::Plan::of_fields(asset.fields(), defined, &self.tail(asset));
             for problem in problems {
                 tracing::warn!("generator {}: {problem:?}", asset.path);
@@ -2094,14 +2096,18 @@ impl Extensions {
                 format!("{}\n{said}", graph::exec::Node::declaration_sha1(&**asset)).as_bytes(),
             );
             for output in &plan.outputs {
-                let named = format!("{uid}/{}", output.name);
+                let Ok(asked) = pe2_path::Asked::new(&output.name) else {
+                    tracing::warn!("generator {}: {}: no output's name", asset.path, output.name);
+                    continue;
+                };
+                let named = pe2_path::ResourcePath::at(uid, asked);
                 let reach = graph::exec::Reach { engine: &engine, world: &Alone };
-                let given = pe2_path::Asked::new(&output.name)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|asked| engine.output_in(Some(reach), &plan, &**asset, asked, None, true));
+                let given = engine.output_in(Some(reach), &plan, &**asset, asked, None, true);
                 let declared = match given.map(|given| given.value) {
                     Ok(Some(value)) => match &*value {
-                        graph::Value::Table(table) => graph::Definition::of(&named, &own_named(table, uid), &version),
+                        graph::Value::Table(table) => {
+                            graph::Definition::of(&named, &own_named(table, &written), &version)
+                        }
                         other => Err(format!("it makes {}, no operation's declaration", other.ty())),
                     },
                     Ok(None) => Err("it makes nothing".to_string()),
@@ -2136,8 +2142,7 @@ impl Extensions {
         *self.generators.write().unwrap_or_else(std::sync::PoisonError::into_inner) = generators.collect();
         *self.generated.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         for asset in self.find(index, graph::DEFINED) {
-            // The graph names an operation by its uid's text.
-            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
+            let Some(uid) = asset.uid.map(pe2_path::ResourcePath::of) else { continue };
             let version = graph::exec::Node::declaration_sha1(asset);
             match graph::Definition::of(&uid, asset.fields_toml(), &version) {
                 Ok(definition) => {
@@ -2148,15 +2153,15 @@ impl Extensions {
         }
         let mut templates = std::collections::BTreeMap::new();
         for asset in self.find(index, graph::DEFINED_TEMPLATE) {
-            let Some(uid) = asset.uid.map(|uid| uid.to_string()) else { continue };
-            match project_template(&uid, asset.fields_toml()) {
+            let Some(uid) = asset.uid else { continue };
+            match project_template(&uid.to_string(), asset.fields_toml()) {
                 Ok(template) => {
-                    templates.insert(template.name.clone(), template);
+                    templates.insert(uid, template);
                 }
                 Err(error) => problems.push(index::Problem::Stack { asset: asset.path.to_string(), error }),
             }
         }
-        let versions = |d: &graph::Definitions| -> std::collections::BTreeMap<String, String> {
+        let versions = |d: &graph::Definitions| -> std::collections::BTreeMap<pe2_path::ResourcePath, String> {
             d.iter().map(|(uid, d)| (uid.clone(), d.version.clone())).collect()
         };
         let mut held = self.definitions.write().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2190,17 +2195,17 @@ impl Extensions {
             .any(|path| defined_at.contains(path) || index.assets.get(path).is_some_and(|asset| defines(asset)))
     }
 
-    /// An operation the project defines, by its uid (`uid://...`).
+    /// An operation the project defines, by what names it (`uid://...`), however it is written.
     #[must_use]
-    pub fn definition(&self, uid: &str) -> Option<Arc<graph::Definition>> {
-        self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(uid).cloned()
+    pub fn definition(&self, name: &str) -> Option<Arc<graph::Definition>> {
+        graph::defined_in(&self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner), name).cloned()
     }
 
     /// Whether an asset defines an operation the project's stacks may use.
     #[must_use]
     pub fn defines(&self, asset: &index::Asset) -> bool {
         let definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        asset.uid.is_some_and(|uid| definitions.contains_key(&uid.to_string()))
+        asset.uid.is_some_and(|uid| definitions.contains_key(&pe2_path::ResourcePath::of(uid)))
     }
 
     fn make_operations(&self) -> graph::Ops {

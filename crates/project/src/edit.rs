@@ -2041,7 +2041,7 @@ mod tests {
     fn part(root: &HostPath, layer: &str, local: bool) -> Vec<String> {
         let folder = if local { root.at(".local/layers").at(layer) } else { root.at("layers").at(layer) };
         let read = crate::records::read_records(&pe2_io::SystemFilesystem, &folder, None).unwrap();
-        let mut uids: Vec<String> = read.keys().map(|uid| uid.digits()).collect();
+        let mut uids: Vec<String> = read.keys().map(|uid| uid.digits().to_string()).collect();
         uids.sort();
         uids
     }
@@ -2066,7 +2066,7 @@ mod tests {
         // Shipped: nothing.
         let paths = super::create_file(&o.project, &o.index, top, &tree("kept.txt"), b"ours", &mut o.history).unwrap();
         o.refresh(&paths);
-        let uid = |path: &str| o.uid(path).digits();
+        let uid = |path: &str| o.uid(path).digits().to_string();
         let mine = [uid(".a.swp"), uid("scratch"), uid("scratch/n.txt")];
         let mut mine: Vec<String> = mine.into_iter().collect();
         mine.sort();
@@ -2098,7 +2098,7 @@ mod tests {
         // `d/e` this machine's: it and what is in it.
         let paths = crate::records::set_local(&o.project, &layer, &tree("d/e"), true, &mut o.history).unwrap();
         o.refresh(&paths);
-        let mut mine = vec![o.uid("d/e").digits(), o.uid("d/e/f.bin").digits()];
+        let mut mine = vec![o.uid("d/e").digits().to_string(), o.uid("d/e/f.bin").digits().to_string()];
         mine.sort();
         assert_eq!(part(&root, "top", true), mine);
         assert_eq!(o.index.entries[&tree("d/e/f.bin")].layer.as_str(), "top", "still the layer's");
@@ -2111,7 +2111,7 @@ mod tests {
         // `d/e/f.bin` shared: it, and `d/e` above it; `h.txt` stays this machine's.
         let paths = crate::records::set_local(&o.project, &layer, &tree("d/e/f.bin"), false, &mut o.history).unwrap();
         o.refresh(&paths);
-        assert_eq!(part(&root, "top", true), [o.uid("d/e/h.txt").digits()]);
+        assert_eq!(part(&root, "top", true), [o.uid("d/e/h.txt").digits().to_string()]);
         assert!(!o.index.entries[&tree("d/e")].local && o.index.entries[&tree("d/e/h.txt")].local);
         let sha1 = crate::extract::sha1_of(b"\0f");
         assert!(crate::chunks::Store::at(&root, crate::testing::io()).has_file(&sha1), "shipped with its content");

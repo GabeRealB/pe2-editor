@@ -189,7 +189,7 @@ fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, prefix: &str, def
         .map(|(id, op)| {
             let name = op.get("op").and_then(Value::as_str).unwrap_or_default().to_string();
             let def = ops.get(&name);
-            let group = ops.definitions.get(&name);
+            let group = ops.defined(&name);
             let output = name == graph::OUTPUT;
             let boxed = [graph::INPUT, graph::SETTING].contains(&name.as_str()) || (defined && output);
             let mut ports = ops.ports_of(&name);

@@ -33,8 +33,8 @@ pub type Stamp = (u64, u32);
 pub struct Declaration {
     /// What of its stack says what it makes.
     pub shape: String,
-    /// The uid it names itself, as declarations did before changesets.
-    pub uid: Option<String>,
+    /// The uid it names itself, where what it writes there is one: what a node written by hand keeps.
+    pub uid: Option<Uid>,
     /// Its `variants`' names, in order.
     pub variants: Vec<String>,
     /// Its references, in the order it writes them.
@@ -147,6 +147,22 @@ impl Out {
             self.text(it);
         }
     }
+
+    /// A uid that may be there, as the number it is: 0 for none.
+    pub(crate) fn uid(&mut self, it: Option<Uid>) {
+        self.u64(it.map_or(0, Uid::get));
+    }
+
+    /// A uid as it was written: the number it is, or - where what was written is none - 0 and that text.
+    pub(crate) fn written_uid(&mut self, it: &std::result::Result<Uid, Box<str>>) {
+        match it {
+            Ok(uid) => self.uid(Some(*uid)),
+            Err(text) => {
+                self.uid(None);
+                self.text(text);
+            }
+        }
+    }
 }
 
 /// A value, read.
@@ -192,6 +208,14 @@ impl<'a> In<'a> {
             _ => Some(self.text()?),
         };
         Some(())
+    }
+
+    /// A uid as it was written (`Out::written_uid`).
+    pub(crate) fn written_uid(&mut self) -> Option<std::result::Result<Uid, Box<str>>> {
+        Some(match Uid::from_u64(self.u64()?) {
+            Some(uid) => Ok(uid),
+            None => Err(self.text()?.into()),
+        })
     }
 }
 
@@ -249,16 +273,17 @@ fn record(name: &str, record: &Record) -> Vec<u8> {
     out.0.extend_from_slice(record.sha1.bytes());
     if let Some(declaration) = declaration {
         out.text(&declaration.shape);
-        out.maybe(declaration.uid.as_deref());
+        out.uid(declaration.uid);
         out.u32(u32::try_from(declaration.variants.len()).unwrap_or(u32::MAX));
         for variant in &declaration.variants {
             out.text(variant);
         }
         out.u32(u32::try_from(declaration.references.len()).unwrap_or(u32::MAX));
-        // Each as text, as declarations write it: a uid that is none as written, none of the rest as nothing.
+        // Each as declarations write it, but the uid, which is its number: one that is none as written, as written;
+        // none of the rest as nothing.
         for declared in &declaration.references {
             out.text(&declared.slot);
-            out.text(&declared.uid.as_ref().map_or_else(ToString::to_string, ToString::to_string));
+            out.written_uid(&declared.uid);
             out.text(declared.target.as_deref().map_or("", |target| target.as_str()));
             out.text(&declared.output.as_deref().map_or_default(ToString::to_string));
         }
@@ -277,10 +302,10 @@ fn sha1_in(read: &mut In<'_>) -> Option<pe2_ext::Sha1> {
 
 /// A reference a declaration makes, read back as `record` writes it: one that is not so is no record this reads.
 fn declared_in(read: &mut In<'_>) -> Option<Declared> {
-    let (slot, uid, target, output) = (read.text()?, read.text()?, read.text()?, read.text()?);
+    let (slot, uid, target, output) = (read.text()?, read.written_uid()?, read.text()?, read.text()?);
     Some(Declared {
         slot: slot.into(),
-        uid: Uid::new(&uid).map_err(|_| uid.into()),
+        uid,
         target: if target.is_empty() { None } else { Some(crate::TreePath::new(&target).ok()?.to_owned()) },
         output: if output.is_empty() { None } else { Some(Arc::from(pe2_path::Asked::new(&output).ok()?)) },
     })
@@ -303,8 +328,8 @@ fn recorded(value: &[u8]) -> Option<(Record, Option<String>)> {
         None
     } else {
         let shape = read.text()?;
-        let (mut uid, mut error) = (None, None);
-        read.maybe(&mut uid)?;
+        let uid = Uid::from_u64(read.u64()?);
+        let mut error = None;
         let variants = (0..read.u32()?).map(|_| read.text()).collect::<Option<Vec<_>>>()?;
         let references = (0..read.u32()?).map(|_| declared_in(&mut read)).collect::<Option<Box<[_]>>>()?;
         read.maybe(&mut error)?;
@@ -390,11 +415,11 @@ pub fn time_of((secs, nanos): Stamp) -> std::time::SystemTime {
 }
 
 /// A layer's record as the model keeps it, with its file's time and length.
-fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, len: u64) -> Vec<u8> {
+fn layer_record(record: &crate::records::Record, modified: Stamp, len: u64) -> Vec<u8> {
     use crate::records::{Content, Kind, Op};
     let mut out = Out::new();
-    let long = name.len() > NAMED;
-    out.u8(if long { says::NAMED } else { 0 });
+    // Its key holds its layer and uid whole: no name is said beside it.
+    out.u8(0);
     stamp(&mut out, modified);
     out.u64(len);
     out.u8(match record.op {
@@ -408,7 +433,7 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
         Kind::Folder => 1,
         Kind::File => 2,
     });
-    out.maybe(record.parent.map(|parent| parent.to_string()).as_deref());
+    out.uid(record.parent);
     out.maybe(record.name.as_ref().map(|path| path.as_str()));
     out.u32(u32::try_from(record.files.len()).unwrap_or(u32::MAX));
     for (file, held) in &record.files {
@@ -448,9 +473,6 @@ fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, le
     }
     out.u8(u8::from(record.local));
     out.maybe(record.theirs.as_deref());
-    if long {
-        out.text(name);
-    }
     out.0
 }
 
@@ -524,7 +546,7 @@ fn delta_in(read: &mut In<'_>) -> Option<crate::records::Delta> {
 }
 
 /// A layer's record read back, with its file's time and length and the name it says where its key could not.
-fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
+fn layer_recorded(value: &[u8]) -> Option<Recorded> {
     use crate::records::{Content, File, Kind, Op, Record};
     let mut read = In::after_stamp(value)?;
     let said = read.u8()?;
@@ -533,13 +555,10 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
     let op = [Op::Create, Op::Override, Op::Move, Op::Delete].get(usize::from(read.u8()?)).copied()?;
     let kind = [Kind::Node, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
     // Each name checked as it is read back: a model naming one that is none is no model to open over.
-    let (mut parent, mut name): (Option<String>, Option<String>) = (None, None);
-    read.maybe(&mut parent)?;
+    // A uid that may be there, as `Out::uid` writes it.
+    let parent = Uid::from_u64(read.u64()?);
+    let mut name: Option<String> = None;
     read.maybe(&mut name)?;
-    let parent = match parent {
-        Some(parent) => Some(pe2_path::Uid::new(&parent).ok()?),
-        None => None,
-    };
     let name = match name {
         Some(name) => Some(pe2_path::Name::new(&name).ok()?.to_owned()),
         None => None,
@@ -571,9 +590,21 @@ fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
     let local = read.u8()? != 0;
     let mut theirs = None;
     read.maybe(&mut theirs)?;
-    let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
+    if said & says::NAMED != 0 {
+        return None;
+    }
     let record = Record { op, kind, parent, name, files, tree, local, theirs };
-    read.0.is_empty().then_some(((Arc::new(record), modified, len), long))
+    read.0.is_empty().then_some((Arc::new(record), modified, len))
+}
+
+/// The key of a layer's record: its layer's name, a 0, and its uid's eight bytes, most significant first - the order of the
+/// numbers.
+fn record_key(layer: &Name, uid: Uid) -> Vec<u8> {
+    let mut key = vec![RECORD];
+    key.extend_from_slice(layer.as_str().as_bytes());
+    key.push(0);
+    key.extend_from_slice(&uid.get().to_be_bytes());
+    key
 }
 
 /// The name of what a layer holds at a path.
@@ -669,9 +700,8 @@ impl Delta {
     /// A record of a layer stored as records is this now, in a file of this time and length - or, with none, is
     /// no more.
     pub fn record(&mut self, layer: &Name, uid: Uid, now: Option<&Recorded>) {
-        let name = held_name(layer, &uid.to_string());
-        let said = now.map(|(record, modified, len)| layer_record(&name, record, *modified, *len));
-        self.changes.push((RECORDS, key(RECORD, &name), said));
+        let said = now.map(|(record, modified, len)| layer_record(record, *modified, *len));
+        self.changes.push((RECORDS, record_key(layer, uid), said));
     }
 
     /// The stack resolves this at a path now, as the index writes it - or, with none, nothing there any more.
@@ -912,13 +942,11 @@ pub fn records(pages: &impl Pages) -> Result<Records> {
     }
     let mut failed = None;
     sfs::tree::scan_prefix(pages, RECORDS, &[RECORD], &mut |key, value| {
-        let read = layer_recorded(value).and_then(|(recorded, long)| {
-            let name = match long {
-                Some(name) => name,
-                None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
-            };
-            let (layer, uid) = name.split_once('\u{0}')?;
-            Some((Name::new(layer).ok()?.to_owned(), Uid::new(uid).ok()?, recorded))
+        let read = layer_recorded(value).and_then(|recorded| {
+            let (layer, uid) = key[1..].split_at_checked(key.len().checked_sub(1 + 9)?)?;
+            let (0, uid) = uid.split_first()? else { return None };
+            let uid = Uid::from_u64(u64::from_be_bytes(uid.try_into().ok()?))?;
+            Some((Name::new(std::str::from_utf8(layer).ok()?).ok()?.to_owned(), uid, recorded))
         });
         match read {
             Some((layer, uid, recorded)) => drop(records.entry(layer).or_default().insert(uid, recorded)),
@@ -1082,19 +1110,20 @@ mod tests {
     fn a_record(n: u64, declared: bool) -> Record {
         let declaration = declared.then(|| Declaration {
             shape: format!("shape {n}"),
-            uid: (n % 2 == 0).then(|| format!("uid://{n:012}")),
+            uid: (n % 2 == 0).then(|| uid(&format!("uid://{:013}", n + 1))),
             variants: (0..n % 3).map(|v| format!("variant {v}")).collect(),
             references: (0..n % 4)
                 .map(|r| Declared {
                     slot: format!("slot{r}").into(),
-                    uid: if r == 3 { Err("uid://no uid".into()) } else { Ok(uid(&format!("uid://{r:012}"))) },
+                    uid: if r == 3 { Err("uid://no uid".into()) } else { Ok(uid(&format!("uid://{:013}", r + 1))) },
                     target: (r % 2 == 0).then(|| crate::testing::tree(&format!("a/b{r}"))),
                     output: (r == 1).then(|| Arc::from(pe2_path::Asked::new("palettes/night").unwrap())),
                 })
                 .collect(),
             error: (n % 5 == 0).then(|| "it cannot be parsed".to_string()),
             text: Arc::from(format!(
-                "uid = \"uid://{n:012}\"\n# {}\n",
+                "uid = \"uid://{:013}\"\n# {}\n",
+                n + 1,
                 "x".repeat(usize::try_from(n * 97 % 3000).unwrap())
             )),
         });
@@ -1233,7 +1262,7 @@ mod tests {
                 local: false,
                 theirs: None,
             };
-            (uid(&format!("uid://{n:012}")), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
+            (uid(&format!("uid://{:013}", n + 1)), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
         };
         [
             (crate::testing::name("game"), (0..300).map(record).collect()),

@@ -743,7 +743,8 @@ impl Worker {
         };
         let index = self.shown.clone().unwrap_or_else(|| Arc::new(self.core.index.clone()));
         let runner = self.runner.lock().unwrap_or_else(PoisonError::into_inner);
-        runner.run(holder::runner::Job { roots: events, index, config, reply: Some(reply) });
+        let roots = events.iter().map(|event| project::events::Event::new(event)).collect();
+        runner.run(holder::runner::Job { roots, index, config, reply: Some(reply) });
         Ok(answered)
     }
 

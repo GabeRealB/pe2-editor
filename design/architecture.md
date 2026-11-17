@@ -101,7 +101,12 @@ past that is one of three kinds, each a type of `pe2_path` or `pe2_io`:
 
 - **What a project names** - an asset by its uid, and what of it an address asks for: a `ResourcePath` (`uid://x/objects`,
   `uid://x/cells/body?palette=night`), its parts `Uid`, `Address`, `Query`, `Asked`. A reference is one; the work
-  graph is asked for one.
+  graph is asked for one. A `Uid` is a number of 64 bits, never 0 (`Option<Uid>` is as large), compared as that and
+  held as that wherever only programs read it - the index, the model, the history's journal, the extension interface;
+  it is text only where people or other programs read it, written one way (`uid://` and 13 lowercase characters of
+  Crockford's base 32, padded with zeros) and read however it is written (either case, unpadded, `i`/`l`/`o` for
+  `1`/`1`/`0`). So whatever looks up what text names - a stack's operation, an event, a reference merged - parses it
+  first.
 - **Where something is in the project's tree** - a node, a file of it, a folder: a `TreePath`, which is a `VfsPath`
   typed by the scope it is in (`Tree`; `Run` and `Given` for what a program is given), so one scope's path is not
   taken for another's. Within a folder, names are `Name`s and paths `RelPath`s: portable, so a project made on one

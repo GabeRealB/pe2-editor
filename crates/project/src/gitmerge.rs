@@ -51,7 +51,7 @@ fn is_record(path: &str) -> bool {
     parts.len() >= 4
         && parts[parts.len() - 4] == crate::LAYERS.as_str()
         && crate::records::is_shard(std::ffi::OsStr::new(parts[parts.len() - 2]))
-        && parts[parts.len() - 1].strip_suffix(".toml").is_some_and(|uid| uid.starts_with(parts[parts.len() - 2]))
+        && parts[parts.len() - 1].strip_suffix(".toml").is_some_and(|uid| uid.ends_with(parts[parts.len() - 2]))
 }
 
 /// Of three versions of something, the merged one: where one side kept the base, the other's; where both made it the
@@ -257,7 +257,7 @@ pub fn root_of(at: &sfs::HostPath, path: &str) -> Option<sfs::HostPath> {
 mod tests {
     use super::merge;
 
-    const PATH: &str = "layers/top/ab/abcdefgh.toml";
+    const PATH: &str = "layers/top/gh/00000abcdefgh.toml";
 
     fn record(fields: &str) -> String {
         format!("format = 1\nop = \"override\"\nkind = \"node\"\n{fields}")

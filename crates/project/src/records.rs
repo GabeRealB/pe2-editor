@@ -122,34 +122,31 @@ pub struct Record {
     pub theirs: Option<String>,
 }
 
-/// Whether a folder's name is a shard's, as a uid's digits make them (`RelPath::sharded`): their first two, or all
-/// of them where there are fewer.
+/// Whether a folder's name is a shard's: two characters a uid is written in (`RelPath::by_uid`).
 #[must_use]
 pub fn is_shard(name: &std::ffi::OsStr) -> bool {
-    (1..=2).contains(&name.len())
+    name.len() == 2 && name.to_str().is_some_and(|name| name.chars().all(|c| pe2_path::UID_ALPHABET.contains(c)))
 }
 
-/// Where a layer's record of an entry is, in its folder.
+/// Where a layer's record of an entry is, in its folder: `<shard>/<digits>.toml`, the uid written in full - a name no
+/// system keeps for itself.
 ///
 /// # Errors
-/// The uid's digits make no file's name on every system (`con`, as Windows reserves it).
+/// None arises: the uid's digits with `.toml` are a portable name.
 pub fn path_of(layer: &HostPath, uid: Uid) -> Result<HostPath, pe2_path::PathError> {
-    Ok(layer.join(&RelPath::sharded(&uid.digits(), ".toml")?))
+    Ok(layer.join(&RelPath::by_uid(uid, ".toml")?))
 }
 
-/// The uid a record's file in a folder of records is of: none for a file that is no record of the folder's.
+/// The uid a record's file in a folder of records is of: none for a file that is no record of the folder's - one
+/// whose name is not a uid as it is written, in its shard.
 #[must_use]
 pub fn uid_of(folder: &HostPath, path: &HostPath) -> Option<Uid> {
     let key = path.file_name()?.to_str()?.strip_suffix(".toml")?;
     let shard = path.parent()?;
-    // Entries' records are sharded by the first two characters of their uid's digits (the digits, where there are
-    // fewer); the extensions' and the marker are elsewhere.
-    let in_records = shard.file_name().is_some_and(|n| n.to_str() == Some(key.get(..2).unwrap_or(key)))
+    let uid = Uid::of_digits(key).filter(|uid| *uid.digits() == *key)?;
+    let in_records = shard.file_name().is_some_and(|n| n.to_str() == Some(&key[pe2_path::UID_DIGITS - 2..]))
         && shard.parent().is_some_and(|records| records == *folder);
-    if !in_records || key.is_empty() {
-        return None;
-    }
-    Uid::new(&format!("uid://{key}")).ok()
+    in_records.then_some(uid)
 }
 
 /// Whether a layer's folder is stored as records.
@@ -2380,7 +2377,7 @@ mod tests {
         let mut record = Record {
             op: Op::Override,
             kind: Kind::Node,
-            parent: Some(uid("uid://1izcb2mud6bit")),
+            parent: Some(uid("uid://1izcb2mvd6bit")),
             name: Some(name("box")),
             files: BTreeMap::default(),
             tree: None,
@@ -2600,7 +2597,7 @@ mod tests {
     fn a_record_is_placed_by_its_uid() {
         let layer = &crate::testing::scratch("record-place").at("layers/top");
         let at = super::path_of(layer, uid("uid://1hwweozpa40d9")).unwrap();
-        assert_eq!(at, layer.at("1h/1hwweozpa40d9.toml"));
+        assert_eq!(at, layer.at("d9/1hwwe0zpa40d9.toml"));
         assert_eq!(super::uid_of(layer, &at), Some(uid("uid://1hwweozpa40d9")));
         assert_eq!(super::uid_of(layer, &layer.join(&super::MARKER)), None);
         assert_eq!(super::uid_of(layer, &layer.at("extensions/1hwweozpa40d9.toml")), None);

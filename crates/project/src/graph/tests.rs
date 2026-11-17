@@ -917,7 +917,7 @@ fn gates_are_boxes_of_a_graph_and_what_they_come_to_wires_an_output() {
     assert_eq!(problems, Vec::new());
     let made = &plan.outputs[0];
     let when = plan.expression(made.events.pull[0]);
-    assert!(when.holds(&|event| event == "saved"));
+    assert!(when.holds(&|event| event.is("saved")));
     assert!(!when.holds(&|_| true));
     assert!(when.waits());
     assert_eq!(plan.rules.len(), 1);
@@ -1350,8 +1350,9 @@ ops.out = { op = "output", name = "text", from = { value = "either" } }
 fn with_definitions(definitions: &[(&str, &str)]) -> Ops {
     let mut ops = ops();
     let defined = definitions.iter().map(|(uid, declaration)| {
-        let definition = super::Definition::of(uid, &toml::from_str(declaration).unwrap(), "1").unwrap();
-        (uid.to_string(), std::sync::Arc::new(definition))
+        let uid = pe2_path::ResourcePath::new(uid).unwrap();
+        let definition = super::Definition::of(&uid, &toml::from_str(declaration).unwrap(), "1").unwrap();
+        (uid, std::sync::Arc::new(definition))
     });
     ops.definitions = std::sync::Arc::new(defined.collect());
     ops
@@ -1430,7 +1431,9 @@ ops.side = { op = "output", name = "second", index = 1, from = { value = "b" } }
 
 #[test]
 fn an_operation_the_project_defines_says_what_it_is_with_its_boxes() {
-    let definition = super::Definition::of("uid://two", &toml::from_str(TWO).unwrap(), "1").unwrap();
+    let definition =
+        super::Definition::of(&pe2_path::ResourcePath::new("uid://two").unwrap(), &toml::from_str(TWO).unwrap(), "1")
+            .unwrap();
     let names = |ports: &[super::Port]| ports.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
     assert_eq!(names(&definition.inputs), ["first", "second"]);
     assert_eq!(definition.settings.iter().map(|(p, _)| p.name.as_str()).collect::<Vec<_>>(), ["loud"]);
@@ -1439,10 +1442,22 @@ fn an_operation_the_project_defines_says_what_it_is_with_its_boxes() {
         "name = \"second\", index = 1, from = { value = \"b\" }",
         "name = \"joined\", from = { value = \"b\" }",
     );
-    let refused = super::Definition::of("uid://two", &toml::from_str(&twice).unwrap(), "1").unwrap_err();
+    let refused = super::Definition::of(
+        &pe2_path::ResourcePath::new("uid://two").unwrap(),
+        &toml::from_str(&twice).unwrap(),
+        "1",
+    )
+    .unwrap_err();
     assert!(refused.contains("two outputs"), "{refused}");
     let outputless = TWO.replace("op = \"output\"", "op = \"t.join\"");
-    assert!(super::Definition::of("uid://two", &toml::from_str(&outputless).unwrap(), "1").is_err());
+    assert!(
+        super::Definition::of(
+            &pe2_path::ResourcePath::new("uid://two").unwrap(),
+            &toml::from_str(&outputless).unwrap(),
+            "1"
+        )
+        .is_err()
+    );
     // Used from a stack: its second output by name, its setting set.
     let ops = with_definitions(&[("uid://two", TWO)]);
     let stack = r#"
@@ -1509,10 +1524,10 @@ ops.out = { op = "output", name = "out", from = { value = "up" } }
 fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
     let dir = crate::testing::scratch("graph-each");
     let _ = std::fs::remove_dir_all(&dir);
-    let ops = with_definitions(&[("uid://louder", LOUDER)]);
+    let ops = with_definitions(&[("uid://lowder", LOUDER)]);
     let stack = |texts: &str| {
         format!(
-            "[[stack]]\nop = \"t.split\"\ntexts = [{texts}]\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://louder\"\n\n\
+            "[[stack]]\nop = \"t.split\"\ntexts = [{texts}]\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://lowder\"\n\n\
              [[stack]]\nop = \"concatenate\"\nname = \"all.txt\"\n\n[[stack]]\nop = \"output\"\nname = \"all\"\nretain = \"cache\"\n"
         )
     };
@@ -1530,7 +1545,7 @@ fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
     assert_eq!(made("\"a\", \"b\", \"c\""), ("ABC".to_string(), 3), "each item made");
     assert_eq!(made("\"a\", \"x\", \"c\""), ("AXC".to_string(), 1), "the changed item alone made again");
     // A table's entries are items too, each its key and value; a body taking more than the item is given `with`.
-    let wrong = "[[stack]]\nop = \"constant\"\nvalue = { a = 1 }\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://louder\"\n\n\
+    let wrong = "[[stack]]\nop = \"constant\"\nvalue = { a = 1 }\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://lowder\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"all\"\n";
     let (plan, _) = Plan::of(&toml::from_str(wrong).unwrap(), &engine.ops, &[]);
     let node = Bundle::new(wrong, &[]);

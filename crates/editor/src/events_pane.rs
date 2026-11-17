@@ -9,7 +9,8 @@ use crate::{icons, theme};
 
 /// A row of the pane.
 struct Row {
-    id: String,
+    /// The event, as it is signaled.
+    id: project::events::Event,
     label: String,
     /// Where it is an asset, its path.
     asset: Option<Arc<project::TreePath>>,
@@ -31,7 +32,7 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mu
                     }
                 }
                 None => {
-                    ui.label(name).on_hover_text(&row.id);
+                    ui.label(name).on_hover_text(row.id.to_string());
                 }
             }
             let count = wired.and_then(|w| w.get(&row.id)).copied().unwrap_or_default();
@@ -44,7 +45,7 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mu
         }
     });
     if let Some(id) = signaled {
-        ws.signal(&id);
+        ws.signal_event(id);
     }
 }
 
@@ -59,8 +60,8 @@ pub fn events_ui(
             .extensions
             .find(&ws.index, "event")
             .filter_map(|asset| {
-                // An event is signaled by its uid's text, as a stack names it.
-                let uid = asset.uid?.to_string();
+                // An event the project defines is signaled by its uid.
+                let uid = project::events::Event::Uid(asset.uid?);
                 let name = asset.path.name().unwrap_or_default();
                 let label = asset.fields_toml().get("label").and_then(toml::Value::as_str).unwrap_or(name).to_string();
                 Some(Row { id: uid, label, asset: Some(asset.path.clone()) })
@@ -95,14 +96,14 @@ pub fn events_ui(
             .extensions
             .events
             .iter()
-            .map(|(id, label)| Row { id: id.clone(), label: label.clone(), asset: None })
+            .map(|(id, label)| Row { id: project::events::Event::new(id), label: label.clone(), asset: None })
             .collect();
         if !theirs.is_empty() {
             theme::section(ui, "Extensions", |ui| rows(ui, "their events", &theirs, ws, nav));
         }
         let built_in: Vec<Row> = BUILT_IN
             .iter()
-            .map(|(id, label)| Row { id: (*id).to_string(), label: (*label).to_string(), asset: None })
+            .map(|(id, label)| Row { id: project::events::Event::new(id), label: (*label).to_string(), asset: None })
             .collect();
         theme::section(ui, "Built in", |ui| rows(ui, "built-in events", &built_in, ws, nav));
     });

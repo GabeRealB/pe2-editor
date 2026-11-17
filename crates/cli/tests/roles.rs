@@ -500,5 +500,5 @@ fn what_a_tool_changed_while_it_had_the_project_is_what_the_host_answers_from_on
     // The host has it back, and what is asked of it first is answered from the project as the tool left it.
     assert_eq!(tried.host(), Some(host), "the same host");
     let (asked, said) = tried.ask(&["problems"]);
-    assert!(asked && said.contains("abcdefghijkl"), "{said}");
+    assert!(asked && said.contains(&pe2_path::Uid::new("uid://abcdefghijkl").unwrap().to_string()), "{said}");
 }

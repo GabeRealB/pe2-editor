@@ -47,5 +47,7 @@ pub fn from<T: ?Sized>(start: &T) -> (std::ops::Bound<&T>, std::ops::Bound<&T>) 
 pub use error::{PathError, Why};
 pub use fold::{UNICODE_VERSION, folded};
 pub use name::{Name, Names, RelPath};
-pub use resource::{Address, Asked, Query, Reference, ResourcePath, Uid};
+pub use resource::{
+    Address, Asked, Query, Reference, ResourcePath, UID_ALPHABET, UID_DIGITS, Uid, UidDigits, uid_number,
+};
 pub use vfs::{Given, RES_PREFIX, Run, Scope, Tree, VfsPath};

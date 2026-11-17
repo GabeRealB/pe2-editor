@@ -753,7 +753,7 @@ fn declaration(bytes: &[u8]) -> Declaration {
         Ok(table) => {
             let string = |key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_string);
             out.shape = crate::graph::shape(&table);
-            out.uid = string("uid");
+            out.uid = string("uid").and_then(|uid| Uid::new(&uid).ok());
             // An image's looks: its variants, keyed by name.
             let settings = crate::graph::with_settings(&table);
             out.variants = settings
@@ -1534,7 +1534,7 @@ impl Node {
             Kind::Folder => 1,
             Kind::File => 2,
         });
-        out.text(&self.uid.to_string());
+        out.uid(Some(self.uid));
         layer(&mut out, self.home);
         layer(&mut out, self.content.0);
         out.text(self.content.1.as_str());
@@ -1565,7 +1565,7 @@ impl Node {
         let mut read = In(bytes);
         let layer = |read: &mut In<'_>| read.u32().and_then(|layer| usize::try_from(layer).ok());
         let kind = [Kind::Asset, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
-        let uid = Uid::new(&read.text()?).ok()?;
+        let uid = Uid::from_u64(read.u64()?)?;
         let home = layer(&mut read)?;
         let content = (layer(&mut read)?, TreePath::new(&read.text()?).ok()?.to_owned());
         let overrides = (0..layer(&mut read)?).map(|_| layer(&mut read)).collect::<Option<Vec<usize>>>()?;
@@ -4110,7 +4110,7 @@ impl Index {
                 .get(&path)
                 .and_then(|files| files.get(NODE_FILE.as_rel()))
                 .and_then(|f| self.records.get(f))
-                .and_then(|r| Uid::new(r.declaration.as_ref()?.uid.as_deref()?).ok())
+                .and_then(|r| r.declaration.as_ref()?.uid)
                 .filter(|u| !taken.contains(u));
             let id = match declared {
                 Some(id) => id,
@@ -4618,13 +4618,13 @@ mod tests {
         assert_eq!(index.assets[&tree("c")].uid, Some(uid_of("b.node")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // What it overrides is there, a node of its own.
-        let below = index.version("below:uid://a").unwrap();
+        let below = index.version(&format!("below:{}", uid("uid://a"))).unwrap();
         assert_eq!(
             (below.named.as_deref(), below.uid, below.layers.as_slice()),
-            (Some("below:uid://a"), None, [crate::testing::name("base")].as_slice())
+            (Some(format!("below:{}", uid("uid://a")).as_str()), None, [crate::testing::name("base")].as_slice())
         );
         assert!(below.files.iter().all(|f| *f.layer == "base"));
-        assert!(index.version("below:below:uid://a").is_none());
+        assert!(index.version(&format!("below:below:{}", uid("uid://a"))).is_none());
         // The base changes under the override: stale.
         crate::testing::write_in(&root, "base", "g/a.node/native.texels", Some("retouched"));
         let (_, index) = open(&root);
@@ -4738,7 +4738,7 @@ mod tests {
         let mut top = Changeset::default();
         top.entries.insert(uid("uid://another"), tree("b.node"));
         top.entries.insert(uid("uid://new"), tree("new.node"));
-        top.ops.insert(uid("uid://unknown"), Op::Delete);
+        top.ops.insert(uid("uid://nowhere"), Op::Delete);
         let files =
             [("b.node/node.toml", "stack = [{ op = \"t.file\" }]\n"), ("new.node/node.toml", "kind = [unclosed\n")];
         crate::testing::apply(&root, "top", &top, &files);
@@ -4749,7 +4749,7 @@ mod tests {
             layers: vec![crate::testing::name("base"), crate::testing::name("top")]
         }));
         assert!(index.problems.iter().any(|p| matches!(p, Problem::Unreadable { asset, .. } if asset == "new")));
-        assert!(has(&Problem::Unbound { layer: crate::testing::name("top"), uid: "uid://unknown".into() }));
+        assert!(has(&Problem::Unbound { layer: crate::testing::name("top"), uid: uid("uid://nowhere").to_string() }));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

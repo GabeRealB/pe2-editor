@@ -15,7 +15,9 @@ below is copied or changed.
 
 | Kind | Storage | Why |
 |---|---|---|
-| A project's layers | **Records**: one file per entry it touches, by uid, in the layer's folder (`layers/<layer>/<aa>/<uid>.toml`, beside its `layer.toml`), its tree addressed under `layers/<layer>/tree` on no disk | Nobody edits them by hand: what they hold - assets, and plain files such as code - is edited through the served folder with any tool; renaming a folder of thousands of entries is one record; text stays text in version control. |
+| A project's layers | **Records**: one file per entry it touches, by uid, in the layer's folder (`layers/<layer>/<xy>/<uid>.toml`, the uid written in full and its shard its last two characters - a random uid's
+evenly spread bits, where its first are only ever `0` or `1` - beside its `layer.toml`; a file named any other way is
+no record), its tree addressed under `layers/<layer>/tree` on no disk | Nobody edits them by hand: what they hold - assets, and plain files such as code - is edited through the served folder with any tool; renaming a folder of thousands of entries is one record; text stays text in version control. |
 | Mounts | **Records** listing a plain tree of files outside the project (`[[layer]] mount = "<folder>"`): each entry's uid, where it is and what it is, none of its files; its `layer.toml` says what it leaves out (`.git/` as it is added) | Worked on with their own tools, where they are: what another program adds, moves or removes there is listed so as it is found - a file moved keeps its uid by its content - as one set said in the log. Edits write the tree's files in place. At the bottom of the stack, below what builds on them. |
 | Generated layers | **Records** too - an override of each node a plan gives files - this machine's alone: in `.local/layers/<layer>/`, what they hold in `.local/store/` | Made of the user's own discs by their plan, which alone writes them: never shipped. |
 

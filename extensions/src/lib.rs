@@ -1195,16 +1195,16 @@ mod tests {
         let (mut history, _) = project::history::History::open(&local).unwrap();
         let index = project::index::Index::open(&p, &local).unwrap();
         // An operation passing on what it is given, and a template importing a text file through it.
-        let group = "uid = \"uid://group\"\n\n[[stack]]\nop = \"pe2.graph@operation\"\nlabel = \"Passed\"\n\
+        let group = "uid = \"uid://grp\"\n\n[[stack]]\nop = \"pe2.graph@operation\"\nlabel = \"Passed\"\n\
                      ops.given = { op = \"input\", name = \"text\" }\nops.out = { op = \"output\", name = \"text\", from = { value = \"given\" } }\n";
         let template = "uid = \"uid://template\"\n\n[[stack]]\nop = \"pe2.graph@template\"\nlabel = \"Passed text\"\nfiles = [\"*.txt\"]\n\
-                        makes = [{ op = \"file\", file = \"{file}\" }, { op = \"uid://group\" }, { op = \"output\", name = \"text\" }]\n";
+                        makes = [{ op = \"file\", file = \"{file}\" }, { op = \"uid://grp\" }, { op = \"output\", name = \"text\" }]\n";
         let (uid, tree) = (|text| pe2_path::Uid::new(text).unwrap(), |text| project::TreePath::new(text).unwrap());
         project::edit::create(
             &p,
             &index,
             pe2_path::Name::constant("project"),
-            uid("uid://group"),
+            uid("uid://grp"),
             tree("graph/passed"),
             (group, &[]),
             &mut history,

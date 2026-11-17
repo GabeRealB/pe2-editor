@@ -6,6 +6,9 @@
 **Asset.** One thing in the project: a picture, a sound, a model, a room's dialogue, a package of the game's code.
 Assets sit in folders, like files. Every asset has a type, fields you edit in the Inspector, and files of its own.
 It also has a permanent identity, its uid, so assets that refer to it still find it after you rename or move it.
+A uid is written `uid://` and 13 characters, such as `uid://0jxpg8v98pf00`. You may write one in either case and
+leave out the zeros it starts with, and `i`, `l` and `o` are read as `1`, `1` and `0`: `uid://JXPG8V98PF00` is the same
+uid.
 The editor also calls an asset a *node*.
 
 **Layers.** A project is a stack of layers, like an image editor's. What you see is all of them combined, top over

@@ -11,12 +11,12 @@
 //! ignore = ["*.swp"]                   # never listed
 //!
 //! [entries]
-//! "uid://k2..." = "stages/akropolis/rooms/plaza/props/neon_sign"
+//! "uid://00k2..." = "stages/akropolis/rooms/plaza/props/neon_sign"
 //!
 //! [ops]
-//! "uid://e8rx12suodf6" = { override = { "node.toml" = "3f2a...", "old.bin" = { was = "77ab...", removed = true } } }
-//! "uid://1x9..." = { to = "stages/akropolis/rooms/plaza/views/old" }
-//! "uid://7q2..." = { delete = true }
+//! "uid://00e8rx12svdf6" = { override = { "node.toml" = "3f2a...", "old.bin" = { was = "77ab...", removed = true } } }
+//! "uid://001x9..." = { to = "stages/akropolis/rooms/plaza/views/old" }
+//! "uid://007q2..." = { delete = true }
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -103,8 +103,12 @@ impl Changeset {
         if let Some(ignore) = table.get("ignore").and_then(toml::Value::as_array) {
             changeset.ignore = ignore.iter().map(|v| string(v, "ignore")).collect::<Result<_>>()?;
         }
+        // A uid written twice, however differently, is one entry or op named twice: refused, not one taking the other's
+        // place.
         for (named, path) in table.get("entries").and_then(toml::Value::as_table).into_iter().flatten() {
-            changeset.entries.insert(uid(named)?, tree_path(path, named)?);
+            if changeset.entries.insert(uid(named)?, tree_path(path, named)?).is_some() {
+                bail!("{named}: an entry its uid names twice");
+            }
         }
         for (named, op) in table.get("ops").and_then(toml::Value::as_table).into_iter().flatten() {
             let uid_text = named;
@@ -137,7 +141,9 @@ impl Changeset {
             } else {
                 bail!("{uid_text}: an op that neither overrides, moves nor deletes");
             };
-            changeset.ops.insert(uid(uid_text)?, op);
+            if changeset.ops.insert(uid(uid_text)?, op).is_some() {
+                bail!("{uid_text}: an op its uid names twice");
+            }
         }
         Ok(changeset)
     }
@@ -261,7 +267,7 @@ mod tests {
             (rel("new.txt"), Base { was: None, removed: false }),
             (rel("old.bin"), Base { was: Some(crate::extract::sha1_of(b"old")), removed: true }),
         ];
-        changeset.ops.insert(uid("uid://o"), Op::Override { files: files.into_iter().collect(), to: Some(tree("w")) });
+        changeset.ops.insert(uid("uid://q"), Op::Override { files: files.into_iter().collect(), to: Some(tree("w")) });
         changeset.ops.insert(uid("uid://p"), Op::Override { files: std::collections::BTreeMap::default(), to: None });
         changeset.ops.insert(uid("uid://m"), Op::Move { to: tree("v") });
         changeset.ops.insert(uid("uid://d"), Op::Delete);
@@ -269,8 +275,11 @@ mod tests {
         assert!(text.find("y/a").unwrap() < text.find("z/b").unwrap());
         assert_eq!(Changeset::parse(&text).unwrap(), changeset);
         assert!(changeset.ignores("a/.x.swp") && !changeset.ignores("a/x.swap"));
+        // One uid written two ways is one entry named twice.
+        let twice = "[entries]\n\"uid://a\" = \"x\"\n\"uid://00A\" = \"y\"\n";
+        assert!(format!("{:#}", Changeset::parse(twice).unwrap_err()).contains("twice"));
         // One written before overrides listed their files is refused, by what it is.
-        let old = "[ops]\n\"uid://o\" = { override = \"sha1:1\" }\n";
+        let old = "[ops]\n\"uid://q\" = { override = \"sha1:1\" }\n";
         assert!(format!("{:#}", Changeset::parse(old).unwrap_err()).contains("older pe2"));
     }
 }

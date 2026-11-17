@@ -455,8 +455,8 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.path().to_string())
     }
 
-    fn uid(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
-        Ok(self.lent(&asset)?.uid().map(|uid| uid.to_string()))
+    fn uid(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<u64>> {
+        Ok(self.lent(&asset)?.uid().map(pe2_ext::Uid::get))
     }
 
     fn node_type(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
@@ -563,7 +563,7 @@ impl host::HostAsset for State {
         let named = self.lent(&asset)?.node_named(&reference);
         Ok(named.map(|named| host::NodeNamed {
             path: named.path.to_string(),
-            uid: named.uid.map(|uid| uid.to_string()),
+            uid: named.uid.map(pe2_ext::Uid::get),
             types: named.types.into_iter().map(String::from).collect(),
         }))
     }

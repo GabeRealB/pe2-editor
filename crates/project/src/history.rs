@@ -94,6 +94,7 @@ impl Change {
 /// A change to a document's working copy: one of its files, by hash before and after; none: absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
+    #[serde(with = "pe2_path::uid_number")]
     pub uid: Uid,
     /// Where the asset was when it was edited.
     pub path: Arc<TreePath>,
@@ -198,6 +199,7 @@ pub struct Document {
 pub struct Session {
     pub done: Vec<Step>,
     pub undone: Vec<Step>,
+    #[serde(with = "pe2_path::uid_number::keys")]
     pub documents: BTreeMap<Uid, Document>,
 }
 
@@ -1198,7 +1200,14 @@ impl History {
 struct SessionRef<'a> {
     done: &'a [Step],
     undone: &'a [Step],
+    #[serde(serialize_with = "documents_out")]
     documents: &'a BTreeMap<Uid, Document>,
+}
+
+/// The documents a session has, by their uids' numbers.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde passes a field, here a reference, by reference")]
+fn documents_out<S: serde::Serializer>(documents: &&BTreeMap<Uid, Document>, out: S) -> Result<S::Ok, S::Error> {
+    pe2_path::uid_number::keys::serialize(documents, out)
 }
 
 /// A line of the session's file: the session whole, or what changed of it since the line before - its steps done
@@ -1207,7 +1216,13 @@ struct SessionRef<'a> {
 #[serde(rename_all = "snake_case")]
 enum Journaled<'a> {
     Whole(SessionRef<'a>),
-    Since { from: usize, done: &'a [Step], undone: Option<&'a [Step]>, documents: BTreeMap<Uid, Option<&'a Document>> },
+    Since {
+        from: usize,
+        done: &'a [Step],
+        undone: Option<&'a [Step]>,
+        #[serde(with = "pe2_path::uid_number::keys")]
+        documents: BTreeMap<Uid, Option<&'a Document>>,
+    },
 }
 
 /// A line of the session's file, read.
@@ -1215,7 +1230,13 @@ enum Journaled<'a> {
 #[serde(rename_all = "snake_case")]
 enum JournaledLine {
     Whole(Session),
-    Since { from: usize, done: Vec<Step>, undone: Option<Vec<Step>>, documents: BTreeMap<Uid, Option<Document>> },
+    Since {
+        from: usize,
+        done: Vec<Step>,
+        undone: Option<Vec<Step>>,
+        #[serde(with = "pe2_path::uid_number::keys")]
+        documents: BTreeMap<Uid, Option<Document>>,
+    },
 }
 
 impl Session {
@@ -1813,11 +1834,12 @@ mod tests {
     }
 
     /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
-    /// layer's is: only a record and the folder of its first two letters are written behind.
+    /// layer's is: only a record and the folder of its shard are written behind.
     fn record(root: &HostPath, uid: &str) -> HostPath {
         let records = root.at("layers/top");
         std::fs::create_dir_all(&records).unwrap();
-        records.at(&uid[..2]).at(&format!("{uid}.toml"))
+        let uid = pe2_path::Uid::new(&format!("uid://{uid}")).unwrap();
+        crate::records::path_of(&records, uid).unwrap()
     }
 
     #[test]
@@ -1890,7 +1912,7 @@ mod tests {
         history.hold_back(false);
         history.settle();
         assert_eq!(read(&a).as_deref(), Some("theirs"), "not written over");
-        assert_eq!(read(&root.at(".local/conflicts/layers/top/aa/aa1.toml")).as_deref(), Some("ours"));
+        assert_eq!(read(&root.at(".local/conflicts/layers/top/a1/0000000000aa1.toml")).as_deref(), Some("ours"));
         assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
         drop(history);
         crate::local::remove_all(&root);

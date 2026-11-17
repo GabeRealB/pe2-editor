@@ -262,7 +262,8 @@ interface host {
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
         path: func() -> string;
-        uid: func() -> option<string>;
+        /// Its uid, as the number it is (never 0).
+        uid: func() -> option<u64>;
         /// Its type, qualified (`pe2.images@image`), as the host resolved it.
         node-type: func() -> option<string>;
         /// Its declaration, as written (TOML).
@@ -368,7 +369,8 @@ interface host {
     /// A node as a reference names it: its path, its uid, and what it is, each type qualified.
     record node-named {
         path: string,
-        uid: option<string>,
+        /// Its uid, as the number it is (never 0).
+        uid: option<u64>,
         types: list<string>,
     }
 

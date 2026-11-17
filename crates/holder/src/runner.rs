@@ -5,8 +5,8 @@
 //! It runs the generated layers' plans too (`extract`): the work graph is theirs alone while they run, so an extraction
 //! waits for the epoch running to end, and what is asked after it waits for it.
 
-use pe2_ext::events::{Build, Clean, Event, FilesChanged};
-use project::events::Report;
+use pe2_ext::events::{Build, Clean, Event as _, FilesChanged};
+use project::events::{Event, Report};
 use project::ext::Extensions;
 use project::index::Index;
 use project::{Config, Project};
@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 
 /// An epoch to run.
 pub struct Job {
-    pub roots: Vec<String>,
+    pub roots: Vec<Event>,
     pub index: Arc<Index>,
     pub config: Config,
     /// Who waits for it, over the editor's link.
@@ -42,20 +42,20 @@ enum Work {
 
 /// An epoch as it ended.
 pub struct Finished {
-    pub roots: Vec<String>,
+    pub roots: Vec<Event>,
     pub config: String,
     pub report: Report,
     /// What could not be wired.
     pub problems: Vec<(String, String)>,
     /// How much is wired to each event.
-    pub wired: BTreeMap<String, usize>,
+    pub wired: BTreeMap<Event, usize>,
 }
 
 impl Finished {
     /// What to say of it, where someone asked for it.
     #[must_use]
     pub fn said(&self) -> Option<String> {
-        let asked = |event: &str| self.roots.iter().any(|root| root == event);
+        let asked = |event: &str| self.roots.iter().any(|root| root.is(event));
         let what = if asked(Build::NAME) {
             "Built"
         } else if asked(Clean::NAME) {
@@ -86,7 +86,7 @@ pub struct Runner {
     /// The epochs asked for and not ended.
     waiting: Arc<AtomicUsize>,
     /// The events the epoch running was signaled by, while one runs.
-    running: Arc<std::sync::Mutex<Vec<String>>>,
+    running: Arc<std::sync::Mutex<Vec<Event>>>,
     wake: Arc<OnceLock<Wake>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -96,7 +96,7 @@ type Wake = Box<dyn Fn() + Send + Sync>;
 
 /// Whether a job can be run as part of the next: they say the same thing of the same config.
 fn same(job: &Job, next: &Job) -> bool {
-    let files = |job: &Job| job.reply.is_none() && matches!(job.roots.as_slice(), [one] if one == FilesChanged::NAME);
+    let files = |job: &Job| job.reply.is_none() && matches!(job.roots.as_slice(), [one] if one.is(FilesChanged::NAME));
     files(job) && files(next) && job.config == next.config
 }
 
@@ -131,7 +131,7 @@ impl Runner {
         let (done, finished) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicUsize::new(0));
-        let running: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let running: Arc<std::sync::Mutex<Vec<Event>>> = Arc::default();
         let woken: Arc<OnceLock<Wake>> = Arc::default();
         let (stop, left, wake, now) = (cancel.clone(), waiting.clone(), woken.clone(), running.clone());
         let thread = std::thread::Builder::new()
@@ -169,8 +169,10 @@ impl Runner {
                     job.roots.clone_into(&mut now.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                     let wiring = project::build::wiring(&job.index, &extensions, &job.config);
                     // What the user signaled: a group of its own, over what the editor does by itself.
-                    let group =
-                        project::schedule::Group::new(project::schedule::Class::Commanded, &job.roots.join(" "));
+                    let group = project::schedule::Group::new(
+                        project::schedule::Class::Commanded,
+                        &project::events::listed(&job.roots, " "),
+                    );
                     let report = group.enter(|| {
                         project::build::epoch(
                             &project,
@@ -239,7 +241,7 @@ impl Runner {
 
     /// The events the epoch running was signaled by; none between epochs.
     #[must_use]
-    pub fn running(&self) -> Vec<String> {
+    pub fn running(&self) -> Vec<Event> {
         self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 

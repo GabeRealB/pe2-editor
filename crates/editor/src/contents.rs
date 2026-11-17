@@ -381,7 +381,7 @@ fn label_of(ws: &Workspace, name: &str) -> String {
     }
     let ops = ws.extensions.operations();
     // An operation the project defines goes by its label too.
-    let defined = || ops.definitions.get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    let defined = || ops.defined(name).map_or_else(|| name.to_string(), |d| d.label.clone());
     ops.get(name).map_or_else(defined, |op| op.label.clone())
 }
 

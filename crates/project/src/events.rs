@@ -10,10 +10,53 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::graph::Gate;
 
+/// An event, by what names it: a name - the host's or an extension's (`files changed`) - or the uid of an event the
+/// project defines, as one is however its uid is written where it is named.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Event {
+    Named(std::sync::Arc<str>),
+    Uid(pe2_path::Uid),
+}
+
+impl Event {
+    /// The event a text names: a uid's where it is one, a name's otherwise.
+    #[must_use]
+    pub fn new(text: &str) -> Event {
+        pe2_path::Uid::new(text).map_or_else(|_| Event::Named(std::sync::Arc::from(text)), Event::Uid)
+    }
+
+    /// Whether it is the event of this name.
+    #[must_use]
+    pub fn is(&self, name: &str) -> bool {
+        matches!(self, Event::Named(named) if **named == *name)
+    }
+}
+
+/// Events said in a line, joined by `by`.
+#[must_use]
+pub fn listed(events: &[Event], by: &str) -> String {
+    events.iter().map(ToString::to_string).collect::<Vec<_>>().join(by)
+}
+
+impl From<&str> for Event {
+    fn from(text: &str) -> Event {
+        Event::new(text)
+    }
+}
+
+impl std::fmt::Display for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::Named(name) => f.write_str(name),
+            Event::Uid(uid) => uid.fmt(f),
+        }
+    }
+}
+
 /// What an event expression says, of the events signaled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
-    Event(String),
+    Event(Event),
     Gate(&'static Gate, Vec<Expr>),
     /// Any of these: what several wires into one port come to.
     Any(Vec<Expr>),
@@ -21,7 +64,7 @@ pub enum Expr {
 
 impl Expr {
     #[must_use]
-    pub fn holds(&self, signaled: &dyn Fn(&str) -> bool) -> bool {
+    pub fn holds(&self, signaled: &dyn Fn(&Event) -> bool) -> bool {
         match self {
             Expr::Event(name) => signaled(name),
             Expr::Any(any) => any.iter().any(|e| e.holds(signaled)),
@@ -44,13 +87,13 @@ impl Expr {
 
     /// The events it reads.
     #[must_use]
-    pub fn named(&self) -> BTreeSet<&str> {
+    pub fn named(&self) -> BTreeSet<&Event> {
         let mut events = BTreeSet::new();
         self.events(&mut events);
         events
     }
 
-    fn events<'a>(&'a self, events: &mut BTreeSet<&'a str>) {
+    fn events<'a>(&'a self, events: &mut BTreeSet<&'a Event>) {
         match self {
             Expr::Event(name) => {
                 events.insert(name);
@@ -68,9 +111,9 @@ pub enum Action {
     /// Make an asset's output stale.
     Push { asset: String, output: String },
     /// Signal an event.
-    Signal(String),
+    Signal(Event),
     /// Run an extension's hook: it runs before what the same event pulls, and failing stops those pulls.
-    Hook { op: String, event: String, signals: Vec<String> },
+    Hook { op: String, event: Event, signals: Vec<Event> },
 }
 
 /// Something done where an expression holds, with the events it may signal.
@@ -78,13 +121,13 @@ pub enum Action {
 pub struct Trigger {
     pub when: Expr,
     pub action: Action,
-    pub signals: Vec<String>,
+    pub signals: Vec<Event>,
 }
 
 /// What an action came to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
-    pub signaled: Vec<String>,
+    pub signaled: Vec<Event>,
     pub failed: Option<String>,
     /// What what was made says of itself, though it was made.
     pub notes: Vec<String>,
@@ -102,7 +145,7 @@ pub trait Effects: Sync {
 /// What an epoch came to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
-    pub signaled: BTreeSet<String>,
+    pub signaled: BTreeSet<Event>,
     /// What actually made something, by asset and output.
     pub made: Vec<(String, String)>,
     pub failed: Vec<(String, String)>,
@@ -128,7 +171,7 @@ pub fn order(triggers: Vec<Trigger>) -> (Vec<Trigger>, Vec<(usize, String)>) {
 fn producers(triggers: &[Trigger], trigger: &Trigger) -> Vec<usize> {
     let mut events = BTreeSet::new();
     trigger.when.events(&mut events);
-    (0..triggers.len()).filter(|t| triggers[*t].signals.iter().any(|s| events.contains(s.as_str()))).collect()
+    (0..triggers.len()).filter(|t| triggers[*t].signals.iter().any(|s| events.contains(s))).collect()
 }
 
 fn reaches_itself(triggers: &[Trigger], start: usize) -> bool {
@@ -148,7 +191,7 @@ fn reaches_itself(triggers: &[Trigger], start: usize) -> bool {
 fn label(action: &Action) -> (String, String) {
     match action {
         Action::Pull { asset, output } | Action::Push { asset, output } => (asset.clone(), output.clone()),
-        Action::Signal(event) => (event.clone(), String::new()),
+        Action::Signal(event) => (event.to_string(), String::new()),
         Action::Hook { op, .. } => (op.clone(), String::new()),
     }
 }
@@ -156,14 +199,14 @@ fn label(action: &Action) -> (String, String) {
 /// Run an epoch begun by `roots`. Each trigger runs at most once. What can fire fires, hooks first; once nothing can, a gate waiting is told, those whose inputs
 /// nothing left can signal first, as `order` left no cycle among them.
 #[must_use]
-pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, cancel: &AtomicBool) -> Report {
+pub fn schedule(triggers: &[Trigger], roots: &[Event], effects: &dyn Effects, cancel: &AtomicBool) -> Report {
     let _span = tracing::info_span!("epoch", roots = ?roots).entered();
     let mut report = Report { signaled: roots.iter().cloned().collect(), ..Report::default() };
     // Events a failed hook took back: signaled, so not again, but pulling nothing.
-    let mut refused: BTreeSet<String> = BTreeSet::new();
+    let mut refused: BTreeSet<Event> = BTreeSet::new();
     let mut fired = vec![false; triggers.len()];
     let mut rounds = 0;
-    let holds = |report: &Report, refused: &BTreeSet<String>, t: &Trigger| {
+    let holds = |report: &Report, refused: &BTreeSet<Event>, t: &Trigger| {
         t.when.holds(&|event| report.signaled.contains(event) && !refused.contains(event))
     };
     loop {
@@ -211,7 +254,7 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
                 if matches!(trigger.action, Action::Hook { .. }) {
                     let mut events = BTreeSet::new();
                     trigger.when.events(&mut events);
-                    refused.extend(events.into_iter().map(str::to_string));
+                    refused.extend(events.into_iter().cloned());
                 }
             } else if outcome.made {
                 report.made.push((asset, output));
@@ -254,7 +297,7 @@ mod tests {
     use crate::graph::GATES;
 
     fn event(name: &str) -> Expr {
-        Expr::Event(name.to_string())
+        Expr::Event(name.into())
     }
 
     fn gate(name: &str, inputs: Vec<Expr>) -> Expr {
@@ -263,7 +306,7 @@ mod tests {
 
     fn pull(when: Expr, asset: &str, signals: &[&str]) -> Trigger {
         let action = Action::Pull { asset: asset.to_string(), output: "native".to_string() };
-        Trigger { when, action, signals: signals.iter().map(ToString::to_string).collect() }
+        Trigger { when, action, signals: signals.iter().map(|s| Event::from(*s)).collect() }
     }
 
     /// Runs what it is told, each action signaling all it may.
@@ -271,7 +314,7 @@ mod tests {
     struct Log {
         ran: Mutex<Vec<String>>,
         failing: Vec<String>,
-        emits: BTreeMap<String, Vec<String>>,
+        emits: BTreeMap<String, Vec<Event>>,
     }
 
     impl Effects for Log {
@@ -291,9 +334,9 @@ mod tests {
     fn run(triggers: &[Trigger], emits: &[(&str, &str)], roots: &[&str]) -> (Vec<String>, Report) {
         let mut log = Log::default();
         for (from, to) in emits {
-            log.emits.entry((*from).to_string()).or_default().push((*to).to_string());
+            log.emits.entry((*from).to_string()).or_default().push((*to).into());
         }
-        let roots: Vec<String> = roots.iter().map(ToString::to_string).collect();
+        let roots: Vec<Event> = roots.iter().map(|root| Event::from(*root)).collect();
         let report = schedule(triggers, &roots, &log, &AtomicBool::new(false));
         (log.ran.into_inner().unwrap(), report)
     }
@@ -303,7 +346,7 @@ mod tests {
         let triggers = [pull(event("a"), "x", &["b"]), pull(event("b"), "y", &["a"])];
         let (ran, report) = run(&triggers, &[("x", "b"), ("y", "a")], &["a"]);
         assert_eq!(ran, ["x", "y"]);
-        assert!(report.signaled.contains("a") && report.signaled.contains("b"));
+        assert!(report.signaled.contains(&Event::from("a")) && report.signaled.contains(&Event::from("b")));
     }
 
     #[test]
@@ -356,7 +399,7 @@ mod tests {
         let (ran, _) = run(&triggers, &[], &["a"]);
         assert_eq!(ran, ["check", "x"]);
         let log = Log { failing: vec!["check".to_string()], ..Log::default() };
-        let report = schedule(&triggers, &["a".to_string()], &log, &AtomicBool::new(false));
+        let report = schedule(&triggers, &["a".into()], &log, &AtomicBool::new(false));
         assert_eq!(log.ran.into_inner().unwrap(), ["check"]);
         assert_eq!(report.failed, [("check".to_string(), "no".to_string())]);
     }
@@ -365,7 +408,7 @@ mod tests {
     fn a_cancelled_epoch_runs_nothing_more() {
         let triggers = [pull(event("a"), "x", &[])];
         let log = Log::default();
-        let report = schedule(&triggers, &["a".to_string()], &log, &AtomicBool::new(true));
+        let report = schedule(&triggers, &["a".into()], &log, &AtomicBool::new(true));
         assert!(report.cancelled && log.ran.into_inner().unwrap().is_empty());
     }
 }

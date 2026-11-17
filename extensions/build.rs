@@ -38,12 +38,15 @@ fn main() {
     let workspace = here.parent().expect("the extensions are in the workspace").to_path_buf();
     let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace.join("target"), PathBuf::from);
     let built = target.join("extensions");
-    // What a component is built from: its crate, the SDK and its contract, the lock file, the cargo configuration.
+    // What a component is built from: its crate, the SDK and its contract, every crate of the workspace either reaches,
+    // the lock file, the cargo configuration.
     let mut inputs: Vec<PathBuf> = vec![
         workspace.join("crates/ext/src"),
         workspace.join("crates/ext-macros/src"),
         workspace.join("crates/ext/wit"),
         workspace.join("crates/ext/Cargo.toml"),
+        workspace.join("crates/path"),
+        workspace.join("crates/model"),
         workspace.join("crates/codecs"),
         workspace.join("crates/formats"),
         workspace.join("crates/typeface"),

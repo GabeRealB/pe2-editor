@@ -177,7 +177,7 @@ impl<'a> Lent<'a> {
             Held::Owned(asset) => asset,
         };
         let (path, uid, node_type) = (told_path(&resource.path()), resource.uid(), resource.node_type());
-        let uid = uid.map(|uid| crate::Uid::new(&uid).unwrap_or_else(|why| broken(&why)));
+        let uid = uid.map(|uid| crate::Uid::from_u64(uid).unwrap_or_else(|| panic!("the host gave 0 for a uid")));
         let declaration = resource.declaration();
         Lent { handle, path, uid, node_type, declaration, fields: OnceCell::new() }
     }
@@ -286,7 +286,7 @@ impl Source for Lent<'_> {
     fn node_named(&self, reference: &crate::Reference) -> Option<crate::NodeNamed> {
         self.resource().node_named(&reference.to_string()).map(|named| crate::NodeNamed {
             path: told_path(&named.path),
-            uid: named.uid.map(|uid| crate::Uid::new(&uid).unwrap_or_else(|why| broken(&why))),
+            uid: named.uid.map(|uid| crate::Uid::from_u64(uid).unwrap_or_else(|| panic!("the host gave 0 for a uid"))),
             types: named.types.into_iter().map(String::into_boxed_str).collect(),
         })
     }

@@ -53,9 +53,28 @@ fn listed(assembled: &Assembled, part: Option<usize>) -> Vec<usize> {
 fn one_row(a: &Slot, b: &Slot) -> bool {
     a.name == b.name
         && a.material == b.material
-        && a.reference == b.reference
+        && same_reference(a.reference.as_ref(), b.reference.as_ref())
         && a.overrides.is_none()
         && b.overrides.is_none()
+}
+
+/// Whether two references name one thing: what they read as - the node, its output and the part of it - however their
+/// uids are written; as written, where one does not read.
+fn same_reference(a: Option<&Value>, b: Option<&Value>) -> bool {
+    let read = |r: &Value| {
+        Some((
+            pe2_ext::target_of(r).ok()?,
+            pe2_ext::asked_of(r).ok()?,
+            pe2_ext::fragment_of(r).ok()?.map(ToString::to_string),
+        ))
+    };
+    match (a, b) {
+        (Some(a), Some(b)) => match (read(a), read(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        },
+        (a, b) => a == b,
+    }
 }
 
 /// The rows: each the slots it stands for.

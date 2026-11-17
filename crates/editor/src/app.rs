@@ -2602,7 +2602,7 @@ impl Editor {
             });
             format!(
                 "{}: {} made, {} failed{cancelled}{failed}",
-                run.roots.join(", "),
+                project::events::listed(&run.roots, ", "),
                 report.made.len(),
                 report.failed.len()
             )

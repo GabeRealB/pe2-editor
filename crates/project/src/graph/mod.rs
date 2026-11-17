@@ -379,8 +379,15 @@ pub const DEFINED_TEMPLATE: &str = "pe2.graph@template";
 /// made for the configuration built and taken as `uid://<generator>#<output>`.
 pub const DEFINED_GENERATOR: &str = "pe2.graph@generator";
 
-/// The operations a project defines, by uid.
-pub type Definitions = HashMap<String, Arc<Definition>>;
+/// The operations a project defines, by what names them: a node's uid, or a generator's output (`uid://<generator>/<part>`).
+pub type Definitions = HashMap<pe2_path::ResourcePath, Arc<Definition>>;
+
+/// The operation a project defines that a name names, where it names one: read as a reference, so that however it is
+/// written, it is the one the uid is.
+#[must_use]
+pub fn defined_in<'d>(definitions: &'d Definitions, name: &str) -> Option<&'d Arc<Definition>> {
+    definitions.get(&pe2_path::ResourcePath::new(name).ok()?)
+}
 
 /// An operation a project defines: a graph of others - laid into each stack naming it by its node's uid, as a graph
 /// layer is - whose boxes say what it is from outside: each `input` it takes, each `setting` it is set to (read inside it
@@ -388,7 +395,8 @@ pub type Definitions = HashMap<String, Arc<Definition>>;
 /// each `output` it makes, the first its result.
 #[derive(Clone, Debug)]
 pub struct Definition {
-    pub uid: String,
+    /// What names it.
+    pub uid: pe2_path::ResourcePath,
     pub label: String,
     /// Its declaration's hash: what tells it changed.
     pub version: String,
@@ -420,7 +428,7 @@ impl Definition {
     /// # Errors
     /// It holds no such layer, it makes nothing, or a box is not one: two of a name, a type or setting not as one is
     /// written.
-    pub fn of(uid: &str, fields: &Table, version: &str) -> Result<Definition, String> {
+    pub fn of(uid: &pe2_path::ResourcePath, fields: &Table, version: &str) -> Result<Definition, String> {
         let layers = fields.get("stack").and_then(Toml::as_array).into_iter().flatten();
         let layer =
             layers.filter_map(Toml::as_table).find(|layer| layer.get("op").and_then(Toml::as_str) == Some(DEFINED));
@@ -467,7 +475,7 @@ impl Definition {
         }
         let label = layer.get("label").and_then(Toml::as_str).map_or_else(|| uid.to_string(), str::to_owned);
         Ok(Definition {
-            uid: uid.to_string(),
+            uid: uid.clone(),
             label,
             version: version.to_string(),
             inputs,
@@ -848,11 +856,17 @@ impl Ops {
         self.defs.get(name)
     }
 
+    /// The operation the project defines that a name names (`defined_in`).
+    #[must_use]
+    pub fn defined(&self, name: &str) -> Option<&Arc<Definition>> {
+        defined_in(&self.definitions, name)
+    }
+
     /// What an operation makes, by name - its first under none (`""`) - with its type: an extension's or the host's,
     /// or one the project defines.
     #[must_use]
     pub fn outputs_of(&self, name: &str) -> Vec<(String, Type)> {
-        match (self.defs.get(name), self.definitions.get(name)) {
+        match (self.defs.get(name), self.defined(name)) {
             (Some(def), _) => std::iter::once((String::new(), def.output.clone().unwrap_or(Type::Any)))
                 .chain(def.also.iter().cloned())
                 .collect(),
@@ -869,7 +883,7 @@ impl Ops {
     /// What an operation takes, by port: an extension's, the host's, or one the project defines.
     #[must_use]
     pub fn ports_of(&self, name: &str) -> Vec<Port> {
-        match (self.defs.get(name), self.definitions.get(name)) {
+        match (self.defs.get(name), self.defined(name)) {
             (Some(def), _) => def.inputs.clone(),
             (None, Some(definition)) => definition.inputs.clone(),
             (None, None) => Vec::new(),
@@ -1143,7 +1157,9 @@ impl Plan {
         let inputs = || step.inputs.iter().flatten().map(|from| self.expression(*from)).collect();
         match GATES.iter().find(|gate| gate.name == step.op) {
             Some(gate) => Expr::Gate(gate, inputs()),
-            None => Expr::Event(step.settings.get("event").and_then(Toml::as_str).unwrap_or_default().to_string()),
+            None => Expr::Event(crate::events::Event::new(
+                step.settings.get("event").and_then(Toml::as_str).unwrap_or_default(),
+            )),
         }
     }
 
@@ -1399,7 +1415,7 @@ struct Lowering<'a> {
     /// The steps picking outputs, by the step and the output.
     picks: HashMap<(usize, usize), usize>,
     /// The operations the project defines being laid in, outermost first.
-    inlining: Vec<String>,
+    inlining: Vec<pe2_path::ResourcePath>,
     /// What the `output` boxes of each being laid in are given, by name.
     collecting: Vec<Vec<(String, usize)>>,
     /// The outputs of each operation the project defines laid in, by its first: what `id.<name>` takes.
@@ -1505,7 +1521,7 @@ impl Lowering<'_> {
                 }
                 GRAPH => above = self.graph(layer, above, &at),
                 _ => {
-                    let defined = self.ops.definitions.get(op).cloned();
+                    let defined = self.ops.defined(op).cloned();
                     let def = self.ops.get(op).cloned();
                     if def.is_none() && defined.is_none() {
                         self.problem(&at, &format!("`{op}`: no extension provides it"));
@@ -2044,7 +2060,7 @@ impl Lowering<'_> {
             self.problem(at, "is a graph inside a graph");
             return None;
         }
-        let defined = self.ops.definitions.get(name).cloned();
+        let defined = self.ops.defined(name).cloned();
         let def = self.ops.get(name).cloned();
         if def.is_none() && defined.is_none() {
             self.problem(at, &format!("`{name}`: no extension provides it"));

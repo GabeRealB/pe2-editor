@@ -368,7 +368,8 @@ impl Host {
             let Some((runner, _)) = runner.as_ref() else { return Err(mcp::Reply::Declined) };
             let (reply, answered) = std::sync::mpsc::channel();
             let index = Arc::new(held.core.index.clone());
-            runner.run(holder::runner::Job { roots: events, index, config, reply: Some(reply) });
+            let roots = events.iter().map(|event| project::events::Event::new(event)).collect();
+            runner.run(holder::runner::Job { roots, index, config, reply: Some(reply) });
             Ok(answered)
         });
         let answered = match started {
@@ -741,7 +742,7 @@ impl Host {
 /// The events the epoch running was signaled by, as said of a host that is busy.
 fn running(state: &State) -> String {
     let events = state.runner.as_ref().map_or_default(|(runner, _)| runner.running());
-    if events.is_empty() { "an epoch".to_string() } else { events.join(", ") }
+    if events.is_empty() { "an epoch".to_string() } else { project::events::listed(&events, ", ") }
 }
 
 /// One process talking to the host: a lease while it keeps the folder served or borrows the project, ended with the
